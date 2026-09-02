@@ -1,0 +1,45 @@
+# cargo-deny configuration — https://embarkstudios.github.io/cargo-deny/
+#
+# CI runs `cargo deny check advisories bans`. Licenses/sources are
+# intentionally omitted, matching the dolos workspace this repository was
+# extracted from.
+
+[graph]
+all-features = true
+exclude-dev = false
+
+[advisories]
+version = 2
+yanked = "warn"
+unmaintained = "none"
+ignore = [
+    # "RUSTSEC-0000-0000", # reason — <issue link>
+]
+
+[bans]
+multiple-versions = "warn"
+
+deny = [
+    # The extraction boundary, stated where it is enforced: the protocol
+    # depends on no profile. In the dolos workspace this was a rule someone
+    # had to keep; here the resolver checks it. Enumerated because cargo-deny
+    # matches names exactly — a new dolos-* crate joins this list when it is
+    # born, which its author is the person editing these manifests anyway.
+    { crate = "dolos", reason = "the Stelae crates must never depend on a dolos crate; the protocol depends on no profile (SPEC.md)" },
+    { crate = "dolos-cardano", reason = "the Stelae crates must never depend on a dolos crate" },
+    { crate = "dolos-core", reason = "the Stelae crates must never depend on a dolos crate" },
+    { crate = "dolos-fjall", reason = "the Stelae crates must never depend on a dolos crate" },
+    { crate = "dolos-flatfiles", reason = "the Stelae crates must never depend on a dolos crate" },
+    { crate = "dolos-minibf", reason = "the Stelae crates must never depend on a dolos crate" },
+    { crate = "dolos-minikupo", reason = "the Stelae crates must never depend on a dolos crate" },
+    { crate = "dolos-mithril", reason = "the Stelae crates must never depend on a dolos crate" },
+    { crate = "dolos-redb3", reason = "the Stelae crates must never depend on a dolos crate" },
+    { crate = "dolos-snapshot", reason = "the Stelae crates must never depend on a dolos crate" },
+    { crate = "dolos-testing", reason = "the Stelae crates must never depend on a dolos crate" },
+    { crate = "dolos-trp", reason = "the Stelae crates must never depend on a dolos crate" },
+    # The same C-toolchain refusal the dolos workspace makes: the oci feature
+    # takes reqwest with rustls-no-provider so the crypto provider is the
+    # host's choice, and nothing here may drag cmake back in.
+    { crate = "cmake", reason = "requires a cmake toolchain; the transport ships no crypto backend of its own (SPEC.md, transport requirements)" },
+    { crate = "aws-lc-sys", reason = "pulls cmake in; hosts install ring as the rustls crypto provider (SPEC.md, transport requirements)" },
+]

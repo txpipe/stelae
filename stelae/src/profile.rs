@@ -15,7 +15,7 @@
 //! at the boundary instead of publishing something a third party cannot coexist
 //! with.
 //!
-//! The rules themselves are normative (ADR-004, "Naming, profiles and media
+//! The rules themselves are normative (SPEC.md, "Profiles, naming and media
 //! types"):
 //!
 //! 1. Payload media types are

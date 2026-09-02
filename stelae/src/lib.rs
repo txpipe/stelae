@@ -15,7 +15,7 @@
 //! supplies. The protocol handles framing, canonicalization, digests and the
 //! naming rules that let distinct vendors coexist in one registry.
 //!
-//! The normative specification is `adrs/004_stelae_snapshots.md`.
+//! The normative specification is `SPEC.md` at the repository root.
 //!
 //! ## Module map
 //!
@@ -112,7 +112,8 @@ pub const MOVING_TAG: &str = "latest";
 /// Ceiling on the size of a stele's OCI manifest.
 ///
 /// Not a spec limit — the OCI distribution specification sets none — but the
-/// figure registries converge on, and the one ADR-004 sized the format against
+/// figure registries converge on, and the one Dolos ADR-004 sized the format
+/// against
 /// ("~1,700 manifest descriptors, well under the 4 MiB manifest guidance"). A
 /// stele that exceeds it is refused before the push rather than after a
 /// registry answers `413`, because the failure is a property of the document

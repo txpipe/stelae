@@ -8,8 +8,7 @@
 //! - **blob digest** — sha256 over the *zstd-compressed* bytes. This is
 //!   transport. It is what an OCI registry addresses the blob by, and it is not
 //!   stable across zstd versions or levels, which is precisely why it cannot be
-//!   the identity anchor (ADR-004, "Determinism is anchored on uncompressed
-//!   bytes").
+//!   the identity anchor (SPEC.md, "Layer format").
 //!
 //! [`LayerWriter`] produces both in a single pass over the data: bytes are
 //! hashed on the way in, compressed, and hashed again on the way out. Nothing

@@ -29,14 +29,16 @@
 //! [`RestoreProgress::record`]; it only guarantees that what was recorded
 //! survives.
 //!
-//! The file's **name and location** are the profile's too. ADR-004 spells them
+//! The file's **name and location** are the profile's too. Dolos ADR-004
+//! spells them
 //! `<storage.path>/.snapshot-restore.json` for the Dolos profile, and
 //! "snapshot" is that profile's word for a stele rather than the protocol's —
 //! so every entry point here takes a path a caller chose.
 //!
 //! ## What this module is not
 //!
-//! Not layer selection, and not the preflight. ADR-004's code-layout sketch
+//! Not layer selection, and not the preflight. Dolos ADR-004's code-layout
+//! sketch
 //! puts both here, and both belong to the profile for the reason the Dolos
 //! restore driver states: a layer's `scope` is opaque to the protocol, so
 //! nothing but a profile can read an epoch out of one, and nothing but a
@@ -59,10 +61,11 @@ use crate::{inscription::LayerDescriptor, transport::BlobIndex, Digest, Error, S
 
 /// A restore's progress, as it survives the process making it.
 ///
-/// Exactly what ADR-004 asks the file to record: the inscription digest, and
-/// the `diffId`s of the layers that are done. The digest is not what decides a
-/// resume — see the module documentation — but it is what lets an operator, or
-/// a later diagnostic, tell which stele a half-finished restore was aimed at.
+/// Exactly what Dolos ADR-004 asks the file to record: the inscription digest,
+/// and the `diffId`s of the layers that are done. The digest is not what
+/// decides a resume — see the module documentation — but it is what lets an
+/// operator, or a later diagnostic, tell which stele a half-finished restore
+/// was aimed at.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreProgress {

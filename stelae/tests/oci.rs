@@ -339,8 +339,8 @@ fn a_manifest_yields_the_identity_to_blob_map() {
     assert_eq!(blobs.blob_for(&digest_of(0xcc)), None);
 }
 
-/// The annotations ADR-004 asks for, checked as content rather than as bytes,
-/// so a reader of this file can see what a generic OCI tool would find.
+/// The annotations Dolos ADR-004 asks for, checked as content rather than as
+/// bytes, so a reader of this file can see what a generic OCI tool would find.
 #[test]
 fn every_layer_is_annotated_with_its_kind_diff_id_and_scope() {
     let (inscription, layers) = fixture();
@@ -459,13 +459,13 @@ fn a_manifest_that_is_not_a_steles_is_refused() {
 ///
 /// A descriptor and its three annotations run to roughly 350 bytes, so a
 /// manifest reaches the ceiling somewhere around twelve thousand layers —
-/// nearly seven times a mainnet stele's ~1,816 (ADR-004's ~600 epochs × three
-/// per-epoch kinds, plus sixteen state shards). Nothing is expected to meet it.
-/// The point is that when something does, the refusal names the document and
-/// the layer count instead of arriving as a registry's `413`.
+/// nearly seven times a mainnet stele's ~1,816 (Dolos ADR-004's ~600 epochs ×
+/// three per-epoch kinds, plus sixteen state shards). Nothing is expected to
+/// meet it. The point is that when something does, the refusal names the
+/// document and the layer count instead of arriving as a registry's `413`.
 #[test]
 fn a_manifest_past_the_size_ceiling_is_refused() {
-    /// Layers of a mainnet stele, by ADR-004's own sizing.
+    /// Layers of a mainnet stele, by Dolos ADR-004's own sizing.
     const MAINNET: usize = 600 * 3 + 16;
     /// Comfortably past the ceiling: nothing here depends on where exactly it
     /// falls, only that it is far above anything a profile would publish.
@@ -510,7 +510,7 @@ fn a_manifest_past_the_size_ceiling_is_refused() {
     );
 
     // A mainnet-sized stele passes it with room to spare, which is the claim
-    // ADR-004 sized the format against.
+    // Dolos ADR-004 sized the format against.
     let body = manifest_bytes(&build(MAINNET)).unwrap();
 
     println!(

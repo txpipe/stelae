@@ -312,8 +312,8 @@ impl Auth {
 
 /// Annotation naming a layer's profile-defined kind.
 ///
-/// The three annotation keys below are the specification's: ADR-004's "OCI
-/// layout and the inscription" section names them, reverse-DNS under
+/// The three annotation keys below are the specification's: SPEC.md's "OCI
+/// layout" section names them, reverse-DNS under
 /// `stelae.store`, a domain TxPipe owns. They are transport metadata and sit
 /// outside the inscription, so they are outside a stele's identity — but only
 /// two of them are informational. [`DIFF_ID_ANNOTATION`] is normative, because
@@ -2415,10 +2415,10 @@ fn layer_descriptor(
 /// many layers: at roughly 350 bytes of descriptor and annotations apiece, a
 /// manifest reaches 4 MiB somewhere around twelve thousand of them — nearly
 /// seven times a mainnet stele's ~1,816. The comparison is in layers because
-/// layers are what the ceiling counts; ADR-004's ~600 is a count of *epochs*,
-/// and a mainnet stele carries three layers per epoch plus sixteen state
-/// shards. It is not a limit anything is expected to reach; it is the limit
-/// that turns "the registry answered 413" into a refusal that names the
+/// layers are what the ceiling counts; Dolos ADR-004's ~600 is a count of
+/// *epochs*, and a mainnet stele carries three layers per epoch plus sixteen
+/// state shards. It is not a limit anything is expected to reach; it is the
+/// limit that turns "the registry answered 413" into a refusal that names the
 /// document and the number of layers in it.
 ///
 /// `a_manifest_past_the_size_ceiling_is_refused` in `tests/oci.rs` measures

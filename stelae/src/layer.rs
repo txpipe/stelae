@@ -2,9 +2,9 @@
 //!
 //! [`crate::digest::read_blob`] decompresses a whole layer into a `Vec` and
 //! hands it over. That is the right shape for a fixture and the wrong one for
-//! the sizes a profile publishes: ADR-004's worked example gives a state shard
-//! of 402,653,184 uncompressed bytes, and one mainnet epoch of blocks runs to
-//! 0.5–1.5 GB. The write path never had this problem —
+//! the sizes a profile publishes: Dolos ADR-004's worked example gives a state
+//! shard of 402,653,184 uncompressed bytes, and one mainnet epoch of blocks
+//! runs to 0.5–1.5 GB. The write path never had this problem —
 //! [`crate::digest::LayerWriter`] hashes, compresses and hashes again in one
 //! pass with nothing buffered — so the asymmetry was one-sided and easy to
 //! miss.

@@ -1,0 +1,14 @@
+# Two crates, one repository, one tag: `stelae` is the lean normative crate a
+# third party implements the protocol from, `stelae-driver` the lifecycle
+# machinery a publisher or restorer needs whatever it is publishing. Versions
+# move in lockstep and `stelae-driver` pins `stelae` exactly, so a release is
+# a single tag and a consumer pins both crates with one git reference.
+[workspace]
+resolver = "2"
+members = ["stelae", "stelae-driver"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/txpipe/stelae"

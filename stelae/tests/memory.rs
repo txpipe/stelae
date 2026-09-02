@@ -1,12 +1,12 @@
 //! Peak memory during a layer read is a property, not an aspiration.
 //!
 //! The protocol's read path used to hold a whole uncompressed layer: fine for a
-//! fixture, fatal at the sizes a profile publishes (ADR-004's worked example
-//! gives a state shard of 402,653,184 bytes). These tests are what stops that
-//! from coming back. They instrument the global allocator with `stats_alloc` —
-//! the idiom the root package's `tests/memory.rs` uses for store iteration —
-//! and read a layer far larger than the reader's window while watching what the
-//! process asks for.
+//! fixture, fatal at the sizes a profile publishes (Dolos ADR-004's worked
+//! example gives a state shard of 402,653,184 bytes). These tests are what
+//! stops that from coming back. They instrument the global allocator with
+//! `stats_alloc` — the idiom the root package's `tests/memory.rs` uses for
+//! store iteration — and read a layer far larger than the reader's window while
+//! watching what the process asks for.
 //!
 //! `bytes_allocated` is cumulative over the region, which is a *stronger*
 //! statement than peak: a run that never allocates more than N bytes in total

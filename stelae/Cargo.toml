@@ -3,6 +3,9 @@ name = "stelae"
 description = "Stelae: a deterministic, content-addressed snapshot protocol"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
 
 [features]
 # OCI registry transport (`src/oci.rs`). Default-off, so a build that does not
@@ -22,19 +25,25 @@ oci = [
     "dep:tokio",
 ]
 
-# This crate is the Stelae protocol. It must never depend on a `dolos-*`
-# package, so that extracting it later is a directory move rather than a
-# refactor. `cargo tree -p stelae -e normal` shows the boundary holding.
-# See adrs/004_stelae_snapshots.md, "Code layout".
+# This crate is the Stelae protocol. It began as a workspace member of
+# txpipe/dolos, where "no `dolos-*` dependency, ever" was the rule that made
+# the extraction a directory move; the boundary is structural now, and the
+# rule survives as this crate's definition — the protocol depends on no
+# profile. See SPEC.md.
 [dependencies]
-hex.workspace = true
-minicbor.workspace = true
-serde.workspace = true
-serde_jcs.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
-thiserror.workspace = true
-zstd.workspace = true
+hex = "0.4.3"
+# Pinned to the 0.26 line that Pallas pulls in, so the Dolos profile — this
+# protocol's first producer and consumer — adds no second CBOR implementation
+# to its tree and encodes against the same codec the protocol does. Moving
+# this line is a byte-compatibility question, not a dependency bump; see
+# README.md, "Versioning".
+minicbor = { version = "0.26", features = ["std"] }
+serde = { version = "1.0.136", features = ["derive", "rc"] }
+serde_jcs = "0.2.0"
+serde_json = "1.0.122"
+sha2 = "0.10.9"
+thiserror = "2.0.12"
+zstd = "0.13.3"
 
 # --- feature `oci` ---------------------------------------------------------
 #
@@ -97,10 +106,10 @@ reqwest = { version = "0.13", optional = true, default-features = false, feature
 # concurrent layer round trips with a `Semaphore`, and the permit is what also
 # bounds how many staged layers can exist at once, while a round trip the
 # registry answered with a `5xx` waits out a backoff before it is made again.
-tokio = { workspace = true, optional = true, features = ["sync", "time"] }
+tokio = { version = "1.47", optional = true, features = ["rt", "rt-multi-thread", "sync", "time"] }
 # `push_blob_stream` takes a `Stream`, which is how a layer is uploaded from
 # its staging file without ever being held.
-futures-util = { workspace = true, optional = true }
+futures-util = { version = "0.3.28", optional = true }
 bytes = { version = "1", optional = true }
 # Solely to name the manifest's `Content-Type`. The manifest is pushed as the
 # exact canonical bytes this crate produced — the ones the golden freezes and
