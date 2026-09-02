@@ -12,3 +12,28 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/txpipe/stelae"
+
+# Same release flow as dolos: `cargo release` bumps the lockstep workspace
+# version, regenerates the root CHANGELOG.md through git-cliff, commits and
+# tags `v{{version}}`; pushing the commit and the tag stays a manual step.
+[workspace.metadata.release]
+push = false
+publish = false
+tag-name = "v{{version}}"
+pre-release-commit-message = "release: v{{version}}"
+# The hook runs once per workspace member, in the member directory — this is a
+# virtual workspace, unlike dolos where the root manifest is a package — so
+# both output path and workdir point one level up: one root changelog, written
+# identically on each run. `--workdir` also keeps git-cliff from deriving the
+# repo root from the git common dir, which points outside the worktree when
+# this repo is checked out as a submodule.
+pre-release-hook = [
+    "git",
+    "cliff",
+    "--workdir",
+    "..",
+    "-o",
+    "../CHANGELOG.md",
+    "--tag",
+    "{{version}}",
+]
