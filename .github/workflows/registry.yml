@@ -1,6 +1,8 @@
 # The #[ignore]d live-registry suite, in a workflow of its own — relocated
-# from dolos's registry.yml when the crates left that workspace; the two
-# dolos-snapshot legs stayed behind with the profile.
+# from dolos's registry.yml when the crates left that workspace. Registry
+# interaction is these crates' responsibility, so this is where the
+# integration gate lives; dolos tests its profile against the directory
+# transport and keeps its registry composition suites as local tools only.
 name: Registry
 
 on:
