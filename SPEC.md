@@ -4,11 +4,14 @@ This document is the normative specification of the Stelae snapshot protocol:
 what the `stelae` crate implements, and what a third-party profile is written
 against. It is the protocol half of what was authored as [Dolos
 ADR-004](https://github.com/txpipe/dolos/blob/main/adrs/004_stelae_snapshots.md),
-extracted when these crates left the Dolos workspace; that ADR keeps the
-decision record and the Dolos profile's own half — its layer kinds, record
-shapes, cut point and pipelines — and this document owes it nothing normative.
-Where a rule needs an example, the Dolos profile (`io.txpipe.dolos.cardano`)
-supplies it, as illustration and never as requirement.
+extracted when these crates left the Dolos workspace. That ADR remains the
+decision record; the Dolos profile's own normative half — its layer kinds,
+record shapes, cut point and pipelines — is
+[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/main/crates/snapshot/PROFILE.md)
+in the Dolos repository, and this document owes both of them nothing
+normative. Where a rule needs an example, the Dolos profile
+(`io.txpipe.dolos.cardano`) supplies it, as illustration and never as
+requirement.
 
 ## Overview
 
@@ -30,6 +33,17 @@ Four properties drive every rule below:
    byte-identical inscriptions, whatever compressed their blobs.
 4. **Multi-party attestation.** Identity is the inscription's sha256;
    independent parties reproduce and sign that one digest.
+
+## Why an OCI registry
+
+Registries are content-addressed: pushing skips blobs the registry already
+holds (HEAD by digest) and pulling fetches only the layers missing locally,
+so immutable layers make delta transfer a property of the transport rather
+than a feature of this protocol. The referrers API gives detached signatures
+a standard, tooling-compatible home. And registry infrastructure — auth, CDN
+distribution, garbage collection, mirroring — is commodity, so the protocol
+specifies none of it. Any OCI Distribution v1.1 registry is a valid home for
+a stele repository.
 
 ## Profiles, naming and media types
 
@@ -164,6 +178,12 @@ copy carries its own inscription — check that inscription's digest against
 the `history` of the latest signed one, then the layers against its diffIds.
 No external trusted storage of attestations is required.
 
+Retention is the publisher's policy, not the protocol's: a publisher keeps a
+trailing window of immutable tags, untagged blobs are the registry's garbage
+collector's to reclaim, and blobs still referenced by later manifests
+survive on their own. `history` is what makes that policy safe — trust
+evidence for a reclaimed stele survives in every later inscription.
+
 **History invariant:** `history` contains exactly one entry per published
 sequence, contiguous from the dataset's first published sequence (pinned
 per dataset alongside the default repository) up to `sequence - 1`, in
@@ -294,6 +314,13 @@ own accounting lives in its half of the spec).
   repository can be free and identity-less and still credentialed.
 
 ## Restore planning
+
+A client reads a stele in a fixed order, refusing early: resolve the tag to
+a manifest and refuse any manifest–inscription disagreement (above, before
+any blob is fetched); verify the inscription's digest, `schema`, profile
+name and major version, and signatures; plan; then fetch, verifying each
+blob's registry digest (transport integrity) and its `diffId` (canonical
+identity).
 
 The protocol's half of a restore is planning and resume; layer selection is
 profile-side by necessity (a layer's `scope` is opaque, so only the profile
