@@ -103,8 +103,9 @@ namespace it has retired keeps its entry at revision `0`, which is not a
 schema revision and reads as "this version defines no records here". A
 restore compares that map against the namespaces it models, before a store is
 opened: an entry that is missing or zero for one it models refuses the
-restore and names the namespace. Only presence is judged, never the
-revision's value — a revision the reader has not seen describes bytes it can
+restore and names the namespace. The gate is presence, with revision `0`
+reading as absence per the sentinel above; a *live* revision's value is
+never compared — a revision the reader has not seen describes bytes it can
 still parse, and gating on it would make every additive append breaking.
 Like `required`, the rule binds forward and not backward. Retiring a
 namespace is a specification-level act for the profile.
