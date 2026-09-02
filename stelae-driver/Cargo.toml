@@ -20,7 +20,7 @@ oci = ["stelae/oci"]
 # so a consumer can never pair a driver with a protocol crate it was not
 # released with. See SPEC.md.
 [dependencies]
-stelae = { path = "../stelae", version = "=0.1.0" }
+stelae = { path = "../stelae", version = "=0.2.0" }
 
 fs4 = { version = "1.1.0", default-features = false }
 minicbor = { version = "0.26", features = ["std"] }

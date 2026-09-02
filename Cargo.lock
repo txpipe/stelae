@@ -1418,7 +1418,7 @@ checksum = "5c0e04424e733e69714ca1bbb9204c1a57f09f5493439520f9f68c132ad25eec"
 
 [[package]]
 name = "stelae"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1441,7 +1441,7 @@ dependencies = [
 
 [[package]]
 name = "stelae-driver"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fs4",
  "minicbor",
