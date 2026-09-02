@@ -245,11 +245,14 @@ TxPipe owns:
 | `store.stelae.layer.scope` | informational | the layer's scope object as stringified canonical JSON |
 
 `store.stelae.layer.diffId` is the identity→blob map — the thing a registry
-hands over for free and a directory has to rebuild by decompressing every
-blob. A client that does not read it cannot fetch a layer; it is the one
-annotation a reader must understand. The other two exist so a human or a
-generic registry tool can see what a blob covers without fetching the config
-blob, and a client may ignore them.
+hands over for free. A directory has no manifest to carry it, so a publish
+writes the same map to a `blobs.json` sidecar beside `inscription.json`; it
+is transport and not identity — unsigned, outside the inscription digest, and
+fully recoverable from the blobs — so a stele without one still restores, by
+decompressing every blob to rebuild it. A client that does not read it cannot
+fetch a layer; it is the one annotation a reader must understand. The other
+two exist so a human or a generic registry tool can see what a blob covers
+without fetching the config blob, and a client may ignore them.
 
 ### Manifest–inscription agreement
 
