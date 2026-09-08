@@ -1,0 +1,20 @@
+{{/*
+The publishers' write path:
+  oci://stelae-registry.stelae-publisher.svc.cluster.local:5000/<repo>
+reached with dolos --insecure, so no TLS and no Cloudflare hop touches it.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "stelae-registry.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "stelae-registry.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "stelae-registry.selectorLabels" . | nindent 4 }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.http.port | int }}
+      name: http

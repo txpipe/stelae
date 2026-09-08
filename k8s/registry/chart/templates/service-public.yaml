@@ -1,0 +1,28 @@
+{{/*
+The public read path, LoadBalancer shape: a second Service so the in-cluster
+ClusterIP one (the publishers' write path) is never widened. The cloud's LB
+controller owns the actual load balancer's lifecycle — it exists because
+this object exists and dies with it, which is what keeps the exit an
+annotation-and-DNS change rather than a teardown project.
+*/}}
+{{- if .Values.loadBalancer.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "stelae-registry.fullname" . }}-public
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "stelae-registry.labels" . | nindent 4 }}
+  {{- with .Values.loadBalancer.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: LoadBalancer
+  selector:
+    {{- include "stelae-registry.selectorLabels" . | nindent 4 }}
+  ports:
+    - port: {{ .Values.loadBalancer.port }}
+      targetPort: {{ .Values.http.port | int }}
+      name: public
+{{- end }}

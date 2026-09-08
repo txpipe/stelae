@@ -27,6 +27,11 @@ producer and consumer; it carries no Cardano assumption.
 The boundary proof lives in the test suite: `stelae/tests/toy_profile.rs`
 implements a second, trivial profile against the protocol surface alone.
 
+## Kubernetes
+
+[`k8s/`](k8s/) contains the instance-agnostic Helm deployment units for the
+Dolos publisher and the Stelae registry.
+
 ## Specification
 
 The normative specification is [`SPEC.md`](SPEC.md). The Dolos profile's own

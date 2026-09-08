@@ -1,0 +1,13 @@
+apiVersion: v2
+name: dolos-publisher
+description: one stele publisher — a Dolos backfill Job that restores, replays, publishes and prunes one network's stele repository
+type: application
+# Chart version: this chart. There is no appVersion on purpose: the dolos
+# build a release runs is image.tag in the network's values file, and the
+# three networks need not agree.
+version: 0.1.0
+home: https://github.com/txpipe/stelae
+keywords:
+  - stelae
+  - oci
+  - publisher

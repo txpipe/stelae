@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "stelae-registry.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "stelae-registry.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "stelae-registry.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "stelae-registry.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Roll the pod when config.json changes; zot reads it only at start.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: zot
+          image: {{ include "stelae-registry.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [{{ required "image.binary is required" .Values.image.binary | quote }}, "serve", "/etc/zot/config.json"]
+          ports:
+            - containerPort: {{ .Values.http.port | int }}
+              name: http
+          envFrom:
+            # R2 keys as AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY: the S3
+            # driver picks them up from the AWS credential chain, so nothing
+            # lands in config.json or the image.
+            - secretRef:
+                name: {{ .Values.auth.r2SecretName }}
+          startupProbe:
+            tcpSocket: { port: {{ .Values.http.port | int }} }
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          readinessProbe:
+            tcpSocket: { port: {{ .Values.http.port | int }} }
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+          livenessProbe:
+            tcpSocket: { port: {{ .Values.http.port | int }} }
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: zot-config
+              mountPath: /etc/zot
+              readOnly: true
+            - name: state
+              mountPath: {{ .Values.persistence.mountPath }}
+      volumes:
+        # config.json is chart-rendered, htpasswd is pre-created; zot wants
+        # both in one directory, which is what the projection gives.
+        - name: zot-config
+          projected:
+            sources:
+              - configMap:
+                  name: {{ include "stelae-registry.fullname" . }}-config
+                  items:
+                    - key: config.json
+                      path: config.json
+              - secret:
+                  name: {{ .Values.auth.htpasswdSecretName }}
+                  items:
+                    - key: htpasswd
+                      path: htpasswd
+        - name: state
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "stelae-registry.fullname" . }}-state
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

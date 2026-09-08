@@ -1,0 +1,568 @@
+From fe0679dab2a9e8e307da893a384f212841d75840 Mon Sep 17 00:00:00 2001
+From: datadot <datadot@users.noreply.github.com>
+Date: Tue, 25 Aug 2026 07:54:52 +0100
+Subject: [PATCH] perf: drop the index walk on blob Content-Type (#4350)
+
+* perf: drop the index walk on blob Content-Type
+
+HEAD/GET on a blob resolved the response Content-Type through
+GetBlobDescriptorFromRepo, which reads index.json and then fetches
+every manifest in the repo until it finds the digest. That is
+O(manifests) storage reads per request, and on a remote driver it
+dominates the response: roughly 0.145s per manifest, so minutes on a
+repo with several hundred tags (#4344).
+
+Content-Type is not specified for blob pulls. The dist-spec requires
+it for manifest pulls only, and the helper already fell back to
+application/octet-stream whenever the lookup failed, so the walk only
+ever upgraded a header that nothing is entitled to depend on.
+
+Blob responses now always advertise application/octet-stream, which
+stays non-empty and parseable for consumers such as
+stargz-snapshotter. Manifest media-type resolution is untouched. This
+reverts the blob half of #4325; the tests that pinned the descriptor
+type now assert the constant and additionally fail if the blob path
+reads the index at all.
+
+Signed-off-by: Paul Kennedy <9027062+datadot@users.noreply.github.com>
+
+* docs: document octet-stream on blob responses
+
+Both blob endpoints now always answer with application/octet-stream, so
+the swagger annotations follow: the GET endpoint declared the gzipped
+layer media type, and the HEAD endpoint declared json while its handler
+sets the same octet-stream header the GET one does.
+
+buildMultipartPartHeader still described resolving a descriptor media
+type, which is the lookup this branch removes.
+
+swagger/ regenerated with make swagger.
+
+Signed-off-by: Paul Kennedy <9027062+datadot@users.noreply.github.com>
+
+* docs: address review on blob Content-Type docs
+
+Drops the repeated comment above the index-read counters: the assertion
+message already explains why the reads are counted (@vrajashkr).
+
+Rewrites the section and fixture documentation, which still described
+deriving the response type from the blob's descriptor. The fixture stays,
+because the tests use it to prove the blob path never reads the index,
+but it no longer reads as if that lookup were live (@copilot).
+
+Restores @Produce json on the blob HEAD endpoint and adds
+application/octet-stream alongside it, rather than replacing it: the
+endpoint answers errors with JSON and successes with headers only
+(@vrajashkr). swagger/ regenerated.
+
+Signed-off-by: Paul Kennedy <9027062+datadot@users.noreply.github.com>
+
+* docs: document json on the blob GET produces list
+
+The blob GET endpoint answers errors with JSON through WriteJSON, so it
+produces both types, the same as HEAD. Success responses are unchanged
+and still carry application/octet-stream.
+
+swagger/ regenerated.
+
+Signed-off-by: Paul Kennedy <9027062+datadot@users.noreply.github.com>
+
+* docs: trim the blob Content-Type test preamble
+
+Drops the sentence on how the response type used to be derived. The
+tests document what the code does now.
+
+Signed-off-by: Paul Kennedy <9027062+datadot@users.noreply.github.com>
+
+---------
+
+Signed-off-by: Paul Kennedy <9027062+datadot@users.noreply.github.com>
+Co-authored-by: Paul Kennedy <9027062+datadot@users.noreply.github.com>
+---
+ pkg/api/routes.go      |  55 +++-----------
+ pkg/api/routes_test.go | 165 +++++++++++++++++++++--------------------
+ swagger/docs.go        |   6 +-
+ swagger/swagger.json   |   6 +-
+ swagger/swagger.yaml   |   4 +-
+ 5 files changed, 107 insertions(+), 129 deletions(-)
+
+diff --git a/pkg/api/routes.go b/pkg/api/routes.go
+index d08e0ece17..806c850c36 100644
+--- a/pkg/api/routes.go
++++ b/pkg/api/routes.go
+@@ -13,7 +13,6 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
+-	"mime"
+ 	"mime/multipart"
+ 	"net/http"
+ 	"net/textproto"
+@@ -1051,41 +1050,12 @@ func canMount(userAc *reqCtx.UserAccessControl, imgStore storageTypes.ImageStore
+ 	return canMount, nil
+ }
+ 
+-// resolveBlobResponseMediaType resolves the OCI media type to advertise for a blob via
+-// the repo's index/manifests. If the descriptor lookup fails (or the descriptor
+-// has no media type), it falls back to application/octet-stream.
+-//
+-// Use this for Content-Type on HEAD/GET blob responses to satisfy OCI
+-// distribution-spec conformance and consumers like stargz-snapshotter that
+-// require a non-empty, well-formed media type.
+-func resolveBlobResponseMediaType(
+-	imgStore storageTypes.ImageStore,
+-	repo string,
+-	digest godigest.Digest,
+-	logger log.Logger,
+-) string {
+-	desc, err := storageCommon.GetBlobDescriptorFromRepo(imgStore, repo, digest, logger)
+-	if err == nil && desc.MediaType != "" {
+-		// Descriptor media types originate from manifest JSON and are not
+-		// necessarily validated. Ensure we only emit a header-safe, parseable
+-		// media type; otherwise fall back to application/octet-stream.
+-		//
+-		// ParseMediaType also strips parameters so we only propagate the base
+-		// type (e.g. "application/vnd.oci.image.layer.v1.tar+gzip").
+-		mediaType, _, parseErr := mime.ParseMediaType(desc.MediaType)
+-		if parseErr == nil && mediaType != "" {
+-			return mediaType
+-		}
+-	}
+-
+-	return constants.BinaryMediaType
+-}
+-
+ // CheckBlob godoc
+ // @Summary Check image blob/layer
+ // @Description Check an image's blob/layer given a digest
+ // @Accept  json
+ // @Produce json
++// @Produce application/octet-stream
+ // @Param   name     path    string     true        "repository name"
+ // @Param   digest   path    string     true        "blob/layer digest"
+ // @Success 200 {object} api.ImageManifest
+@@ -1175,7 +1145,7 @@ func (rh *RouteHandler) CheckBlob(response http.ResponseWriter, request *http.Re
+ 
+ 	response.Header().Set("Content-Length", strconv.FormatInt(blen, 10))
+ 	response.Header().Set("Accept-Ranges", "bytes")
+-	response.Header().Set("Content-Type", resolveBlobResponseMediaType(imgStore, name, digest, rh.c.Log))
++	response.Header().Set("Content-Type", constants.BinaryMediaType)
+ 	response.Header().Set(constants.DistContentDigestKey, digest.String())
+ 	response.WriteHeader(http.StatusOK)
+ }
+@@ -1344,10 +1314,10 @@ func buildMultipartPartHeader(rng httpRange, mediaType string, size int64) textp
+ 	partHeader := textproto.MIMEHeader{}
+ 	partHeader.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rng.start, rng.end, size))
+ 
+-	// RFC 9110 §15.3.7 lets us omit per-part Content-Type, but when the
+-	// caller has resolved a real media type (descriptor lookup succeeded
+-	// or fell back to application/octet-stream) we propagate it so OCI
+-	// clients don't have to re-derive it from the index for every part.
++	// RFC 9110 §15.3.7 lets us omit per-part Content-Type, but when the caller
++	// has a media type for the blob we propagate it to each part so clients do
++	// not have to derive one themselves. Blob responses always carry
++	// application/octet-stream.
+ 	if mediaType != "" {
+ 		partHeader.Set("Content-Type", mediaType)
+ 	}
+@@ -1478,7 +1448,8 @@ func normalizeBlobRedirectURL(rawURL string) (string, bool) {
+ // @Summary Get image blob/layer
+ // @Description Get an image's blob/layer given a digest
+ // @Accept  json
+-// @Produce application/vnd.oci.image.layer.v1.tar+gzip
++// @Produce json
++// @Produce application/octet-stream
+ // @Param   name     path    string     true        "repository name"
+ // @Param   digest   path    string     true        "blob/layer digest"
+ // @Header  200 {string} Docker-Content-Digest "Manifest digest of the content"
+@@ -1573,9 +1544,7 @@ func (rh *RouteHandler) GetBlob(response http.ResponseWriter, request *http.Requ
+ 			return
+ 		}
+ 
+-		// Resolve the response Content-Type from the blob's OCI descriptor (if
+-		// any), with a fallback to application/octet-stream.
+-		mediaType := resolveBlobResponseMediaType(imgStore, name, digest, rh.c.Log)
++		mediaType := constants.BinaryMediaType
+ 
+ 		ranges, err := parseRangeHeader(contentRange, bsize)
+ 		if err != nil {
+@@ -1641,11 +1610,7 @@ func (rh *RouteHandler) GetBlob(response http.ResponseWriter, request *http.Requ
+ 
+ 	var blen int64
+ 
+-	// Resolve the response Content-Type from the blob's OCI descriptor
+-	// (if any), with a fallback to application/octet-stream. This lookup
+-	// may require an additional repo index/manifest walk before we read
+-	// the blob, but preserves a more specific Content-Type when available.
+-	mediaType := resolveBlobResponseMediaType(imgStore, name, digest, rh.c.Log)
++	mediaType := constants.BinaryMediaType
+ 
+ 	repo, blen, err := imgStore.GetBlob(name, digest, mediaType)
+ 	if err != nil {
+diff --git a/pkg/api/routes_test.go b/pkg/api/routes_test.go
+index 0f79c781bc..94a693e71f 100644
+--- a/pkg/api/routes_test.go
++++ b/pkg/api/routes_test.go
+@@ -2339,17 +2339,14 @@ func TestWriteDataFromReader(t *testing.T) {
+ 	})
+ }
+ 
+-// Descriptor-aware Content-Type tests for blob HEAD/GET.
++// Content-Type tests for blob HEAD/GET.
+ //
+-// The blob endpoints derive the response Content-Type from the OCI
+-// descriptor associated with the blob (via the repo's index/manifest
+-// chain), and fall back to application/octet-stream when no such
+-// descriptor is available. These tests use mock image stores to drive
+-// both branches independently of the on-disk storage layer.
++// Blob responses always advertise application/octet-stream. These tests use mock
++// image stores that serve an index and manifest chain, so they can assert both the
++// constant header and that the blob path never reads the index.
+ 
+ // descriptorTestDigests returns deterministic layer, manifest, and
+-// config digests (in that order) used by the descriptor-aware
+-// Content-Type tests.
++// config digests (in that order) used by the blob Content-Type tests.
+ func descriptorTestDigests() (godigest.Digest, godigest.Digest, godigest.Digest) {
+ 	return godigest.FromString("layer"), godigest.FromString("manifest"), godigest.FromString("config")
+ }
+@@ -2369,9 +2366,9 @@ func newBlobTestRouteHandler(t *testing.T, store mocks.MockedImageStore) *api.Ro
+ 	return api.NewRouteHandler(ctlr)
+ }
+ 
+-// descriptorFixture builds a minimal index -> manifest -> layer chain
+-// that resolves the layer digest from descriptorTestDigests to
+-// MediaTypeImageLayerGzip.
++// descriptorFixture builds a minimal index -> manifest -> layer chain that would
++// resolve the layer digest from descriptorTestDigests to MediaTypeImageLayerGzip.
++// It exists so the tests can prove the blob path leaves it untouched.
+ func descriptorFixture(t *testing.T) ([]byte, []byte) {
+ 	t.Helper()
+ 
+@@ -2416,10 +2413,11 @@ func descriptorFixture(t *testing.T) ([]byte, []byte) {
+ 	return indexJSON, manifestJSON
+ }
+ 
+-// descriptorStore returns a mock store backed by descriptorFixture.
+-// Looking up the layer digest from descriptorTestDigests resolves to a
+-// layer with media type MediaTypeImageLayerGzip via the index walk;
+-// other digests fall through to the binary fallback.
++// descriptorStore returns a mock store backed by descriptorFixture, whose index
++// and manifest would resolve the layer digest from descriptorTestDigests to
++// MediaTypeImageLayerGzip. Blob responses no longer consult it: the tests below
++// keep the fixture so they can assert that the blob path never reads it, since
++// that lookup was O(manifests) per request (project-zot/zot#4344).
+ func descriptorStore(t *testing.T) mocks.MockedImageStore {
+ 	t.Helper()
+ 
+@@ -2446,8 +2444,21 @@ func descriptorStore(t *testing.T) mocks.MockedImageStore {
+ 	}
+ }
+ 
+-func TestCheckBlobUsesDescriptorContentType(t *testing.T) {
++func TestCheckBlobAlwaysBinaryContentType(t *testing.T) {
+ 	store := descriptorStore(t)
++
++	var indexReads atomic.Int32
++
++	store.GetIndexContentFn = func(repo string) ([]byte, error) {
++		indexReads.Add(1)
++
++		return []byte("{}"), nil
++	}
++	store.GetBlobContentFn = func(repo string, digest godigest.Digest) ([]byte, error) {
++		indexReads.Add(1)
++
++		return []byte("{}"), nil
++	}
+ 	store.CheckBlobFn = func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
+ 		return true, 42, nil
+ 	}
+@@ -2475,9 +2486,11 @@ func TestCheckBlobUsesDescriptorContentType(t *testing.T) {
+ 	defer resp.Body.Close()
+ 
+ 	require.Equal(t, http.StatusOK, resp.StatusCode)
+-	assert.Equal(t, ispec.MediaTypeImageLayerGzip, resp.Header.Get("Content-Type"))
++	assert.Equal(t, constants.BinaryMediaType, resp.Header.Get("Content-Type"))
+ 	assert.Equal(t, "bytes", resp.Header.Get("Accept-Ranges"))
+ 	assert.Equal(t, layerDigest.String(), resp.Header.Get(constants.DistContentDigestKey))
++
++	assert.Zero(t, indexReads.Load(), "blob path must not walk the repo index")
+ }
+ 
+ func TestCheckBlobFallsBackToBinaryContentType(t *testing.T) {
+@@ -2517,70 +2530,30 @@ func TestCheckBlobFallsBackToBinaryContentType(t *testing.T) {
+ 	assert.Equal(t, constants.BinaryMediaType, resp.Header.Get("Content-Type"))
+ }
+ 
+-func TestGetBlobUsesDescriptorContentType(t *testing.T) {
++func TestGetBlobAlwaysBinaryContentType(t *testing.T) {
+ 	store := descriptorStore(t)
+-	store.GetBlobFn = func(repo string, digest godigest.Digest, mediaType string) (io.ReadCloser, int64, error) {
+-		// The mediaType argument forwarded to the storage layer is a
+-		// hint and is currently ignored; we still feed it the resolved
+-		// value so the surface stays consistent.
+-		assert.Equal(t, ispec.MediaTypeImageLayerGzip, mediaType)
+ 
+-		return io.NopCloser(strings.NewReader("blob")), 4, nil
+-	}
+-
+-	handler := newBlobTestRouteHandler(t, store)
+-
+-	layerDigest, _, _ := descriptorTestDigests()
++	var indexReads atomic.Int32
+ 
+-	req := httptest.NewRequestWithContext(
+-		context.Background(),
+-		http.MethodGet,
+-		"http://example.com/v2/test/blobs/sha256:test",
+-		http.NoBody,
+-	)
+-	// Wildcard / mixed Accept must not leak into the response.
+-	req.Header.Set("Accept", "application/vnd.oci.image.layer.v1.tar+gzip, */*")
+-	req = mux.SetURLVars(req, map[string]string{
+-		"name":   "test",
+-		"digest": layerDigest.String(),
+-	})
+-
+-	rec := httptest.NewRecorder()
+-	handler.GetBlob(rec, req)
+-
+-	resp := rec.Result()
+-	defer resp.Body.Close()
++	store.GetIndexContentFn = func(repo string) ([]byte, error) {
++		indexReads.Add(1)
+ 
+-	require.Equal(t, http.StatusOK, resp.StatusCode)
+-	assert.Equal(t, ispec.MediaTypeImageLayerGzip, resp.Header.Get("Content-Type"))
+-}
++		return []byte("{}"), nil
++	}
++	store.GetBlobContentFn = func(repo string, digest godigest.Digest) ([]byte, error) {
++		indexReads.Add(1)
+ 
+-func TestGetBlobFallsBackOnInvalidDescriptorContentType(t *testing.T) {
+-	// Descriptor media types are user-supplied and may be invalid as HTTP
+-	// header values. resolveBlobResponseMediaType must sanitize/validate
+-	// and fall back to application/octet-stream on parse failure.
+-	store := descriptorStore(t)
++		return []byte("{}"), nil
++	}
+ 	store.GetBlobFn = func(repo string, digest godigest.Digest, mediaType string) (io.ReadCloser, int64, error) {
++		// The mediaType argument forwarded to the storage layer is a
++		// hint and is currently ignored; we still feed it the resolved
++		// value so the surface stays consistent.
+ 		assert.Equal(t, constants.BinaryMediaType, mediaType)
+ 
+ 		return io.NopCloser(strings.NewReader("blob")), 4, nil
+ 	}
+ 
+-	// Force descriptor lookup success but with an invalid media type string.
+-	store.GetBlobContentFn = func(repo string, digest godigest.Digest) ([]byte, error) {
+-		_, manifestJSON := descriptorFixture(t)
+-
+-		var manifest ispec.Manifest
+-		require.NoError(t, json.Unmarshal(manifestJSON, &manifest))
+-		require.Len(t, manifest.Layers, 1)
+-		manifest.Layers[0].MediaType = "bad\r\nvalue"
+-
+-		out, err := json.Marshal(manifest)
+-		require.NoError(t, err)
+-
+-		return out, nil
+-	}
+-
+ 	handler := newBlobTestRouteHandler(t, store)
+ 
+ 	layerDigest, _, _ := descriptorTestDigests()
+@@ -2591,6 +2564,8 @@ func TestGetBlobFallsBackOnInvalidDescriptorContentType(t *testing.T) {
+ 		"http://example.com/v2/test/blobs/sha256:test",
+ 		http.NoBody,
+ 	)
++	// Wildcard / mixed Accept must not leak into the response.
++	req.Header.Set("Accept", "application/vnd.oci.image.layer.v1.tar+gzip, */*")
+ 	req = mux.SetURLVars(req, map[string]string{
+ 		"name":   "test",
+ 		"digest": layerDigest.String(),
+@@ -2604,6 +2579,8 @@ func TestGetBlobFallsBackOnInvalidDescriptorContentType(t *testing.T) {
+ 
+ 	require.Equal(t, http.StatusOK, resp.StatusCode)
+ 	assert.Equal(t, constants.BinaryMediaType, resp.Header.Get("Content-Type"))
++
++	assert.Zero(t, indexReads.Load(), "blob path must not walk the repo index")
+ }
+ 
+ func TestGetBlobFallsBackToBinaryContentType(t *testing.T) {
+@@ -2645,8 +2622,21 @@ func TestGetBlobFallsBackToBinaryContentType(t *testing.T) {
+ 	assert.Equal(t, constants.BinaryMediaType, resp.Header.Get("Content-Type"))
+ }
+ 
+-func TestGetBlobPartialUsesDescriptorContentType(t *testing.T) {
++func TestGetBlobPartialAlwaysBinaryContentType(t *testing.T) {
+ 	store := descriptorStore(t)
++
++	var indexReads atomic.Int32
++
++	store.GetIndexContentFn = func(repo string) ([]byte, error) {
++		indexReads.Add(1)
++
++		return []byte("{}"), nil
++	}
++	store.GetBlobContentFn = func(repo string, digest godigest.Digest) ([]byte, error) {
++		indexReads.Add(1)
++
++		return []byte("{}"), nil
++	}
+ 	store.GetBlobPartialFn = func(
+ 		repo string,
+ 		digest godigest.Digest,
+@@ -2654,7 +2644,7 @@ func TestGetBlobPartialUsesDescriptorContentType(t *testing.T) {
+ 		from,
+ 		to int64,
+ 	) (io.ReadCloser, int64, int64, error) {
+-		assert.Equal(t, ispec.MediaTypeImageLayerGzip, mediaType)
++		assert.Equal(t, constants.BinaryMediaType, mediaType)
+ 		assert.Equal(t, int64(0), from)
+ 		assert.Equal(t, int64(1), to)
+ 
+@@ -2684,9 +2674,11 @@ func TestGetBlobPartialUsesDescriptorContentType(t *testing.T) {
+ 	defer resp.Body.Close()
+ 
+ 	require.Equal(t, http.StatusPartialContent, resp.StatusCode)
+-	assert.Equal(t, ispec.MediaTypeImageLayerGzip, resp.Header.Get("Content-Type"))
++	assert.Equal(t, constants.BinaryMediaType, resp.Header.Get("Content-Type"))
+ 	assert.Equal(t, "bytes 0-1/4", resp.Header.Get("Content-Range"))
+ 	assert.Equal(t, layerDigest.String(), resp.Header.Get(constants.DistContentDigestKey))
++
++	assert.Zero(t, indexReads.Load(), "blob path must not walk the repo index")
+ }
+ 
+ func TestGetBlobPartialFallsBackToBinaryContentType(t *testing.T) {
+@@ -2735,13 +2727,26 @@ func TestGetBlobPartialFallsBackToBinaryContentType(t *testing.T) {
+ 	assert.Equal(t, constants.BinaryMediaType, resp.Header.Get("Content-Type"))
+ }
+ 
+-// TestGetBlobMultipartPartHasDescriptorContentType verifies that each
+-// part of a multipart/byteranges response carries the descriptor-
+-// derived Content-Type alongside the per-part Content-Range.
+-func TestGetBlobMultipartPartHasDescriptorContentType(t *testing.T) {
++// TestGetBlobMultipartPartBinaryContentType verifies that each part of a
++// multipart/byteranges response carries application/octet-stream
++// alongside the per-part Content-Range.
++func TestGetBlobMultipartPartBinaryContentType(t *testing.T) {
+ 	const blobBody = "0123456789"
+ 
+ 	store := descriptorStore(t)
++
++	var indexReads atomic.Int32
++
++	store.GetIndexContentFn = func(repo string) ([]byte, error) {
++		indexReads.Add(1)
++
++		return []byte("{}"), nil
++	}
++	store.GetBlobContentFn = func(repo string, digest godigest.Digest) ([]byte, error) {
++		indexReads.Add(1)
++
++		return []byte("{}"), nil
++	}
+ 	store.CheckBlobFn = func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
+ 		return true, int64(len(blobBody)), nil
+ 	}
+@@ -2752,7 +2757,7 @@ func TestGetBlobMultipartPartHasDescriptorContentType(t *testing.T) {
+ 		from,
+ 		to int64,
+ 	) (io.ReadCloser, int64, int64, error) {
+-		assert.Equal(t, ispec.MediaTypeImageLayerGzip, mediaType)
++		assert.Equal(t, constants.BinaryMediaType, mediaType)
+ 
+ 		return io.NopCloser(strings.NewReader(blobBody[from : to+1])), to - from + 1, int64(len(blobBody)), nil
+ 	}
+@@ -2801,7 +2806,7 @@ func TestGetBlobMultipartPartHasDescriptorContentType(t *testing.T) {
+ 		require.NoError(t, err, "read part %d", i)
+ 
+ 		assert.Equal(t, want.contentRange, part.Header.Get("Content-Range"), "part %d content-range", i)
+-		assert.Equal(t, ispec.MediaTypeImageLayerGzip, part.Header.Get("Content-Type"),
++		assert.Equal(t, constants.BinaryMediaType, part.Header.Get("Content-Type"),
+ 			"part %d content-type", i)
+ 
+ 		body, err := io.ReadAll(part)
+@@ -2813,6 +2818,8 @@ func TestGetBlobMultipartPartHasDescriptorContentType(t *testing.T) {
+ 	require.ErrorIs(t, err, io.EOF)
+ 
+ 	assert.Equal(t, layerDigest.String(), resp.Header.Get(constants.DistContentDigestKey))
++
++	assert.Zero(t, indexReads.Load(), "blob path must not walk the repo index")
+ }
+ 
+ // Streaming-multipart tests for the lazy-fan-out path.
+diff --git a/swagger/docs.go b/swagger/docs.go
+index c419ee326a..08a64a7624 100644
+--- a/swagger/docs.go
++++ b/swagger/docs.go
+@@ -633,7 +633,8 @@ const docTemplate = `{
+                     "application/json"
+                 ],
+                 "produces": [
+-                    "application/vnd.oci.image.layer.v1.tar+gzip"
++                    "application/json",
++                    "application/octet-stream"
+                 ],
+                 "summary": "Get image blob/layer",
+                 "parameters": [
+@@ -698,7 +699,8 @@ const docTemplate = `{
+                     "application/json"
+                 ],
+                 "produces": [
+-                    "application/json"
++                    "application/json",
++                    "application/octet-stream"
+                 ],
+                 "summary": "Check image blob/layer",
+                 "parameters": [
+diff --git a/swagger/swagger.json b/swagger/swagger.json
+index 5d13646ce2..3132eac27b 100644
+--- a/swagger/swagger.json
++++ b/swagger/swagger.json
+@@ -625,7 +625,8 @@
+                     "application/json"
+                 ],
+                 "produces": [
+-                    "application/vnd.oci.image.layer.v1.tar+gzip"
++                    "application/json",
++                    "application/octet-stream"
+                 ],
+                 "summary": "Get image blob/layer",
+                 "parameters": [
+@@ -690,7 +691,8 @@
+                     "application/json"
+                 ],
+                 "produces": [
+-                    "application/json"
++                    "application/json",
++                    "application/octet-stream"
+                 ],
+                 "summary": "Check image blob/layer",
+                 "parameters": [
+diff --git a/swagger/swagger.yaml b/swagger/swagger.yaml
+index 8f011420f4..5a03de6251 100644
+--- a/swagger/swagger.yaml
++++ b/swagger/swagger.yaml
+@@ -468,7 +468,8 @@ paths:
+         required: true
+         type: string
+       produces:
+-      - application/vnd.oci.image.layer.v1.tar+gzip
++      - application/json
++      - application/octet-stream
+       responses:
+         "200":
+           description: OK
+@@ -492,6 +493,7 @@ paths:
+         type: string
+       produces:
+       - application/json
++      - application/octet-stream
+       responses:
+         "200":
+           description: OK

@@ -1,0 +1,48 @@
+{{/*
+The restore-or-genesis entrypoint and the network's dolos.toml, mounted at
+/etc/publisher. The entrypoint is templated (concurrency, --insecure); the
+dolos.toml is the values string verbatim.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dolos-publisher.configMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dolos-publisher.labels" . | nindent 4 }}
+data:
+  entrypoint.sh: |
+    #!/bin/sh
+    # Restore-or-genesis, then run the backfill loop.
+    #
+    # /data is an emptyDir — every pod start begins empty. If the repo holds
+    # a stele, restore it (pruned by sync.max_history) and continue from
+    # there; an empty repo means genesis. A transient restore failure
+    # degrades to a genesis run whose publish lands on Standing::UpToDate
+    # and no-ops — wasted CPU, never a corrupt repo.
+    #
+    # Rendered by the dolos-publisher chart: the concurrency and the
+    # --insecure flag come from the network's values file, with their
+    # reasons.
+    set -eu
+
+    REPO="${PUBLISHER_REPO:?PUBLISHER_REPO is required}"
+    CONFIG=/etc/publisher/dolos.toml
+    DATA=/data/db
+
+    if [ ! -d "$DATA" ] || [ -z "$(ls -A "$DATA" 2>/dev/null || true)" ]; then
+        echo "fresh disk: attempting restore of own latest stele from $REPO"
+        if dolos --config "$CONFIG" bootstrap stelae --source "$REPO" --point latest{{ if .Values.insecure }} --insecure{{ end }}; then
+            echo "restored own latest stele"
+        else
+            echo "no restorable stele — starting from genesis"
+        fi
+    fi
+
+    exec dolos --config "$CONFIG" snapshot backfill --repo "$REPO" \
+        {{- if .Values.insecure }}
+        --insecure \
+        {{- end }}
+        --concurrency {{ required "concurrency is required" .Values.concurrency }}
+  dolos.toml: |
+    {{- required "dolosToml is required" .Values.dolosToml | nindent 4 }}
