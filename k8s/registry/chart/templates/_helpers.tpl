@@ -38,9 +38,11 @@ app: {{ include "stelae-registry.fullname" . }}
 
 {{- define "stelae-registry.image" -}}
 {{- $img := .Values.image -}}
+{{- $repository := required "image.repository is required" $img.repository -}}
+{{- $tag := required "image.tag is required" $img.tag -}}
 {{- if $img.digest -}}
-{{- printf "%s:%s@%s" $img.repository $img.tag $img.digest -}}
+{{- printf "%s:%s@%s" $repository $tag $img.digest -}}
 {{- else -}}
-{{- printf "%s:%s" $img.repository $img.tag -}}
+{{- printf "%s:%s" $repository $tag -}}
 {{- end -}}
 {{- end -}}

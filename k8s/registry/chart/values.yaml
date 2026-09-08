@@ -4,33 +4,29 @@
 # These defaults are instance-agnostic — no cluster, bucket, hostname or
 # credential is assumed. Everything an instance must supply is empty here and
 # `required` in the templates, so a missing value fails at render rather than
-# deploying a half-configured registry. This domain's instance supplies them
-# from `solution/stelae/ops/` (values file + secrets manifest + runbook).
+# deploying a half-configured registry. The operator supplies them from its
+# infrastructure repository (values file + secrets manifest + runbook).
 #
-# Values that look arbitrary carry their reason. Several are load-bearing —
-# `redirectBlobURL`, the JSON-string sizes, `rootDirectory: "/"`, the HTTP
-# timeouts — and the evidence for them is in
-# `solution/stelae/kb/zot-instance-disconnects/`.
+# Values that look arbitrary carry their reason. Several are load-bearing:
+# `redirectBlobURL`, the JSON-string sizes, `rootDirectory: "/"`, and the HTTP
+# timeouts.
 
 nameOverride: ""
 fullnameOverride: ""
 
 image:
-  # The upstream release, which is what a fresh instance should run.
-  #
   # Caveat with teeth: zot v2.1.17–v2.1.20 answer a blob HEAD's Content-Type
   # by walking the repo's manifests out of the object store — O(tags) per
   # request, which at ~300 tags measured 143 s per HEAD and made publishing
-  # impossible. Upstream fixed it in commit fe0679da (#4350), unreleased as
-  # of 2026-08-29. An instance publishing at any scale must either run
-  # v2.1.21+ once it ships, or override this with a patched build (ours is
-  # ../zot-build/, wired up in solution/stelae/ops/values.registry-m2.yaml).
-  repository: ghcr.io/project-zot/zot-linux-arm64
-  tag: v2.1.20
-  digest: sha256:56230c5a589eb55acc57afc34307f6ea1b2efe5cf8e0057ccca64099ba837ff6
+  # impossible. Upstream fixed it in commit fe0679da (#4350). The operator
+  # must choose an official release containing that fix or a patched build
+  # such as ../zot-build/, and match the image architecture to placement.
+  repository: ""
+  tag: ""
+  digest: ""
   pullPolicy: IfNotPresent
   # Upstream images name the binary by platform; a custom build may not.
-  binary: /usr/local/bin/zot-linux-arm64
+  binary: ""
 
 # One replica, Recreate: chunked upload sessions and the metaDB live on an
 # RWO volume, so two pods must never overlap.

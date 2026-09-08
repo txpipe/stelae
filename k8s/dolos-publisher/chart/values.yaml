@@ -6,8 +6,8 @@
 # These defaults are instance-agnostic — no network, registry, image pin or
 # credential is assumed. Everything a network must supply is empty here and
 # `required` in the templates, so a missing value fails at render rather
-# than starting a half-configured publisher. This domain's instances are
-# The operator supplies one values file per network.
+# than starting a half-configured publisher. The operator supplies one values
+# file per network.
 #
 # Two values are deliberately without a default. `concurrency` was measured
 # per network against the registry it writes to. `dolosToml` carries the

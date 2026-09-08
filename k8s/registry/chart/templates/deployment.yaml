@@ -39,7 +39,7 @@ spec:
         - name: zot
           image: {{ include "stelae-registry.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: [{{ .Values.image.binary | quote }}, "serve", "/etc/zot/config.json"]
+          command: [{{ required "image.binary is required" .Values.image.binary | quote }}, "serve", "/etc/zot/config.json"]
           ports:
             - containerPort: {{ .Values.http.port | int }}
               name: http

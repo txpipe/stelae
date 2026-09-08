@@ -1,16 +1,9 @@
----
-provenance: authored
-owner: org/founder
-tags: []
----
 # Dolos publisher — deployment unit
 
 The publisher is one Kubernetes Job per network, rendered from the Helm
-chart in [`chart/`](chart/) with a values file per network in
-[`solution/stelae/ops/`](../../../ops/README.md), and deployed by the same
-two commands as the registry. The
-[`stelae-registry-ops`](../../../skills/registry-ops/SKILL.md) skill
-holds those commands with the re-run, first-run and monitoring procedures.
+chart in [`chart/`](chart/) with a values file per network maintained by the
+operator. The operator's runbook owns deployment, re-run, first-run, and
+monitoring procedures.
 Each Job runs the official `ghcr.io/txpipe/dolos` image on the Demeter m2
 EKS cluster: it restores its network's latest stele (or starts from
 genesis), replays to the next epoch boundary, publishes, prunes, repeats,
@@ -81,19 +74,10 @@ HTTP), `publisherSecretName`, `backoffLimit`,
 Local check, no cluster needed:
 
 ```bash
-helm lint solution/stelae/codebase/k8s/dolos-publisher/chart \
-    --values solution/stelae/ops/values.publisher-preprod.yaml
-helm template stelae-publisher-preprod solution/stelae/codebase/k8s/dolos-publisher/chart \
-    --namespace stelae-publisher --values solution/stelae/ops/values.publisher-preprod.yaml
+helm lint k8s/dolos-publisher/chart --values "$PUBLISHER_VALUES"
+helm template stelae-publisher-preprod k8s/dolos-publisher/chart \
+    --namespace stelae-publisher --values "$PUBLISHER_VALUES"
 ```
 
-Its predecessors are in git history: the raw manifests this chart replaced
-(one Job and ConfigMap per network under `k8s/`, applied by hand, retired
-under [publisher-chart](../../../../../archive/plans/dolos-stelae-publication-ops-publisher-chart.md)),
-and before them a Cloudflare Worker with a container-backed Durable Object.
-The registry moved to the cluster
-(`decisions/0037-stelae-registry-on-eks.md`), the Jobs followed, the
-Worker's cron was stood down (`decisions/0038-preprod-stele-publication.md`),
-and the infrastructure was deleted on 2026-09-06 under
-[registry-decommission](../../../../../plans/stelae-registry-decommission.md),
-tier 5.
+Its predecessors are in git history: raw manifests applied by hand, and before
+them a Cloudflare Worker with a container-backed Durable Object.
