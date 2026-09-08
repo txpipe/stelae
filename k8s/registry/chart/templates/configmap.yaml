@@ -1,0 +1,65 @@
+{{/*
+zot's config.json. The htpasswd file it references is mounted alongside from
+a pre-created Secret, projected into the same directory by the Deployment.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "stelae-registry.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "stelae-registry.labels" . | nindent 4 }}
+data:
+  config.json: |
+    {
+      "storage": {
+        "rootDirectory": {{ .Values.persistence.mountPath | quote }},
+        "dedupe": {{ .Values.storage.dedupe }},
+        "remoteCache": {{ .Values.storage.remoteCache }},
+        "gc": {{ .Values.storage.gc }},
+        "commit": {{ .Values.storage.commit }},
+        "redirectBlobURL": {{ .Values.storage.redirectBlobURL }},
+        "fastRestart": {{ .Values.storage.fastRestart }},
+        "storageDriver": {
+          "name": "s3",
+          "rootdirectory": {{ .Values.s3.rootDirectory | quote }},
+          "region": {{ .Values.s3.region | quote }},
+          "regionendpoint": {{ required "s3.endpoint is required" .Values.s3.endpoint | quote }},
+          "bucket": {{ required "s3.bucket is required" .Values.s3.bucket | quote }},
+          "forcepathstyle": true,
+          "secure": true,
+          "skipverify": false,
+          "chunksize": {{ .Values.s3.chunkSize | quote }},
+          "multipartcopythresholdsize": {{ .Values.s3.multipartCopyThresholdSize | quote }}
+        }
+      },
+      "http": {
+        "address": "0.0.0.0",
+        "port": {{ .Values.http.port | quote }},
+        "readTimeout": {{ .Values.http.readTimeout | quote }},
+        "writeTimeout": {{ .Values.http.writeTimeout | quote }},
+        "auth": {
+          "htpasswd": { "path": "/etc/zot/htpasswd" },
+          "failDelay": 1
+        },
+        "accessControl": {
+          "repositories": {
+            "**": {
+              "policies": [
+                {
+                  "users": [{{ required "auth.readonlyUsername is required" .Values.auth.readonlyUsername | quote }}],
+                  "actions": ["read"]
+                }
+              ],
+              "defaultPolicy": [],
+              "anonymousPolicy": []
+            }
+          },
+          "adminPolicy": {
+            "users": [{{ required "auth.publisherUsername is required" .Values.auth.publisherUsername | quote }}],
+            "actions": ["read", "create", "update", "delete"]
+          }
+        }
+      },
+      "log": { "level": {{ .Values.log.level | quote }} }
+    }

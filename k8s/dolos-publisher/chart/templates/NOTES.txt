@@ -1,0 +1,17 @@
+{{ include "dolos-publisher.jobName" . }} in {{ .Release.Namespace }} — {{ .Values.network }}, run {{ .Values.run }}, concurrency {{ .Values.concurrency }}, {{ .Values.image.repository }}:{{ .Values.image.tag }}
+
+Follow the run:
+  kubectl -n {{ .Release.Namespace }} logs -f job/{{ include "dolos-publisher.jobName" . }}
+
+Lines worth reading:
+  restored own latest stele                            a pod start paid a full restore
+  no restorable stele — starting from genesis          the repository was empty
+  replaying toward the next epoch boundary target=N    replay started for N
+  sequence: N (tag epoch-N)                            publish window opened
+  the registry failed a round trip; making it again attempt=K
+                                                       a retry; attempt=3 is worth attention
+
+Re-run on purpose: bump `run` in the values file and upgrade. Any other
+change to the pod template without a bump fails the upgrade against the
+Job's immutable template — that failure is the guard, and the answer is
+to bump `run`. Never delete the Job by hand.

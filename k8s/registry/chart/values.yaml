@@ -1,0 +1,159 @@
+# zot as a stelae registry: real registry software over an object store, with
+# blob reads redirected to the store so payload bytes never cross the pod.
+#
+# These defaults are instance-agnostic — no cluster, bucket, hostname or
+# credential is assumed. Everything an instance must supply is empty here and
+# `required` in the templates, so a missing value fails at render rather than
+# deploying a half-configured registry. This domain's instance supplies them
+# from `solution/stelae/ops/` (values file + secrets manifest + runbook).
+#
+# Values that look arbitrary carry their reason. Several are load-bearing —
+# `redirectBlobURL`, the JSON-string sizes, `rootDirectory: "/"`, the HTTP
+# timeouts — and the evidence for them is in
+# `solution/stelae/kb/zot-instance-disconnects/`.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  # The upstream release, which is what a fresh instance should run.
+  #
+  # Caveat with teeth: zot v2.1.17–v2.1.20 answer a blob HEAD's Content-Type
+  # by walking the repo's manifests out of the object store — O(tags) per
+  # request, which at ~300 tags measured 143 s per HEAD and made publishing
+  # impossible. Upstream fixed it in commit fe0679da (#4350), unreleased as
+  # of 2026-08-29. An instance publishing at any scale must either run
+  # v2.1.21+ once it ships, or override this with a patched build (ours is
+  # ../zot-build/, wired up in solution/stelae/ops/values.registry-m2.yaml).
+  repository: ghcr.io/project-zot/zot-linux-arm64
+  tag: v2.1.20
+  digest: sha256:56230c5a589eb55acc57afc34307f6ea1b2efe5cf8e0057ccca64099ba837ff6
+  pullPolicy: IfNotPresent
+  # Upstream images name the binary by platform; a custom build may not.
+  binary: /usr/local/bin/zot-linux-arm64
+
+# One replica, Recreate: chunked upload sessions and the metaDB live on an
+# RWO volume, so two pods must never overlap.
+replicaCount: 1
+
+# Instance placement. Empty means "anywhere the scheduler likes", which is
+# rarely right on a tainted cluster.
+nodeSelector: {}
+tolerations: []
+
+resources:
+  requests:
+    cpu: "1"
+    memory: 1Gi
+  limits:
+    cpu: "2"
+    memory: 4Gi
+
+persistence:
+  enabled: true
+  size: 10Gi
+  # Empty string uses the cluster default StorageClass.
+  storageClass: ""
+  # zot rebuilds its metaDB by parsing every manifest in the bucket unless it
+  # finds its fast-restart stamp here. On ephemeral storage that parse runs on
+  # every start and grows with the repository — it is what crash-looped this
+  # registry on its previous substrate, against a platform start deadline.
+  # Persist it and boot is seconds.
+  mountPath: /var/lib/zot
+
+service:
+  type: ClusterIP
+  port: 5000
+
+# Public reads — two mutually exclusive shapes, both off by default.
+# Publishers use neither: they reach the ClusterIP Service in-cluster over
+# plain HTTP. Blob payloads use neither: reads are 307s to presigned
+# object-store URLs, so what crosses the public path is auth, manifests and
+# redirects.
+
+# Shape 1: a cluster ingress controller + cert-manager certificate.
+ingress:
+  enabled: false
+  className: ""
+  # Optional: cert-manager issues the certificate named in tlsSecretName.
+  clusterIssuer: ""
+  host: ""
+  tlsSecretName: ""
+  annotations: {}
+
+# Shape 2: a second Service of type LoadBalancer, rendered only when
+# enabled. The chart is dialect-neutral: whatever makes the cloud terminate
+# TLS and pick subnets is the instance's annotations, not the chart's
+# business. The ClusterIP Service stays untouched either way, so enabling
+# this never exposes the publishers' plain-HTTP port by accident.
+loadBalancer:
+  enabled: false
+  port: 443
+  annotations: {}
+
+# The object store behind the registry. No default is possible.
+s3:
+  endpoint: ""
+  bucket: ""
+  region: auto
+  # The S3 driver applies rootdirectory twice — "/zot" yields keys at
+  # zot/zot/..., an empty value is rejected — so "/" is the only value that
+  # gives one un-prefixed layout at the bucket root.
+  rootDirectory: "/"
+  # Both are JSON strings on purpose: as numbers, zot refuses to start.
+  chunkSize: "10485760"
+  multipartCopyThresholdSize: "5368709120"
+
+storage:
+  # A blob GET answered with a 307 to a presigned URL, so payload bytes never
+  # enter the pod. Not a tweak: proxied reads meter every restore through the
+  # cluster and give up the store's egress terms. If a blob GET ever answers
+  # 200 instead of 307, the deployment is wrong.
+  redirectBlobURL: true
+  fastRestart: true
+  # Dedupe needs a cache driver, which for a remote store means a remote
+  # dependency; it is an optimization, not a correctness property. gc is off
+  # where every blob is referenced by its own tag and nothing is collectable.
+  dedupe: false
+  remoteCache: false
+  gc: false
+  commit: false
+
+http:
+  port: "5000"
+  # 10 m, not zot's 60 s default: a monolithic layer PUT has to stream and
+  # commit to the store inside this window, and at 60 s mid-size layers behind
+  # a busy commit queue were killed and retried forever.
+  readTimeout: 10m
+  writeTimeout: 10m
+
+auth:
+  # Reach zot's accessControl policies, and must match the htpasswd entries
+  # in the Secret below — divergence authenticates a user and grants nothing.
+  publisherUsername: ""
+  readonlyUsername: ""
+  # Referenced, never templated: htpasswd needs bcrypt hashing no template can
+  # do, and object-store keys are credentials. The store Secret's keys reach
+  # the S3 driver through the AWS credential chain, so they must be named
+  # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+  htpasswdSecretName: stelae-registry-htpasswd
+  r2SecretName: stelae-registry-r2
+
+log:
+  level: info
+
+# TCP probes because every HTTP route is behind htpasswd. The startup budget
+# is generous for one reason: the first boot on an empty volume runs the full
+# metaDB parse over the bucket. Every later boot finds the stamp.
+probes:
+  startup:
+    periodSeconds: 10
+    failureThreshold: 90
+  readiness:
+    periodSeconds: 10
+  liveness:
+    periodSeconds: 30
+
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}

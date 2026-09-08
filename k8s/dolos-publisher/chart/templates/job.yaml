@@ -1,0 +1,59 @@
+{{/*
+The backfill Job. Its name carries the run counter: a Job's pod template is
+immutable, so a re-run is a new Job, and Helm removes the old one in the
+same upgrade. Everything else about the pod is a value.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "dolos-publisher.jobName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dolos-publisher.labels" . | nindent 4 }}
+spec:
+  backoffLimit: {{ .Values.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.network }}-backfill
+    spec:
+      restartPolicy: OnFailure
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: publisher
+          image: {{ .Values.image.repository }}:{{ required "image.tag is required" .Values.image.tag }}
+          command: ["/bin/sh", "/etc/publisher/entrypoint.sh"]
+          env:
+            - name: PUBLISHER_REPO
+              value: {{ required "repo is required" .Values.repo | quote }}
+            - name: DOLOS_STELAE_REGISTRY_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.publisherSecretName }}
+                  key: DOLOS_STELAE_REGISTRY_USER
+            - name: DOLOS_STELAE_REGISTRY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.publisherSecretName }}
+                  key: DOLOS_STELAE_REGISTRY_PASSWORD
+          resources:
+            {{- required "resources is required" .Values.resources | toYaml | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: {{ .Values.network }}-config
+              mountPath: /etc/publisher
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: {{ .Values.network }}-config
+          configMap:
+            name: {{ include "dolos-publisher.configMapName" . }}

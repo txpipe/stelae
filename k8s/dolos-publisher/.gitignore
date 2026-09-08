@@ -1,0 +1,2 @@
+# Nothing local lives here: the registry pair is the third Secret in
+# ../../../ops/secrets.local.yaml, ignored there.

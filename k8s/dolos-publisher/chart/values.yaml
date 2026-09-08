@@ -1,0 +1,72 @@
+# One stele publisher: a Kubernetes Job running the official dolos image,
+# which restores its network's latest stele (or starts from genesis),
+# replays to the next epoch boundary, publishes, prunes, and repeats until
+# it reaches the aggregator tip. One release per network.
+#
+# These defaults are instance-agnostic — no network, registry, image pin or
+# credential is assumed. Everything a network must supply is empty here and
+# `required` in the templates, so a missing value fails at render rather
+# than starting a half-configured publisher. This domain's instances are
+# The operator supplies one values file per network.
+#
+# Two values are deliberately without a default. `concurrency` was measured
+# per network against the registry it writes to. `dolosToml` carries the
+# `[snapshot] state_epochs` list, which is signed input frozen at the
+# network's first publish. Neither may be inherited from a chart.
+
+# The network name. Prefixes the Job name and labels the pod.
+network: ""
+
+# The deliberate re-run counter. The Job is named <network>-backfill-<run>,
+# so bumping it makes the upgrade create a new Job and remove the old one,
+# paying the restart cost on purpose. A pod template change without a bump
+# fails the upgrade against the Job's immutable template, which is the guard
+# against re-running by accident. See README.md.
+run: ""
+
+# Where the publisher writes: an oci:// URL to the network's stele
+# repository.
+repo: ""
+
+# Uploads in flight during a publish. Measured per network against the
+# registry it writes to; never lowered to make bursts smaller.
+concurrency: ""
+
+# The network's dolos.toml, carried verbatim into the ConfigMap — comments
+# included — so the frozen state_epochs list and its reasoning stay readable
+# in the values file and no template can change signed input.
+dolosToml: ""
+
+image:
+  # The official image: CI-built from every merge to main, every network's
+  # genesis files at /etc/genesis/<network>/, multi-arch.
+  repository: ghcr.io/txpipe/dolos
+  # Pin to the sha-<short> tag of a known commit — never latest. Each
+  # network's values file holds its own pin; there is no chart-wide dolos
+  # version.
+  tag: ""
+
+# The registry runs in-cluster and the write path is plain HTTP, so both the
+# restore and the backfill pass --insecure. Turn off only for a TLS registry.
+insecure: true
+
+# Secret holding DOLOS_STELAE_REGISTRY_USER and DOLOS_STELAE_REGISTRY_PASSWORD.
+# Referenced by name, never templated.
+publisherSecretName: stelae-registry-publisher
+
+# Restart budget. Every pod restart costs one epoch by design (/data is an
+# emptyDir; the pod restores from latest), and on spot capacity an eviction
+# counts here too.
+backoffLimit: 200
+
+# Covers the driver's SIGTERM handler finishing its chunk and flushing the
+# stores.
+terminationGracePeriodSeconds: 600
+
+# Placement. Empty means anywhere the scheduler likes, which is rarely right
+# on a tainted cluster.
+nodeSelector: {}
+tolerations: []
+
+# No default: the working set is a network fact.
+resources: {}

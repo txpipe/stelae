@@ -1,0 +1,24 @@
+{{ .Chart.Name }} {{ .Chart.Version }} — zot {{ .Chart.AppVersion }}
+
+Write path (publishers, in-cluster, plain HTTP):
+  oci://{{ include "stelae-registry.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/cardano/mainnet
+{{ if .Values.ingress.enabled }}
+Read path (public, ingress shape):
+  https://{{ .Values.ingress.host }}/v2/
+  Needs a DNS record for {{ .Values.ingress.host }} pointing at the class
+  `{{ .Values.ingress.className }}` load balancer before cert-manager can pass http01.
+{{ end }}
+{{- if .Values.loadBalancer.enabled }}
+Read path (public, LoadBalancer shape):
+  kubectl -n {{ .Release.Namespace }} get svc {{ include "stelae-registry.fullname" . }}-public \
+      -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+  Point the public hostname at that address (DNS-only / grey cloud).
+{{- end }}
+Smoke test:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "stelae-registry.fullname" . }} 15000:{{ .Values.service.port }}
+  curl -sS -o /dev/null -w '%{http_code} %{time_total}s\n' http://localhost:15000/v2/          # 401, fast
+  curl -sS -o /dev/null -w '%{http_code} %{time_total}s\n' -u USER:PASS -I \
+    http://localhost:15000/v2/cardano/mainnet/blobs/sha256:<digest>                            # 200, sub-second
+
+A blob GET must answer 307, never 200: reads redirect to presigned R2 URLs,
+and a 200 means payload bytes are crossing the pod.

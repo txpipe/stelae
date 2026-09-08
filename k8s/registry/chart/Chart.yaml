@@ -1,0 +1,13 @@
+apiVersion: v2
+name: stelae-registry
+description: zot as the stelae OCI registry, serving stele repositories over R2's S3 API
+type: application
+# Chart version: this chart. appVersion: the zot build it deploys — bump both
+# at the v2.1.21 re-pin (plans/stelae-zot-upstream-repin.md).
+version: 0.1.0
+appVersion: v2.1.20-pr4350
+home: https://github.com/txpipe/stelae
+keywords:
+  - stelae
+  - oci
+  - registry
