@@ -71,6 +71,8 @@ pub enum Error {
     },
     #[error("the download window must be at least 1 immutable file")]
     EmptyWindow,
+    #[error("backfill::run must be called outside an entered Tokio runtime")]
+    AsyncRuntimeContext,
     #[error(
         "interrupted by a shutdown signal; the stores are consistent and a rerun resumes here"
     )]
@@ -292,6 +294,18 @@ pub struct Options {
     pub skip_validation: bool,
 }
 
+fn require_synchronous_context() -> Result<(), Error> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        Err(Error::AsyncRuntimeContext)
+    } else {
+        Ok(())
+    }
+}
+
+/// Run backfill on a synchronous process thread.
+///
+/// OCI publication stays on this thread while a private Tokio runtime drives
+/// Mithril. Calling this entry point from an entered Tokio runtime is rejected.
 pub fn run(
     config: &RootConfig,
     genesis: &Genesis,
@@ -299,6 +313,7 @@ pub fn run(
     cancel: CancellationToken,
     observer: &stelae::progress::Observer,
 ) -> Result<Outcome, Error> {
+    require_synchronous_context()?;
     let mithril = config.mithril.as_ref().ok_or_else(|| {
         Error::caller(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -316,8 +331,6 @@ pub fn run(
         insecure: options.insecure,
         scratch_dir: options.scratch_dir.as_deref(),
         rebuild: false,
-        dry_run: false,
-        require_new: false,
         tuning: dolos_snapshot::registry::Tuning {
             concurrency: options.concurrency,
             verify_adopted: options.verify_carried,
@@ -717,5 +730,19 @@ mod tests {
         let error =
             finish_both::<()>(Err(Error::Interrupted), Err(Error::EmptyWindow)).unwrap_err();
         assert!(matches!(error, Error::ReplayAndShutdown { .. }));
+    }
+
+    #[test]
+    fn synchronous_entrypoint_refuses_an_entered_tokio_runtime() {
+        assert!(require_synchronous_context().is_ok());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert!(matches!(
+                require_synchronous_context(),
+                Err(Error::AsyncRuntimeContext)
+            ));
+        });
     }
 }

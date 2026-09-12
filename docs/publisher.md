@@ -26,6 +26,9 @@ cargo tree --locked -d
 cargo deny check advisories bans
 ```
 
+Whole-workspace builds use Rust 1.93 or newer, as required by the pinned
+Mithril dependency graph.
+
 The first two trees must contain no package matching `dolos` or `dolos-*`.
 `deny.toml` permits Dolos packages only under `stelae-cardano`; a Dolos edge
 from the protocol or generic driver is an error.

@@ -21,8 +21,6 @@ pub struct RepositoryPublish<'a> {
     pub insecure: bool,
     pub scratch_dir: Option<&'a Path>,
     pub rebuild: bool,
-    pub dry_run: bool,
-    pub require_new: bool,
     pub tuning: Tuning,
 }
 
@@ -257,8 +255,6 @@ pub fn publish_once(
                     insecure,
                     scratch_dir: scratch_dir.as_deref(),
                     rebuild,
-                    dry_run,
-                    require_new,
                     tuning: Tuning {
                         concurrency,
                         verify_adopted: verify_carried,

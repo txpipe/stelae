@@ -183,7 +183,13 @@ fn load_config(explicit: Option<&Path>) -> Result<RootConfig, config::ConfigErro
     let mut builder = config::Config::builder()
         .add_source(config::File::with_name("/etc/dolos/daemon.toml").required(false))
         .add_source(config::File::with_name("dolos.toml").required(false));
-    if let Some(path) = explicit.and_then(Path::to_str) {
+    if let Some(path) = explicit {
+        let path = path.to_str().ok_or_else(|| {
+            config::ConfigError::Message(format!(
+                "configuration path is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
         builder = builder.add_source(config::File::with_name(path).required(true));
     }
     builder
@@ -365,5 +371,23 @@ fn main() -> miette::Result<()> {
             run_initialize(&config, &genesis, &initialize, &observer)?;
             run_backfill(&config, &genesis, &args.backfill, &observer)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_non_utf8_config_path_is_rejected() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+        let path = PathBuf::from(OsString::from_vec(vec![0xff]));
+        let error = match load_config(Some(&path)) {
+            Ok(_) => panic!("non-UTF-8 path was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not valid UTF-8"));
     }
 }

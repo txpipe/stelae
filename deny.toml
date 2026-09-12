@@ -20,13 +20,10 @@ ignore = [
 multiple-versions = "warn"
 
 deny = [
-    # The extraction boundary, stated where it is enforced: the protocol and
-    # generic driver depend on no profile. The Cardano application integration
-    # is the one named wrapper. Enumerated because cargo-deny matches names
-    # exactly — a new dolos-* crate joins this list when it is born.
-    # Dolos is admitted only below the Cardano application integration. The
-    # wrappers keep these bans effective for the protocol and generic driver:
-    # a direct Dolos edge from either crate still fails this check.
+    # Dolos is admitted only below the Cardano integration. These wrappers keep
+    # the protocol and generic-driver boundary resolver-enforced: a direct Dolos
+    # edge from either crate fails. Names are enumerated because cargo-deny
+    # matches exactly; a new dolos-* crate must be added when introduced.
     { crate = "dolos", wrappers = ["stelae-cardano"], reason = "Dolos belongs only below the Cardano integration; the protocol depends on no profile (SPEC.md)" },
     { crate = "dolos-cardano", wrappers = ["stelae-cardano", "dolos", "dolos-snapshot", "dolos-testing"], reason = "Dolos belongs only below the Cardano integration" },
     { crate = "dolos-core", wrappers = ["stelae-cardano", "dolos", "dolos-cardano", "dolos-snapshot", "dolos-mithril", "dolos-fjall", "dolos-redb3", "dolos-testing"], reason = "Dolos belongs only below the Cardano integration" },
