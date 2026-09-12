@@ -23,6 +23,11 @@ producer and consumer; it carries no Cardano assumption.
 | --- | --- |
 | [`stelae`](stelae/) | The wire protocol: framing, inscription, digests, plan/resume, the directory and OCI transports. The normative crate — a third party implements a profile against this and nothing else. |
 | [`stelae-driver`](stelae-driver/) | Profile-generic lifecycle machinery: the chained-publish lifecycle, restore budget/checkpoint, preflight, retry, reporting. A profile author's toolkit, never required for wire compatibility. |
+| [`stelae-cardano`](stelae-cardano/) | Cardano application integration: cold-start restore, publication policy and the sequential Mithril backfill state machine. The only workspace crate allowed to depend on Dolos. |
+| [`stelae-publisher`](stelae-publisher/) | The `stelae-publisher` executable and its operator-facing commands. |
+
+Publisher commands, configuration precedence and persisted-state contracts are
+documented in [docs/publisher.md](docs/publisher.md).
 
 The boundary proof lives in the test suite: `stelae/tests/toy_profile.rs`
 implements a second, trivial profile against the protocol surface alone.

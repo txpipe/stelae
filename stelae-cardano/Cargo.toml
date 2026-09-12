@@ -1,0 +1,32 @@
+[package]
+name = "stelae-cardano"
+description = "Cardano publisher integration for Stelae"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+stelae = { path = "../stelae", version = "=0.2.0", features = ["oci"] }
+stelae-driver = { path = "../stelae-driver", version = "=0.2.0", features = ["oci"] }
+
+# Accepted publisher-pipeline facade revision: txpipe/dolos PR #1334.
+dolos = { git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30", default-features = false }
+dolos-cardano = { git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30" }
+dolos-core = { git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30" }
+dolos-mithril = { git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30" }
+dolos-snapshot = { git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30" }
+
+itertools = "0.14.0"
+pallas = { version = "1.1.1", features = ["hardano", "phase2", "unstable"] }
+serde = { version = "1.0.136", features = ["derive"] }
+serde_json = "1.0.122"
+thiserror = "2.0.12"
+tokio = { version = "1.47", features = ["rt", "rt-multi-thread", "signal"] }
+tokio-util = { version = "0.7.11", features = ["rt"] }
+tracing = "0.1.37"
+
+[dev-dependencies]
+dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30" }
+tempfile = "3.20.0"
+toml = "0.8.13"
