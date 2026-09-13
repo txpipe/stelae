@@ -28,7 +28,7 @@ deny = [
     { crate = "dolos-cardano", wrappers = ["stelae-cardano", "dolos", "dolos-snapshot", "dolos-testing"], reason = "Dolos belongs only below the Cardano integration" },
     { crate = "dolos-core", wrappers = ["stelae-cardano", "dolos", "dolos-cardano", "dolos-snapshot", "dolos-mithril", "dolos-fjall", "dolos-redb3", "dolos-testing"], reason = "Dolos belongs only below the Cardano integration" },
     { crate = "dolos-fjall", wrappers = ["dolos", "dolos-testing"], reason = "Dolos belongs only below the Cardano integration" },
-    { crate = "dolos-flatfiles", wrappers = ["dolos-fjall"], reason = "Dolos belongs only below the Cardano integration" },
+    { crate = "dolos-flatfiles", wrappers = ["stelae-cardano", "dolos-fjall"], reason = "Dolos belongs only below the Cardano integration" },
     { crate = "dolos-minibf", reason = "Dolos belongs only below the Cardano integration" },
     { crate = "dolos-minikupo", reason = "Dolos belongs only below the Cardano integration" },
     { crate = "dolos-mithril", wrappers = ["stelae-cardano"], reason = "Dolos belongs only below the Cardano integration" },

@@ -335,8 +335,12 @@ fn run_publish(
             identity,
             built,
             reused,
+            transfer,
         } => {
-            println!("wrote sequence {sequence}: {identity} ({built} built, {reused} reused)")
+            println!(
+                "wrote sequence {sequence}: {identity} ({built} built, {reused} reused; {} bytes uploaded, {} skipped, {} reused)",
+                transfer.bytes_uploaded, transfer.bytes_skipped, transfer.bytes_reused
+            )
         }
     }
     Ok(())

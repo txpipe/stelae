@@ -207,6 +207,7 @@ pub enum PublishOutcome {
         identity: String,
         built: usize,
         reused: usize,
+        transfer: stelae::oci::Transfer,
     },
 }
 
@@ -279,6 +280,7 @@ pub fn publish_once(
                                 identity: published.identity.to_string(),
                                 built: published.layers_built,
                                 reused: published.layers_reused,
+                                transfer: published.transfer,
                             }
                         }
                     }

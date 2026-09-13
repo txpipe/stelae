@@ -131,3 +131,6 @@ This increment does not ship an image, change a Helm chart, deploy, publish to
 a production registry, or claim full production parity. Packaging, operational
 cutover, differential live-registry evidence and later pin cleanup remain the
 following publisher-pipeline steps.
+
+The executable old/new replay, publication, recovery, resource, and local OCI
+evidence is documented in [publisher-parity.md](publisher-parity.md).

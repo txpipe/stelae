@@ -27,6 +27,12 @@ tokio-util = { version = "0.7.11", features = ["rt"] }
 tracing = "0.1.37"
 
 [dev-dependencies]
+dolos-flatfiles = { git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30" }
 dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30" }
+hex = "0.4.3"
+libc = "0.2.186"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+sha2 = "0.10.9"
 tempfile = "3.20.0"
 toml = "0.8.13"
+zstd-safe = "7.2.4"
