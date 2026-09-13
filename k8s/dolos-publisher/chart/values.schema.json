@@ -7,7 +7,7 @@
     "run": {
       "oneOf": [
         { "type": "integer", "minimum": 1 },
-        { "type": "string", "minLength": 1 }
+        { "type": "string", "pattern": "^[1-9][0-9]*$" }
       ]
     },
     "repo": { "type": "string", "pattern": "^oci://[^/]+/.+" },

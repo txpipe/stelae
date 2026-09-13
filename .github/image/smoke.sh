@@ -12,6 +12,7 @@ trap cleanup EXIT
 trap 'exit 1' INT TERM
 
 docker run --rm --network none "$IMAGE" --version | grep -F 'stelae-publisher'
+test "$(docker image inspect --format '{{.Config.User}}' "$IMAGE")" = 65532:65532
 
 # Exercise the chart's run command with packaged genesis and a data volume.
 # With no network or blocks, it initializes and waits for Mithril until stopped.

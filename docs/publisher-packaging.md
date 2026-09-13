@@ -3,8 +3,10 @@
 The publisher ships as a Linux amd64/arm64 image at
 `ghcr.io/txpipe/stelae-publisher`. It contains the publisher executable, a
 digest-pinned distroless runtime with CA roots, and vendored Cardano genesis.
-It runs the executable directly as PID 1. No Dolos executable or shell is
-needed.
+It runs the executable directly as PID 1 with UID/GID `65532:65532`. No Dolos
+executable or shell is needed. The image owns `/data` as that user, so new
+Docker volumes inherit writable storage. Host bind mounts and existing
+volumes must grant that UID/GID write access.
 
 Genesis files are copied into `/etc/genesis/<network>/`; their
 [source](../.github/image/GENESIS.md) is recorded once. They are independent
@@ -13,17 +15,20 @@ of subsequent Dolos code revisions. Explicit genesis paths and
 
 ## Build and verification
 
-On Linux, build and stage the executable for your native architecture:
+On x86_64 Linux, build and stage the native amd64 executable:
 
 ```sh
 cargo +1.93.0 build --locked --release --package stelae-publisher
 mkdir -p .github/image/bin
-# Use Linux-amd64 on x86_64 Linux.
-cp target/release/stelae-publisher .github/image/bin/stelae-publisher-Linux-arm64
-docker build --platform linux/arm64 --tag stelae-publisher:local .github/image
+cp target/release/stelae-publisher .github/image/bin/stelae-publisher-Linux-amd64
+docker build --platform linux/amd64 --tag stelae-publisher:local .github/image
 .github/image/smoke.sh stelae-publisher:local
 k8s/dolos-publisher/test.sh
 ```
+
+On arm64 Linux, replace `Linux-amd64` with `Linux-arm64` and
+`--platform linux/amd64` with `--platform linux/arm64`. Both the staged name
+and image platform must match the native binary.
 
 The `Publisher image` workflow builds with Rust 1.93.0 and the committed
 `Cargo.lock` on native amd64 and arm64 runners. Each runner builds its image

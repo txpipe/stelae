@@ -26,6 +26,8 @@ The image bundles genesis at `/etc/genesis/<network>/`. Existing config
 paths remain valid, including storage, markers, journals, scratch and Mithril
 downloads beneath `/data/db`. Direct PID-1 execution delivers SIGTERM to
 the publisher.
+The pod requires a non-root image user and sets `fsGroup: 65532`, giving the
+image's UID/GID `65532:65532` write access to the `/data` emptyDir.
 
 ## Values
 

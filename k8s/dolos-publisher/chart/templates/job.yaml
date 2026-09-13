@@ -18,6 +18,9 @@ spec:
         app: {{ .Values.network }}-backfill
     spec:
       restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65532
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
