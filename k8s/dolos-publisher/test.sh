@@ -36,6 +36,11 @@ helm template publisher "$CHART" --values "$VALUES" \
 grep -F -- '- --allow-genesis' "$OUT/stelae-genesis.yaml"
 
 if helm template publisher "$CHART" --values "$VALUES" \
+    --set host=stelae >"$OUT/stelae-dolos-image.yaml" 2>&1; then
+    echo "Stelae host accepted the default Dolos image" >&2
+    exit 1
+fi
+if helm template publisher "$CHART" --values "$VALUES" \
     --set host=unknown >"$OUT/invalid-host.yaml" 2>&1; then
     echo "unknown host passed chart validation" >&2
     exit 1
