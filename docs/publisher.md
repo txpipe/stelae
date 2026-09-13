@@ -127,10 +127,10 @@ module: `stelae-cardano/src/backfill.rs` owns the running loop. The duplicate is
 temporary evidence for parity. Publisher-pipeline step 6 removes the old Dolos
 implementation after parity, and step 7 removes the stale dependency pin.
 
-This increment does not ship an image, change a Helm chart, deploy, publish to
-a production registry, or claim full production parity. Packaging, operational
-cutover, differential live-registry evidence and later pin cleanup remain the
-following publisher-pipeline steps.
+The image build, release identities, chart cutover and compatible rollback
+are documented in [publisher-packaging.md](publisher-packaging.md). Building a
+candidate does not publish, deploy, modify a network source, or claim production
+parity; operational cutover and later pin cleanup remain separate steps.
 
 The executable old/new replay, publication, recovery, resource, and local OCI
 evidence is documented in [publisher-parity.md](publisher-parity.md).

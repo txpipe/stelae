@@ -1,7 +1,5 @@
-# One stele publisher: a Kubernetes Job running the official dolos image,
-# which restores its network's latest stele (or starts from genesis),
-# replays to the next epoch boundary, publishes, prunes, and repeats until
-# it reaches the aggregator tip. One release per network.
+# One Stelae publisher Job per network. Chart 0.2 requires the Stelae image;
+# existing Dolos deployments must stay pinned to chart 0.1 until cutover.
 #
 # These defaults are instance-agnostic — no network, registry, image pin or
 # credential is assumed. Everything a network must supply is empty here and
@@ -38,13 +36,16 @@ concurrency: ""
 dolosToml: ""
 
 image:
-  # The official image: CI-built from every merge to main, every network's
-  # genesis files at /etc/genesis/<network>/, multi-arch.
-  repository: ghcr.io/txpipe/dolos
+  repository: ghcr.io/txpipe/stelae-publisher
   # Pin to the sha-<short> tag of a known commit — never latest. Each
-  # network's values file holds its own pin; there is no chart-wide dolos
+  # network's values file holds its own pin; there is no chart-wide publisher
   # version.
   tag: ""
+
+# Established repositories fail closed when
+# `latest` cannot be restored. Enable this solely for a deliberate first
+# publication after independently verifying that the repository is empty.
+allowGenesisFallback: false
 
 # The registry runs in-cluster and the write path is plain HTTP, so both the
 # restore and the backfill pass --insecure. Turn off only for a TLS registry.

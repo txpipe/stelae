@@ -1,0 +1,26 @@
+network: preview
+run: 7
+repo: oci://registry.invalid/cardano/preview
+concurrency: 4
+image:
+  tag: sha-deadbee
+resources:
+  requests:
+    cpu: "1"
+dolosToml: |
+  [upstream]
+  peer_address = "unused.invalid:3001"
+  [storage]
+  version = "v4"
+  path = "/data/db"
+  [genesis]
+  byron_path = "/etc/genesis/preview/byron.json"
+  shelley_path = "/etc/genesis/preview/shelley.json"
+  alonzo_path = "/etc/genesis/preview/alonzo.json"
+  conway_path = "/etc/genesis/preview/conway.json"
+  [chain]
+  type = "cardano"
+  magic = 2
+  is_testnet = true
+  [snapshot]
+  state_epochs = [1]

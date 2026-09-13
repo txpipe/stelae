@@ -1,83 +1,78 @@
-# Dolos publisher — deployment unit
+# Publisher — deployment unit
 
-The publisher is one Kubernetes Job per network, rendered from the Helm
-chart in [`chart/`](chart/) with a values file per network maintained by the
-operator. The operator's runbook owns deployment, re-run, first-run, and
-monitoring procedures.
-Each Job runs the official `ghcr.io/txpipe/dolos` image on the Demeter m2
-EKS cluster: it restores its network's latest stele (or starts from
-genesis), replays to the next epoch boundary, publishes, prunes, repeats,
-and exits 0 at the aggregator tip. Each publish is its own checkpoint, so a
-pod restart costs one epoch and nothing more.
+The chart in [chart/](chart/) runs one `stelae-publisher` Job per network.
+The publisher restores its latest stele, replays to epoch boundaries,
+publishes, prunes, and exits at the aggregator tip. The operator maintains
+network values and owns deployment, first publication and monitoring.
 
-## What the chart renders
+Chart 0.2 requires the Stelae image. Existing Dolos deployments remain pinned
+to chart 0.1 until cutover; rollback uses that previous chart and image.
+There is no host selector. The directory and chart name stay
+`dolos-publisher` to preserve release and object naming.
 
-Release `stelae-publisher-<network>` in namespace `stelae-publisher` — the
-registry's namespace, which the chart does not create; the deploy passes
-`--namespace`. Two objects:
+## Rendered resources
 
-- **ConfigMap** `<release>-config`, mounted at `/etc/publisher`:
-  `entrypoint.sh`, the restore-or-genesis script templated from the chart
-  (`concurrency` and `--insecure` from values), and `dolos.toml`, the
-  network's config carried **verbatim** from the values string `dolosToml`.
-  Its `[snapshot] state_epochs` list is signed input, frozen at the
-  network's first publish (decisions 0028, 0030, 0038) and extended only
-  above the then-current tip. Carrying the file verbatim means no template
-  can change it silently, and its comments stay in the values file.
-- **Job** `<network>-backfill-<run>`: the official image pinned by
-  `image.tag`, `/data` an `emptyDir`, the ConfigMap at `/etc/publisher`, the
-  registry pair from the Secret named `publisherSecretName`
-  (`stelae-registry-publisher` — referenced, never templated).
+- ConfigMap `<release>-config`, mounted at `/etc/publisher`, carries
+  `dolos.toml` verbatim from `dolosToml`. No shell entrypoint is generated.
+  The retained `[snapshot] state_epochs` list remains signed input and must
+  not change incidentally.
+- Job `<network>-backfill-<run>` directly invokes
+  `/usr/local/bin/stelae-publisher --config /etc/publisher/dolos.toml run`.
+  It mounts an emptyDir at `/data` and reads registry credentials from the
+  existing Secret, using `DOLOS_STELAE_REGISTRY_USER` and
+  `DOLOS_STELAE_REGISTRY_PASSWORD`.
 
-## The `run` mechanism
+The image bundles genesis at `/etc/genesis/<network>/`. Existing config
+paths remain valid, including storage, markers, journals, scratch and Mithril
+downloads beneath `/data/db`. Direct PID-1 execution delivers SIGTERM to
+the publisher.
+The pod requires a non-root image user and sets `fsGroup: 65532`, giving the
+image's UID/GID `65532:65532` write access to the `/data` emptyDir.
 
-A Job's pod template is immutable: it cannot be upgraded in place. The
-chart makes the re-run a deliberate act by putting a counter in the Job's
-name. Bumping `run` in the values file and upgrading makes Helm create the
-new Job and remove the old one; the new pod restores from `latest` and the
-epoch cost is paid on purpose. Changing anything else in the pod template
-without a bump fails the upgrade against the immutable field — the guard
-the raw manifests lacked. Deleting a Job by hand instead of bumping leaves
-the release history and the cluster disagreeing: the next upgrade recreates
-it under the old name. Bump, never delete.
+## Values
 
-## Values a network must supply
+| Value | Purpose |
+| --- | --- |
+| `network` | Job name prefix |
+| `run` | Deliberate re-run counter; bump when changing the Job |
+| `repo` | Network's `oci://` publication repository |
+| `concurrency` | Measured upload concurrency, with no chart default |
+| `dolosToml` | Network configuration, verbatim |
+| `image.repository` | Defaults to `ghcr.io/txpipe/stelae-publisher` |
+| `image.tag` | Tested version or `sha-<7>` tag, with no default |
+| `resources` | Network working set, with no default |
 
-| value | holds |
-|---|---|
-| `network` | prefixes the Job name, labels the pod |
-| `run` | the re-run counter |
-| `repo` | the `oci://` URL the publisher writes |
-| `concurrency` | uploads in flight per publish — measured per network, never a default |
-| `dolosToml` | the network's `dolos.toml`, verbatim |
-| `image.tag` | the `sha-<short>` pin; there is no chart-wide dolos version |
-| `resources` | the working set; no default |
+[values.yaml](chart/values.yaml) also exposes transport, secret name, retry
+budget, termination grace period and placement. Initialization fails closed
+by default. `allowGenesisFallback: true` adds `--allow-genesis`; use it only
+for a deliberately verified first publication.
 
-Everything else defaults in [`chart/values.yaml`](chart/values.yaml)
-with its reason beside it: `insecure` on (the write path is in-cluster plain
-HTTP), `publisherSecretName`, `backoffLimit`,
-`terminationGracePeriodSeconds`, and empty placement.
+## Validation
 
-## Constraints
-
-- **Concurrency is a network fact.** Mainnet 16 because zot parallelises
-  where the old Worker did not; the testnets 4 because in-cluster zot
-  serialises blob commits, and a deeper queue only adds latency to any
-  mainnet window beside it. Never lowered to make bursts smaller.
-- **Single-publisher discipline.** Exactly one writer per
-  `cardano/<network>`, ever.
-- **Placement is a value.** The dedicated `stele-backfill` nodegroup was
-  deleted on 2026-08-31; every network runs on the shared best-effort pool
-  today, and a dedicated node again is a `nodeSelector` and `tolerations`
-  change in that network's values file.
-
-Local check, no cluster needed:
-
-```bash
-helm lint k8s/dolos-publisher/chart --values "$PUBLISHER_VALUES"
+```sh
+k8s/dolos-publisher/test.sh
 helm template stelae-publisher-preprod k8s/dolos-publisher/chart \
-    --namespace stelae-publisher --values "$PUBLISHER_VALUES"
+  --namespace stelae-publisher --values "$PUBLISHER_VALUES"
 ```
 
-Its predecessors are in git history: raw manifests applied by hand, and before
-them a Cloudflare Worker with a container-backed Durable Object.
+The checks cover direct invocation, genesis opt-in, TLS selection, missing
+configuration and accidental use of the legacy Dolos image.
+
+## Upgrade and rollback
+
+A Job's pod template is immutable. Bump `run` to create a new Job for an
+upgrade or re-run. Helm also removes the old Job, but that replacement order
+does not guarantee a single writer: stop the previous writer and wait for its
+pod to terminate before starting the next run.
+
+For cutover, select chart 0.2, set the Stelae image repository and tested tag,
+bump `run`, and retain the existing config, secret and tuning values.
+Keep `allowGenesisFallback: false` for established repositories.
+
+For rollback, stop the Stelae writer, select the pinned 0.1 chart and previous
+tested Dolos image, and bump `run` again. The new emptyDir restores the
+compatible published head. Never reuse incompatible persistent scratch or an
+unpublished checkpoint across hosts.
+
+Full build, release and rollback details are in
+[publisher-packaging.md](../../docs/publisher-packaging.md).

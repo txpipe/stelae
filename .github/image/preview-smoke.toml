@@ -1,0 +1,31 @@
+# Offline container startup check. No blocks or registry are needed: the host
+# initializes from packaged genesis and waits for Mithril until SIGTERM.
+[upstream]
+peer_address = "unused.invalid:3001"
+
+[storage]
+version = "v4"
+path = "/data/db"
+
+[genesis]
+byron_path = "/etc/genesis/preview/byron.json"
+shelley_path = "/etc/genesis/preview/shelley.json"
+alonzo_path = "/etc/genesis/preview/alonzo.json"
+conway_path = "/etc/genesis/preview/conway.json"
+force_protocol = 6
+
+[sync]
+max_rollback = 25920
+max_history = 432000
+
+[mithril]
+aggregator = "http://127.0.0.1:1"
+genesis_key = ""
+
+[chain]
+type = "cardano"
+magic = 2
+is_testnet = true
+
+[snapshot]
+state_epochs = [1]

@@ -18,6 +18,9 @@ spec:
         app: {{ .Values.network }}-backfill
     spec:
       restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65532
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -30,10 +33,22 @@ spec:
       containers:
         - name: publisher
           image: {{ .Values.image.repository }}:{{ required "image.tag is required" .Values.image.tag }}
-          command: ["/bin/sh", "/etc/publisher/entrypoint.sh"]
+          command: ["/usr/local/bin/stelae-publisher"]
+          args:
+            - --config
+            - /etc/publisher/dolos.toml
+            - run
+            - --repo
+            - {{ required "repo is required" .Values.repo | quote }}
+            {{- if .Values.insecure }}
+            - --insecure
+            {{- end }}
+            - --concurrency
+            - {{ required "concurrency is required" .Values.concurrency | quote }}
+            {{- if .Values.allowGenesisFallback }}
+            - --allow-genesis
+            {{- end }}
           env:
-            - name: PUBLISHER_REPO
-              value: {{ required "repo is required" .Values.repo | quote }}
             - name: DOLOS_STELAE_REGISTRY_USER
               valueFrom:
                 secretKeyRef:

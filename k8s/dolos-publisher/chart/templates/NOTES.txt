@@ -1,17 +1,11 @@
-{{ include "dolos-publisher.jobName" . }} in {{ .Release.Namespace }} — {{ .Values.network }}, run {{ .Values.run }}, concurrency {{ .Values.concurrency }}, {{ .Values.image.repository }}:{{ .Values.image.tag }}
+{{ include "dolos-publisher.jobName" . }} in {{ .Release.Namespace }} — {{ .Values.network }}, run {{ .Values.run }}, {{ .Values.image.repository }}:{{ .Values.image.tag }}
 
 Follow the run:
   kubectl -n {{ .Release.Namespace }} logs -f job/{{ include "dolos-publisher.jobName" . }}
 
-Lines worth reading:
-  restored own latest stele                            a pod start paid a full restore
-  no restorable stele — starting from genesis          the repository was empty
-  replaying toward the next epoch boundary target=N    replay started for N
-  sequence: N (tag epoch-N)                            publish window opened
-  the registry failed a round trip; making it again attempt=K
-                                                       a retry; attempt=3 is worth attention
+Initialization restores latest and fails closed. Enable allowGenesisFallback
+only for a verified first publication.
 
-Re-run on purpose: bump `run` in the values file and upgrade. Any other
-change to the pod template without a bump fails the upgrade against the
-Job's immutable template — that failure is the guard, and the answer is
-to bump `run`. Never delete the Job by hand.
+Before an upgrade or rollback, stop the previous writer and wait for its pod
+to terminate. Bump run for the new Job. Rollback to Dolos requires the pinned
+0.1 chart and its tested Dolos image; chart 0.2 runs only Stelae.

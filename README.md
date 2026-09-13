@@ -27,7 +27,9 @@ producer and consumer; it carries no Cardano assumption.
 | [`stelae-publisher`](stelae-publisher/) | The `stelae-publisher` executable and its operator-facing commands. |
 
 Publisher commands, configuration precedence and persisted-state contracts are
-documented in [docs/publisher.md](docs/publisher.md).
+documented in [docs/publisher.md](docs/publisher.md). Reproducible image inputs,
+release provenance and the chart upgrade/rollback contract are in
+[docs/publisher-packaging.md](docs/publisher-packaging.md).
 
 The boundary proof lives in the test suite: `stelae/tests/toy_profile.rs`
 implements a second, trivial profile against the protocol surface alone.
@@ -35,7 +37,7 @@ implements a second, trivial profile against the protocol surface alone.
 ## Kubernetes
 
 [`k8s/`](k8s/) contains the instance-agnostic Helm deployment units for the
-Dolos publisher and the Stelae registry.
+Stelae publisher and registry.
 
 ## Specification
 
