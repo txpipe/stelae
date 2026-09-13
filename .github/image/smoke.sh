@@ -16,6 +16,15 @@ GENESIS_DATA=$(mktemp -d)
 cleanup() {
     docker rm -f "$REGISTRY" "$INSPECT" "$STOP" >/dev/null 2>&1 || true
     docker network rm "$NETWORK" >/dev/null 2>&1 || true
+
+    # The image runs as root, so release bind-mounted files through the pinned
+    # registry image before the unprivileged runner removes its temp trees.
+    for path in "$DATA" "$FAIL_DATA" "$GENESIS_DATA"; do
+        docker run --rm \
+            --volume "$path:/cleanup" \
+            --entrypoint /bin/chmod \
+            "$STELAE_TEST_REGISTRY_IMAGE" -R a+rwX /cleanup >/dev/null 2>&1 || true
+    done
     rm -rf "$DATA" "$FAIL_DATA" "$GENESIS_DATA"
 }
 trap cleanup EXIT INT TERM
