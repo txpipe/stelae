@@ -17,7 +17,7 @@ use std::{
 };
 
 use dolos::engine::{BulkReplaySession, ReplayWorkspace};
-use dolos_core::{config::RootConfig, ReplayProgress};
+use dolos_core::{config::RootConfig, Genesis, ReplayProgress};
 use dolos_flatfiles::{BlockLocation, FlatFileStore};
 use dolos_snapshot::{
     facade::SnapshotSource,
@@ -90,6 +90,18 @@ fn fixture_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/preview-epoch-0/000000.segment")
 }
 
+fn fixture_genesis() -> Genesis {
+    let root = fixture_path().parent().unwrap().to_owned();
+    Genesis::from_file_paths(
+        root.join("byron.json"),
+        root.join("shelley.json"),
+        root.join("alonzo.json"),
+        root.join("conway.json"),
+        Some(6),
+    )
+    .unwrap()
+}
+
 fn read_fixture() -> Vec<Arc<Vec<u8>>> {
     let path = fixture_path();
     for (name, expected) in [
@@ -156,7 +168,7 @@ fn sha256(bytes: &[u8]) -> String {
 
 fn replay(node: &Node, blocks: Vec<Arc<Vec<u8>>>) -> (u64, u128) {
     let started = Instant::now();
-    let genesis = Arc::new(dolos_cardano::include::preview::load());
+    let genesis = Arc::new(fixture_genesis());
     let mut replay = BulkReplaySession::open(&node.config, genesis, Some(1)).unwrap();
     let ReplayProgress::Boundary { position } = replay.import_blocks(blocks).unwrap() else {
         panic!("real fixture did not stop at the first Preview epoch boundary")
@@ -168,7 +180,7 @@ fn replay(node: &Node, blocks: Vec<Arc<Vec<u8>>>) -> (u64, u128) {
 
 fn old_host_publish(node: &Node, output: &Path) -> (String, u128) {
     let started = Instant::now();
-    let genesis = Arc::new(dolos_cardano::include::preview::load());
+    let genesis = Arc::new(fixture_genesis());
     let workspace = ReplayWorkspace::open(&node.config, genesis.clone()).unwrap();
     let result = (|| {
         let snapshot = workspace.snapshot();
@@ -187,7 +199,7 @@ fn old_host_publish(node: &Node, output: &Path) -> (String, u128) {
 
 fn new_host_publish(node: &Node, output: &Path) -> (String, u128) {
     let started = Instant::now();
-    let genesis = dolos_cardano::include::preview::load();
+    let genesis = fixture_genesis();
     let (_, outcome) = publish_once(
         &node.config,
         &genesis,
@@ -210,7 +222,7 @@ fn old_host_publish_repository(
     dry_run: bool,
     require_new: bool,
 ) -> Result<Option<Published>, AnyError> {
-    let genesis = Arc::new(dolos_cardano::include::preview::load());
+    let genesis = Arc::new(fixture_genesis());
     let workspace = ReplayWorkspace::open(&node.config, genesis.clone())?;
     let result: Result<Option<Published>, dolos_snapshot::Error> = (|| {
         let snapshot = workspace.snapshot();
@@ -269,7 +281,7 @@ fn new_host_publish_repository(
     dry_run: bool,
     require_new: bool,
 ) -> Result<PublishOutcome, AnyError> {
-    let genesis = dolos_cardano::include::preview::load();
+    let genesis = fixture_genesis();
     let (_, outcome) = publish_once(
         &node.config,
         &genesis,
@@ -393,7 +405,7 @@ fn inspect_repository(repository: &Repository, scratch: &Path) -> (String, Vec<u
 
 fn restore_with_unchanged_consumer(source: &Path) -> Node {
     let node = Node::new();
-    let genesis = dolos_cardano::include::preview::load();
+    let genesis = fixture_genesis();
     let outcome = initialize::run(
         &node.config,
         &genesis,
@@ -418,7 +430,7 @@ fn restore_with_unchanged_consumer(source: &Path) -> Node {
 
 fn restore_repository_with_unchanged_consumer(source: Repository) -> Node {
     let node = Node::new();
-    let genesis = dolos_cardano::include::preview::load();
+    let genesis = fixture_genesis();
     let outcome = initialize::run(
         &node.config,
         &genesis,
