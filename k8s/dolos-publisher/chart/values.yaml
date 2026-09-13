@@ -1,6 +1,5 @@
-# One stele publisher: a Kubernetes Job retaining the Dolos host by default
-# and switching to the Stelae host only when an operator asks. One release per
-# network.
+# One Stelae publisher Job per network. Chart 0.2 requires the Stelae image;
+# existing Dolos deployments must stay pinned to chart 0.1 until cutover.
 #
 # These defaults are instance-agnostic — no network, registry, image pin or
 # credential is assumed. Everything a network must supply is empty here and
@@ -15,10 +14,6 @@
 
 # The network name. Prefixes the Job name and labels the pod.
 network: ""
-
-# Application host. `dolos` preserves the chart's 0.1 behavior byte-for-byte;
-# `stelae` invokes the separately packaged stelae-publisher executable.
-host: dolos
 
 # The deliberate re-run counter. The Job is named <network>-backfill-<run>,
 # so bumping it makes the upgrade create a new Job and remove the old one,
@@ -41,15 +36,13 @@ concurrency: ""
 dolosToml: ""
 
 image:
-  # The legacy default is deliberate. A Stelae cutover must set both host and
-  # repository while retaining a commit/version-pinned tag.
-  repository: ghcr.io/txpipe/dolos
+  repository: ghcr.io/txpipe/stelae-publisher
   # Pin to the sha-<short> tag of a known commit — never latest. Each
-  # network's values file holds its own pin; there is no chart-wide dolos
+  # network's values file holds its own pin; there is no chart-wide publisher
   # version.
   tag: ""
 
-# Used only by the Stelae host. Established repositories fail closed when
+# Established repositories fail closed when
 # `latest` cannot be restored. Enable this solely for a deliberate first
 # publication after independently verifying that the repository is empty.
 allowGenesisFallback: false

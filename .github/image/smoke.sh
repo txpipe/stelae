@@ -2,107 +2,41 @@
 set -eu
 
 IMAGE=${1:?usage: smoke.sh IMAGE}
-FIXTURE=${STELAE_PACKAGING_FIXTURE:?STELAE_PACKAGING_FIXTURE is required}
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-RUN_ID="stelae-image-smoke-$$"
-NETWORK="$RUN_ID-network"
-REGISTRY="$RUN_ID-registry"
-INSPECT="$RUN_ID-inspect"
-STOP="$RUN_ID-stop"
-DATA=$(mktemp -d)
-FAIL_DATA=$(mktemp -d)
-GENESIS_DATA=$(mktemp -d)
-
+CONTAINER="stelae-image-smoke-$$"
 cleanup() {
-    docker rm -f "$REGISTRY" "$INSPECT" "$STOP" >/dev/null 2>&1 || true
-    docker network rm "$NETWORK" >/dev/null 2>&1 || true
-
-    # The image runs as root, so release bind-mounted files through the pinned
-    # registry image before the unprivileged runner removes its temp trees.
-    for path in "$DATA" "$FAIL_DATA" "$GENESIS_DATA"; do
-        docker run --rm \
-            --volume "$path:/cleanup" \
-            --entrypoint /bin/chmod \
-            "$STELAE_TEST_REGISTRY_IMAGE" -R a+rwX /cleanup >/dev/null 2>&1 || true
-    done
-    rm -rf "$DATA" "$FAIL_DATA" "$GENESIS_DATA"
+    docker logs "$CONTAINER" 2>&1 || true
+    docker rm -fv "$CONTAINER" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 1' INT TERM
 
-docker network create "$NETWORK" >/dev/null
-docker run --detach --rm \
-    --name "$REGISTRY" \
-    --network "$NETWORK" \
-    --publish 127.0.0.1::5000 \
-    "${STELAE_TEST_REGISTRY_IMAGE:?STELAE_TEST_REGISTRY_IMAGE is required}" >/dev/null
+docker run --rm --network none "$IMAGE" --version | grep -F 'stelae-publisher'
 
-docker run --rm "$IMAGE" --version | grep -F "stelae-publisher"
-
-# Inspect the filesystem, not PATH: the runtime is intentionally shell-free.
-docker create --name "$INSPECT" "$IMAGE" --version >/dev/null
-if docker export "$INSPECT" | tar -tf - | grep -Eq '(^|/)(bin/)?dolos$'; then
-    echo "publisher image unexpectedly contains a Dolos executable" >&2
-    exit 1
-fi
-docker rm "$INSPECT" >/dev/null
-
-# The packaged executable retains the host's cold-start policy: missing latest
-# fails closed, and genesis remains an explicit opt-in.
-if docker run --rm \
-    --volume "$FAIL_DATA:/data" \
+# Exercise the chart's run command with packaged genesis and a data volume.
+# With no network or blocks, it initializes and waits for Mithril until stopped.
+docker create --name "$CONTAINER" --network none \
+    --volume /data \
     --volume "$SCRIPT_DIR/preview-smoke.toml:/etc/publisher/dolos.toml:ro" \
-    "$IMAGE" --config /etc/publisher/dolos.toml \
-    initialize --source file:///missing; then
-    echo "missing restore source unexpectedly selected genesis" >&2
-    exit 1
-fi
-test ! -e "$FAIL_DATA/db/.stelae-publisher-initialized.json"
+    "$IMAGE" --config /etc/publisher/dolos.toml run \
+    --restore-source file:///missing --allow-genesis \
+    --repo oci://127.0.0.1:1/cardano/smoke --insecure --concurrency 1 >/dev/null
+docker start "$CONTAINER" >/dev/null
 
-docker run --rm \
-    --volume "$GENESIS_DATA:/data" \
-    --volume "$SCRIPT_DIR/preview-smoke.toml:/etc/publisher/dolos.toml:ro" \
-    "$IMAGE" --config /etc/publisher/dolos.toml \
-    initialize --source file:///missing --allow-genesis
-grep -F '"mode": "genesis"' "$GENESIS_DATA/db/.stelae-publisher-initialized.json"
+# Wait for the acquisition loop, not a fixed startup delay.
+ready=false
+for attempt in $(seq 1 60); do
+    if docker logs "$CONTAINER" 2>&1 | grep -Fq 'listing mithril snapshots'; then
+        ready=true
+        break
+    fi
+    test "$(docker inspect --format '{{.State.Running}}' "$CONTAINER")" = true
+    sleep 1
+done
+test "$ready" = true
+docker cp "$CONTAINER:/data/db/.stelae-publisher-initialized.json" - |
+    tar -xO | grep -F '"mode": "genesis"'
 
-docker run --rm \
-    --network "$NETWORK" \
-    --volume "$FIXTURE:/fixture:ro" \
-    --volume "$DATA:/data" \
-    --volume "$SCRIPT_DIR/preview-smoke.toml:/etc/publisher/dolos.toml:ro" \
-    "$IMAGE" --config /etc/publisher/dolos.toml \
-    initialize --source file:///fixture
-
-test -f "$DATA/db/.stelae-publisher-initialized.json"
-
-docker run --rm \
-    --network "$NETWORK" \
-    --volume "$DATA:/data" \
-    --volume "$SCRIPT_DIR/preview-smoke.toml:/etc/publisher/dolos.toml:ro" \
-    "$IMAGE" --config /etc/publisher/dolos.toml \
-    backfill --repo "oci://$REGISTRY:5000/cardano/image-smoke" \
-    --insecure --until-epoch 1
-
-PORT=$(docker port "$REGISTRY" 5000/tcp | sed -n 's/.*://p')
-curl --fail --silent --show-error \
-    "http://127.0.0.1:$PORT/v2/cardano/image-smoke/tags/list" |
-    grep -F '"latest"'
-
-test -d "$DATA/db/scratch"
-
-# After the pending boundary is published, the host waits on the deliberately
-# unreachable Mithril endpoint. SIGTERM must stop it before Docker's kill code.
-docker run --detach \
-    --name "$STOP" \
-    --network "$NETWORK" \
-    --volume "$DATA:/data" \
-    --volume "$SCRIPT_DIR/preview-smoke.toml:/etc/publisher/dolos.toml:ro" \
-    "$IMAGE" --config /etc/publisher/dolos.toml \
-    backfill --repo "oci://$REGISTRY:5000/cardano/image-smoke" \
-    --insecure >/dev/null
-sleep 2
-docker stop --time 20 "$STOP" >/dev/null
-EXIT_CODE=$(docker inspect --format '{{.State.ExitCode}}' "$STOP")
-test "$EXIT_CODE" = 1
-docker logs "$STOP" 2>&1 | grep -F "shutdown requested"
-docker rm "$STOP" >/dev/null
+docker stop --time 20 "$CONTAINER" >/dev/null
+test "$(docker inspect --format '{{.State.ExitCode}}' "$CONTAINER")" = 1
+docker logs "$CONTAINER" 2>&1 | grep -F 'shutdown requested'

@@ -1,22 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": [
-    "network",
-    "host",
-    "run",
-    "repo",
-    "concurrency",
-    "dolosToml",
-    "image",
-    "resources"
-  ],
+  "required": ["network", "run", "repo", "concurrency", "dolosToml", "image", "resources"],
   "properties": {
     "network": { "type": "string", "minLength": 1 },
-    "host": { "type": "string", "enum": ["dolos", "stelae"] },
     "run": {
       "oneOf": [
-        { "type": "integer", "minimum": 0 },
+        { "type": "integer", "minimum": 1 },
         { "type": "string", "minLength": 1 }
       ]
     },
@@ -32,7 +22,11 @@
       "type": "object",
       "required": ["repository", "tag"],
       "properties": {
-        "repository": { "type": "string", "minLength": 1 },
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "not": { "const": "ghcr.io/txpipe/dolos" }
+        },
         "tag": { "type": "string", "minLength": 1 }
       },
       "additionalProperties": true
@@ -46,24 +40,5 @@
     "tolerations": { "type": "array" },
     "resources": { "type": "object", "minProperties": 1 }
   },
-  "allOf": [
-    {
-      "if": {
-        "properties": { "host": { "const": "stelae" } },
-        "required": ["host"]
-      },
-      "then": {
-        "properties": {
-          "image": {
-            "properties": {
-              "repository": {
-                "not": { "const": "ghcr.io/txpipe/dolos" }
-              }
-            }
-          }
-        }
-      }
-    }
-  ],
   "additionalProperties": true
 }

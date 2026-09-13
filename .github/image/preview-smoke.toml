@@ -1,6 +1,5 @@
-# Offline fixture configuration for the packaged-image gate. The backfill exits
-# immediately after publishing the restored epoch-one boundary, so the Mithril
-# endpoint is deliberately unreachable and must never be contacted.
+# Offline container startup check. No blocks or registry are needed: the host
+# initializes from packaged genesis and waits for Mithril until SIGTERM.
 [upstream]
 peer_address = "unused.invalid:3001"
 
@@ -20,7 +19,7 @@ max_rollback = 25920
 max_history = 432000
 
 [mithril]
-aggregator = "http://unused.invalid"
+aggregator = "http://127.0.0.1:1"
 genesis_key = ""
 
 [chain]

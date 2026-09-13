@@ -215,25 +215,6 @@ fn new_host_publish(node: &Node, output: &Path) -> (String, u128) {
     (identity, started.elapsed().as_millis())
 }
 
-#[test]
-#[ignore = "exports the real-boundary image-smoke fixture on explicit request"]
-fn export_packaging_smoke_fixture() {
-    let Some(output) = std::env::var_os("STELAE_PACKAGING_FIXTURE").map(std::path::PathBuf::from)
-    else {
-        eprintln!("STELAE_PACKAGING_FIXTURE is unset; fixture export not requested");
-        return;
-    };
-    assert!(!output.exists(), "fixture output already exists");
-
-    let node = Node::new();
-    replay(&node, read_fixture());
-    let (identity, _) = new_host_publish(&node, &output);
-    assert_eq!(
-        identity,
-        "sha256:6232659be34afdf24f56784b9ba3db3ccee70cd7476708652b8ba0381bea0027"
-    );
-}
-
 fn old_host_publish_repository(
     node: &Node,
     repository: &Repository,
