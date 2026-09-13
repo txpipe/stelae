@@ -8,7 +8,7 @@ No command starts or shells out to a Dolos executable.
 
 ## Source and dependency identity
 
-All imported Dolos crates are pinned to
+All Dolos crates in the normal publisher dependency graph are pinned to
 `2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5`, the merge revision of
 [Dolos PR 1335](https://github.com/txpipe/dolos/pull/1335). This is the
 publisher-retirement revision: it retains the headless ledger, storage,
