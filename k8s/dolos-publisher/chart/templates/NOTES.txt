@@ -1,11 +1,19 @@
-{{ include "dolos-publisher.jobName" . }} in {{ .Release.Namespace }} — {{ .Values.network }}, run {{ .Values.run }}, concurrency {{ .Values.concurrency }}, {{ .Values.image.repository }}:{{ .Values.image.tag }}
+{{ include "dolos-publisher.jobName" . }} in {{ .Release.Namespace }} — {{ .Values.network }}, host {{ .Values.host }}, run {{ .Values.run }}, concurrency {{ .Values.concurrency }}, {{ .Values.image.repository }}:{{ .Values.image.tag }}
 
 Follow the run:
   kubectl -n {{ .Release.Namespace }} logs -f job/{{ include "dolos-publisher.jobName" . }}
 
 Lines worth reading:
+{{- if eq .Values.host "stelae" }}
+  restored sequence N                                    cold start restored latest and wrote its marker
+  publisher storage already initialized                 restart accepted the persisted contract
+  latest stele restore failed; refusing genesis fallback
+                                                       established lineage could not be restored
+  restore unavailable; explicit genesis start selected intentional first-publication opt-in
+{{- else }}
   restored own latest stele                            a pod start paid a full restore
   no restorable stele — starting from genesis          the repository was empty
+{{- end }}
   replaying toward the next epoch boundary target=N    replay started for N
   sequence: N (tag epoch-N)                            publish window opened
   the registry failed a round trip; making it again attempt=K

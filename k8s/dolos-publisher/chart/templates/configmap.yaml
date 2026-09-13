@@ -1,7 +1,7 @@
 {{/*
-The restore-or-genesis entrypoint and the network's dolos.toml, mounted at
-/etc/publisher. The entrypoint is templated (concurrency, --insecure); the
-dolos.toml is the values string verbatim.
+The legacy Dolos entrypoint and the network's dolos.toml, mounted at
+/etc/publisher. Stelae mode invokes its binary directly from the Job template;
+keeping this key preserves the ConfigMap interface for existing releases.
 */}}
 apiVersion: v1
 kind: ConfigMap

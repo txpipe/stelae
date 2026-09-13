@@ -1,0 +1,32 @@
+# Offline fixture configuration for the packaged-image gate. The backfill exits
+# immediately after publishing the restored epoch-one boundary, so the Mithril
+# endpoint is deliberately unreachable and must never be contacted.
+[upstream]
+peer_address = "unused.invalid:3001"
+
+[storage]
+version = "v4"
+path = "/data/db"
+
+[genesis]
+byron_path = "/etc/genesis/preview/byron.json"
+shelley_path = "/etc/genesis/preview/shelley.json"
+alonzo_path = "/etc/genesis/preview/alonzo.json"
+conway_path = "/etc/genesis/preview/conway.json"
+force_protocol = 6
+
+[sync]
+max_rollback = 25920
+max_history = 432000
+
+[mithril]
+aggregator = "http://unused.invalid"
+genesis_key = ""
+
+[chain]
+type = "cardano"
+magic = 2
+is_testnet = true
+
+[snapshot]
+state_epochs = [1]

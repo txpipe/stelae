@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "network",
+    "host",
+    "run",
+    "repo",
+    "concurrency",
+    "dolosToml",
+    "image",
+    "resources"
+  ],
+  "properties": {
+    "network": { "type": "string", "minLength": 1 },
+    "host": { "type": "string", "enum": ["dolos", "stelae"] },
+    "run": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "string", "minLength": 1 }
+      ]
+    },
+    "repo": { "type": "string", "pattern": "^oci://[^/]+/.+" },
+    "concurrency": {
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "string", "pattern": "^[1-9][0-9]*$" }
+      ]
+    },
+    "dolosToml": { "type": "string", "minLength": 1 },
+    "image": {
+      "type": "object",
+      "required": ["repository", "tag"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "allowGenesisFallback": { "type": "boolean" },
+    "insecure": { "type": "boolean" },
+    "publisherSecretName": { "type": "string", "minLength": 1 },
+    "backoffLimit": { "type": "integer", "minimum": 0 },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1 },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "resources": { "type": "object", "minProperties": 1 }
+  },
+  "additionalProperties": true
+}

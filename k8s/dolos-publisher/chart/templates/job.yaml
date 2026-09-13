@@ -30,7 +30,25 @@ spec:
       containers:
         - name: publisher
           image: {{ .Values.image.repository }}:{{ required "image.tag is required" .Values.image.tag }}
+          {{- if eq .Values.host "stelae" }}
+          command: ["/usr/local/bin/stelae-publisher"]
+          args:
+            - --config
+            - /etc/publisher/dolos.toml
+            - run
+            - --repo
+            - {{ required "repo is required" .Values.repo | quote }}
+            {{- if .Values.insecure }}
+            - --insecure
+            {{- end }}
+            - --concurrency
+            - {{ required "concurrency is required" .Values.concurrency | quote }}
+            {{- if .Values.allowGenesisFallback }}
+            - --allow-genesis
+            {{- end }}
+          {{- else }}
           command: ["/bin/sh", "/etc/publisher/entrypoint.sh"]
+          {{- end }}
           env:
             - name: PUBLISHER_REPO
               value: {{ required "repo is required" .Values.repo | quote }}
