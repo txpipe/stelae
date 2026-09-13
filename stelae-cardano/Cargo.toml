@@ -10,12 +10,12 @@ repository.workspace = true
 stelae = { path = "../stelae", version = "=0.2.0", features = ["oci"] }
 stelae-driver = { path = "../stelae-driver", version = "=0.2.0", features = ["oci"] }
 
-# Accepted publisher-pipeline facade revision: txpipe/dolos PR #1334.
-dolos = { git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30", default-features = false }
-dolos-cardano = { git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30" }
-dolos-core = { git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30" }
-dolos-mithril = { git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30" }
-dolos-snapshot = { git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30" }
+# Accepted publisher-retirement revision: txpipe/dolos PR #1335.
+dolos = { git = "https://github.com/txpipe/dolos", rev = "2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5", default-features = false }
+dolos-cardano = { git = "https://github.com/txpipe/dolos", rev = "2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5" }
+dolos-core = { git = "https://github.com/txpipe/dolos", rev = "2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5" }
+dolos-mithril = { git = "https://github.com/txpipe/dolos", rev = "2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5" }
+dolos-snapshot = { git = "https://github.com/txpipe/dolos", rev = "2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5" }
 
 itertools = "0.14.0"
 pallas = { version = "1.1.1", features = ["hardano", "phase2", "unstable"] }
@@ -27,8 +27,12 @@ tokio-util = { version = "0.7.11", features = ["rt"] }
 tracing = "0.1.37"
 
 [dev-dependencies]
-dolos-flatfiles = { git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30" }
-dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30" }
+dolos-flatfiles = { git = "https://github.com/txpipe/dolos", rev = "2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5" }
+dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5" }
+# Step-4's immutable comparison host remains test-only after Dolos removes it.
+# Aliases keep its types visibly separate from the final consumer graph above.
+dolos-old = { package = "dolos", git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30", default-features = false }
+dolos-snapshot-old = { package = "dolos-snapshot", git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30" }
 hex = "0.4.3"
 libc = "0.2.186"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

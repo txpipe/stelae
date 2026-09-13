@@ -8,13 +8,22 @@ No command starts or shells out to a Dolos executable.
 
 ## Source and dependency identity
 
-All imported Dolos crates are pinned to
-`1ae4e91c18a9e1456a3612af402d7b9b97546d30`, the merge revision of
-[Dolos PR 1334](https://github.com/txpipe/dolos/pull/1334). The root `dolos`
-package is imported with default features disabled. The workspace patch for
-`https://github.com/txpipe/stelae` resolves the profile's v0.2.0 dependencies
-back to the workspace `stelae` and `stelae-driver` packages. This prevents two
-same-version protocol type universes.
+All Dolos crates in the normal publisher dependency graph are pinned to
+`2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5`, the merge revision of
+[Dolos PR 1335](https://github.com/txpipe/dolos/pull/1335). This is the
+publisher-retirement revision: it retains the headless ledger, storage,
+profile, restore and repository facades but contains no publisher command,
+backfill loop or publisher policy module. The root `dolos` package is imported
+with default features disabled, so its service features are absent from the
+publisher graph.
+
+The workspace patch for `https://github.com/txpipe/stelae` resolves the
+profile's v0.2.0 dependencies back to the workspace `stelae` and
+`stelae-driver` packages. This prevents two same-version protocol type
+universes. The step-4 parity test retains the former Dolos host at immutable
+revision `1ae4e91c18a9e1456a3612af402d7b9b97546d30` through explicitly named,
+test-only dependency aliases; those aliases are reference evidence and are not
+in the publisher's normal dependency graph.
 
 The lockfile is committed. These commands verify the intended graph:
 
@@ -119,18 +128,19 @@ The backfill state machine preserves these rules from the accepted Dolos host:
 - retain `snapshot.state_epochs` and the profile's existing plan, schema,
   media-type, compression and journal identities.
 
-## Finite duplication window
+## Final ownership boundary
 
-Dolos still carries its old `snapshot publish` / `snapshot backfill` command
-and backfill module at the pinned revision. This host does not call that
-module: `stelae-cardano/src/backfill.rs` owns the running loop. The duplicate is
-temporary evidence for parity. Publisher-pipeline step 6 removes the old Dolos
-implementation after parity, and step 7 removes the stale dependency pin.
+`stelae-cardano/src/backfill.rs` is the only running publisher loop, and
+`stelae-cardano/src/publisher.rs` owns the host's repository-standing and
+journal policy. It composes Dolos's supported `SnapshotRepository`,
+`Publishing` and `SnapshotSource` facades; it does not import a Dolos publisher
+or backfill API. The immutable old-host aliases used by the parity test are not
+linked into `stelae-publisher`.
 
 The image build, release identities, chart cutover and compatible rollback
 are documented in [publisher-packaging.md](publisher-packaging.md). Building a
 candidate does not publish, deploy, modify a network source, or claim production
-parity; operational cutover and later pin cleanup remain separate steps.
+parity; operational cutover remains a separate step.
 
 The executable old/new replay, publication, recovery, resource, and local OCI
 evidence is documented in [publisher-parity.md](publisher-parity.md).

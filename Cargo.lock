@@ -1146,11 +1146,71 @@ dependencies = [
  "chrono",
  "clap",
  "config",
- "dolos-cardano",
- "dolos-core",
- "dolos-fjall",
- "dolos-redb3",
- "dolos-snapshot",
+ "dolos-cardano 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30)",
+ "dolos-core 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30)",
+ "dolos-fjall 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30)",
+ "dolos-redb3 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30)",
+ "dolos-snapshot 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30)",
+ "flate2",
+ "futures-core",
+ "futures-util",
+ "gasket",
+ "hex",
+ "http",
+ "hyper",
+ "indicatif",
+ "itertools 0.14.0",
+ "lazy_static",
+ "log",
+ "miette",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "pallas",
+ "paste",
+ "protoc-wkt",
+ "rayon",
+ "redb-extras",
+ "reqwest 0.12.28",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tar",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower 0.4.13",
+ "tower-http",
+ "tracing",
+ "tracing-log",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "trait-variant",
+ "vergen-gitcl",
+ "xxhash-rust",
+ "zstd",
+]
+
+[[package]]
+name = "dolos"
+version = "2.0.0-alpha.0"
+source = "git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5#2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "bech32 0.11.1",
+ "bincode 1.3.3",
+ "bytes",
+ "chrono",
+ "clap",
+ "config",
+ "dolos-cardano 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
+ "dolos-core 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
+ "dolos-fjall 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
+ "dolos-redb3 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
+ "dolos-snapshot 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
  "flate2",
  "futures-core",
  "futures-util",
@@ -1201,7 +1261,32 @@ dependencies = [
  "async-trait",
  "chrono",
  "crc",
- "dolos-core",
+ "dolos-core 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30)",
+ "futures-core",
+ "hex",
+ "itertools 0.14.0",
+ "num-bigint",
+ "num-rational",
+ "pallas",
+ "paste",
+ "rayon",
+ "self_cell",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "dolos-cardano"
+version = "2.0.0-alpha.0"
+source = "git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5#2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "crc",
+ "dolos-core 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
  "futures-core",
  "hex",
  "itertools 0.14.0",
@@ -1242,13 +1327,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "dolos-core"
+version = "2.0.0-alpha.0"
+source = "git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5#2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5"
+dependencies = [
+ "futures-core",
+ "futures-util",
+ "hex",
+ "itertools 0.14.0",
+ "opentelemetry",
+ "pallas",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_with 3.23.0",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-opentelemetry",
+ "trait-variant",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "dolos-fjall"
 version = "2.0.0-alpha.0"
 source = "git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30#1ae4e91c18a9e1456a3612af402d7b9b97546d30"
 dependencies = [
  "bincode 1.3.3",
- "dolos-core",
- "dolos-flatfiles",
+ "dolos-core 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30)",
+ "dolos-flatfiles 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30)",
+ "fjall",
+ "pallas",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "dolos-fjall"
+version = "2.0.0-alpha.0"
+source = "git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5#2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5"
+dependencies = [
+ "bincode 1.3.3",
+ "dolos-core 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
+ "dolos-flatfiles 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
  "fjall",
  "pallas",
  "tempfile",
@@ -1268,11 +1393,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dolos-flatfiles"
+version = "2.0.0-alpha.0"
+source = "git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5#2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5"
+dependencies = [
+ "rayon",
+ "tempfile",
+ "zstd",
+]
+
+[[package]]
 name = "dolos-mithril"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30#1ae4e91c18a9e1456a3612af402d7b9b97546d30"
+source = "git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5#2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5"
 dependencies = [
- "dolos-core",
+ "dolos-core 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
  "mithril-client",
  "tracing",
 ]
@@ -1283,7 +1418,30 @@ version = "2.0.0-alpha.0"
 source = "git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30#1ae4e91c18a9e1456a3612af402d7b9b97546d30"
 dependencies = [
  "bincode 1.3.3",
- "dolos-core",
+ "dolos-core 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30)",
+ "futures-core",
+ "futures-util",
+ "hex",
+ "itertools 0.14.0",
+ "pallas",
+ "redb",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower-http",
+ "tracing",
+]
+
+[[package]]
+name = "dolos-redb3"
+version = "2.0.0-alpha.0"
+source = "git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5#2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5"
+dependencies = [
+ "bincode 1.3.3",
+ "dolos-core 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
  "futures-core",
  "futures-util",
  "hex",
@@ -1305,8 +1463,25 @@ name = "dolos-snapshot"
 version = "2.0.0-alpha.0"
 source = "git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30#1ae4e91c18a9e1456a3612af402d7b9b97546d30"
 dependencies = [
- "dolos-cardano",
- "dolos-core",
+ "dolos-cardano 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30)",
+ "dolos-core 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30)",
+ "hex",
+ "minicbor 0.26.5",
+ "serde",
+ "serde_json",
+ "stelae",
+ "stelae-driver",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "dolos-snapshot"
+version = "2.0.0-alpha.0"
+source = "git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5#2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5"
+dependencies = [
+ "dolos-cardano 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
+ "dolos-core 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
  "hex",
  "minicbor 0.26.5",
  "serde",
@@ -1320,13 +1495,13 @@ dependencies = [
 [[package]]
 name = "dolos-testing"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30#1ae4e91c18a9e1456a3612af402d7b9b97546d30"
+source = "git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5#2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5"
 dependencies = [
  "bech32 0.9.1",
- "dolos-cardano",
- "dolos-core",
- "dolos-fjall",
- "dolos-redb3",
+ "dolos-cardano 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
+ "dolos-core 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
+ "dolos-fjall 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
+ "dolos-redb3 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
  "futures-core",
  "futures-util",
  "hex",
@@ -4641,12 +4816,14 @@ dependencies = [
 name = "stelae-cardano"
 version = "0.2.0"
 dependencies = [
- "dolos",
- "dolos-cardano",
- "dolos-core",
- "dolos-flatfiles",
+ "dolos 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30)",
+ "dolos 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
+ "dolos-cardano 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
+ "dolos-core 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
+ "dolos-flatfiles 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
  "dolos-mithril",
- "dolos-snapshot",
+ "dolos-snapshot 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=1ae4e91c18a9e1456a3612af402d7b9b97546d30)",
+ "dolos-snapshot 2.0.0-alpha.0 (git+https://github.com/txpipe/dolos?rev=2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5)",
  "dolos-testing",
  "hex",
  "itertools 0.14.0",

@@ -8,7 +8,9 @@ use dolos_snapshot::{
     facade::SnapshotSource,
     node,
     planning::{self, PlanReport},
-    registry::{self, Auth, Preview, Published, Repository, Tuning},
+    registry::{
+        self, Auth, Preview, Published, Publishing, Repository, SnapshotRepository, Tuning,
+    },
 };
 use stelae::progress::Observer;
 use stelae_driver::Standing;
@@ -33,11 +35,7 @@ pub enum Next {
 }
 
 impl Next {
-    pub fn read(
-        standing: Standing,
-        sequence: u64,
-        require_new: bool,
-    ) -> Result<Self, dolos_snapshot::Error> {
+    pub fn read(standing: Standing, sequence: u64, require_new: bool) -> Result<Self, PolicyError> {
         match standing {
             Standing::Empty => Ok(Self::First),
             Standing::Next { latest } => Ok(Self::After { latest }),
@@ -46,12 +44,12 @@ impl Next {
                     "nothing to publish: this repository is at sequence {latest} and this node is at sequence {sequence}"
                 );
                 if require_new {
-                    Err(dolos_snapshot::Error::NothingToPublish(message))
+                    Err(PolicyError::NothingToPublish(message))
                 } else {
                     Ok(Self::Nothing(message))
                 }
             }
-            Standing::Ahead { latest, distance } => Err(dolos_snapshot::Error::PublishWouldGap {
+            Standing::Ahead { latest, distance } => Err(PolicyError::PublishWouldGap {
                 latest,
                 sequence,
                 distance,
@@ -60,9 +58,29 @@ impl Next {
     }
 }
 
+/// Publisher-host refusals that do not belong to the Dolos profile facade.
+#[derive(Debug, thiserror::Error)]
+pub enum PolicyError {
+    #[error("{0}")]
+    NothingToPublish(String),
+
+    #[error(
+        "this repository's latest stele is sequence {latest} and this node is at sequence \
+         {sequence}, {distance} sequences ahead: a publish must follow the repository's latest \
+         stele, and this one would leave a gap no later stele could close"
+    )]
+    PublishWouldGap {
+        latest: u64,
+        sequence: u64,
+        distance: u64,
+    },
+}
+
 /// An opened repository plus the journal and reuse policy of this publisher.
 pub struct Publisher {
-    inner: dolos_snapshot::publisher::Publisher,
+    repository: SnapshotRepository,
+    record_path: PathBuf,
+    rebuild: bool,
 }
 
 impl Publisher {
@@ -93,25 +111,21 @@ impl Publisher {
         rebuild: bool,
         tuning: Tuning,
     ) -> Result<Self, dolos_snapshot::Error> {
-        let inner = dolos_snapshot::publisher::Publisher::open_explicit(
+        let repository = SnapshotRepository::open(repository, insecure, auth, scratch_dir, tuning)?;
+
+        Ok(Self {
             repository,
-            insecure,
-            auth,
-            scratch_dir,
             record_path,
             rebuild,
-            tuning,
-        )?;
-
-        Ok(Self { inner })
+        })
     }
 
     pub fn standing(&self, plan: &Plan) -> Result<Standing, dolos_snapshot::Error> {
-        self.inner.standing(plan)
+        self.repository.standing(plan)
     }
 
     pub fn preflight(&self) -> Result<(), dolos_snapshot::Error> {
-        self.inner.preflight()
+        self.repository.preflight()
     }
 
     pub fn preview(
@@ -119,7 +133,7 @@ impl Publisher {
         plan: &Plan,
         source: &dyn SnapshotSource,
     ) -> Result<Preview, dolos_snapshot::Error> {
-        source.preview(&self.inner, plan)
+        source.preview_repository(self.publishing(), plan)
     }
 
     pub fn publish(
@@ -128,7 +142,14 @@ impl Publisher {
         source: &dyn SnapshotSource,
         observer: &Observer,
     ) -> Result<Published, dolos_snapshot::Error> {
-        source.publish(&self.inner, plan, observer)
+        source.publish_repository(self.publishing(), plan, observer)
+    }
+
+    fn publishing(&self) -> Publishing<'_> {
+        self.repository
+            .publishing()
+            .recording_in(self.record_path.clone())
+            .rebuilding(self.rebuild)
     }
 }
 

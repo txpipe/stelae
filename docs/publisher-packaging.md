@@ -45,10 +45,30 @@ identify the released image and source revision. Native binaries are only
 intermediate workflow artifacts; there are no standalone binary releases or
 custom provenance files.
 
+## Candidate identity
+
+A candidate is the tuple of the full Stelae commit, committed `Cargo.lock`,
+accepted Dolos revision
+`2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5`, chart source at that same Stelae
+commit, and reviewed values/configuration. Record all of them at handoff. Before
+publication the image digest is intentionally unknown; use the commit as the
+candidate identity, then add the registry digest and attestation after the
+explicit tag-driven publication. Never substitute a moving image tag for the
+missing digest.
+
+The publisher image and its Dolos profile/protocol dependencies do not need an
+artificial release cadence. The immutable git pin and lockfile make the exact
+combination reproducible, so a publisher candidate can be tested without a new
+Dolos release, and a Dolos or Stelae protocol release need not publish a new
+publisher image when its locked inputs did not change. This repository's one
+workspace tag remains a source identity for the Stelae crates and application;
+publication of protocol crates, image artifacts and deployment are still
+distinct, explicit decisions.
+
 ## Release
 
-1. Verify the candidate commit passed the workspace, parity, registry, image
-   and chart checks.
+1. Verify the candidate tuple above passed the workspace, parity, registry,
+   image and chart checks.
 2. Prepare the version/changelog with the repository's `cargo release` flow
    and review the release commit and signed `v<version>` tag before pushing.
 3. Pushing the version tag triggers image publication after both architecture
