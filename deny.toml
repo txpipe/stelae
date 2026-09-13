@@ -20,23 +20,22 @@ ignore = [
 multiple-versions = "warn"
 
 deny = [
-    # The extraction boundary, stated where it is enforced: the protocol
-    # depends on no profile. In the dolos workspace this was a rule someone
-    # had to keep; here the resolver checks it. Enumerated because cargo-deny
-    # matches names exactly — a new dolos-* crate joins this list when it is
-    # born, which its author is the person editing these manifests anyway.
-    { crate = "dolos", reason = "the Stelae crates must never depend on a dolos crate; the protocol depends on no profile (SPEC.md)" },
-    { crate = "dolos-cardano", reason = "the Stelae crates must never depend on a dolos crate" },
-    { crate = "dolos-core", reason = "the Stelae crates must never depend on a dolos crate" },
-    { crate = "dolos-fjall", reason = "the Stelae crates must never depend on a dolos crate" },
-    { crate = "dolos-flatfiles", reason = "the Stelae crates must never depend on a dolos crate" },
-    { crate = "dolos-minibf", reason = "the Stelae crates must never depend on a dolos crate" },
-    { crate = "dolos-minikupo", reason = "the Stelae crates must never depend on a dolos crate" },
-    { crate = "dolos-mithril", reason = "the Stelae crates must never depend on a dolos crate" },
-    { crate = "dolos-redb3", reason = "the Stelae crates must never depend on a dolos crate" },
-    { crate = "dolos-snapshot", reason = "the Stelae crates must never depend on a dolos crate" },
-    { crate = "dolos-testing", reason = "the Stelae crates must never depend on a dolos crate" },
-    { crate = "dolos-trp", reason = "the Stelae crates must never depend on a dolos crate" },
+    # Dolos is admitted only below the Cardano integration. These wrappers keep
+    # the protocol and generic-driver boundary resolver-enforced: a direct Dolos
+    # edge from either crate fails. Names are enumerated because cargo-deny
+    # matches exactly; a new dolos-* crate must be added when introduced.
+    { crate = "dolos", wrappers = ["stelae-cardano"], reason = "Dolos belongs only below the Cardano integration; the protocol depends on no profile (SPEC.md)" },
+    { crate = "dolos-cardano", wrappers = ["stelae-cardano", "dolos", "dolos-snapshot", "dolos-testing"], reason = "Dolos belongs only below the Cardano integration" },
+    { crate = "dolos-core", wrappers = ["stelae-cardano", "dolos", "dolos-cardano", "dolos-snapshot", "dolos-mithril", "dolos-fjall", "dolos-redb3", "dolos-testing"], reason = "Dolos belongs only below the Cardano integration" },
+    { crate = "dolos-fjall", wrappers = ["dolos", "dolos-testing"], reason = "Dolos belongs only below the Cardano integration" },
+    { crate = "dolos-flatfiles", wrappers = ["dolos-fjall"], reason = "Dolos belongs only below the Cardano integration" },
+    { crate = "dolos-minibf", reason = "Dolos belongs only below the Cardano integration" },
+    { crate = "dolos-minikupo", reason = "Dolos belongs only below the Cardano integration" },
+    { crate = "dolos-mithril", wrappers = ["stelae-cardano"], reason = "Dolos belongs only below the Cardano integration" },
+    { crate = "dolos-redb3", wrappers = ["dolos", "dolos-testing"], reason = "Dolos belongs only below the Cardano integration" },
+    { crate = "dolos-snapshot", wrappers = ["stelae-cardano", "dolos"], reason = "Dolos belongs only below the Cardano integration" },
+    { crate = "dolos-testing", wrappers = ["stelae-cardano"], reason = "Dolos belongs only below the Cardano integration" },
+    { crate = "dolos-trp", reason = "Dolos belongs only below the Cardano integration" },
     # The same C-toolchain refusal the dolos workspace makes: the oci feature
     # takes reqwest with rustls-no-provider so the crypto provider is the
     # host's choice, and nothing here may drag cmake back in.

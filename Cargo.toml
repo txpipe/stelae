@@ -5,13 +5,21 @@
 # a single tag and a consumer pins both crates with one git reference.
 [workspace]
 resolver = "2"
-members = ["stelae", "stelae-driver"]
+members = ["stelae", "stelae-driver", "stelae-cardano", "stelae-publisher"]
 
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/txpipe/stelae"
+
+# Dolos v2.0.0-alpha.0 pins the released v0.2.0 Stelae crates. The publisher
+# is built in this workspace, so patch both names back to these paths: this is
+# what makes the profile's trait and registry types identical to the host's,
+# rather than two same-version crates from different sources.
+[patch."https://github.com/txpipe/stelae"]
+stelae = { path = "stelae" }
+stelae-driver = { path = "stelae-driver" }
 
 # Same release flow as dolos: `cargo release` bumps the lockstep workspace
 # version, regenerates the root CHANGELOG.md through git-cliff, commits and
