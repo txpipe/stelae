@@ -4644,13 +4644,18 @@ dependencies = [
  "dolos",
  "dolos-cardano",
  "dolos-core",
+ "dolos-flatfiles",
  "dolos-mithril",
  "dolos-snapshot",
  "dolos-testing",
+ "hex",
  "itertools 0.14.0",
+ "libc",
  "pallas",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "stelae",
  "stelae-driver",
  "tempfile",
@@ -4659,6 +4664,7 @@ dependencies = [
  "tokio-util",
  "toml 0.8.23",
  "tracing",
+ "zstd-safe",
 ]
 
 [[package]]
