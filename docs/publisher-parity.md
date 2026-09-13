@@ -9,6 +9,9 @@ wire format or the Dolos consumer.
 - old host: Dolos `1ae4e91c18a9e1456a3612af402d7b9b97546d30`
   (`dolos snapshot publish` and its headless snapshot facade);
 - new host base: Stelae `47b38a4`, the merge of publisher-host PR 3;
+- final Dolos consumer/facade graph:
+  `2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5`, the merge of publisher-retirement
+  PR 1335;
 - protocol/profile: Stelae 0.2.0 and `io.txpipe.dolos.cardano` v1;
 - real fixture: `stelae-cardano/tests/fixtures/preview-epoch-0`, identified
   and explained by its README;
@@ -33,10 +36,11 @@ cargo test --locked -p stelae-cardano --test publisher_parity \
   -- --ignored --nocapture
 ```
 
-The JSON report identifies both hosts and all pins, records pass/fail checks,
-and measures replay/publish wall time, process peak RSS, artifact size,
-transfer, and scratch use. Directory publication moves zero network bytes and
-uses no OCI scratch, so both values are explicitly zero rather than omitted.
+The JSON report identifies both hosts, the final Dolos dependency pin and all
+fixture/profile pins, records pass/fail checks, and measures replay/publish
+wall time, process peak RSS, artifact size, transfer, and scratch use. Directory
+publication moves zero network bytes and uses no OCI scratch, so both values
+are explicitly zero rather than omitted.
 The report also records each host's first-push layer and byte transfer counters
 from separate repositories in a disposable `registry:2`. CI runs the command
 in the `Real publisher parity` job and uploads `publisher-parity-report`.
@@ -95,9 +99,11 @@ exercise the orchestration seams around it.
 ## Scope and interpretation
 
 All repositories are loopback/disposable and no production registry is named.
-The old source is required only by immutable git revision, not by a future
-Dolos release branch. The real fixture and genesis inputs live here by content
-identity, so removal of the old Dolos command does not remove the evidence.
+The old source is required only by immutable, test-only git aliases; its package
+types remain separate from the final Dolos graph used by `stelae-publisher` and
+the consumer restore checks. It needs no future Dolos release branch. The real
+fixture and genesis inputs live here by content identity, so removal of the old
+Dolos command does not remove the evidence.
 
 This gate establishes code-path parity for packaging. Production canary, soak,
 and mainnet performance remain separate operations and must not be inferred

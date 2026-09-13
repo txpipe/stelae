@@ -16,8 +16,8 @@ pub use dolos_snapshot::{
     restore::Source as RestoreSource,
 };
 
-/// The exact Dolos revision accepted by publisher-pipeline step 2.
-pub const DOLOS_REVISION: &str = "1ae4e91c18a9e1456a3612af402d7b9b97546d30";
+/// The exact Dolos revision accepted by publisher-pipeline step 6.
+pub const DOLOS_REVISION: &str = "2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5";
 
 #[cfg(test)]
 mod dependency_identity {

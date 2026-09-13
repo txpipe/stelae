@@ -16,14 +16,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dolos::engine::{BulkReplaySession, ReplayWorkspace};
+use dolos::engine::BulkReplaySession;
 use dolos_core::{config::RootConfig, Genesis, ReplayProgress};
 use dolos_flatfiles::{BlockLocation, FlatFileStore};
-use dolos_snapshot::{
-    facade::SnapshotSource,
-    planning,
+use dolos_old::engine::{
+    BulkReplaySession as OldBulkReplaySession, ReplayWorkspace as OldReplayWorkspace,
+};
+use dolos_snapshot::registry::{
+    Auth, Point as RepositoryPoint, Repository, SnapshotRepository, Tuning,
+};
+use dolos_snapshot_old::{
+    facade::SnapshotSource as OldSnapshotSource,
+    planning as old_planning,
     publisher::{Next as OldNext, Publisher as OldPublisher, RepositoryPublish as OldPublish},
-    registry::{Auth, Point as RepositoryPoint, Published, Repository, SnapshotRepository, Tuning},
+    registry::{Auth as OldAuth, Published as OldPublished, Tuning as OldTuning},
 };
 use pallas::ledger::traverse::MultiEraBlock;
 use stelae::progress::Observer;
@@ -47,34 +53,58 @@ struct Node {
     config: RootConfig,
 }
 
+struct OldNode {
+    root: tempfile::TempDir,
+    config: dolos_old::core::config::RootConfig,
+}
+
+impl OldNode {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let document = node_config(root.path());
+        Self {
+            root,
+            config: toml::from_str(&document).unwrap(),
+        }
+    }
+
+    fn stele(&self, name: &str) -> std::path::PathBuf {
+        self.root.path().join(name)
+    }
+}
+
+fn node_config(root: &Path) -> String {
+    format!(
+        r#"
+        [upstream]
+        peer_address = "unused.invalid:3001"
+
+        [storage]
+        version = "v4"
+        path = {}
+
+        [genesis]
+        byron_path = "unused"
+        shelley_path = "unused"
+        alonzo_path = "unused"
+        conway_path = "unused"
+
+        [snapshot]
+        state_epochs = [1]
+
+        [chain]
+        type = "cardano"
+        magic = 2
+        is_testnet = true
+        "#,
+        toml::Value::String(root.join("data").display().to_string()),
+    )
+}
+
 impl Node {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
-        let document = format!(
-            r#"
-            [upstream]
-            peer_address = "unused.invalid:3001"
-
-            [storage]
-            version = "v4"
-            path = {}
-
-            [genesis]
-            byron_path = "unused"
-            shelley_path = "unused"
-            alonzo_path = "unused"
-            conway_path = "unused"
-
-            [snapshot]
-            state_epochs = [1]
-
-            [chain]
-            type = "cardano"
-            magic = 2
-            is_testnet = true
-            "#,
-            toml::Value::String(root.path().join("data").display().to_string()),
-        );
+        let document = node_config(root.path());
         Self {
             root,
             config: toml::from_str(&document).unwrap(),
@@ -93,6 +123,18 @@ fn fixture_path() -> std::path::PathBuf {
 fn fixture_genesis() -> Genesis {
     let root = fixture_path().parent().unwrap().to_owned();
     Genesis::from_file_paths(
+        root.join("byron.json"),
+        root.join("shelley.json"),
+        root.join("alonzo.json"),
+        root.join("conway.json"),
+        Some(6),
+    )
+    .unwrap()
+}
+
+fn old_fixture_genesis() -> dolos_old::core::Genesis {
+    let root = fixture_path().parent().unwrap().to_owned();
+    dolos_old::core::Genesis::from_file_paths(
         root.join("byron.json"),
         root.join("shelley.json"),
         root.join("alonzo.json"),
@@ -178,20 +220,34 @@ fn replay(node: &Node, blocks: Vec<Arc<Vec<u8>>>) -> (u64, u128) {
     (position.slot(), started.elapsed().as_millis())
 }
 
-fn old_host_publish(node: &Node, output: &Path) -> (String, u128) {
+fn old_replay(node: &OldNode, blocks: Vec<Arc<Vec<u8>>>) -> (u64, u128) {
     let started = Instant::now();
-    let genesis = Arc::new(fixture_genesis());
-    let workspace = ReplayWorkspace::open(&node.config, genesis.clone()).unwrap();
+    let genesis = Arc::new(old_fixture_genesis());
+    let mut replay = OldBulkReplaySession::open(&node.config, genesis, Some(1)).unwrap();
+    let dolos_old::core::ReplayProgress::Boundary { position } =
+        replay.import_blocks(blocks).unwrap()
+    else {
+        panic!("real fixture did not stop at the first Preview epoch boundary")
+    };
+    assert!(position.slot() >= PREVIEW_EPOCH_LENGTH);
+    replay.finish().unwrap();
+    (position.slot(), started.elapsed().as_millis())
+}
+
+fn old_host_publish(node: &OldNode, output: &Path) -> (String, u128) {
+    let started = Instant::now();
+    let genesis = Arc::new(old_fixture_genesis());
+    let workspace = OldReplayWorkspace::open(&node.config, genesis.clone()).unwrap();
     let result = (|| {
         let snapshot = workspace.snapshot();
-        let retained = planning::retained_epochs(&node.config)?;
+        let retained = old_planning::retained_epochs(&node.config)?;
         let plan = snapshot.selected_plan(
             u64::from(genesis.network_magic()),
             retained,
-            Selection::default(),
+            dolos_snapshot_old::facade::Selection::default(),
         )?;
         let inscription = snapshot.publish_directory(output, &plan, &Observer::silent())?;
-        Ok::<_, dolos_snapshot::Error>(inscription.digest()?.to_string())
+        Ok::<_, dolos_snapshot_old::Error>(inscription.digest()?.to_string())
     })();
     workspace.finish().unwrap();
     (result.unwrap(), started.elapsed().as_millis())
@@ -216,20 +272,20 @@ fn new_host_publish(node: &Node, output: &Path) -> (String, u128) {
 }
 
 fn old_host_publish_repository(
-    node: &Node,
+    node: &OldNode,
     repository: &Repository,
     rebuild: bool,
     dry_run: bool,
     require_new: bool,
-) -> Result<Option<Published>, AnyError> {
-    let genesis = Arc::new(fixture_genesis());
-    let workspace = ReplayWorkspace::open(&node.config, genesis.clone())?;
-    let result: Result<Option<Published>, dolos_snapshot::Error> = (|| {
+) -> Result<Option<OldPublished>, AnyError> {
+    let genesis = Arc::new(old_fixture_genesis());
+    let workspace = OldReplayWorkspace::open(&node.config, genesis.clone())?;
+    let result: Result<Option<OldPublished>, dolos_snapshot_old::Error> = (|| {
         let snapshot = workspace.snapshot();
         let plan = snapshot.selected_plan(
             u64::from(genesis.network_magic()),
-            planning::retained_epochs(&node.config)?,
-            Selection::default(),
+            old_planning::retained_epochs(&node.config)?,
+            dolos_snapshot_old::facade::Selection::default(),
         )?;
         let settings = OldPublish {
             repo: repository,
@@ -238,9 +294,9 @@ fn old_host_publish_repository(
             rebuild,
             dry_run,
             require_new,
-            tuning: Tuning::default(),
+            tuning: OldTuning::default(),
         };
-        let publisher = OldPublisher::open(&node.config, &settings, Auth::Anonymous)?;
+        let publisher = OldPublisher::open(&node.config, &settings, OldAuth::Anonymous)?;
         match OldNext::read(publisher.standing(&plan)?, plan.sequence, require_new)? {
             OldNext::Nothing(_) => Ok(None),
             OldNext::First | OldNext::After { .. } => {
@@ -493,9 +549,9 @@ fn peak_rss_bytes() -> u64 {
 #[ignore = "replays 4,958 real Preview blocks; run by the parity CI lane"]
 fn old_and_new_hosts_replay_publish_and_restore_the_same_real_boundary() {
     let fixture = read_fixture();
-    let old = Node::new();
+    let old = OldNode::new();
     let new = Node::new();
-    let (old_slot, old_replay_ms) = replay(&old, fixture.clone());
+    let (old_slot, old_replay_ms) = old_replay(&old, fixture.clone());
     let (new_slot, new_replay_ms) = replay(&new, fixture);
     assert_eq!(old_slot, new_slot);
 
@@ -513,7 +569,7 @@ fn old_and_new_hosts_replay_publish_and_restore_the_same_real_boundary() {
 
     let restored = restore_with_unchanged_consumer(&new_dir);
     let restored_dir = restored.stele("restored-stele");
-    let (restored_identity, _) = old_host_publish(&restored, &restored_dir);
+    let (restored_identity, _) = new_host_publish(&restored, &restored_dir);
     assert_eq!(new_identity, restored_identity);
 
     let registry = LocalRegistry::spawn();
@@ -589,7 +645,7 @@ fn old_and_new_hosts_replay_publish_and_restore_the_same_real_boundary() {
     let restored_registry = restore_repository_with_unchanged_consumer(new_repository.clone());
     let restored_registry_dir = restored_registry.stele("restored-registry-stele");
     let (restored_registry_identity, _) =
-        old_host_publish(&restored_registry, &restored_registry_dir);
+        new_host_publish(&restored_registry, &restored_registry_dir);
     assert_eq!(new_registry_identity, restored_registry_identity);
 
     let report = serde_json::json!({
@@ -599,6 +655,7 @@ fn old_and_new_hosts_replay_publish_and_restore_the_same_real_boundary() {
             "old": {"revision": OLD_HOST_REVISION, "kind": "dolos snapshot publish"},
             "new": {
                 "revision": option_env!("STELAE_PARITY_NEW_REVISION").unwrap_or("worktree"),
+                "dolos_revision": stelae_cardano::DOLOS_REVISION,
                 "kind": "stelae-publisher"
             }
         },
