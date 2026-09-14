@@ -11,8 +11,8 @@ name = "stelae-publisher"
 path = "src/main.rs"
 
 [dependencies]
-stelae = { path = "../stelae", version = "=0.2.0", features = ["oci"] }
-stelae-cardano = { path = "../stelae-cardano", version = "=0.2.0" }
+stelae = { path = "../stelae", version = "=0.3.0", features = ["oci"] }
+stelae-cardano = { path = "../stelae-cardano", version = "=0.3.0" }
 
 clap = { version = "4.5.37", features = ["derive"] }
 config = { version = "0.15.19", default-features = false, features = ["toml", "json"] }

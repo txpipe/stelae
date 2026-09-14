@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-09-14
+
+### 🚀 Features
+
+- Add Kubernetes deployment units (#2)
+- Add Stelae-owned Cardano publisher host (#3)
+
+### 🔧 Continuous Integration
+
+- Package the Stelae publisher image and deployment chart (#5)
+
+### ⚙️ Miscellaneous Tasks
+
+- Prove Stelae publisher host parity (#4)
+- Pin cleaned Dolos publisher graph (#6)
+
 ## [0.2.0] - 2026-09-02
 
 ### 📚 Documentation
@@ -15,6 +31,10 @@ All notable changes to this project will be documented in this file.
 ### ⚙️ Miscellaneous Tasks
 
 - Adopt the dolos release flow (cargo-release + git-cliff)
+
+### Release
+
+- V0.2.0
 
 ### Spec
 

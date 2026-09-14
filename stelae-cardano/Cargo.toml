@@ -7,8 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-stelae = { path = "../stelae", version = "=0.2.0", features = ["oci"] }
-stelae-driver = { path = "../stelae-driver", version = "=0.2.0", features = ["oci"] }
+stelae = { path = "../stelae", version = "=0.3.0", features = ["oci"] }
+stelae-driver = { path = "../stelae-driver", version = "=0.3.0", features = ["oci"] }
 
 # Accepted publisher-retirement revision: txpipe/dolos PR #1335.
 dolos = { git = "https://github.com/txpipe/dolos", rev = "2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5", default-features = false }
