@@ -232,19 +232,24 @@ impl MediaType {
         // Kinds are dot-free, so of several infixes the rightmost one still
         // followed by a `.v` segment splits vendor from kind: a vendor label or
         // a kind named after either spelling stays where it is. Without such a
-        // split, the leftmost one reports what the rest is missing.
+        // split, the leftmost one reports what the rest is missing. Comparing
+        // against the last `.v` once keeps this linear in untrusted input.
+        let last_version = body.rfind(".v");
+
         let splits = body.match_indices('.').filter_map(|(at, _)| {
             [STELAE_INFIX, DEPRECATED_STELE_INFIX]
                 .into_iter()
                 .find(|infix| body[at..].starts_with(infix))
-                .map(|infix| (&body[..at], &body[at + infix.len()..]))
+                .map(|infix| (at, at + infix.len()))
         });
 
-        let (vendor, tail) = splits
+        let (at, tail_at) = splits
             .clone()
-            .rfind(|(_, tail)| tail.contains(".v"))
+            .rfind(|&(_, tail_at)| last_version.is_some_and(|v| v >= tail_at))
             .or_else(|| splits.clone().next())
             .ok_or_else(|| invalid("expected `.stelae.` between the vendor and the kind"))?;
+
+        let (vendor, tail) = (&body[..at], &body[tail_at..]);
 
         if vendor.is_empty() {
             return Err(invalid("empty vendor"));
@@ -464,6 +469,20 @@ mod tests {
                 "application/vnd.dolos.stelae.blocks.vx+zstd",
                 "decimal integer",
             ),
+            // No tail has a `.v`, so the leftmost infix splits.
+            (
+                "application/vnd.acme.stelae.Foo.stelae.blocks+zstd",
+                "`.v{n}`",
+            ),
+            (
+                "application/vnd.acme.stele.Foo.stele.blocks+zstd",
+                "`.v{n}`",
+            ),
+            (
+                "application/vnd..stelae.x.stelae.blocks+zstd",
+                "empty vendor",
+            ),
+            ("application/vnd..stele.x.stele.blocks+zstd", "empty vendor"),
         ] {
             let err = MediaType::parse(raw).unwrap_err();
             assert!(
@@ -471,6 +490,20 @@ mod tests {
                 "{raw}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_an_infix_dense_media_type_in_linear_time() {
+        // A registry controls layer media types on restore. Rescanning the
+        // tail per infix took about 15 s on this input unoptimized; a linear
+        // parse takes milliseconds.
+        let raw = format!("application/vnd.a{}.x+zstd", ".stele".repeat(1 << 16));
+
+        let started = std::time::Instant::now();
+        assert!(MediaType::parse(&raw).is_err());
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
     }
 
     #[test]
