@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-10-21
+
+### ⚙️ Miscellaneous Tasks
+
+- Raise rustls trust components and move the publisher base to cc-debian13 (#7)
+
 ## [0.3.0] - 2026-09-14
 
 ### 🚀 Features
@@ -17,6 +23,10 @@ All notable changes to this project will be documented in this file.
 
 - Prove Stelae publisher host parity (#4)
 - Pin cleaned Dolos publisher graph (#6)
+
+### Release
+
+- V0.3.0
 
 ## [0.2.0] - 2026-09-02
 
