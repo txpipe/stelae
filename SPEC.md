@@ -55,13 +55,15 @@ are vendor-owned:
 | Artifact type (manifest) | `application/vnd.stelae.stele.v1` | protocol |
 | Config blob (the inscription) | `application/vnd.stelae.inscription.v1+json` | protocol |
 | Signature (referrer artifact) | `application/vnd.stelae.signature.v1` | protocol |
-| Layer payloads | `application/vnd.{vendor}.stele.{kind}.v{n}+{codec}` | vendor |
+| Layer payloads | `application/vnd.{vendor}.stelae.{kind}.v{n}+{codec}` | vendor |
 
 Normative rules for coexistence:
 
 1. Payload media types must carry a vendor slot the publisher controls.
    `vnd.stelae.*` is reserved for envelope types and is never a payload type —
-   Stelae defines no payload format.
+   Stelae defines no payload format. The `.stele.` infix is a deprecated
+   spelling of `.stelae.`: clients still accept it in this release, and the
+   next release removes it.
 2. Profile names are reverse-DNS and vendor-owned (the first profile is
    `io.txpipe.dolos.cardano`, version 1). The short token in media types
    follows IANA `vnd.` custom.
@@ -151,7 +153,7 @@ profile-owned opaque objects — `position`, `parameters` and each layer's
     {"sequence": 548, "inscriptionDigest": "sha256:…"},
     {"sequence": 549, "inscriptionDigest": "sha256:…"} ],
   "layers": [
-    {"kind": "blocks", "mediaType": "application/vnd.dolos.stele.blocks.v1+zstd",
+    {"kind": "blocks", "mediaType": "application/vnd.dolos.stelae.blocks.v1+zstd",
      "diffId": "sha256:…", "records": 21600, "uncompressedSize": 43210000,
      "scope": {"epoch": 0, "startSlot": 0, "endSlot": 21599}} ] }
 ```

@@ -34,9 +34,9 @@ use stelae::{
 };
 
 const PROFILE_NAME: &str = "dev.example.toy";
-const NOTES_MEDIA_TYPE: &str = "application/vnd.example.stele.notes.v1+zstd";
-const INDEX_MEDIA_TYPE: &str = "application/vnd.example.stele.index.v1+zstd";
-const COVERS_MEDIA_TYPE: &str = "application/vnd.example.stele.covers.v1+zstd";
+const NOTES_MEDIA_TYPE: &str = "application/vnd.example.stelae.notes.v1+zstd";
+const INDEX_MEDIA_TYPE: &str = "application/vnd.example.stelae.index.v1+zstd";
+const COVERS_MEDIA_TYPE: &str = "application/vnd.example.stelae.covers.v1+zstd";
 const COMPRESSION_LEVEL: i32 = 9;
 
 /// A vendor's profile. Everything here is the vendor's business; none of it is
@@ -809,7 +809,7 @@ fn the_core_composes_no_vendor_owned_string() {
     let canonical = String::from_utf8(inscription.canonicalize().unwrap()).unwrap();
     assert!(canonical.contains(NOTES_MEDIA_TYPE));
     assert!(canonical.contains(INDEX_MEDIA_TYPE));
-    assert!(!canonical.contains("vnd.stelae.stele"));
+    assert!(!canonical.contains("vnd.stelae."));
     assert!(!canonical.contains("dolos"));
     assert!(!canonical.contains("cardano"));
 }
@@ -890,7 +890,7 @@ fn a_foreign_profile_is_refused() {
             &["receipts"]
         }
         fn layer_media_type(&self, kind: &str) -> Result<String, Error> {
-            Ok(format!("application/vnd.acme.stele.{kind}.v1+zstd"))
+            Ok(format!("application/vnd.acme.stelae.{kind}.v1+zstd"))
         }
         fn tag_for_sequence(&self, sequence: u64) -> Result<String, Error> {
             Ok(format!("r-{sequence}"))
@@ -1419,7 +1419,7 @@ fn a_layer_media_type_that_is_not_the_profiles_is_refused() {
     // Another vendor's name, and this vendor's name for a different kind. Both
     // are well formed, so structural validation passes them.
     for media_type in [
-        "application/vnd.other.stele.notes.v1+zstd",
+        "application/vnd.other.stelae.notes.v1+zstd",
         INDEX_MEDIA_TYPE,
     ] {
         let tampered = with_media_type(media_type);
@@ -1432,8 +1432,8 @@ fn a_layer_media_type_that_is_not_the_profiles_is_refused() {
     // Version and codec are transport detail the profile may move within one
     // major, so they are not frozen here — only the vendor and the kind are.
     for media_type in [
-        "application/vnd.example.stele.notes.v2+zstd",
-        "application/vnd.example.stele.notes.v1+cbor",
+        "application/vnd.example.stelae.notes.v2+zstd",
+        "application/vnd.example.stelae.notes.v1+cbor",
     ] {
         with_media_type(media_type)
             .check_profile(&ToyProfile)
@@ -1458,7 +1458,7 @@ fn a_profile_cannot_claim_the_protocols_namespace() {
             &["notes"]
         }
         fn layer_media_type(&self, kind: &str) -> Result<String, Error> {
-            Ok(format!("application/vnd.stelae.stele.{kind}.v1+zstd"))
+            Ok(format!("application/vnd.stelae.stelae.{kind}.v1+zstd"))
         }
         fn tag_for_sequence(&self, sequence: u64) -> Result<String, Error> {
             Ok(format!("c-{sequence}"))
@@ -1509,7 +1509,7 @@ fn golden_digests_pin_the_encoding() {
 
     assert_eq!(
         digest.to_string(),
-        "sha256:127aa748abafed971fc7ef690a60f1c7d5d1ee49d2e25d043920545c2be2f274",
+        "sha256:cd83855e8946dc9012f9ede51fd2d449f5cc300cfb52987556cfb55dd4d6167d",
         "inscription digest drifted"
     );
 
@@ -1547,10 +1547,10 @@ fn golden_digests_pin_the_encoding() {
             r#""history":[{"inscriptionDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","sequence":1},"#,
             r#"{"inscriptionDigest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","sequence":2}],"#,
             r#""layers":[{"diffId":"sha256:e4f2187aa877f927788b5b4d59241fa2c92de3077eae30022731b4cfba0614f8","kind":"notes","#,
-            r#""mediaType":"application/vnd.example.stele.notes.v1+zstd","records":4,"#,
+            r#""mediaType":"application/vnd.example.stelae.notes.v1+zstd","records":4,"#,
             r#""scope":{"chapter":3,"firstId":1,"lastId":3},"uncompressedSize":155},"#,
             r#"{"diffId":"sha256:c00d73e03ccfa604f1c7ed5294f2986a4987d3400286ebda8c233503b350e502","kind":"index","#,
-            r#""mediaType":"application/vnd.example.stele.index.v1+zstd","records":4,"#,
+            r#""mediaType":"application/vnd.example.stelae.index.v1+zstd","records":4,"#,
             r#""scope":{"chapter":3},"uncompressedSize":77}],"#,
             r#""parameters":{"noteWidth":40,"titleOrder":"byte"},"#,
             r#""position":{"chapter":3,"curator":{"name":"example","since":1998},"shelf":"east"},"#,

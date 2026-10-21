@@ -130,7 +130,7 @@ impl Profile for BulkProfile {
     }
 
     fn layer_media_type(&self, kind: &str) -> Result<String, Error> {
-        Ok(format!("application/vnd.example.stele.{kind}.v1+zstd"))
+        Ok(format!("application/vnd.example.stelae.{kind}.v1+zstd"))
     }
 
     fn tag_for_sequence(&self, sequence: u64) -> Result<String, Error> {

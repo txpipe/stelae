@@ -127,8 +127,8 @@ fn exclusive() -> MutexGuard<'static, ()> {
 }
 
 const PROFILE_NAME: &str = "dev.example.toy";
-const NOTES_MEDIA_TYPE: &str = "application/vnd.example.stele.notes.v1+zstd";
-const INDEX_MEDIA_TYPE: &str = "application/vnd.example.stele.index.v1+zstd";
+const NOTES_MEDIA_TYPE: &str = "application/vnd.example.stelae.notes.v1+zstd";
+const INDEX_MEDIA_TYPE: &str = "application/vnd.example.stelae.index.v1+zstd";
 const COMPRESSION_LEVEL: i32 = 9;
 
 /// The same profile the directory tests use, and for the same reason: if the
@@ -303,20 +303,20 @@ fn the_manifest_shape_is_frozen() {
         String::from_utf8(body).unwrap(),
         concat!(
             r#"{"artifactType":"application/vnd.stelae.stele.v1","#,
-            r#""config":{"digest":"sha256:3eff2efc90e091c19097c2b7c33e6d5270bdcbc11306c7a0ce9265d0d5601cc4","#,
-            r#""mediaType":"application/vnd.stelae.inscription.v1+json","size":873},"#,
+            r#""config":{"digest":"sha256:aeb1754e4a744864cd811f4f8a0dfaefe2599c5161521e605c094c9a1407b441","#,
+            r#""mediaType":"application/vnd.stelae.inscription.v1+json","size":875},"#,
             r#""layers":[{"annotations":{"#,
             r#""store.stelae.layer.diffId":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
             r#""store.stelae.layer.kind":"notes","#,
             r#""store.stelae.layer.scope":"{\"chapter\":3}"},"#,
             r#""digest":"sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","#,
-            r#""mediaType":"application/vnd.example.stele.notes.v1+zstd","size":91},"#,
+            r#""mediaType":"application/vnd.example.stelae.notes.v1+zstd","size":91},"#,
             r#"{"annotations":{"#,
             r#""store.stelae.layer.diffId":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","#,
             r#""store.stelae.layer.kind":"index","#,
             r#""store.stelae.layer.scope":"{\"chapter\":3,\"sortedBy\":\"title\"}"},"#,
             r#""digest":"sha256:b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1","#,
-            r#""mediaType":"application/vnd.example.stele.index.v1+zstd","size":60}],"#,
+            r#""mediaType":"application/vnd.example.stelae.index.v1+zstd","size":60}],"#,
             r#""mediaType":"application/vnd.oci.image.manifest.v1+json","schemaVersion":2}"#,
         ),
         "the manifest shape drifted"
@@ -1194,7 +1194,7 @@ fn a_stele_survives_the_round_trip() {
             &["receipts"]
         }
         fn layer_media_type(&self, kind: &str) -> Result<String, Error> {
-            Ok(format!("application/vnd.acme.stele.{kind}.v1+zstd"))
+            Ok(format!("application/vnd.acme.stelae.{kind}.v1+zstd"))
         }
         fn tag_for_sequence(&self, sequence: u64) -> Result<String, Error> {
             Ok(format!("r-{sequence}"))
