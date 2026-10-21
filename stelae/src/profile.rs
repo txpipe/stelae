@@ -400,6 +400,12 @@ mod tests {
                 "org.stele",
                 "blocks",
             ),
+            // A `.v` inside the kind comes before the version's.
+            (
+                "application/vnd.org.stelae.stele.votes.v1+zstd",
+                "org.stelae",
+                "votes",
+            ),
         ] {
             let parsed = MediaType::parse(raw).unwrap();
             assert_eq!(parsed.vendor, vendor, "{raw}");
@@ -483,6 +489,12 @@ mod tests {
                 "empty vendor",
             ),
             ("application/vnd..stele.x.stele.blocks+zstd", "empty vendor"),
+            // The last `.v` starts right where the rightmost tail does.
+            (
+                "application/vnd.acme.stelae.x.stelae..v1+zstd",
+                "empty kind",
+            ),
+            ("application/vnd.acme.stele.x.stele..v1+zstd", "empty kind"),
         ] {
             let err = MediaType::parse(raw).unwrap_err();
             assert!(
@@ -496,8 +508,9 @@ mod tests {
     fn rejects_an_infix_dense_media_type_in_linear_time() {
         // A registry controls layer media types on restore. Rescanning the
         // tail per infix took about 15 s on this input unoptimized; a linear
-        // parse takes milliseconds.
-        let raw = format!("application/vnd.a{}.x+zstd", ".stele".repeat(1 << 16));
+        // parse takes milliseconds. The leading `.v` makes every candidate
+        // reach the comparison against the last `.v`.
+        let raw = format!("application/vnd.a.v{}.x+zstd", ".stele".repeat(1 << 16));
 
         let started = std::time::Instant::now();
         assert!(MediaType::parse(&raw).is_err());
