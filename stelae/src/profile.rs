@@ -210,16 +210,6 @@ const STELAE_INFIX: &str = ".stelae.";
 /// Deprecated spelling of [`STELAE_INFIX`], accepted for one release.
 const DEPRECATED_STELE_INFIX: &str = ".stele.";
 
-/// Split `body` at the first infix of either spelling, so a kind that happens
-/// to be named after the other spelling still parses.
-fn split_infix(body: &str) -> Option<(&str, &str)> {
-    [STELAE_INFIX, DEPRECATED_STELE_INFIX]
-        .into_iter()
-        .filter_map(|infix| body.find(infix).map(|at| (at, infix.len())))
-        .min_by_key(|&(at, _)| at)
-        .map(|(at, len)| (&body[..at], &body[at + len..]))
-}
-
 impl MediaType {
     pub fn parse(value: &str) -> Result<Self, Error> {
         let invalid = |reason: &str| Error::InvalidMediaType {
@@ -239,7 +229,17 @@ impl MediaType {
             return Err(invalid("empty codec"));
         }
 
-        let (vendor, tail) = split_infix(body)
+        let (head, version) = body
+            .rsplit_once(".v")
+            .ok_or_else(|| invalid("expected a `.v{n}` version segment after the kind"))?;
+
+        // Kinds are dot-free, so the infix is read from the right: a vendor
+        // label or a kind named after either spelling stays where it is.
+        let (vendor_and_infix, kind) = head.split_at(head.rfind('.').map_or(0, |at| at + 1));
+
+        let vendor = [STELAE_INFIX, DEPRECATED_STELE_INFIX]
+            .into_iter()
+            .find_map(|infix| vendor_and_infix.strip_suffix(infix))
             .ok_or_else(|| invalid("expected `.stelae.` between the vendor and the kind"))?;
 
         if vendor.is_empty() {
@@ -263,10 +263,6 @@ impl MediaType {
                 "vendor may contain lowercase ascii letters, digits, hyphens and periods only",
             ));
         }
-
-        let (kind, version) = tail
-            .rsplit_once(".v")
-            .ok_or_else(|| invalid("expected a `.v{n}` version segment after the kind"))?;
 
         if kind.is_empty() {
             return Err(invalid("empty kind"));
@@ -365,17 +361,36 @@ mod tests {
         }
     }
 
-    /// The first infix of either spelling separates vendor from kind, so a
-    /// kind named after the other spelling is still a kind.
+    /// The infix is the one right before the kind, so a kind or a vendor label
+    /// named after either spelling keeps its place.
     #[test]
-    fn a_kind_may_be_named_after_either_infix() {
-        for (raw, kind) in [
-            ("application/vnd.acme.stele.stelae.v1+zstd", "stelae"),
-            ("application/vnd.acme.stelae.stele.v1+zstd", "stele"),
+    fn a_kind_or_vendor_label_may_be_named_after_either_infix() {
+        for (raw, vendor, kind) in [
+            (
+                "application/vnd.acme.stele.stelae.v1+zstd",
+                "acme",
+                "stelae",
+            ),
+            ("application/vnd.acme.stelae.stele.v1+zstd", "acme", "stele"),
+            (
+                "application/vnd.org.stelae.stele.blocks.v1+zstd",
+                "org.stelae",
+                "blocks",
+            ),
+            (
+                "application/vnd.org.stelae.stelae.blocks.v1+zstd",
+                "org.stelae",
+                "blocks",
+            ),
+            (
+                "application/vnd.org.stele.stelae.blocks.v1+zstd",
+                "org.stele",
+                "blocks",
+            ),
         ] {
             let parsed = MediaType::parse(raw).unwrap();
-            assert_eq!(parsed.vendor, "acme");
-            assert_eq!(parsed.kind, kind);
+            assert_eq!(parsed.vendor, vendor, "{raw}");
+            assert_eq!(parsed.kind, kind, "{raw}");
         }
     }
 
@@ -427,6 +442,12 @@ mod tests {
         ] {
             assert!(MediaType::parse(raw).is_err(), "{raw} must not parse");
         }
+
+        let err = MediaType::parse("application/vnd.dolos.blocks.v1+zstd").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidMediaType { reason, .. } if reason.contains("`.stelae.`")),
+            "{err:?}"
+        );
     }
 
     #[test]

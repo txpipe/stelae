@@ -922,6 +922,27 @@ fn a_foreign_profile_is_refused() {
     assert!(matches!(err, Error::UnknownLayerKind { .. }), "{err:?}");
 }
 
+/// A stele written with the deprecated `.stele.` infix is still this profile's
+/// stele, on both the read and the publish side, while the profile itself now
+/// names its layers `.stelae.`.
+#[test]
+fn a_deprecated_infix_layer_passes_the_profile_checks() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut inscription, _) = write_stele(temp.path());
+
+    for layer in &mut inscription.layers {
+        layer.media_type = layer.media_type.replace(".stelae.", ".stele.");
+    }
+    assert!(inscription
+        .layers
+        .iter()
+        .any(|layer| layer.media_type == "application/vnd.example.stele.notes.v1+zstd"));
+
+    inscription.validate().unwrap();
+    inscription.check_profile(&ToyProfile).unwrap();
+    inscription.check_profile_strict(&ToyProfile).unwrap();
+}
+
 /// Tampering is caught on both halves of a stele: the document, whose bytes are
 /// its digest, and the blobs, whose names are their digests.
 #[test]
