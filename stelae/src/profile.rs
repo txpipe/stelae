@@ -229,17 +229,21 @@ impl MediaType {
             return Err(invalid("empty codec"));
         }
 
-        let (head, version) = body
-            .rsplit_once(".v")
-            .ok_or_else(|| invalid("expected a `.v{n}` version segment after the kind"))?;
+        // Kinds are dot-free, so of several infixes the rightmost one still
+        // followed by a `.v` segment splits vendor from kind: a vendor label or
+        // a kind named after either spelling stays where it is. Without such a
+        // split, the leftmost one reports what the rest is missing.
+        let splits = body.match_indices('.').filter_map(|(at, _)| {
+            [STELAE_INFIX, DEPRECATED_STELE_INFIX]
+                .into_iter()
+                .find(|infix| body[at..].starts_with(infix))
+                .map(|infix| (&body[..at], &body[at + infix.len()..]))
+        });
 
-        // Kinds are dot-free, so the infix is read from the right: a vendor
-        // label or a kind named after either spelling stays where it is.
-        let (vendor_and_infix, kind) = head.split_at(head.rfind('.').map_or(0, |at| at + 1));
-
-        let vendor = [STELAE_INFIX, DEPRECATED_STELE_INFIX]
-            .into_iter()
-            .find_map(|infix| vendor_and_infix.strip_suffix(infix))
+        let (vendor, tail) = splits
+            .clone()
+            .rfind(|(_, tail)| tail.contains(".v"))
+            .or_else(|| splits.clone().next())
             .ok_or_else(|| invalid("expected `.stelae.` between the vendor and the kind"))?;
 
         if vendor.is_empty() {
@@ -263,6 +267,10 @@ impl MediaType {
                 "vendor may contain lowercase ascii letters, digits, hyphens and periods only",
             ));
         }
+
+        let (kind, version) = tail
+            .rsplit_once(".v")
+            .ok_or_else(|| invalid("expected a `.v{n}` version segment after the kind"))?;
 
         if kind.is_empty() {
             return Err(invalid("empty kind"));
@@ -443,11 +451,26 @@ mod tests {
             assert!(MediaType::parse(raw).is_err(), "{raw} must not parse");
         }
 
-        let err = MediaType::parse("application/vnd.dolos.blocks.v1+zstd").unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidMediaType { reason, .. } if reason.contains("`.stelae.`")),
-            "{err:?}"
-        );
+        for (raw, expected) in [
+            ("application/vnd.dolos.blocks.v1+zstd", "`.stelae.`"),
+            ("application/vnd.acme.stelae.votes+zstd", "`.v{n}`"),
+            ("application/vnd.io.vendor.stele.blocks+zstd", "`.v{n}`"),
+            ("application/vnd.acme.stelae.v1+zstd", "`.v{n}`"),
+            (
+                "application/vnd.acme.stelae.foo.bar.v1+zstd",
+                "kind may contain",
+            ),
+            (
+                "application/vnd.dolos.stelae.blocks.vx+zstd",
+                "decimal integer",
+            ),
+        ] {
+            let err = MediaType::parse(raw).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidMediaType { reason, .. } if reason.contains(expected)),
+                "{raw}: {err:?}"
+            );
+        }
     }
 
     #[test]
