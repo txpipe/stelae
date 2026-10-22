@@ -201,11 +201,12 @@ mod tests {
     #[test]
     fn a_moved_section_names_the_publisher_input() {
         let (_dir, loaded) = config(
-            "compatibility = \"v2-alpha.1\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"preview\"\n[snapshot]\nstate_epochs = [1]\n[mithril]\naggregator = \"http://aggregator\"\n",
+            "compatibility = \"v2-alpha.1\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"preview\"\n[snapshot]\nstate_epochs = [1]\n[mithril]\naggregator = \"http://aggregator\"\n[stelae]\nuser = \"publisher\"\n",
         );
         let error = loaded.unwrap_err().to_string();
         assert!(error.contains("--state-epochs-file"), "{error}");
         assert!(error.contains("--mithril-aggregator"), "{error}");
+        assert!(error.contains("DOLOS_STELAE_USER"), "{error}");
         assert!(!error.contains("dolos "), "{error}");
     }
 

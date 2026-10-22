@@ -79,8 +79,12 @@ rewrite `dolosToml` in the v2 schema, move its `[snapshot] state_epochs`
 list unchanged into `stateEpochs`, set `allowGenesisFallback: true` and bump
 `run`. The Job replays from genesis. Once `latest` is near the chain tip,
 set `allowGenesisFallback: false` and bump `run` again. Never deploy 0.3
-before the repository is empty: the Job would refuse the old `latest`, clear
-its store and restart until `backoffLimit`. The Secret and tuning values stay
+before the repository is empty. The Job refuses to restore the old `latest`
+and, with genesis fallback on, starts from genesis instead. It then replays
+silently: every boundary up to the old `latest` reports nothing to publish,
+which lasts days on mainnet. Only at the next boundary does it refuse the v1
+predecessor, and from there it restarts until `backoffLimit`. It uploads
+nothing, so the old lineage stays intact. The Secret and tuning values stay
 as they are.
 
 Rollback to chart 0.2 works only while the repository still holds its v1

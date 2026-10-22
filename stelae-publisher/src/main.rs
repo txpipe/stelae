@@ -174,7 +174,11 @@ impl BackfillArgs {
             Some(_) => "invocation",
             None => "network catalog",
         };
-        tracing::info!(aggregator = %mithril.aggregator, from = origin, "Mithril aggregator");
+        tracing::info!(
+            aggregator = %without_userinfo(&mithril.aggregator),
+            from = origin,
+            "Mithril aggregator"
+        );
         Ok(backfill::Options {
             repository: self.repo.clone(),
             auth: auth()?,
@@ -189,6 +193,19 @@ impl BackfillArgs {
             mithril,
             retained: self.state_epochs.read()?,
         })
+    }
+}
+
+/// The URL as logged: userinfo works as Basic auth, so it never reaches the
+/// logs.
+fn without_userinfo(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.to_string()
+        }
+        Err(_) => "(unparseable URL)".to_owned(),
     }
 }
 
@@ -516,9 +533,12 @@ mod tests {
     }
 
     #[test]
-    fn only_a_registry_source_reads_registry_credentials() {
+    fn a_command_off_the_registry_ignores_its_credentials() {
         let dir = tempfile::tempdir().unwrap();
         let config = node(dir.path());
+        let epochs = dir.path().join("state-epochs");
+        std::fs::write(&epochs, "1\n").unwrap();
+        let output = dir.path().join("stele");
 
         let from_directory = parse(&[
             "--config",
@@ -531,19 +551,70 @@ mod tests {
         .unwrap();
         execute(from_directory, &orphan_password).unwrap();
 
-        let from_registry = parse(&[
+        let to_directory = parse(&[
             "--config",
             &config,
-            "initialize",
-            "--source",
-            "oci://registry.invalid/cardano/preview",
+            "publish",
+            "--output-dir",
+            output.to_str().unwrap(),
+            "--state-epochs-file",
+            epochs.to_str().unwrap(),
         ])
         .unwrap();
-        let auth = || from_registry.credentials.auth_from(&orphan_password);
-        let Command::Initialize(args) = &from_registry.command else {
-            panic!("parsed another command");
-        };
-        assert!(args.options(&auth).is_err());
+        // Past the credentials, publishing reaches the store, empty since the
+        // genesis start.
+        let error = format!("{:?}", execute(to_directory, &orphan_password).unwrap_err());
+        assert!(error.contains("has no cursor"), "{error}");
+    }
+
+    #[test]
+    fn every_registry_command_refuses_bad_credentials_before_a_store_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = node(dir.path());
+        let epochs = dir.path().join("state-epochs");
+        std::fs::write(&epochs, "1\n").unwrap();
+        let epochs = epochs.to_str().unwrap();
+        let repo = "oci://registry.invalid/cardano/preview";
+
+        let commands: [&[&str]; 4] = [
+            &["initialize", "--source", repo],
+            &["publish", "--repo", repo, "--state-epochs-file", epochs],
+            &["backfill", "--repo", repo, "--state-epochs-file", epochs],
+            &[
+                "run",
+                "--repo",
+                repo,
+                "--state-epochs-file",
+                epochs,
+                "--restore-source",
+                "file:///missing-stele",
+            ],
+        ];
+        for command in commands {
+            let args: Vec<&str> = ["--config", config.as_str()]
+                .into_iter()
+                .chain(command.iter().copied())
+                .collect();
+            let error = format!(
+                "{:?}",
+                execute(parse(&args).unwrap(), &orphan_password).unwrap_err()
+            );
+            assert!(
+                error.contains("a password with no user"),
+                "{}: {error}",
+                command[0]
+            );
+            assert!(!dir.path().join("data").exists(), "{}", command[0]);
+        }
+    }
+
+    #[test]
+    fn a_logged_aggregator_drops_its_userinfo() {
+        assert_eq!(
+            without_userinfo("https://user:key@aggregator.invalid/aggregator"),
+            "https://aggregator.invalid/aggregator"
+        );
+        assert_eq!(without_userinfo("not a url"), "(unparseable URL)");
     }
 
     #[test]

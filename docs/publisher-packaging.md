@@ -93,7 +93,10 @@ neither reads a stele cut by 0.2 nor is read by it. A release moves to 0.3
 as the first publication of a fresh lineage: an emptied repository, a v2
 `dolosToml`, its retained epochs in `stateEpochs`, a matching image,
 `allowGenesisFallback: true` until `latest` nears the tip, and a bumped
-`run`. It rolls back to 0.2 with its previous image and v1 configuration only
+`run`. Deployed onto a repository that still holds a v1 `latest`, 0.3 falls
+back to genesis, replays silently to that `latest` (days on mainnet), and only
+then refuses the v1 predecessor and restarts until `backoffLimit`, uploading
+nothing. It rolls back to 0.2 with its previous image and v1 configuration only
 while the repository still holds its v1 lineage. The
 [chart README](../k8s/dolos-publisher/README.md#upgrade-and-rollback) has the
 order.
