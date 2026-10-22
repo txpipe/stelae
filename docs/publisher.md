@@ -25,10 +25,7 @@ are absent from the publisher graph.
 The workspace patch for `https://github.com/txpipe/stelae` resolves the
 profile's v0.2.0 dependencies back to the workspace `stelae` and
 `stelae-driver` packages. This prevents two same-version protocol type
-universes. The step-4 parity test retains the former Dolos host at immutable
-revision `1ae4e91c18a9e1456a3612af402d7b9b97546d30` through explicitly named,
-test-only dependency aliases; those aliases are reference evidence and are not
-in the publisher's normal dependency graph.
+universes.
 
 The lockfile is committed. These commands verify the intended graph:
 
@@ -154,13 +151,12 @@ The backfill state machine preserves these rules from the accepted Dolos host:
 `stelae-cardano/src/publisher.rs` owns the host's repository-standing and
 journal policy. It composes Dolos's supported `SnapshotRepository`,
 `Publishing` and `SnapshotSource` facades; it does not import a Dolos publisher
-or backfill API. The immutable old-host aliases used by the parity test are not
-linked into `stelae-publisher`.
+or backfill API.
 
 The image build, release identities, chart cutover and compatible rollback
 are documented in [publisher-packaging.md](publisher-packaging.md). Building a
 candidate does not publish, deploy, modify a network source, or claim production
 parity; operational cutover remains a separate step.
 
-The executable old/new replay, publication, recovery, resource, and local OCI
-evidence is documented in [publisher-parity.md](publisher-parity.md).
+The local OCI and host-policy evidence is documented in
+[publisher-verification.md](publisher-verification.md).

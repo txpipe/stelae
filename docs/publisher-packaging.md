@@ -38,7 +38,7 @@ a mounted data volume and SIGTERM delivery. The smoke check runs `run` with netw
 disabled, opts into genesis against a missing local restore source, waits
 for the acquisition loop and stops the process. It needs no chain fixture or
 registry. Replay, restore policy and OCI correctness remain covered by the
-existing host, publisher-parity and registry suites.
+existing host and registry suites.
 
 Docker's setup, metadata, login and build actions handle image assembly and
 publication. BuildKit provenance and a signed GitHub artifact attestation
@@ -68,7 +68,7 @@ distinct, explicit decisions.
 
 ## Release
 
-1. Verify the candidate tuple above passed the workspace, parity, registry,
+1. Verify the candidate tuple above passed the workspace, registry,
    image and chart checks.
 2. Prepare the version/changelog with the repository's `cargo release` flow
    and review the release commit and signed `v<version>` tag before pushing.

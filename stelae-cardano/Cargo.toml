@@ -28,16 +28,6 @@ tokio-util = { version = "0.7.11", features = ["rt"] }
 tracing = "0.1.37"
 
 [dev-dependencies]
-dolos-flatfiles = { git = "https://github.com/txpipe/dolos", rev = "e184a965644bcd7a4317097eda94206bd50a35d7" }
 dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "e184a965644bcd7a4317097eda94206bd50a35d7" }
-# Step-4's immutable comparison host remains test-only after Dolos removes it.
-# Aliases keep its types visibly separate from the final consumer graph above.
-dolos-old = { package = "dolos", git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30", default-features = false }
-dolos-snapshot-old = { package = "dolos-snapshot", git = "https://github.com/txpipe/dolos", rev = "1ae4e91c18a9e1456a3612af402d7b9b97546d30" }
-hex = "0.4.3"
-libc = "0.2.186"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-sha2 = "0.10.9"
 tempfile = "3.20.0"
 toml = "0.8.13"
-zstd-safe = "7.2.4"
