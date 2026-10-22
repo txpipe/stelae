@@ -2,20 +2,17 @@ use std::{cell::Cell, io, sync::Arc};
 
 use dolos::engine::{BulkReplaySession, ReplayWorkspace};
 use dolos_core::{
-    config::{ChainConfig, MithrilConfig, RootConfig},
-    ChainPoint,
+    config::{ChainConfig, RootConfig},
+    ChainPoint, Genesis,
 };
 use dolos_snapshot::{export::Plan, source::SnapshotSource};
-use dolos_testing::{
-    blocks::make_conway_block_with_prev,
-    synthetic::{build_synthetic_blocks, SyntheticBlockConfig},
-};
+use dolos_testing::blocks::make_conway_block_with_prev;
 use stelae::progress::Observer;
 use stelae_cardano::{
     backfill::{self, Driver},
     initialize,
     publisher::{publish_once, Destination, PublishOutcome},
-    Point, RestoreSource, Selection,
+    Auth, MithrilSource, Point, RestoreSource, RetainedEpochs, Selection,
 };
 
 struct Node {
@@ -26,57 +23,54 @@ struct Node {
 impl Node {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
+        let compatibility = RootConfig::new(ChainConfig::known("preview")).compatibility();
         let document = format!(
             r#"
-            [upstream]
-            peer_address = "unused.invalid:3001"
-
-            [storage]
-            version = "v4"
-            path = {}
-
-            [genesis]
-            byron_path = "unused"
-            shelley_path = "unused"
-            alonzo_path = "unused"
-            conway_path = "unused"
-            force_protocol = 6
+            compatibility = "{compatibility}"
 
             [chain]
-            type = "cardano"
-            magic = 2
-            is_testnet = true
+            protocol = "cardano"
+            network = "preview"
+
+            [storage]
+            path = {}
             "#,
             toml::Value::String(root.path().join("data").display().to_string()),
         );
-        Self {
-            root,
-            config: toml::from_str(&document).unwrap(),
-        }
+        let path = root.path().join("dolos.toml");
+        std::fs::write(&path, document).unwrap();
+        let config = stelae_cardano::config::load(Some(&path)).unwrap();
+        Self { root, config }
+    }
+
+    /// Replays the last block of epoch 0 and the first of epoch 1, stopping on
+    /// the boundary a stele is cut at.
+    fn replay_to_the_first_boundary(&self) -> (Arc<Genesis>, ChainPoint) {
+        let mut genesis = dolos_cardano::include::preview::load();
+        genesis.force_protocol = Some(9);
+        let epoch_one = genesis.shelley.epoch_length.unwrap() as u64;
+        let genesis = Arc::new(genesis);
+        let (before, block_before) = make_conway_block_with_prev(epoch_one - 1, None, 1);
+        let (boundary, block_boundary) = make_conway_block_with_prev(epoch_one, before.hash(), 2);
+        let mut session = BulkReplaySession::open(&self.config, genesis.clone(), Some(1)).unwrap();
+        session
+            .import_blocks(vec![block_before, block_boundary])
+            .unwrap();
+        session.finish().unwrap();
+        (genesis, boundary)
     }
 }
 
 #[test]
 fn a_bounded_fixture_publishes_to_a_directory_through_the_new_host() {
-    let mut node = Node::new();
-    let genesis = dolos_cardano::include::preview::load();
-    let (blocks, _, chain) = build_synthetic_blocks(SyntheticBlockConfig {
-        block_count: 3,
-        txs_per_block: 2,
-        slot: 100,
-        ..Default::default()
-    });
-    node.config.chain = ChainConfig::Cardano(chain);
-
-    let mut session =
-        BulkReplaySession::open(&node.config, Arc::new(genesis.clone()), None).unwrap();
-    session.import_blocks(blocks).unwrap();
-    session.finish().unwrap();
+    let node = Node::new();
+    let (genesis, _) = node.replay_to_the_first_boundary();
 
     let destination = node.root.path().join("stele");
     let (_, outcome) = publish_once(
         &node.config,
         &genesis,
+        &RetainedEpochs::default(),
         Selection::default(),
         Destination::Directory(destination.clone()),
         false,
@@ -97,6 +91,7 @@ fn a_bounded_fixture_publishes_to_a_directory_through_the_new_host() {
         &initialize::Options {
             source: RestoreSource::Dir(destination),
             point: Point::Latest,
+            auth: Auth::Anonymous,
             insecure: false,
             scratch_dir: None,
             skip_space_check: false,
@@ -106,8 +101,43 @@ fn a_bounded_fixture_publishes_to_a_directory_through_the_new_host() {
         &Observer::silent(),
     )
     .unwrap();
-    assert!(matches!(outcome, initialize::Outcome::Restored { .. }));
+    assert_eq!(outcome, initialize::Outcome::Restored { sequence: 1 });
     assert!(dolos::storage::has_existing_data(&restored.config).unwrap());
+}
+
+#[test]
+fn retained_state_epochs_reach_the_signed_inscription() {
+    let node = Node::new();
+    let (genesis, _) = node.replay_to_the_first_boundary();
+
+    let destination = node.root.path().join("stele");
+    let retained = dolos_snapshot::planning::retained_epochs(&[1]).unwrap();
+    publish_once(
+        &node.config,
+        &genesis,
+        &retained,
+        Selection::default(),
+        Destination::Directory(destination.clone()),
+        false,
+        &Observer::silent(),
+    )
+    .unwrap();
+
+    let inscription: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(destination.join("inscription.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        inscription["parameters"]["stateEpochs"],
+        serde_json::json!([1])
+    );
+    let retained_dump = inscription["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|layer| {
+            layer["kind"].as_str().unwrap().starts_with("state-") && layer["scope"]["epoch"] == 1
+        });
+    assert!(retained_dump, "no state dump of epoch 1 was published");
 }
 
 #[test]
@@ -122,6 +152,7 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
     impl backfill::Publish for Publisher {
         fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {
             assert_eq!(plan.sequence, 1);
+            assert_eq!(plan.retained.as_slice(), &[1]);
             assert_eq!(
                 source.committed_position().unwrap(),
                 Some(self.expected.clone())
@@ -138,25 +169,14 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
         }
     }
 
-    let mut node = Node::new();
-    let mut genesis = dolos_cardano::include::preview::load();
-    genesis.force_protocol = Some(9);
-    let epoch_one = genesis.shelley.epoch_length.unwrap() as u64;
-    let genesis = Arc::new(genesis);
-    let (before, block_before) = make_conway_block_with_prev(epoch_one - 1, None, 1);
-    let (boundary, block_boundary) = make_conway_block_with_prev(epoch_one, before.hash(), 2);
-    node.config.chain = ChainConfig::Cardano(Default::default());
-    let mut session = BulkReplaySession::open(&node.config, genesis.clone(), Some(1)).unwrap();
-    session
-        .import_blocks(vec![block_before, block_boundary])
-        .unwrap();
-    session.finish().unwrap();
+    let node = Node::new();
+    let (genesis, boundary) = node.replay_to_the_first_boundary();
 
-    let mithril = MithrilConfig {
+    let mithril = MithrilSource {
         aggregator: "http://unused.invalid".to_owned(),
-        genesis_key: String::new(),
-        ancillary_key: None,
+        genesis_vkey: String::new(),
     };
+    let retained = dolos_snapshot::planning::retained_epochs(&[1]).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -174,8 +194,8 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
             ReplayWorkspace::open(&node.config, genesis.clone()).map_err(backfill::Error::caller)
         };
         let driver = Driver {
-            config: &node.config,
             genesis: &genesis,
+            retained: &retained,
             mithril: &mithril,
             download_dir: node.root.path().join("unused"),
             window: 1,
@@ -207,6 +227,7 @@ fn cold_start_fails_closed_and_genesis_requires_explicit_opt_in() {
     let mut options = initialize::Options {
         source: RestoreSource::Dir(node.root.path().join("missing-stele")),
         point: Point::Latest,
+        auth: Auth::Anonymous,
         insecure: false,
         scratch_dir: None,
         skip_space_check: false,

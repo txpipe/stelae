@@ -15,10 +15,13 @@ stelae = { path = "../stelae", version = "=0.3.1", features = ["oci"] }
 stelae-cardano = { path = "../stelae-cardano", version = "=0.3.1" }
 
 clap = { version = "4.5.37", features = ["derive"] }
-config = { version = "0.15.19", default-features = false, features = ["toml", "json"] }
 miette = { version = "7.6.0", features = ["fancy"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tokio = { version = "1.47", features = ["rt", "signal"] }
 tokio-util = { version = "0.7.11", features = ["rt"] }
 tracing = "0.1.37"
 tracing-subscriber = "0.3.17"
+url = "2.5"
+
+[dev-dependencies]
+tempfile = "3.20.0"

@@ -9,9 +9,10 @@ Docker volumes inherit writable storage. Host bind mounts and existing
 volumes must grant that UID/GID write access.
 
 Genesis files are copied into `/etc/genesis/<network>/`; their
-[source](../.github/image/GENESIS.md) is recorded once. They are independent
-of subsequent Dolos code revisions. Explicit genesis paths and
-`force_protocol` in existing configuration keep their meaning.
+[source](../.github/image/GENESIS.md) is recorded once. Under the Dolos v2
+configuration a known network takes its embedded genesis from the Dolos
+catalog and names no genesis path, so these files are read only by a
+`custom` network configuration that points at them.
 
 ## Build and verification
 
@@ -32,12 +33,12 @@ and image platform must match the native binary.
 
 The `Publisher image` workflow builds with Rust 1.93.0 and the committed
 `Cargo.lock` on native amd64 and arm64 runners. Each runner builds its image
-and checks executable startup, bundled genesis/configuration, a mounted data
-volume and SIGTERM delivery. The smoke check runs `run` with networking
+and checks executable startup, a v2 configuration with its state epochs file,
+a mounted data volume and SIGTERM delivery. The smoke check runs `run` with networking
 disabled, opts into genesis against a missing local restore source, waits
 for the acquisition loop and stops the process. It needs no chain fixture or
 registry. Replay, restore policy and OCI correctness remain covered by the
-existing host, publisher-parity and registry suites.
+existing host and registry suites.
 
 Docker's setup, metadata, login and build actions handle image assembly and
 publication. BuildKit provenance and a signed GitHub artifact attestation
@@ -49,7 +50,7 @@ custom provenance files.
 
 A candidate is the tuple of the full Stelae commit, committed `Cargo.lock`,
 accepted Dolos revision
-`2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5`, chart source at that same Stelae
+`e184a965644bcd7a4317097eda94206bd50a35d7`, chart source at that same Stelae
 commit, and reviewed values/configuration. Record all of them at handoff. Before
 publication the image digest is intentionally unknown; use the commit as the
 candidate identity, then add the registry digest and attestation after the
@@ -67,7 +68,7 @@ distinct, explicit decisions.
 
 ## Release
 
-1. Verify the candidate tuple above passed the workspace, parity, registry,
+1. Verify the candidate tuple above passed the workspace, registry,
    image and chart checks.
 2. Prepare the version/changelog with the repository's `cargo release` flow
    and review the release commit and signed `v<version>` tag before pushing.
@@ -87,6 +88,21 @@ does not create GitHub Releases, tags, or deployments.
 
 Chart 0.2 runs Stelae only. Existing Dolos deployments stay pinned to chart
 0.1 and their tested image until the operator performs an explicit cutover.
+Chart 0.3 runs a publisher built on the Dolos v2 configuration, which
+neither reads a stele cut by 0.2 nor is read by it. A release moves to 0.3
+as the first publication of a fresh lineage: an emptied repository, a v2
+`dolosToml`, its retained epochs in `stateEpochs`, a matching image,
+`allowGenesisFallback: true` until `latest` nears the tip, and a bumped
+`run`. Deployed onto a repository that still holds a v1 `latest`, 0.3 refuses
+to restore it. With genesis fallback off, it refuses again on every restart
+until `backoffLimit`. With it on, it falls back to genesis and replays silently
+to that `latest` (days on mainnet); then it refuses the v1 predecessor and
+restarts until `backoffLimit`, or completes as up to date when Mithril has not
+certified the next boundary. It uploads nothing either way. It rolls back to
+0.2 with its previous image and v1 configuration only while the repository
+still holds its v1 lineage. The
+[chart README](../k8s/dolos-publisher/README.md#upgrade-and-rollback) has the
+order.
 The chart directory/name remains `dolos-publisher` to preserve release and
 object naming; the legacy shell entrypoint and host selector are removed.
 

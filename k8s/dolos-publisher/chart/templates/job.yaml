@@ -38,6 +38,8 @@ spec:
             - --config
             - /etc/publisher/dolos.toml
             - run
+            - --state-epochs-file
+            - /etc/publisher/state-epochs
             - --repo
             - {{ required "repo is required" .Values.repo | quote }}
             {{- if .Values.insecure }}
@@ -49,12 +51,12 @@ spec:
             - --allow-genesis
             {{- end }}
           env:
-            - name: DOLOS_STELAE_REGISTRY_USER
+            - name: DOLOS_STELAE_USER
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.publisherSecretName }}
                   key: DOLOS_STELAE_REGISTRY_USER
-            - name: DOLOS_STELAE_REGISTRY_PASSWORD
+            - name: DOLOS_STELAE_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.publisherSecretName }}

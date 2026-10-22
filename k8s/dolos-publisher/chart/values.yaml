@@ -1,5 +1,7 @@
-# One Stelae publisher Job per network. Chart 0.2 requires the Stelae image;
-# existing Dolos deployments must stay pinned to chart 0.1 until cutover.
+# One Stelae publisher Job per network. Chart 0.3 runs a publisher built on
+# the Dolos v2 configuration: dolosToml is a v2 file, and the retained state
+# epochs are a value of their own. Releases on chart 0.2 keep their v1
+# dolosToml until they are rewritten for 0.3.
 #
 # These defaults are instance-agnostic — no network, registry, image pin or
 # credential is assumed. Everything a network must supply is empty here and
@@ -8,9 +10,9 @@
 # file per network.
 #
 # Two values are deliberately without a default. `concurrency` was measured
-# per network against the registry it writes to. `dolosToml` carries the
-# `[snapshot] state_epochs` list, which is signed input frozen at the
-# network's first publish. Neither may be inherited from a chart.
+# per network against the registry it writes to. `stateEpochs` is signed
+# input frozen at the network's first publish. Neither may be inherited from
+# a chart.
 
 # The network name. Prefixes the Job name and labels the pod.
 network: ""
@@ -30,10 +32,17 @@ repo: ""
 # registry it writes to; never lowered to make bursts smaller.
 concurrency: ""
 
-# The network's dolos.toml, carried verbatim into the ConfigMap — comments
-# included — so the frozen state_epochs list and its reasoning stay readable
-# in the values file and no template can change signed input.
+# The network's Dolos v2 dolos.toml, carried verbatim into the ConfigMap,
+# comments included.
 dolosToml: ""
+
+# The epochs whose state the publisher retains a dump of, ascending, each at
+# least 1. Echoed into every inscription's parameters as signed input
+# (decision 0026), so it is frozen at the network's first publish: additions
+# above the then-current tip only. Rendered one per line into the ConfigMap
+# and passed as --state-epochs-file. An empty list retains the tip alone; an
+# absent one fails the render.
+stateEpochs: null
 
 image:
   repository: ghcr.io/txpipe/stelae-publisher
@@ -51,7 +60,8 @@ allowGenesisFallback: false
 # restore and the backfill pass --insecure. Turn off only for a TLS registry.
 insecure: true
 
-# Secret holding DOLOS_STELAE_REGISTRY_USER and DOLOS_STELAE_REGISTRY_PASSWORD.
+# Secret holding DOLOS_STELAE_REGISTRY_USER and DOLOS_STELAE_REGISTRY_PASSWORD,
+# handed to the publisher as DOLOS_STELAE_USER and DOLOS_STELAE_PASSWORD.
 # Referenced by name, never templated.
 publisherSecretName: stelae-registry-publisher
 

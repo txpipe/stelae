@@ -11,13 +11,10 @@ use std::{
 };
 
 use dolos::engine::{BulkReplaySession, ReplayWorkspace};
-use dolos_core::{
-    config::{MithrilConfig, RootConfig},
-    BlockSlot, ChainPoint, Genesis, RawBlock, ReplayProgress,
-};
+use dolos_core::{config::RootConfig, BlockSlot, ChainPoint, Genesis, RawBlock, ReplayProgress};
 use dolos_mithril as mithril;
-use dolos_mithril::mithril_client::feedback::FeedbackReceiver;
-use dolos_snapshot::{export::Plan, planning, source::SnapshotSource};
+use dolos_mithril::{mithril_client::feedback::FeedbackReceiver, MithrilSource};
+use dolos_snapshot::{export::Plan, registry::Auth, source::SnapshotSource, RetainedEpochs};
 use itertools::Itertools as _;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -33,8 +30,6 @@ const FALLBACK_SLOTS_PER_IMMUTABLE_FILE: u64 = 21_600;
 pub enum Error {
     #[error("{0}")]
     Caller(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
-    #[error("reading snapshot.state_epochs")]
-    RetainedEpochs(#[source] dolos_snapshot::Error),
     #[error("planning the publish")]
     Planning(#[source] dolos_snapshot::Error),
     #[error("replay failed ({replay}) and shutting down also failed ({shutdown})")]
@@ -266,9 +261,9 @@ fn cleanup_consumed(immutable_dir: &Path, cursor_slot: u64, width: u64) -> Resul
 }
 
 pub struct Driver<'a, W: Workspace> {
-    pub config: &'a RootConfig,
     pub genesis: &'a Genesis,
-    pub mithril: &'a MithrilConfig,
+    pub retained: &'a RetainedEpochs,
+    pub mithril: &'a MithrilSource,
     pub download_dir: PathBuf,
     pub window: u64,
     pub until_epoch: Option<u64>,
@@ -284,6 +279,7 @@ pub struct Driver<'a, W: Workspace> {
 #[derive(Debug, Clone)]
 pub struct Options {
     pub repository: dolos_snapshot::registry::Repository,
+    pub auth: Auth,
     pub insecure: bool,
     pub scratch_dir: Option<PathBuf>,
     pub concurrency: Option<std::num::NonZeroUsize>,
@@ -292,6 +288,8 @@ pub struct Options {
     pub window: u64,
     pub until_epoch: Option<u64>,
     pub skip_validation: bool,
+    pub mithril: MithrilSource,
+    pub retained: RetainedEpochs,
 }
 
 fn require_synchronous_context() -> Result<(), Error> {
@@ -314,12 +312,6 @@ pub fn run(
     observer: &stelae::progress::Observer,
 ) -> Result<Outcome, Error> {
     require_synchronous_context()?;
-    let mithril = config.mithril.as_ref().ok_or_else(|| {
-        Error::caller(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "missing mithril config",
-        ))
-    })?;
     let download_dir = options
         .download_dir
         .clone()
@@ -328,6 +320,7 @@ pub fn run(
     let runtime = tokio::runtime::Runtime::new().map_err(Error::caller)?;
     let settings = RepositoryPublish {
         repo: &options.repository,
+        auth: options.auth.clone(),
         insecure: options.insecure,
         scratch_dir: options.scratch_dir.as_deref(),
         rebuild: false,
@@ -343,9 +336,9 @@ pub fn run(
     };
     let genesis = Arc::new(genesis.clone());
     let driver = Driver::<ReplayWorkspace> {
-        config,
         genesis: &genesis,
-        mithril,
+        retained: &options.retained,
+        mithril: &options.mithril,
         download_dir,
         window: options.window,
         until_epoch: options.until_epoch,
@@ -433,9 +426,11 @@ impl<W: Workspace> Driver<'_, W> {
                 prune: false,
             });
         }
-        let retained = planning::retained_epochs(self.config).map_err(Error::RetainedEpochs)?;
         let plan = source
-            .plan(u64::from(self.genesis.network_magic()), retained)
+            .plan(
+                u64::from(self.genesis.network_magic()),
+                self.retained.clone(),
+            )
             .map_err(Error::Planning)?;
         self.publish.announce(&plan)?;
         stelae_driver::retry::transient(

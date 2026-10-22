@@ -7,5 +7,7 @@ Initialization restores latest and fails closed. Enable allowGenesisFallback
 only for a verified first publication.
 
 Before an upgrade or rollback, stop the previous writer and wait for its pod
-to terminate. Bump run for the new Job. Rollback to Dolos requires the pinned
-0.1 chart and its tested Dolos image; chart 0.2 runs only Stelae.
+to terminate. Bump run for the new Job. Chart 0.3 reads only steles cut on
+the Dolos v2 configuration: moving from 0.2 starts a fresh lineage in an
+emptied repository (see the chart README). Rollback to Dolos requires the
+pinned 0.1 chart and its tested Dolos image.

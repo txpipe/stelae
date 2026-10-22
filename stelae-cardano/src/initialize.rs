@@ -10,7 +10,7 @@ use dolos_core::{seed_wal_from_state, Genesis, WalSeed};
 use dolos_snapshot::{
     facade::{self, Point, RestoreInput, SnapshotRepository},
     node,
-    registry::{self, Repository},
+    registry::{self, Auth, Repository},
     restore::{Restoring, Source, Target},
 };
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,8 @@ type AnyError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub struct Options {
     pub source: Source,
     pub point: Point,
+    /// What a registry source is read with; unused for a directory.
+    pub auth: Auth,
     pub insecure: bool,
     pub scratch_dir: Option<PathBuf>,
     pub skip_space_check: bool,
@@ -125,6 +127,21 @@ fn seed_wal(config: &crate::RootConfig) -> Result<(), AnyError> {
     Ok(())
 }
 
+/// How a restore runs: bounded by the configured history window.
+fn restoring<'a>(
+    config: &'a crate::RootConfig,
+    genesis: &Genesis,
+    options: &Options,
+) -> Restoring<'a> {
+    Restoring {
+        network_magic: u64::from(genesis.network_magic()),
+        max_history: config.history.max_slots(),
+        storage_path: &config.storage.path,
+        resume: options.resume,
+        skip_space_check: options.skip_space_check,
+    }
+}
+
 fn restore(
     config: &crate::RootConfig,
     genesis: &Genesis,
@@ -133,13 +150,7 @@ fn restore(
 ) -> Result<u64, AnyError> {
     let archive = dolos::storage::open_archive_store(config)?;
     let state = dolos::storage::open_state_store(config)?;
-    let restoring = Restoring {
-        network_magic: u64::from(genesis.network_magic()),
-        max_history: config.sync.max_history,
-        storage_path: &config.storage.path,
-        resume: options.resume,
-        skip_space_check: options.skip_space_check,
-    };
+    let restoring = restoring(config, genesis, options);
     let target = Target::new(&archive, &state);
 
     let outcome = match &options.source {
@@ -150,12 +161,11 @@ fn restore(
             Some(observer),
         ),
         Source::Repo(repository) => {
-            let auth = node::registry_auth(&config.stelae)?;
             let scratch = node::scratch_dir(&config.storage, options.scratch_dir.as_deref());
             let repository = SnapshotRepository::open(
                 repository,
                 options.insecure,
-                auth,
+                options.auth.clone(),
                 scratch,
                 registry::Tuning::default(),
             )?;
@@ -289,6 +299,30 @@ mod tests {
         assert!(validate_storage_path(Path::new("/")).is_err());
         assert!(validate_storage_path(Path::new("/data/../db")).is_err());
         assert!(validate_storage_path(Path::new("/data/db")).is_ok());
+    }
+
+    #[test]
+    fn the_history_window_bounds_a_restore() {
+        let options = Options {
+            source: Source::Dir(PathBuf::from("/stele")),
+            point: Point::Latest,
+            auth: Auth::Anonymous,
+            insecure: false,
+            scratch_dir: None,
+            skip_space_check: false,
+            resume: false,
+            allow_genesis: false,
+        };
+        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/image");
+        let rolling = crate::config::load(Some(&image.join("preview-smoke.toml"))).unwrap();
+        let genesis = crate::config::genesis(&rolling).unwrap();
+        assert_eq!(
+            restoring(&rolling, &genesis, &options).max_history,
+            Some(432_000)
+        );
+
+        let unbounded = crate::RootConfig::new(dolos_core::config::ChainConfig::known("preview"));
+        assert_eq!(restoring(&unbounded, &genesis, &options).max_history, None);
     }
 
     #[test]
