@@ -4689,6 +4689,7 @@ dependencies = [
  "rustls",
  "stelae",
  "stelae-cardano",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

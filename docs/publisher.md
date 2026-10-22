@@ -64,11 +64,13 @@ takes the same way:
 | Mithril aggregator | `--mithril-aggregator` or `DOLOS_MITHRIL_AGGREGATOR` | the known network's; required for `custom` |
 | Mithril genesis key | `--mithril-genesis-vkey` or `DOLOS_MITHRIL_GENESIS_VKEY` | the known network's; required for `custom` |
 | Registry user | global `--registry-user` or `DOLOS_STELAE_USER` | anonymous |
-| Registry secret | `DOLOS_STELAE_PASSWORD` or `DOLOS_STELAE_TOKEN`, never an argument | none |
+| Registry secret | `DOLOS_STELAE_PASSWORD` or `DOLOS_STELAE_TOKEN`, never an argument | none; a user with no secret takes the official registry's read-only password |
 
 The retained epochs are echoed into every inscription's parameters as signed
 input (decision 0026), so they are validated (ascending, no repeats, no epoch
-0) before any store opens. A token and user together, or a password with no
+0) before any store opens. A command that touches no registry (`publish
+--output-dir`, `initialize --source file://…`) reads no registry
+credentials. A token and user together, or a password with no
 user, fail through the shared profile credential policy. CLI command names
 belong to this executable; profile names, media types, tags and repository
 identities remain the existing wire values.

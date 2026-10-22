@@ -106,6 +106,41 @@ fn a_bounded_fixture_publishes_to_a_directory_through_the_new_host() {
 }
 
 #[test]
+fn retained_state_epochs_reach_the_signed_inscription() {
+    let node = Node::new();
+    let (genesis, _) = node.replay_to_the_first_boundary();
+
+    let destination = node.root.path().join("stele");
+    let retained = dolos_snapshot::planning::retained_epochs(&[1]).unwrap();
+    publish_once(
+        &node.config,
+        &genesis,
+        &retained,
+        Selection::default(),
+        Destination::Directory(destination.clone()),
+        false,
+        &Observer::silent(),
+    )
+    .unwrap();
+
+    let inscription: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(destination.join("inscription.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        inscription["parameters"]["stateEpochs"],
+        serde_json::json!([1])
+    );
+    let retained_dump = inscription["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|layer| {
+            layer["kind"].as_str().unwrap().starts_with("state-") && layer["scope"]["epoch"] == 1
+        });
+    assert!(retained_dump, "no state dump of epoch 1 was published");
+}
+
+#[test]
 fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
     struct Publisher {
         expected: ChainPoint,
@@ -117,6 +152,7 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
     impl backfill::Publish for Publisher {
         fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {
             assert_eq!(plan.sequence, 1);
+            assert_eq!(plan.retained.as_slice(), &[1]);
             assert_eq!(
                 source.committed_position().unwrap(),
                 Some(self.expected.clone())
@@ -140,7 +176,7 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
         aggregator: "http://unused.invalid".to_owned(),
         genesis_vkey: String::new(),
     };
-    let retained = RetainedEpochs::default();
+    let retained = dolos_snapshot::planning::retained_epochs(&[1]).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

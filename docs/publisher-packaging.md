@@ -88,10 +88,15 @@ does not create GitHub Releases, tags, or deployments.
 
 Chart 0.2 runs Stelae only. Existing Dolos deployments stay pinned to chart
 0.1 and their tested image until the operator performs an explicit cutover.
-Chart 0.3 runs a publisher built on the Dolos v2 configuration: a release
-moves to it with a v2 `dolosToml`, its retained epochs in `stateEpochs`, a
-matching image and a bumped `run`, and rolls back to 0.2 with its previous
-image and v1 configuration.
+Chart 0.3 runs a publisher built on the Dolos v2 configuration, which
+neither reads a stele cut by 0.2 nor is read by it. A release moves to 0.3
+as the first publication of a fresh lineage: an emptied repository, a v2
+`dolosToml`, its retained epochs in `stateEpochs`, a matching image,
+`allowGenesisFallback: true` until `latest` nears the tip, and a bumped
+`run`. It rolls back to 0.2 with its previous image and v1 configuration only
+while the repository still holds its v1 lineage. The
+[chart README](../k8s/dolos-publisher/README.md#upgrade-and-rollback) has the
+order.
 The chart directory/name remains `dolos-publisher` to preserve release and
 object naming; the legacy shell entrypoint and host selector are removed.
 

@@ -26,6 +26,39 @@ pub fn load(path: Option<&Path>) -> Result<RootConfig, ConfigError> {
             .map(|_| ())
             .map_err(|error| ConfigError::invalid(["chain.network"], error.to_string()))
     })
+    .map_err(|error| match error {
+        ConfigError::MovedSections(moved) => {
+            ConfigError::MovedSections(moved.into_iter().map(publisher_destination).collect())
+        }
+        error => error,
+    })
+}
+
+/// Where the publisher takes each section Dolos moved out of the file.
+const MOVED_TO_ARGUMENTS: [(&str, &str); 3] = [
+    (
+        "mithril",
+        "`--mithril-aggregator` / `DOLOS_MITHRIL_AGGREGATOR` and `--mithril-genesis-vkey` / \
+         `DOLOS_MITHRIL_GENESIS_VKEY`",
+    ),
+    (
+        "snapshot",
+        "`--state-epochs-file` (the chart's `stateEpochs`)",
+    ),
+    (
+        "stelae",
+        "`--registry-user` / `DOLOS_STELAE_USER`, `DOLOS_STELAE_PASSWORD` and `DOLOS_STELAE_TOKEN`",
+    ),
+];
+
+/// Rewrites Dolos's remedy, which names `dolos` commands, as this
+/// executable's; a section it does not know keeps Dolos's text.
+fn publisher_destination(moved: String) -> String {
+    MOVED_TO_ARGUMENTS
+        .iter()
+        .find(|(section, _)| moved.starts_with(&format!("[{section}]")))
+        .map(|(section, destination)| format!("[{section}] moved to {destination}"))
+        .unwrap_or(moved)
 }
 
 /// The chain's genesis: embedded for a known network, read from the
@@ -163,6 +196,17 @@ mod tests {
         );
         let error = loaded.unwrap_err().to_string();
         assert!(error.contains("unknown network `nowhere`"), "{error}");
+    }
+
+    #[test]
+    fn a_moved_section_names_the_publisher_input() {
+        let (_dir, loaded) = config(
+            "compatibility = \"v2-alpha.1\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"preview\"\n[snapshot]\nstate_epochs = [1]\n[mithril]\naggregator = \"http://aggregator\"\n",
+        );
+        let error = loaded.unwrap_err().to_string();
+        assert!(error.contains("--state-epochs-file"), "{error}");
+        assert!(error.contains("--mithril-aggregator"), "{error}");
+        assert!(!error.contains("dolos "), "{error}");
     }
 
     #[test]

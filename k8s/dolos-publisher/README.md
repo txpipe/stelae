@@ -70,16 +70,25 @@ upgrade or re-run. Helm also removes the old Job, but that replacement order
 does not guarantee a single writer: stop the previous writer and wait for its
 pod to terminate before starting the next run.
 
-To move a release from chart 0.2 to 0.3, set a publisher image built on the
-v2 configuration, rewrite `dolosToml` in the v2 schema, move its
-`[snapshot] state_epochs` list unchanged into `stateEpochs`, and bump `run`.
-The Secret and tuning values stay as they are. Keep
-`allowGenesisFallback: false` for established repositories.
+Chart 0.3 cannot continue a repository published by chart 0.2. Its
+publisher refuses to restore a stele cut before the Dolos v2 profile, and
+chart 0.2 refuses one cut by 0.3, so a release moves to 0.3 by starting a
+fresh lineage. Stop the writer and delete every tag in the repository,
+`latest` first. Then set a publisher image built on the v2 configuration,
+rewrite `dolosToml` in the v2 schema, move its `[snapshot] state_epochs`
+list unchanged into `stateEpochs`, set `allowGenesisFallback: true` and bump
+`run`. The Job replays from genesis. Once `latest` is near the chain tip,
+set `allowGenesisFallback: false` and bump `run` again. Never deploy 0.3
+before the repository is empty: the Job would refuse the old `latest`, clear
+its store and restart until `backoffLimit`. The Secret and tuning values stay
+as they are.
 
-For rollback, stop the writer, select chart 0.2 with its previous image and
-v1 `dolosToml`, and bump `run` again. The new emptyDir restores the
-compatible published head. Never reuse incompatible persistent scratch or an
-unpublished checkpoint across hosts.
+Rollback to chart 0.2 works only while the repository still holds its v1
+lineage, that is, before its tags are deleted. Stop the writer, select chart
+0.2 with its previous image and v1 `dolosToml`, and bump `run` again. Once a
+0.3 Job has published, going back to 0.2 needs a fresh v1 lineage in the same
+way. Never reuse incompatible persistent scratch or an unpublished checkpoint
+across hosts.
 
 Full build, release and rollback details are in
 [publisher-packaging.md](../../docs/publisher-packaging.md).

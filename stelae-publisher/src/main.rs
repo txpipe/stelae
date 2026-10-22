@@ -38,12 +38,15 @@ struct CredentialArgs {
 const PASSWORD_ENV: &str = "DOLOS_STELAE_PASSWORD";
 const TOKEN_ENV: &str = "DOLOS_STELAE_TOKEN";
 
-impl CredentialArgs {
-    fn auth(&self) -> miette::Result<Auth> {
-        self.auth_from(|name| std::env::var(name).ok())
-    }
+/// Reads one environment variable; the process environment outside tests.
+type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
 
-    fn auth_from(&self, env: impl Fn(&str) -> Option<String>) -> miette::Result<Auth> {
+/// Resolves the registry identity, called only by a command that reaches a
+/// registry.
+type ResolveAuth<'a> = &'a dyn Fn() -> miette::Result<Auth>;
+
+impl CredentialArgs {
+    fn auth_from(&self, env: Env) -> miette::Result<Auth> {
         // An empty value is no secret, as in Dolos.
         let secret = |name| env(name).filter(|value: &String| !value.is_empty());
         let inputs = RegistryAuth::from_inputs(
@@ -104,8 +107,12 @@ struct InitializeArgs {
 }
 
 impl InitializeArgs {
-    fn options(&self, auth: Auth) -> initialize::Options {
-        initialize::Options {
+    fn options(&self, auth: ResolveAuth) -> miette::Result<initialize::Options> {
+        let auth = match self.source {
+            RestoreSource::Repo(_) => auth()?,
+            RestoreSource::Dir(_) => Auth::Anonymous,
+        };
+        Ok(initialize::Options {
             source: self.source.clone(),
             point: self.point,
             auth,
@@ -114,7 +121,7 @@ impl InitializeArgs {
             skip_space_check: self.skip_space_check,
             resume: self.resume,
             allow_genesis: self.allow_genesis,
-        }
+        })
     }
 }
 
@@ -152,8 +159,8 @@ struct BackfillArgs {
 }
 
 impl BackfillArgs {
-    /// Every backfill input, resolved and validated before a store opens.
-    fn options(&self, config: &RootConfig, auth: Auth) -> miette::Result<backfill::Options> {
+    /// Every backfill input, resolved before a store opens.
+    fn options(&self, config: &RootConfig, auth: ResolveAuth) -> miette::Result<backfill::Options> {
         if self.window == 0 {
             return Err(miette::miette!("--window must be at least 1"));
         }
@@ -163,9 +170,14 @@ impl BackfillArgs {
             self.mithril_genesis_vkey.clone(),
         )
         .into_diagnostic()?;
+        let origin = match self.mithril_aggregator {
+            Some(_) => "invocation",
+            None => "network catalog",
+        };
+        tracing::info!(aggregator = %mithril.aggregator, from = origin, "Mithril aggregator");
         Ok(backfill::Options {
             repository: self.repo.clone(),
-            auth,
+            auth: auth()?,
             insecure: self.insecure,
             scratch_dir: self.scratch_dir.clone(),
             concurrency: self.concurrency,
@@ -292,10 +304,10 @@ fn run_initialize(
     config: &RootConfig,
     genesis: &Genesis,
     args: &InitializeArgs,
-    auth: Auth,
+    auth: ResolveAuth,
     observer: &Observer,
 ) -> miette::Result<()> {
-    match initialize::run(config, genesis, &args.options(auth), observer)
+    match initialize::run(config, genesis, &args.options(auth)?, observer)
         .map_err(|error| miette::miette!("{error}"))?
     {
         initialize::Outcome::Existing => println!("publisher storage already initialized"),
@@ -326,7 +338,7 @@ fn run_publish(
     config: &RootConfig,
     genesis: &Genesis,
     args: &PublishArgs,
-    auth: Auth,
+    auth: ResolveAuth,
     observer: &Observer,
 ) -> miette::Result<()> {
     let retained = args.state_epochs.read()?;
@@ -339,7 +351,7 @@ fn run_publish(
         (Some(path), None) => Destination::Directory(path.clone()),
         (None, Some(repository)) => Destination::Repository {
             repository: repository.clone(),
-            auth,
+            auth: auth()?,
             insecure: args.insecure,
             scratch_dir: args.scratch_dir.clone(),
             rebuild: args.rebuild,
@@ -392,23 +404,26 @@ fn run_publish(
 fn main() -> miette::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt().with_target(false).init();
-    let cli = Cli::parse();
+    execute(Cli::parse(), &|name| std::env::var(name).ok())
+}
+
+fn execute(cli: Cli, env: Env) -> miette::Result<()> {
     let config = config::load(cli.config.as_deref())
         .into_diagnostic()
         .context("parsing configuration")?;
     let genesis = load_genesis(&config)?;
-    let auth = cli.credentials.auth()?;
+    let auth = || cli.credentials.auth_from(env);
     let observer = Observer::new(Arc::new(ConsoleProgress));
 
     match cli.command {
-        Command::Initialize(args) => run_initialize(&config, &genesis, &args, auth, &observer),
-        Command::Publish(args) => run_publish(&config, &genesis, &args, auth, &observer),
+        Command::Initialize(args) => run_initialize(&config, &genesis, &args, &auth, &observer),
+        Command::Publish(args) => run_publish(&config, &genesis, &args, &auth, &observer),
         Command::Backfill(args) => {
-            let options = args.options(&config, auth)?;
+            let options = args.options(&config, &auth)?;
             run_backfill(&config, &genesis, &options, &observer)
         }
         Command::Run(args) => {
-            let options = args.backfill.options(&config, auth.clone())?;
+            let options = args.backfill.options(&config, &auth)?;
             let initialize = InitializeArgs {
                 source: args
                     .restore_source
@@ -420,7 +435,7 @@ fn main() -> miette::Result<()> {
                 resume: args.resume,
                 allow_genesis: args.allow_genesis,
             };
-            run_initialize(&config, &genesis, &initialize, auth, &observer)?;
+            run_initialize(&config, &genesis, &initialize, &auth, &observer)?;
             run_backfill(&config, &genesis, &options, &observer)
         }
     }
@@ -428,10 +443,131 @@ fn main() -> miette::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use clap::CommandFactory as _;
+
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("stelae-publisher").chain(args.iter().copied()))
+    }
+
+    /// A preview node whose stores live in `dir`, and its configuration file.
+    fn node(dir: &Path) -> String {
+        let path = dir.join("dolos.toml");
+        let document = format!(
+            "compatibility = \"v2-alpha.1\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"preview\"\n[storage]\npath = {:?}\n",
+            dir.join("data").display().to_string(),
+        );
+        std::fs::write(&path, document).unwrap();
+        path.display().to_string()
+    }
+
+    /// A password with no user: refused wherever credentials are resolved.
+    fn orphan_password(name: &str) -> Option<String> {
+        (name == PASSWORD_ENV).then(|| "secret".to_owned())
+    }
+
+    #[test]
+    fn backfill_options_carry_the_state_epochs_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config::load(Some(Path::new(&node(dir.path())))).unwrap();
+        let epochs = dir.path().join("state-epochs");
+        std::fs::write(&epochs, "1\n200\n").unwrap();
+
+        let cli = parse(&[
+            "backfill",
+            "--repo",
+            "oci://registry.invalid/cardano/preview",
+            "--state-epochs-file",
+            epochs.to_str().unwrap(),
+        ])
+        .unwrap();
+        let Command::Backfill(args) = cli.command else {
+            panic!("parsed another command");
+        };
+        let options = args.options(&config, &|| Ok(Auth::Anonymous)).unwrap();
+        assert_eq!(options.retained.as_slice(), &[1, 200]);
+    }
+
+    #[test]
+    fn run_checks_its_backfill_inputs_before_restoring() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = node(dir.path());
+        let epochs = dir.path().join("state-epochs");
+        std::fs::write(&epochs, "four\n").unwrap();
+
+        let cli = parse(&[
+            "--config",
+            &config,
+            "run",
+            "--repo",
+            "oci://registry.invalid/cardano/preview",
+            "--state-epochs-file",
+            epochs.to_str().unwrap(),
+            "--restore-source",
+            "file:///missing-stele",
+        ])
+        .unwrap();
+        let error = format!("{:?}", execute(cli, &|_| None).unwrap_err());
+        assert!(error.contains("state epochs file"), "{error}");
+        assert!(!dir.path().join("data").exists());
+    }
+
+    #[test]
+    fn only_a_registry_source_reads_registry_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = node(dir.path());
+
+        let from_directory = parse(&[
+            "--config",
+            &config,
+            "initialize",
+            "--source",
+            "file:///missing-stele",
+            "--allow-genesis",
+        ])
+        .unwrap();
+        execute(from_directory, &orphan_password).unwrap();
+
+        let from_registry = parse(&[
+            "--config",
+            &config,
+            "initialize",
+            "--source",
+            "oci://registry.invalid/cardano/preview",
+        ])
+        .unwrap();
+        let auth = || from_registry.credentials.auth_from(&orphan_password);
+        let Command::Initialize(args) = &from_registry.command else {
+            panic!("parsed another command");
+        };
+        assert!(args.options(&auth).is_err());
+    }
+
+    #[test]
+    fn the_chart_sets_the_credential_names_the_binary_reads() {
+        let job = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../k8s/dolos-publisher/chart/templates/job.yaml"),
+        )
+        .unwrap();
+        let command = Cli::command();
+        let user = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "registry_user")
+            .and_then(|arg| arg.get_env())
+            .unwrap()
+            .to_str()
+            .unwrap();
+        for name in [user, PASSWORD_ENV] {
+            let entry = format!("- name: {name}");
+            assert!(
+                job.lines().any(|line| line.trim() == entry),
+                "job.yaml does not set {name}"
+            );
+        }
     }
 
     #[test]
@@ -456,14 +592,14 @@ mod tests {
         let anonymous = CredentialArgs {
             registry_user: None,
         };
-        assert_eq!(anonymous.auth_from(|_| None).unwrap(), Auth::Anonymous);
+        assert_eq!(anonymous.auth_from(&|_| None).unwrap(), Auth::Anonymous);
 
         let publisher = CredentialArgs {
             registry_user: Some("publisher".to_owned()),
         };
         let password = |name: &str| (name == PASSWORD_ENV).then(|| "secret".to_owned());
         assert_eq!(
-            publisher.auth_from(password).unwrap(),
+            publisher.auth_from(&password).unwrap(),
             Auth::Basic {
                 user: "publisher".to_owned(),
                 password: "secret".to_owned(),
@@ -472,10 +608,10 @@ mod tests {
 
         let token = |name: &str| (name == TOKEN_ENV).then(|| "ghp_x".to_owned());
         assert_eq!(
-            anonymous.auth_from(token).unwrap(),
+            anonymous.auth_from(&token).unwrap(),
             Auth::Bearer("ghp_x".to_owned())
         );
-        assert!(publisher.auth_from(token).is_err());
-        assert!(anonymous.auth_from(password).is_err());
+        assert!(publisher.auth_from(&token).is_err());
+        assert!(anonymous.auth_from(&password).is_err());
     }
 }
