@@ -17,7 +17,10 @@ use std::{
 };
 
 use dolos::engine::BulkReplaySession;
-use dolos_core::{config::RootConfig, Genesis, ReplayProgress};
+use dolos_core::{
+    config::{ChainConfig, RootConfig},
+    Genesis, ReplayProgress,
+};
 use dolos_flatfiles::{BlockLocation, FlatFileStore};
 use dolos_old::engine::{
     BulkReplaySession as OldBulkReplaySession, ReplayWorkspace as OldReplayWorkspace,
@@ -36,7 +39,7 @@ use stelae::progress::Observer;
 use stelae_cardano::{
     initialize,
     publisher::{publish_once, Destination, PublishOutcome},
-    Point, RestoreSource, Selection,
+    Point, RestoreSource, RetainedEpochs, Selection,
 };
 
 const OLD_HOST_REVISION: &str = "1ae4e91c18a9e1456a3612af402d7b9b97546d30";
@@ -51,6 +54,7 @@ type AnyError = Box<dyn std::error::Error + Send + Sync + 'static>;
 struct Node {
     root: tempfile::TempDir,
     config: RootConfig,
+    retained: RetainedEpochs,
 }
 
 struct OldNode {
@@ -61,7 +65,7 @@ struct OldNode {
 impl OldNode {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
-        let document = node_config(root.path());
+        let document = old_node_config(root.path());
         Self {
             root,
             config: toml::from_str(&document).unwrap(),
@@ -73,7 +77,7 @@ impl OldNode {
     }
 }
 
-fn node_config(root: &Path) -> String {
+fn old_node_config(root: &Path) -> String {
     format!(
         r#"
         [upstream]
@@ -101,13 +105,36 @@ fn node_config(root: &Path) -> String {
     )
 }
 
+/// The old host's node in the v2 schema.
+fn node_config(root: &Path) -> String {
+    let compatibility = RootConfig::new(ChainConfig::known("preview")).compatibility();
+    format!(
+        r#"
+        compatibility = "{compatibility}"
+
+        [chain]
+        protocol = "cardano"
+        network = "preview"
+
+        [storage]
+        path = {}
+        "#,
+        toml::Value::String(root.join("data").display().to_string()),
+    )
+}
+
 impl Node {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
-        let document = node_config(root.path());
+        let config = root.path().join("dolos.toml");
+        fs::write(&config, node_config(root.path())).unwrap();
+        // The old host's `[snapshot] state_epochs`, as the publisher takes it.
+        let state_epochs = root.path().join("state-epochs");
+        fs::write(&state_epochs, "1\n").unwrap();
         Self {
+            config: stelae_cardano::config::load(Some(&config)).unwrap(),
+            retained: stelae_cardano::config::read_state_epochs(&state_epochs).unwrap(),
             root,
-            config: toml::from_str(&document).unwrap(),
         }
     }
 
@@ -259,6 +286,7 @@ fn new_host_publish(node: &Node, output: &Path) -> (String, u128) {
     let (_, outcome) = publish_once(
         &node.config,
         &genesis,
+        &node.retained,
         Selection::default(),
         Destination::Directory(output.to_owned()),
         false,
@@ -341,9 +369,11 @@ fn new_host_publish_repository(
     let (_, outcome) = publish_once(
         &node.config,
         &genesis,
+        &node.retained,
         Selection::default(),
         Destination::Repository {
             repository: repository.clone(),
+            auth: Auth::Anonymous,
             insecure: true,
             scratch_dir: None,
             rebuild,
@@ -468,6 +498,7 @@ fn restore_with_unchanged_consumer(source: &Path) -> Node {
         &initialize::Options {
             source: RestoreSource::Dir(source.to_owned()),
             point: Point::Latest,
+            auth: Auth::Anonymous,
             insecure: false,
             scratch_dir: None,
             skip_space_check: false,
@@ -493,6 +524,7 @@ fn restore_repository_with_unchanged_consumer(source: Repository) -> Node {
         &initialize::Options {
             source: RestoreSource::Repo(source),
             point: RepositoryPoint::Latest,
+            auth: Auth::Anonymous,
             insecure: true,
             scratch_dir: None,
             skip_space_check: false,

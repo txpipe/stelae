@@ -5,26 +5,29 @@ The publisher restores its latest stele, replays to epoch boundaries,
 publishes, prunes, and exits at the aggregator tip. The operator maintains
 network values and owns deployment, first publication and monitoring.
 
-Chart 0.2 requires the Stelae image. Existing Dolos deployments remain pinned
-to chart 0.1 until cutover; rollback uses that previous chart and image.
-There is no host selector. The directory and chart name stay
+Chart 0.3 runs a publisher built on the Dolos v2 configuration: `dolosToml`
+is a v2 file and the retained state epochs are their own value. Releases on
+chart 0.2 keep their v1 configuration until rewritten for 0.3. There is no
+host selector. The directory and chart name stay
 `dolos-publisher` to preserve release and object naming.
 
 ## Rendered resources
 
 - ConfigMap `<release>-config`, mounted at `/etc/publisher`, carries
-  `dolos.toml` verbatim from `dolosToml`. No shell entrypoint is generated.
-  The retained `[snapshot] state_epochs` list remains signed input and must
-  not change incidentally.
+  `dolos.toml` verbatim from `dolosToml` and `state-epochs`, one epoch per
+  line, from `stateEpochs`. No shell entrypoint is generated. The retained
+  epochs are signed input and must not change incidentally.
 - Job `<network>-backfill-<run>` directly invokes
-  `/usr/local/bin/stelae-publisher --config /etc/publisher/dolos.toml run`.
-  It mounts an emptyDir at `/data` and reads registry credentials from the
-  existing Secret, using `DOLOS_STELAE_REGISTRY_USER` and
-  `DOLOS_STELAE_REGISTRY_PASSWORD`.
+  `/usr/local/bin/stelae-publisher --config /etc/publisher/dolos.toml run
+  --state-epochs-file /etc/publisher/state-epochs`. It mounts an emptyDir at
+  `/data` and reads registry credentials from the existing Secret's
+  `DOLOS_STELAE_REGISTRY_USER` and `DOLOS_STELAE_REGISTRY_PASSWORD` keys into
+  the publisher's `DOLOS_STELAE_USER` and `DOLOS_STELAE_PASSWORD`.
 
-The image bundles genesis at `/etc/genesis/<network>/`. Existing config
-paths remain valid, including storage, markers, journals, scratch and Mithril
-downloads beneath `/data/db`. Direct PID-1 execution delivers SIGTERM to
+A known network (`mainnet`, `preprod`, `preview`) takes its genesis and
+Mithril aggregator from the Dolos catalog, so `dolosToml` names neither.
+Storage, markers, journals, scratch and Mithril downloads stay beneath the
+configured `storage.path`, `/data/db` in the deployed values. Direct PID-1 execution delivers SIGTERM to
 the publisher.
 The pod requires a non-root image user and sets `fsGroup: 65532`, giving the
 image's UID/GID `65532:65532` write access to the `/data` emptyDir.
@@ -37,7 +40,8 @@ image's UID/GID `65532:65532` write access to the `/data` emptyDir.
 | `run` | Deliberate re-run counter; bump when changing the Job |
 | `repo` | Network's `oci://` publication repository |
 | `concurrency` | Measured upload concurrency, with no chart default |
-| `dolosToml` | Network configuration, verbatim |
+| `dolosToml` | Network's Dolos v2 configuration, verbatim |
+| `stateEpochs` | Retained state-dump epochs, ascending, with no chart default; `[]` retains the tip alone |
 | `image.repository` | Defaults to `ghcr.io/txpipe/stelae-publisher` |
 | `image.tag` | Tested version or `sha-<7>` tag, with no default |
 | `resources` | Network working set, with no default |
@@ -55,8 +59,9 @@ helm template stelae-publisher-preprod k8s/dolos-publisher/chart \
   --namespace stelae-publisher --values "$PUBLISHER_VALUES"
 ```
 
-The checks cover direct invocation, genesis opt-in, TLS selection, missing
-configuration and accidental use of the legacy Dolos image.
+The checks cover direct invocation, the state epochs file and argument,
+genesis opt-in, TLS selection, missing or invalid configuration and
+accidental use of the legacy Dolos image.
 
 ## Upgrade and rollback
 
@@ -65,12 +70,14 @@ upgrade or re-run. Helm also removes the old Job, but that replacement order
 does not guarantee a single writer: stop the previous writer and wait for its
 pod to terminate before starting the next run.
 
-For cutover, select chart 0.2, set the Stelae image repository and tested tag,
-bump `run`, and retain the existing config, secret and tuning values.
-Keep `allowGenesisFallback: false` for established repositories.
+To move a release from chart 0.2 to 0.3, set a publisher image built on the
+v2 configuration, rewrite `dolosToml` in the v2 schema, move its
+`[snapshot] state_epochs` list unchanged into `stateEpochs`, and bump `run`.
+The Secret and tuning values stay as they are. Keep
+`allowGenesisFallback: false` for established repositories.
 
-For rollback, stop the Stelae writer, select the pinned 0.1 chart and previous
-tested Dolos image, and bump `run` again. The new emptyDir restores the
+For rollback, stop the writer, select chart 0.2 with its previous image and
+v1 `dolosToml`, and bump `run` again. The new emptyDir restores the
 compatible published head. Never reuse incompatible persistent scratch or an
 unpublished checkpoint across hosts.
 

@@ -10,7 +10,7 @@ use dolos_core::{seed_wal_from_state, Genesis, WalSeed};
 use dolos_snapshot::{
     facade::{self, Point, RestoreInput, SnapshotRepository},
     node,
-    registry::{self, Repository},
+    registry::{self, Auth, Repository},
     restore::{Restoring, Source, Target},
 };
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,8 @@ type AnyError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub struct Options {
     pub source: Source,
     pub point: Point,
+    /// What a registry source is read with; unused for a directory.
+    pub auth: Auth,
     pub insecure: bool,
     pub scratch_dir: Option<PathBuf>,
     pub skip_space_check: bool,
@@ -135,7 +137,7 @@ fn restore(
     let state = dolos::storage::open_state_store(config)?;
     let restoring = Restoring {
         network_magic: u64::from(genesis.network_magic()),
-        max_history: config.sync.max_history,
+        max_history: config.history.max_slots(),
         storage_path: &config.storage.path,
         resume: options.resume,
         skip_space_check: options.skip_space_check,
@@ -150,12 +152,11 @@ fn restore(
             Some(observer),
         ),
         Source::Repo(repository) => {
-            let auth = node::registry_auth(&config.stelae)?;
             let scratch = node::scratch_dir(&config.storage, options.scratch_dir.as_deref());
             let repository = SnapshotRepository::open(
                 repository,
                 options.insecure,
-                auth,
+                options.auth.clone(),
                 scratch,
                 registry::Tuning::default(),
             )?;

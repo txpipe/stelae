@@ -15,6 +15,12 @@ grep -F -- '- /etc/publisher/dolos.toml' "$OUT/default.yaml"
 grep -Fx '            - run' "$OUT/default.yaml"
 grep -Fx '        runAsNonRoot: true' "$OUT/default.yaml"
 grep -Fx '        fsGroup: 65532' "$OUT/default.yaml"
+grep -F -- '- --state-epochs-file' "$OUT/default.yaml"
+grep -F -- '- /etc/publisher/state-epochs' "$OUT/default.yaml"
+grep -Fx '  state-epochs: |' "$OUT/default.yaml"
+grep -Fx '    646' "$OUT/default.yaml"
+grep -F 'name: DOLOS_STELAE_USER' "$OUT/default.yaml"
+grep -F 'name: DOLOS_STELAE_PASSWORD' "$OUT/default.yaml"
 if grep -Eq -- 'entrypoint.sh|--allow-genesis' "$OUT/default.yaml"; then
     echo "default chart enabled genesis fallback or a shell entrypoint" >&2
     exit 1
@@ -34,6 +40,15 @@ fi
 helm template publisher "$CHART" --values "$VALUES" \
     --set-string run=8 >"$OUT/counter.yaml"
 grep -Fx '  name: preview-backfill-8' "$OUT/counter.yaml"
+
+# The retained epochs are signed input: absent, zero or repeated fails.
+for invalid in stateEpochs=null 'stateEpochs={0}' 'stateEpochs={3,3}'; do
+    if helm template publisher "$CHART" --values "$VALUES" \
+        --set "$invalid" >"$OUT/invalid.yaml" 2>&1; then
+        echo "invalid state epochs accepted: $invalid" >&2
+        exit 1
+    fi
+done
 
 for invalid in image.repository=ghcr.io/txpipe/dolos repo= dolosToml= run=retry-one run=0 run=-1; do
     if helm template publisher "$CHART" --values "$VALUES" \

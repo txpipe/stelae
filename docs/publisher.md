@@ -9,13 +9,18 @@ No command starts or shells out to a Dolos executable.
 ## Source and dependency identity
 
 All Dolos crates in the normal publisher dependency graph are pinned to
-`2cadf62a2cd9b15ed1c17a9816f976a8646ac2e5`, the merge revision of
-[Dolos PR 1335](https://github.com/txpipe/dolos/pull/1335). This is the
-publisher-retirement revision: it retains the headless ledger, storage,
-profile, restore and repository facades but contains no publisher command,
-backfill loop or publisher policy module. The root `dolos` package is imported
-with default features disabled, so its service features are absent from the
-publisher graph.
+`e184a965644bcd7a4317097eda94206bd50a35d7`, a Dolos `main` revision carrying
+the v2 configuration contract: bootstrap and publisher inputs on the
+invocation ([PR 1466](https://github.com/txpipe/dolos/pull/1466)), the v2
+schema and loader ([PR 1468](https://github.com/txpipe/dolos/pull/1468)),
+store lifecycle ([PR 1479](https://github.com/txpipe/dolos/pull/1479)) and
+the Fjall `standard` preset ([PR 1478](https://github.com/txpipe/dolos/pull/1478)).
+Like every revision since the publisher retirement of
+[PR 1335](https://github.com/txpipe/dolos/pull/1335), it retains the headless
+ledger, storage, profile, restore and repository facades but contains no
+publisher command, backfill loop or publisher policy module. The root `dolos`
+package is imported with default features disabled, so its service features
+are absent from the publisher graph.
 
 The workspace patch for `https://github.com/txpipe/stelae` resolves the
 profile's v0.2.0 dependencies back to the workspace `stelae` and
@@ -42,20 +47,32 @@ The first two trees must contain no package matching `dolos` or `dolos-*`.
 `deny.toml` permits Dolos packages only under `stelae-cardano`; a Dolos edge
 from the protocol or generic driver is an error.
 
-## Configuration precedence
+## Configuration
 
-The host deliberately keeps the current Dolos configuration names. Sources
-are layered from lowest to highest precedence:
+The node's lasting description is a Dolos v2 `dolos.toml`, read by Dolos's own
+loader: the file named by global `--config`, else `./dolos.toml`, with
+`DOLOS_` environment variables using `__` for nesting (for example
+`DOLOS_STORAGE__PATH`) overriding it. Unknown fields are rejected, and so is a
+network the Dolos catalog does not know. A known network (`mainnet`,
+`preprod`, `preview`) takes its embedded genesis; a `custom` one names its
+genesis files under `[chain.cardano.genesis]`. The rolling `history.window`
+bounds how much chain history a restore reads.
 
-1. optional `/etc/dolos/daemon.toml`;
-2. optional `./dolos.toml`;
-3. the required file named by global `--config`;
-4. `DOLOS_*` environment variables.
+What Dolos takes from an invocation rather than from that file, the publisher
+takes the same way:
 
-Registry credentials therefore remain
-`DOLOS_STELAE_REGISTRY_USER`, `DOLOS_STELAE_REGISTRY_PASSWORD`, and
-`DOLOS_STELAE_REGISTRY_TOKEN`. A token and user together, or a password with
-no user, fail through the shared profile credential policy. CLI command names
+| Input | Source | Default |
+| --- | --- | --- |
+| Retained state-dump epochs | `--state-epochs-file PATH`, one epoch per line, ascending | none: `publish`, `backfill` and `run` require it; an empty file retains the tip alone |
+| Mithril aggregator | `--mithril-aggregator` or `DOLOS_MITHRIL_AGGREGATOR` | the known network's; required for `custom` |
+| Mithril genesis key | `--mithril-genesis-vkey` or `DOLOS_MITHRIL_GENESIS_VKEY` | the known network's; required for `custom` |
+| Registry user | global `--registry-user` or `DOLOS_STELAE_USER` | anonymous |
+| Registry secret | `DOLOS_STELAE_PASSWORD` or `DOLOS_STELAE_TOKEN`, never an argument | none |
+
+The retained epochs are echoed into every inscription's parameters as signed
+input (decision 0026), so they are validated (ascending, no repeats, no epoch
+0) before any store opens. A token and user together, or a password with no
+user, fail through the shared profile credential policy. CLI command names
 belong to this executable; profile names, media types, tags and repository
 identities remain the existing wire values.
 
@@ -64,7 +81,8 @@ identities remain the existing wire values.
 Publish the committed stores once to a directory:
 
 ```sh
-stelae-publisher --config dolos.toml publish --output-dir ./stele
+stelae-publisher --config dolos.toml publish --output-dir ./stele \
+  --state-epochs-file state-epochs
 ```
 
 Publish once to a repository:
@@ -72,6 +90,7 @@ Publish once to a repository:
 ```sh
 stelae-publisher --config dolos.toml publish \
   --repo oci://registry.example/cardano/preview \
+  --state-epochs-file state-epochs \
   --concurrency 4
 ```
 
@@ -84,6 +103,7 @@ Initialize empty stores and then backfill:
 ```sh
 stelae-publisher --config dolos.toml run \
   --repo oci://registry.example/cardano/preview \
+  --state-epochs-file state-epochs \
   --concurrency 4
 ```
 
@@ -105,7 +125,7 @@ The following paths are part of restart compatibility:
 
 | Path | Meaning |
 | --- | --- |
-| `<storage.path>/` | Dolos WAL, state, archive and mempool stores selected by the existing config |
+| `<storage.path>/` | Dolos WAL, state, archive and mempool stores selected by the configuration |
 | `<storage.path>/.snapshot-publish.json` | completed-layer publication journal used for in-place retry |
 | `<storage.path>/.snapshot-restore.json` | immutable-layer restore checkpoint read by `--resume` |
 | `<storage.path>/.stelae-publisher-initialized.json` | source, storage path, network magic and restore/genesis decision for cold start |
@@ -125,8 +145,8 @@ The backfill state machine preserves these rules from the accepted Dolos host:
 - retain two immutable files of cleanup/download margin using the configured
   network's genesis chunk geometry;
 - retry transient repository work in place using the publication journal;
-- retain `snapshot.state_epochs` and the profile's existing plan, schema,
-  media-type, compression and journal identities.
+- retain the `--state-epochs-file` epochs and the profile's existing plan,
+  schema, media-type, compression and journal identities.
 
 ## Final ownership boundary
 

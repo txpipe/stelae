@@ -7,10 +7,11 @@ use dolos_snapshot::{
     export::Plan,
     facade::SnapshotSource,
     node,
-    planning::{self, PlanReport},
+    planning::PlanReport,
     registry::{
         self, Auth, Preview, Published, Publishing, Repository, SnapshotRepository, Tuning,
     },
+    RetainedEpochs,
 };
 use stelae::progress::Observer;
 use stelae_driver::Standing;
@@ -20,6 +21,7 @@ use crate::backfill;
 /// Resolved repository publication settings.
 pub struct RepositoryPublish<'a> {
     pub repo: &'a Repository,
+    pub auth: Auth,
     pub insecure: bool,
     pub scratch_dir: Option<&'a Path>,
     pub rebuild: bool,
@@ -87,13 +89,12 @@ impl Publisher {
     pub fn open(
         config: &RootConfig,
         publish: &RepositoryPublish<'_>,
-        auth: Auth,
     ) -> Result<Self, dolos_snapshot::Error> {
         let scratch = node::scratch_dir(&config.storage, publish.scratch_dir);
         Self::open_explicit(
             publish.repo,
             publish.insecure,
-            auth,
+            publish.auth.clone(),
             scratch,
             registry::record_path_in(&config.storage.path),
             publish.rebuild,
@@ -172,9 +173,8 @@ impl backfill::Publish for BackfillPublisher<'_> {
     }
 
     fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {
-        let auth = node::registry_auth(&self.config.stelae).map_err(backfill::Error::caller)?;
         let publisher =
-            Publisher::open(self.config, &self.settings, auth).map_err(backfill::Error::caller)?;
+            Publisher::open(self.config, &self.settings).map_err(backfill::Error::caller)?;
         let standing = publisher.standing(plan).map_err(backfill::Error::caller)?;
         match Next::read(standing, plan.sequence, false).map_err(backfill::Error::caller)? {
             Next::Nothing(message) => {
@@ -203,6 +203,7 @@ pub enum Destination {
     Directory(PathBuf),
     Repository {
         repository: Repository,
+        auth: Auth,
         insecure: bool,
         scratch_dir: Option<PathBuf>,
         rebuild: bool,
@@ -235,6 +236,7 @@ pub enum PublishOutcome {
 pub fn publish_once(
     config: &RootConfig,
     genesis: &dolos_core::Genesis,
+    retained: &RetainedEpochs,
     selection: dolos_snapshot::facade::Selection,
     destination: Destination,
     dry_run: bool,
@@ -244,9 +246,11 @@ pub fn publish_once(
         dolos::engine::ReplayWorkspace::open(config, std::sync::Arc::new(genesis.clone()))?;
     let result = (|| {
         let snapshot = workspace.snapshot();
-        let retained = planning::retained_epochs(config)?;
-        let plan =
-            snapshot.selected_plan(u64::from(genesis.network_magic()), retained, selection)?;
+        let plan = snapshot.selected_plan(
+            u64::from(genesis.network_magic()),
+            retained.clone(),
+            selection,
+        )?;
         let report = PlanReport::read(&plan)?;
         let outcome = match destination {
             Destination::Directory(path) => {
@@ -265,6 +269,7 @@ pub fn publish_once(
             }
             Destination::Repository {
                 repository,
+                auth,
                 insecure,
                 scratch_dir,
                 rebuild,
@@ -274,6 +279,7 @@ pub fn publish_once(
             } => {
                 let settings = RepositoryPublish {
                     repo: &repository,
+                    auth,
                     insecure,
                     scratch_dir: scratch_dir.as_deref(),
                     rebuild,
@@ -282,8 +288,7 @@ pub fn publish_once(
                         verify_adopted: verify_carried,
                     },
                 };
-                let auth = node::registry_auth(&config.stelae)?;
-                let publisher = Publisher::open(config, &settings, auth)?;
+                let publisher = Publisher::open(config, &settings)?;
                 let standing = publisher.standing(&plan)?;
                 match Next::read(standing, plan.sequence, require_new)? {
                     Next::Nothing(message) => PublishOutcome::Nothing(message),

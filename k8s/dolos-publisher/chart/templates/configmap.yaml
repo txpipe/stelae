@@ -8,3 +8,7 @@ metadata:
 data:
   dolos.toml: |
     {{- required "dolosToml is required" .Values.dolosToml | nindent 4 }}
+  state-epochs: |
+    {{- range (required "stateEpochs is required" .Values.stateEpochs) }}
+    {{ int . }}
+    {{- end }}

@@ -1,27 +1,73 @@
-use std::{
-    num::NonZeroUsize,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
 
 use clap::{Args, Parser, Subcommand};
 use miette::{Context as _, IntoDiagnostic as _};
 use stelae::progress::{Event, Observer, Progress};
 use stelae_cardano::{
-    backfill, initialize,
+    backfill, config, initialize,
     publisher::{self, Destination, PublishOutcome},
-    EpochRange, Genesis, Point, Repository, RestoreSource, RootConfig, Selection,
+    Auth, EpochRange, Genesis, Point, RegistryAuth, Repository, RestoreSource, RetainedEpochs,
+    RootConfig, Selection,
 };
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
 #[command(name = "stelae-publisher", version, about)]
 struct Cli {
-    /// Explicit Dolos-compatible configuration file.
+    /// The Dolos configuration file; defaults to ./dolos.toml.
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
+    #[command(flatten)]
+    credentials: CredentialArgs,
     #[command(subcommand)]
     command: Command,
+}
+
+/// The registry identity, from the invocation and never from dolos.toml.
+///
+/// The names are Dolos's own: `--registry-user` / `DOLOS_STELAE_USER`, and the
+/// secret from `DOLOS_STELAE_PASSWORD` or `DOLOS_STELAE_TOKEN`, never an
+/// argument, where it would land in process listings.
+#[derive(Debug, Args, Clone)]
+struct CredentialArgs {
+    /// The user to authenticate to the registry as.
+    #[arg(long, global = true, env = "DOLOS_STELAE_USER", value_name = "USER")]
+    registry_user: Option<String>,
+}
+
+const PASSWORD_ENV: &str = "DOLOS_STELAE_PASSWORD";
+const TOKEN_ENV: &str = "DOLOS_STELAE_TOKEN";
+
+impl CredentialArgs {
+    fn auth(&self) -> miette::Result<Auth> {
+        self.auth_from(|name| std::env::var(name).ok())
+    }
+
+    fn auth_from(&self, env: impl Fn(&str) -> Option<String>) -> miette::Result<Auth> {
+        // An empty value is no secret, as in Dolos.
+        let secret = |name| env(name).filter(|value: &String| !value.is_empty());
+        let inputs = RegistryAuth::from_inputs(
+            self.registry_user.clone().filter(|user| !user.is_empty()),
+            secret(PASSWORD_ENV),
+            secret(TOKEN_ENV),
+        );
+        stelae_cardano::registry_auth(&inputs).into_diagnostic()
+    }
+}
+
+/// The epochs this publisher retains a state dump of: signed input, so every
+/// command that plans a publish requires it.
+#[derive(Debug, Args, Clone)]
+struct StateEpochsArgs {
+    /// File listing the retained state-dump epochs, one per line, ascending.
+    #[arg(long, value_name = "PATH")]
+    state_epochs_file: PathBuf,
+}
+
+impl StateEpochsArgs {
+    fn read(&self) -> miette::Result<RetainedEpochs> {
+        config::read_state_epochs(&self.state_epochs_file).into_diagnostic()
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -58,10 +104,11 @@ struct InitializeArgs {
 }
 
 impl InitializeArgs {
-    fn options(&self) -> initialize::Options {
+    fn options(&self, auth: Auth) -> initialize::Options {
         initialize::Options {
             source: self.source.clone(),
             point: self.point,
+            auth,
             insecure: self.insecure,
             scratch_dir: self.scratch_dir.clone(),
             skip_space_check: self.skip_space_check,
@@ -76,6 +123,16 @@ struct BackfillArgs {
     /// OCI repository to extend.
     #[arg(long, value_name = "OCI_URL")]
     repo: Repository,
+    #[command(flatten)]
+    state_epochs: StateEpochsArgs,
+    /// The Mithril aggregator to replay from; defaults to the configured
+    /// network's, and is required for a custom network.
+    #[arg(long, env = "DOLOS_MITHRIL_AGGREGATOR", value_name = "URL")]
+    mithril_aggregator: Option<String>,
+    /// The aggregator's genesis verification key, JSON-hex encoded; defaults
+    /// to the configured network's, and is required for a custom network.
+    #[arg(long, env = "DOLOS_MITHRIL_GENESIS_VKEY", value_name = "KEY")]
+    mithril_genesis_vkey: Option<String>,
     #[arg(long, action)]
     insecure: bool,
     #[arg(long)]
@@ -95,9 +152,20 @@ struct BackfillArgs {
 }
 
 impl BackfillArgs {
-    fn options(&self) -> backfill::Options {
-        backfill::Options {
+    /// Every backfill input, resolved and validated before a store opens.
+    fn options(&self, config: &RootConfig, auth: Auth) -> miette::Result<backfill::Options> {
+        if self.window == 0 {
+            return Err(miette::miette!("--window must be at least 1"));
+        }
+        let mithril = config::mithril_source(
+            config,
+            self.mithril_aggregator.clone(),
+            self.mithril_genesis_vkey.clone(),
+        )
+        .into_diagnostic()?;
+        Ok(backfill::Options {
             repository: self.repo.clone(),
+            auth,
             insecure: self.insecure,
             scratch_dir: self.scratch_dir.clone(),
             concurrency: self.concurrency,
@@ -106,7 +174,9 @@ impl BackfillArgs {
             window: self.window,
             until_epoch: self.until_epoch,
             skip_validation: self.skip_validation,
-        }
+            mithril,
+            retained: self.state_epochs.read()?,
+        })
     }
 }
 
@@ -134,6 +204,8 @@ struct PublishArgs {
     output_dir: Option<PathBuf>,
     #[arg(long, value_name = "OCI_URL")]
     repo: Option<Repository>,
+    #[command(flatten)]
+    state_epochs: StateEpochsArgs,
     #[arg(long)]
     epochs: Option<EpochRange>,
     #[arg(long)]
@@ -179,35 +251,10 @@ impl Progress for ConsoleProgress {
     }
 }
 
-fn load_config(explicit: Option<&Path>) -> Result<RootConfig, config::ConfigError> {
-    let mut builder = config::Config::builder()
-        .add_source(config::File::with_name("/etc/dolos/daemon.toml").required(false))
-        .add_source(config::File::with_name("dolos.toml").required(false));
-    if let Some(path) = explicit {
-        let path = path.to_str().ok_or_else(|| {
-            config::ConfigError::Message(format!(
-                "configuration path is not valid UTF-8: {}",
-                path.display()
-            ))
-        })?;
-        builder = builder.add_source(config::File::with_name(path).required(true));
-    }
-    builder
-        .add_source(config::Environment::with_prefix("DOLOS").separator("_"))
-        .build()?
-        .try_deserialize()
-}
-
 fn load_genesis(config: &RootConfig) -> miette::Result<Genesis> {
-    Genesis::from_file_paths(
-        &config.genesis.byron_path,
-        &config.genesis.shelley_path,
-        &config.genesis.alonzo_path,
-        &config.genesis.conway_path,
-        config.genesis.force_protocol,
-    )
-    .into_diagnostic()
-    .context("loading genesis files")
+    config::genesis(config)
+        .into_diagnostic()
+        .context("loading genesis")
 }
 
 fn spawn_exit_watcher() -> miette::Result<CancellationToken> {
@@ -245,9 +292,10 @@ fn run_initialize(
     config: &RootConfig,
     genesis: &Genesis,
     args: &InitializeArgs,
+    auth: Auth,
     observer: &Observer,
 ) -> miette::Result<()> {
-    match initialize::run(config, genesis, &args.options(), observer)
+    match initialize::run(config, genesis, &args.options(auth), observer)
         .map_err(|error| miette::miette!("{error}"))?
     {
         initialize::Outcome::Existing => println!("publisher storage already initialized"),
@@ -262,20 +310,11 @@ fn run_initialize(
 fn run_backfill(
     config: &RootConfig,
     genesis: &Genesis,
-    args: &BackfillArgs,
+    options: &backfill::Options,
     observer: &Observer,
 ) -> miette::Result<()> {
-    if args.window == 0 {
-        return Err(miette::miette!("--window must be at least 1"));
-    }
-    match backfill::run(
-        config,
-        genesis,
-        &args.options(),
-        spawn_exit_watcher()?,
-        observer,
-    )
-    .into_diagnostic()?
+    match backfill::run(config, genesis, options, spawn_exit_watcher()?, observer)
+        .into_diagnostic()?
     {
         backfill::Outcome::UntilEpoch { sequence } => println!("sequence {sequence} published"),
         backfill::Outcome::UpToDate => println!("repository is up to date with Mithril"),
@@ -287,8 +326,10 @@ fn run_publish(
     config: &RootConfig,
     genesis: &Genesis,
     args: &PublishArgs,
+    auth: Auth,
     observer: &Observer,
 ) -> miette::Result<()> {
+    let retained = args.state_epochs.read()?;
     let selection = Selection {
         epochs: args.epochs,
         index_band: args.index_band,
@@ -298,6 +339,7 @@ fn run_publish(
         (Some(path), None) => Destination::Directory(path.clone()),
         (None, Some(repository)) => Destination::Repository {
             repository: repository.clone(),
+            auth,
             insecure: args.insecure,
             scratch_dir: args.scratch_dir.clone(),
             rebuild: args.rebuild,
@@ -310,6 +352,7 @@ fn run_publish(
     let (report, outcome) = publisher::publish_once(
         config,
         genesis,
+        &retained,
         selection,
         destination,
         args.dry_run,
@@ -350,17 +393,22 @@ fn main() -> miette::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt().with_target(false).init();
     let cli = Cli::parse();
-    let config = load_config(cli.config.as_deref())
+    let config = config::load(cli.config.as_deref())
         .into_diagnostic()
         .context("parsing configuration")?;
     let genesis = load_genesis(&config)?;
+    let auth = cli.credentials.auth()?;
     let observer = Observer::new(Arc::new(ConsoleProgress));
 
     match cli.command {
-        Command::Initialize(args) => run_initialize(&config, &genesis, &args, &observer),
-        Command::Publish(args) => run_publish(&config, &genesis, &args, &observer),
-        Command::Backfill(args) => run_backfill(&config, &genesis, &args, &observer),
+        Command::Initialize(args) => run_initialize(&config, &genesis, &args, auth, &observer),
+        Command::Publish(args) => run_publish(&config, &genesis, &args, auth, &observer),
+        Command::Backfill(args) => {
+            let options = args.options(&config, auth)?;
+            run_backfill(&config, &genesis, &options, &observer)
+        }
         Command::Run(args) => {
+            let options = args.backfill.options(&config, auth.clone())?;
             let initialize = InitializeArgs {
                 source: args
                     .restore_source
@@ -372,8 +420,8 @@ fn main() -> miette::Result<()> {
                 resume: args.resume,
                 allow_genesis: args.allow_genesis,
             };
-            run_initialize(&config, &genesis, &initialize, &observer)?;
-            run_backfill(&config, &genesis, &args.backfill, &observer)
+            run_initialize(&config, &genesis, &initialize, auth, &observer)?;
+            run_backfill(&config, &genesis, &options, &observer)
         }
     }
 }
@@ -382,16 +430,52 @@ fn main() -> miette::Result<()> {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    #[test]
-    fn an_explicit_non_utf8_config_path_is_rejected() {
-        use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("stelae-publisher").chain(args.iter().copied()))
+    }
 
-        let path = PathBuf::from(OsString::from_vec(vec![0xff]));
-        let error = match load_config(Some(&path)) {
-            Ok(_) => panic!("non-UTF-8 path was accepted"),
-            Err(error) => error,
+    #[test]
+    fn every_publishing_command_requires_the_state_epochs_file() {
+        let repo = ["--repo", "oci://registry.invalid/cardano/preview"];
+        for command in ["publish", "backfill", "run"] {
+            let args: Vec<&str> = std::iter::once(command).chain(repo).collect();
+            let error = parse(&args).unwrap_err().to_string();
+            assert!(error.contains("--state-epochs-file"), "{command}: {error}");
+
+            let args: Vec<&str> = args
+                .into_iter()
+                .chain(["--state-epochs-file", "/etc/publisher/state-epochs"])
+                .collect();
+            parse(&args).unwrap();
+        }
+        parse(&["initialize", "--source", "file:///stele"]).unwrap();
+    }
+
+    #[test]
+    fn registry_credentials_come_from_the_invocation() {
+        let anonymous = CredentialArgs {
+            registry_user: None,
         };
-        assert!(error.to_string().contains("not valid UTF-8"));
+        assert_eq!(anonymous.auth_from(|_| None).unwrap(), Auth::Anonymous);
+
+        let publisher = CredentialArgs {
+            registry_user: Some("publisher".to_owned()),
+        };
+        let password = |name: &str| (name == PASSWORD_ENV).then(|| "secret".to_owned());
+        assert_eq!(
+            publisher.auth_from(password).unwrap(),
+            Auth::Basic {
+                user: "publisher".to_owned(),
+                password: "secret".to_owned(),
+            }
+        );
+
+        let token = |name: &str| (name == TOKEN_ENV).then(|| "ghp_x".to_owned());
+        assert_eq!(
+            anonymous.auth_from(token).unwrap(),
+            Auth::Bearer("ghp_x".to_owned())
+        );
+        assert!(publisher.auth_from(token).is_err());
+        assert!(anonymous.auth_from(password).is_err());
     }
 }

@@ -14,12 +14,16 @@ trap 'exit 1' INT TERM
 docker run --rm --network none "$IMAGE" --version | grep -F 'stelae-publisher'
 test "$(docker image inspect --format '{{.Config.User}}' "$IMAGE")" = 65532:65532
 
-# Exercise the chart's run command with packaged genesis and a data volume.
-# With no network or blocks, it initializes and waits for Mithril until stopped.
+# Exercise the chart's run command with a v2 configuration, its state epochs
+# file and a data volume. With no network or blocks, it initializes and waits
+# for Mithril until stopped.
 docker create --name "$CONTAINER" --network none \
     --volume /data \
     --volume "$SCRIPT_DIR/preview-smoke.toml:/etc/publisher/dolos.toml:ro" \
+    --volume "$SCRIPT_DIR/preview-smoke.state-epochs:/etc/publisher/state-epochs:ro" \
     "$IMAGE" --config /etc/publisher/dolos.toml run \
+    --state-epochs-file /etc/publisher/state-epochs \
+    --mithril-aggregator http://127.0.0.1:1 \
     --restore-source file:///missing --allow-genesis \
     --repo oci://127.0.0.1:1/cardano/smoke --insecure --concurrency 1 >/dev/null
 docker start "$CONTAINER" >/dev/null
