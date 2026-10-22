@@ -206,7 +206,8 @@ mod tests {
         let error = loaded.unwrap_err().to_string();
         assert!(error.contains("--state-epochs-file"), "{error}");
         assert!(error.contains("--mithril-aggregator"), "{error}");
-        assert!(error.contains("DOLOS_STELAE_USER"), "{error}");
+        assert!(error.contains("--registry-user"), "{error}");
+        assert!(error.contains("DOLOS_STELAE_TOKEN"), "{error}");
         assert!(!error.contains("dolos "), "{error}");
     }
 

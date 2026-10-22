@@ -226,6 +226,32 @@ struct RunArgs {
     allow_genesis: bool,
 }
 
+impl RunArgs {
+    /// The restore and backfill inputs, the backfill's resolved first so a bad
+    /// one fails before the restore clears a store.
+    fn options(
+        &self,
+        config: &RootConfig,
+        auth: ResolveAuth,
+    ) -> miette::Result<(initialize::Options, backfill::Options)> {
+        let backfill = self.backfill.options(config, auth)?;
+        let initialize = InitializeArgs {
+            source: self
+                .restore_source
+                .clone()
+                .unwrap_or_else(|| RestoreSource::Repo(self.backfill.repo.clone())),
+            point: self.point,
+            insecure: self.backfill.insecure,
+            scratch_dir: self.backfill.scratch_dir.clone(),
+            skip_space_check: self.skip_space_check,
+            resume: self.resume,
+            allow_genesis: self.allow_genesis,
+        }
+        .options(auth)?;
+        Ok((initialize, backfill))
+    }
+}
+
 #[derive(Debug, Args)]
 #[command(group(clap::ArgGroup::new("destination").required(true).args(["output_dir", "repo"])))]
 struct PublishArgs {
@@ -320,11 +346,10 @@ fn spawn_exit_watcher() -> miette::Result<CancellationToken> {
 fn run_initialize(
     config: &RootConfig,
     genesis: &Genesis,
-    args: &InitializeArgs,
-    auth: ResolveAuth,
+    options: &initialize::Options,
     observer: &Observer,
 ) -> miette::Result<()> {
-    match initialize::run(config, genesis, &args.options(auth)?, observer)
+    match initialize::run(config, genesis, options, observer)
         .map_err(|error| miette::miette!("{error}"))?
     {
         initialize::Outcome::Existing => println!("publisher storage already initialized"),
@@ -433,27 +458,18 @@ fn execute(cli: Cli, env: Env) -> miette::Result<()> {
     let observer = Observer::new(Arc::new(ConsoleProgress));
 
     match cli.command {
-        Command::Initialize(args) => run_initialize(&config, &genesis, &args, &auth, &observer),
+        Command::Initialize(args) => {
+            run_initialize(&config, &genesis, &args.options(&auth)?, &observer)
+        }
         Command::Publish(args) => run_publish(&config, &genesis, &args, &auth, &observer),
         Command::Backfill(args) => {
             let options = args.options(&config, &auth)?;
             run_backfill(&config, &genesis, &options, &observer)
         }
         Command::Run(args) => {
-            let options = args.backfill.options(&config, &auth)?;
-            let initialize = InitializeArgs {
-                source: args
-                    .restore_source
-                    .unwrap_or_else(|| RestoreSource::Repo(args.backfill.repo.clone())),
-                point: args.point,
-                insecure: args.backfill.insecure,
-                scratch_dir: args.backfill.scratch_dir.clone(),
-                skip_space_check: args.skip_space_check,
-                resume: args.resume,
-                allow_genesis: args.allow_genesis,
-            };
-            run_initialize(&config, &genesis, &initialize, &auth, &observer)?;
-            run_backfill(&config, &genesis, &options, &observer)
+            let (initialize, backfill) = args.options(&config, &auth)?;
+            run_initialize(&config, &genesis, &initialize, &observer)?;
+            run_backfill(&config, &genesis, &backfill, &observer)
         }
     }
 }
@@ -506,6 +522,37 @@ mod tests {
         };
         let options = args.options(&config, &|| Ok(Auth::Anonymous)).unwrap();
         assert_eq!(options.retained.as_slice(), &[1, 200]);
+    }
+
+    #[test]
+    fn run_restores_with_the_registry_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config::load(Some(Path::new(&node(dir.path())))).unwrap();
+        let epochs = dir.path().join("state-epochs");
+        std::fs::write(&epochs, "1\n").unwrap();
+        let basic = Auth::Basic {
+            user: "publisher".to_owned(),
+            password: "secret".to_owned(),
+        };
+        let auth = || Ok(basic.clone());
+
+        let repo = ["--repo", "oci://registry.invalid/cardano/preview"];
+        let epochs = ["--state-epochs-file", epochs.to_str().unwrap()];
+        let elsewhere = ["--restore-source", "oci://registry.invalid/cardano/other"];
+        for restore in [&[][..], &elsewhere[..]] {
+            let args: Vec<&str> = std::iter::once("run")
+                .chain(repo)
+                .chain(epochs)
+                .chain(restore.iter().copied())
+                .collect();
+            let Command::Run(args) = parse(&args).unwrap().command else {
+                panic!("parsed another command");
+            };
+            let (initialize, backfill) = args.options(&config, &auth).unwrap();
+            assert!(matches!(initialize.source, RestoreSource::Repo(_)));
+            assert_eq!(initialize.auth, basic, "{restore:?}");
+            assert_eq!(backfill.auth, basic, "{restore:?}");
+        }
     }
 
     #[test]
@@ -591,7 +638,9 @@ mod tests {
             ],
         ];
         for command in commands {
-            let args: Vec<&str> = ["--config", config.as_str()]
+            // The user is pinned empty so one in the caller's environment
+            // cannot pair with the password.
+            let args: Vec<&str> = ["--config", config.as_str(), "--registry-user", ""]
                 .into_iter()
                 .chain(command.iter().copied())
                 .collect();
