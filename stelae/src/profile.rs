@@ -19,9 +19,10 @@
 //! types"):
 //!
 //! 1. Payload media types are
-//!    `application/vnd.{vendor}.stele.{kind}.v{n}+{codec}` and carry a vendor
+//!    `application/vnd.{vendor}.stelae.{kind}.v{n}+{codec}` and carry a vendor
 //!    slot the publisher controls. `vnd.stelae.*` is reserved for the
-//!    protocol's envelope types and is never a payload type.
+//!    protocol's envelope types and is never a payload type. The `.stele.`
+//!    spelling still parses for one release and is then removed.
 //! 2. Profile names are reverse-DNS and vendor-owned.
 //! 3. The protocol never parses layer bodies or a profile's opaque objects. An
 //!    unknown profile is a clean refusal, never a partial restore.
@@ -190,10 +191,11 @@ pub fn validate_tag(tag: &str) -> Result<(), Error> {
 }
 
 /// A parsed payload media type:
-/// `application/vnd.{vendor}.stele.{kind}.v{n}+{codec}`.
+/// `application/vnd.{vendor}.stelae.{kind}.v{n}+{codec}`.
 ///
 /// The protocol parses these to enforce the coexistence rules. It does not
-/// build them and does not attach meaning to `kind` or `codec`.
+/// build them and does not attach meaning to `kind` or `codec`. Parsing also
+/// accepts the deprecated `.stele.` infix; `Display` always writes `.stelae.`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaType {
     pub vendor: String,
@@ -203,7 +205,10 @@ pub struct MediaType {
 }
 
 const MEDIA_TYPE_PREFIX: &str = "application/vnd.";
-const STELE_INFIX: &str = ".stele.";
+const STELAE_INFIX: &str = ".stelae.";
+
+/// Deprecated spelling of [`STELAE_INFIX`], accepted for one release.
+const DEPRECATED_STELE_INFIX: &str = ".stele.";
 
 impl MediaType {
     pub fn parse(value: &str) -> Result<Self, Error> {
@@ -224,9 +229,27 @@ impl MediaType {
             return Err(invalid("empty codec"));
         }
 
-        let (vendor, tail) = body
-            .split_once(STELE_INFIX)
-            .ok_or_else(|| invalid("expected `.stele.` between the vendor and the kind"))?;
+        // Kinds are dot-free, so of several infixes the rightmost one still
+        // followed by a `.v` segment splits vendor from kind: a vendor label or
+        // a kind named after either spelling stays where it is. Without such a
+        // split, the leftmost one reports what the rest is missing. Comparing
+        // against the last `.v` once keeps this linear in untrusted input.
+        let last_version = body.rfind(".v");
+
+        let splits = body.match_indices('.').filter_map(|(at, _)| {
+            [STELAE_INFIX, DEPRECATED_STELE_INFIX]
+                .into_iter()
+                .find(|infix| body[at..].starts_with(infix))
+                .map(|infix| (at, at + infix.len()))
+        });
+
+        let (at, tail_at) = splits
+            .clone()
+            .rfind(|&(_, tail_at)| last_version.is_some_and(|v| v >= tail_at))
+            .or_else(|| splits.clone().next())
+            .ok_or_else(|| invalid("expected `.stelae.` between the vendor and the kind"))?;
+
+        let (vendor, tail) = (&body[..at], &body[tail_at..]);
 
         if vendor.is_empty() {
             return Err(invalid("empty vendor"));
@@ -288,7 +311,7 @@ impl std::fmt::Display for MediaType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{MEDIA_TYPE_PREFIX}{}{STELE_INFIX}{}.v{}+{}",
+            "{MEDIA_TYPE_PREFIX}{}{STELAE_INFIX}{}.v{}+{}",
             self.vendor, self.kind, self.version, self.codec
         )
     }
@@ -302,22 +325,22 @@ mod tests {
     fn parses_the_reference_profile_media_types() {
         for (raw, vendor, kind) in [
             (
-                "application/vnd.dolos.stele.blocks.v1+zstd",
+                "application/vnd.dolos.stelae.blocks.v1+zstd",
                 "dolos",
                 "blocks",
             ),
             (
-                "application/vnd.dolos.stele.state.v1+zstd",
+                "application/vnd.dolos.stelae.state.v1+zstd",
                 "dolos",
                 "state",
             ),
             (
-                "application/vnd.acme.stele.receipts.v1+zstd",
+                "application/vnd.acme.stelae.receipts.v1+zstd",
                 "acme",
                 "receipts",
             ),
             (
-                "application/vnd.example.stele.notes.v1+zstd",
+                "application/vnd.example.stelae.notes.v1+zstd",
                 "example",
                 "notes",
             ),
@@ -331,13 +354,73 @@ mod tests {
         }
     }
 
+    /// The deprecated `.stele.` spelling parses to the same value and is
+    /// written back in the current one.
+    #[test]
+    fn deprecated_infix_parses_and_displays_as_stelae() {
+        for (old, new) in [
+            (
+                "application/vnd.dolos.stele.blocks.v1+zstd",
+                "application/vnd.dolos.stelae.blocks.v1+zstd",
+            ),
+            (
+                "application/vnd.io.txpipe.stele.state.v2+cbor",
+                "application/vnd.io.txpipe.stelae.state.v2+cbor",
+            ),
+        ] {
+            let parsed = MediaType::parse(old).unwrap();
+            assert_eq!(parsed, MediaType::parse(new).unwrap());
+            assert_eq!(parsed.to_string(), new);
+        }
+    }
+
+    /// The infix is the one right before the kind, so a kind or a vendor label
+    /// named after either spelling keeps its place.
+    #[test]
+    fn a_kind_or_vendor_label_may_be_named_after_either_infix() {
+        for (raw, vendor, kind) in [
+            (
+                "application/vnd.acme.stele.stelae.v1+zstd",
+                "acme",
+                "stelae",
+            ),
+            ("application/vnd.acme.stelae.stele.v1+zstd", "acme", "stele"),
+            (
+                "application/vnd.org.stelae.stele.blocks.v1+zstd",
+                "org.stelae",
+                "blocks",
+            ),
+            (
+                "application/vnd.org.stelae.stelae.blocks.v1+zstd",
+                "org.stelae",
+                "blocks",
+            ),
+            (
+                "application/vnd.org.stele.stelae.blocks.v1+zstd",
+                "org.stele",
+                "blocks",
+            ),
+            // A `.v` inside the kind comes before the version's.
+            (
+                "application/vnd.org.stelae.stele.votes.v1+zstd",
+                "org.stelae",
+                "votes",
+            ),
+        ] {
+            let parsed = MediaType::parse(raw).unwrap();
+            assert_eq!(parsed.vendor, vendor, "{raw}");
+            assert_eq!(parsed.kind, kind, "{raw}");
+        }
+    }
+
     /// The reserved-vendor rule is the one that makes third-party coexistence
     /// safe, so it is checked in both spellings.
     #[test]
     fn rejects_the_reserved_vendor_slot() {
         for raw in [
+            "application/vnd.stelae.stelae.blocks.v1+zstd",
+            "application/vnd.stelae.inscription.stelae.x.v1+zstd",
             "application/vnd.stelae.stele.blocks.v1+zstd",
-            "application/vnd.stelae.inscription.stele.x.v1+zstd",
         ] {
             let err = MediaType::parse(raw).unwrap_err();
             assert!(
@@ -364,18 +447,76 @@ mod tests {
     fn rejects_malformed_media_types() {
         for raw in [
             "application/json",
-            "application/vnd.dolos.stele.blocks.v1",
+            "application/vnd.dolos.stelae.blocks.v1",
             "application/vnd.dolos.blocks.v1+zstd",
-            "application/vnd..stele.blocks.v1+zstd",
-            "application/vnd.dolos.stele..v1+zstd",
-            "application/vnd.dolos.stele.blocks.v+zstd",
-            "application/vnd.dolos.stele.blocks.vx+zstd",
-            "application/vnd.dolos.stele.blocks.v1+",
-            "application/vnd.Dolos.stele.blocks.v1+zstd",
-            "application/vnd.dolos.stele.Blocks.v1+zstd",
+            "application/vnd.dolos.stela.blocks.v1+zstd",
+            "application/vnd.dolos.stelaeblocks.v1+zstd",
+            "application/vnd..stelae.blocks.v1+zstd",
+            "application/vnd.dolos.stelae..v1+zstd",
+            "application/vnd.dolos.stelae.blocks.v+zstd",
+            "application/vnd.dolos.stelae.blocks.vx+zstd",
+            "application/vnd.dolos.stelae.blocks.v1+",
+            "application/vnd.Dolos.stelae.blocks.v1+zstd",
+            "application/vnd.dolos.stelae.Blocks.v1+zstd",
         ] {
             assert!(MediaType::parse(raw).is_err(), "{raw} must not parse");
         }
+
+        for (raw, expected) in [
+            ("application/vnd.dolos.blocks.v1+zstd", "`.stelae.`"),
+            ("application/vnd.acme.stelae.votes+zstd", "`.v{n}`"),
+            ("application/vnd.io.vendor.stele.blocks+zstd", "`.v{n}`"),
+            ("application/vnd.acme.stelae.v1+zstd", "`.v{n}`"),
+            (
+                "application/vnd.acme.stelae.foo.bar.v1+zstd",
+                "kind may contain",
+            ),
+            (
+                "application/vnd.dolos.stelae.blocks.vx+zstd",
+                "decimal integer",
+            ),
+            // No tail has a `.v`, so the leftmost infix splits.
+            (
+                "application/vnd.acme.stelae.Foo.stelae.blocks+zstd",
+                "`.v{n}`",
+            ),
+            (
+                "application/vnd.acme.stele.Foo.stele.blocks+zstd",
+                "`.v{n}`",
+            ),
+            (
+                "application/vnd..stelae.x.stelae.blocks+zstd",
+                "empty vendor",
+            ),
+            ("application/vnd..stele.x.stele.blocks+zstd", "empty vendor"),
+            // The last `.v` starts right where the rightmost tail does.
+            (
+                "application/vnd.acme.stelae.x.stelae..v1+zstd",
+                "empty kind",
+            ),
+            ("application/vnd.acme.stele.x.stele..v1+zstd", "empty kind"),
+        ] {
+            let err = MediaType::parse(raw).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidMediaType { reason, .. } if reason.contains(expected)),
+                "{raw}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_an_infix_dense_media_type_in_linear_time() {
+        // A registry controls layer media types on restore. Rescanning the
+        // tail per infix took about 15 s on this input unoptimized; a linear
+        // parse takes milliseconds. The leading `.v` makes every candidate
+        // reach the comparison against the last `.v`.
+        let raw = format!("application/vnd.a.v{}.x+zstd", ".stele".repeat(1 << 16));
+
+        let started = std::time::Instant::now();
+        assert!(MediaType::parse(&raw).is_err());
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
     }
 
     #[test]
@@ -450,23 +591,23 @@ mod tests {
     #[test]
     fn checked_accessors_refuse_bad_profile_answers() {
         let good = Fake {
-            media_type: "application/vnd.example.stele.notes.v1+zstd",
+            media_type: "application/vnd.example.stelae.notes.v1+zstd",
             tag: "note-1",
         };
         assert_eq!(
             checked_layer_media_type(&good, "notes").unwrap(),
-            "application/vnd.example.stele.notes.v1+zstd"
+            "application/vnd.example.stelae.notes.v1+zstd"
         );
         assert_eq!(checked_tag_for_sequence(&good, 1).unwrap(), "note-1");
 
         let colliding = Fake {
-            media_type: "application/vnd.stelae.stele.notes.v1+zstd",
+            media_type: "application/vnd.stelae.stelae.notes.v1+zstd",
             tag: "note-1",
         };
         assert!(checked_layer_media_type(&colliding, "notes").is_err());
 
         let bad_tag = Fake {
-            media_type: "application/vnd.example.stele.notes.v1+zstd",
+            media_type: "application/vnd.example.stelae.notes.v1+zstd",
             tag: "note 1",
         };
         assert!(checked_tag_for_sequence(&bad_tag, 1).is_err());
@@ -482,7 +623,7 @@ mod tests {
     #[test]
     fn checked_media_type_refuses_a_name_for_another_kind() {
         let mislabelled = Fake {
-            media_type: "application/vnd.example.stele.blocks.v1+zstd",
+            media_type: "application/vnd.example.stelae.blocks.v1+zstd",
             tag: "note-1",
         };
 
@@ -493,7 +634,7 @@ mod tests {
     #[test]
     fn moving_tag_defaults_to_latest() {
         let profile = Fake {
-            media_type: "application/vnd.example.stele.notes.v1+zstd",
+            media_type: "application/vnd.example.stelae.notes.v1+zstd",
             tag: "note-1",
         };
         assert_eq!(profile.moving_tag(), MOVING_TAG);

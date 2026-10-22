@@ -543,7 +543,7 @@ mod tests {
         }
 
         fn layer_media_type(&self, kind: &str) -> Result<String, Error> {
-            Ok(format!("application/vnd.example.stele.{kind}.v1+zstd"))
+            Ok(format!("application/vnd.example.stelae.{kind}.v1+zstd"))
         }
 
         fn tag_for_sequence(&self, sequence: u64) -> Result<String, Error> {
@@ -580,7 +580,7 @@ mod tests {
 
         inscription.layers = vec![LayerDescriptor {
             kind: "notes".to_owned(),
-            media_type: "application/vnd.example.stele.notes.v1+zstd".to_owned(),
+            media_type: "application/vnd.example.stelae.notes.v1+zstd".to_owned(),
             diff_id: digest_of(3),
             records: 5,
             uncompressed_size: 128,
@@ -872,7 +872,7 @@ mod tests {
     #[test]
     fn rejects_a_payload_media_type_in_the_reserved_namespace() {
         let mut inscription = sample();
-        inscription.layers[0].media_type = "application/vnd.stelae.stele.notes.v1+zstd".to_owned();
+        inscription.layers[0].media_type = "application/vnd.stelae.stelae.notes.v1+zstd".to_owned();
 
         let err = inscription.validate().unwrap_err();
         assert!(matches!(err, Error::InvalidMediaType { .. }), "{err:?}");
@@ -1045,7 +1045,7 @@ mod tests {
         let mut inscription = sample();
         inscription.layers.push(LayerDescriptor {
             kind: "notes".to_owned(),
-            media_type: "application/vnd.example.stele.notes.v1+zstd".to_owned(),
+            media_type: "application/vnd.example.stelae.notes.v1+zstd".to_owned(),
             diff_id: digest_of(4),
             records: 2,
             uncompressed_size: 72,
