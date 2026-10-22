@@ -98,8 +98,9 @@ to restore it. With genesis fallback off, it refuses again on every restart
 until `backoffLimit`. With it on, it falls back to genesis and replays silently
 to that `latest` (days on mainnet); then it refuses the v1 predecessor and
 restarts until `backoffLimit`, or completes as up to date when Mithril has not
-certified the next boundary. It uploads nothing either way. It rolls back to 0.2 with its previous image and v1 configuration only
-while the repository still holds its v1 lineage. The
+certified the next boundary. It uploads nothing either way. It rolls back to
+0.2 with its previous image and v1 configuration only while the repository
+still holds its v1 lineage. The
 [chart README](../k8s/dolos-publisher/README.md#upgrade-and-rollback) has the
 order.
 The chart directory/name remains `dolos-publisher` to preserve release and

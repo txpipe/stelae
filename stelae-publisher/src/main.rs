@@ -525,11 +525,12 @@ mod tests {
     }
 
     #[test]
-    fn run_restores_with_the_registry_credentials() {
+    fn run_restores_with_its_inputs_and_the_registry_credentials() {
         let dir = tempfile::tempdir().unwrap();
         let config = config::load(Some(Path::new(&node(dir.path())))).unwrap();
         let epochs = dir.path().join("state-epochs");
         std::fs::write(&epochs, "1\n").unwrap();
+        let scratch = dir.path().join("scratch");
         let basic = Auth::Basic {
             user: "publisher".to_owned(),
             password: "secret".to_owned(),
@@ -538,8 +539,21 @@ mod tests {
 
         let repo = ["--repo", "oci://registry.invalid/cardano/preview"];
         let epochs = ["--state-epochs-file", epochs.to_str().unwrap()];
-        let elsewhere = ["--restore-source", "oci://registry.invalid/cardano/other"];
-        for restore in [&[][..], &elsewhere[..]] {
+        let elsewhere = [
+            "--restore-source",
+            "oci://registry.invalid/cardano/other",
+            "--resume",
+        ];
+        let flags = [
+            "--point",
+            "epoch-7",
+            "--insecure",
+            "--scratch-dir",
+            scratch.to_str().unwrap(),
+            "--skip-space-check",
+            "--allow-genesis",
+        ];
+        for restore in [&[][..], &elsewhere[..], &flags[..]] {
             let args: Vec<&str> = std::iter::once("run")
                 .chain(repo)
                 .chain(epochs)
@@ -549,7 +563,31 @@ mod tests {
                 panic!("parsed another command");
             };
             let (initialize, backfill) = args.options(&config, &auth).unwrap();
-            assert!(matches!(initialize.source, RestoreSource::Repo(_)));
+            let RestoreSource::Repo(source) = &initialize.source else {
+                panic!("{restore:?} restores from a directory");
+            };
+            let expected = if restore == elsewhere {
+                "cardano/other"
+            } else {
+                "cardano/preview"
+            };
+            assert_eq!(source.repository(), expected, "{restore:?}");
+            let flagged = restore == flags;
+            let point = if flagged {
+                Point::Epoch(7)
+            } else {
+                Point::Latest
+            };
+            assert_eq!(initialize.point, point, "{restore:?}");
+            assert_eq!(initialize.insecure, flagged, "{restore:?}");
+            assert_eq!(
+                initialize.scratch_dir,
+                flagged.then(|| scratch.clone()),
+                "{restore:?}"
+            );
+            assert_eq!(initialize.skip_space_check, flagged, "{restore:?}");
+            assert_eq!(initialize.allow_genesis, flagged, "{restore:?}");
+            assert_eq!(initialize.resume, restore == elsewhere, "{restore:?}");
             assert_eq!(initialize.auth, basic, "{restore:?}");
             assert_eq!(backfill.auth, basic, "{restore:?}");
         }
