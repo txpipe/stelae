@@ -93,14 +93,17 @@ Pending. Start over whenever the kept stores no longer fit the release:
   from the state the suspect image left, and every boundary it publishes
   afterwards is built on that state.
 
-Once the claim exists its class is fixed. Any change to the rendered
-`storageClassName` fails, clearing a named class back to empty included,
+Once the claim exists its class is fixed. Naming a class other than the
+one the claim has fails, and so does clearing a named class back to empty,
 even when that class is the cluster default: once a class is named, keep
 naming it. Left empty at the first install, the claim got the cluster
 default, and naming that same class later is no change. The size can only
 grow, and only on a Bound claim of a class that sets `allowVolumeExpansion`.
-Changing the class, lowering `size`, or raising it on a Pending claim or a
-class without expansion makes `helm upgrade` report failure. That failure
+The one exception, on Kubernetes 1.32 and later: while an expansion has not
+finished, `size` can be lowered again to a value above the claim's current
+capacity, which is how a failed expansion is recovered. Changing the class,
+lowering `size` otherwise, or raising it on a Pending claim or a class
+without expansion makes `helm upgrade` report failure. That failure
 is not atomic: with a bumped `run` the new Job
 is still created and runs on the claim, and the old Job is not removed and
 keeps running, so two writers share the claim. Each further failed upgrade

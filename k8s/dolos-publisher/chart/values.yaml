@@ -79,11 +79,13 @@ persistence:
   # Required when the chart creates the claim. A network fact, like resources.
   # Once the claim exists it can only grow, and only while it is Bound on a
   # class with allowVolumeExpansion; anything else fails the upgrade, which
-  # still creates the new Job (see README.md).
+  # still creates the new Job. README.md has the one exception, lowering an
+  # unfinished expansion.
   size: ""
-  # Empty uses the cluster's default class. Fixed once the claim exists: any
-  # change to the rendered class fails the upgrade, as above, clearing a
-  # named class back to empty included. Once named, keep naming it.
+  # Empty uses the cluster's default class. Fixed once the claim exists:
+  # naming a different class fails the upgrade, as above, and so does
+  # clearing a named class back to empty. Naming the default the claim got
+  # while empty is no change. Once named, keep naming it.
   storageClassName: ""
   # Mount this claim instead of creating one. The chart never creates or
   # deletes it.

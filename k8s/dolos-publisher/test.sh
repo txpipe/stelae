@@ -129,6 +129,36 @@ if grep -Eq 'PersistentVolumeClaim|persistentVolumeClaim|mainnet-history' "$OUT/
     exit 1
 fi
 
+# The install notes say whether the run resumes a kept claim, and which.
+# helm template skips NOTES.txt and Helm 3 install --dry-run needs a
+# cluster, so a copy of the chart renders it through tpl.
+cp -R "$CHART" "$OUT/notes-chart"
+cp "$CHART/templates/NOTES.txt" "$OUT/notes-chart/notes.txt"
+printf '%s\n' 'kind: Notes' 'text: {{ tpl (.Files.Get "notes.txt") . | toJson }}' \
+    >"$OUT/notes-chart/templates/notes.yaml"
+notes() {
+    helm template publisher "$OUT/notes-chart" --values "$VALUES" "$@" \
+        --show-only templates/notes.yaml | sed -n 's/^text: //p'
+}
+notes >"$OUT/notes-default.txt"
+grep -F 'Initialization restores latest and fails closed.' "$OUT/notes-default.txt"
+if grep -Fq 'resumes the stores' "$OUT/notes-default.txt"; then
+    echo "default notes promised a kept claim" >&2
+    exit 1
+fi
+notes --set persistence.enabled=true >"$OUT/notes-claim.txt"
+grep -F '\nThe run resumes the stores kept on claim publisher-data.\n' "$OUT/notes-claim.txt"
+notes --set persistence.enabled=true \
+    --set persistence.existingClaim=mainnet-history \
+    --set persistence.size= >"$OUT/notes-existing.txt"
+grep -F '\nThe run resumes the stores kept on claim mainnet-history.\n' "$OUT/notes-existing.txt"
+for mode in claim existing; do
+    if grep -Fq 'Initialization restores latest' "$OUT/notes-$mode.txt"; then
+        echo "$mode notes promised a fresh restore" >&2
+        exit 1
+    fi
+done
+
 if helm template publisher "$CHART" --values "$VALUES" \
     --set persistence.enabled=true \
     --set persistence.size= >"$OUT/invalid.yaml" 2>&1; then
