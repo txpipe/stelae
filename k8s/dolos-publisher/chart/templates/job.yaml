@@ -21,6 +21,9 @@ spec:
       securityContext:
         runAsNonRoot: true
         fsGroup: 65532
+        {{- if .Values.persistence.enabled }}
+        fsGroupChangePolicy: OnRootMismatch
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -70,7 +73,12 @@ spec:
               mountPath: /etc/publisher
       volumes:
         - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "dolos-publisher.claimName" . }}
+          {{- else }}
           emptyDir: {}
+          {{- end }}
         - name: {{ .Values.network }}-config
           configMap:
             name: {{ include "dolos-publisher.configMapName" . }}

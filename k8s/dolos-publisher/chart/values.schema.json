@@ -37,6 +37,16 @@
       "additionalProperties": true
     },
     "allowGenesisFallback": { "type": "boolean" },
+    "persistence": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "size": { "type": "string" },
+        "storageClassName": { "type": "string" },
+        "existingClaim": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
     "insecure": { "type": "boolean" },
     "publisherSecretName": { "type": "string", "minLength": 1 },
     "backoffLimit": { "type": "integer", "minimum": 0 },

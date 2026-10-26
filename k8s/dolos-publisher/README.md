@@ -17,10 +17,13 @@ host selector. The directory and chart name stay
   `dolos.toml` verbatim from `dolosToml` and `state-epochs`, one epoch per
   line, from `stateEpochs`. No shell entrypoint is generated. The retained
   epochs are signed input and must not change incidentally.
+- PersistentVolumeClaim `<release>-data`, only with `persistence.enabled`
+  and no `persistence.existingClaim`. It carries
+  `helm.sh/resource-policy: keep`, so `helm uninstall` leaves it.
 - Job `<network>-backfill-<run>` directly invokes
   `/usr/local/bin/stelae-publisher --config /etc/publisher/dolos.toml run
-  --state-epochs-file /etc/publisher/state-epochs`. It mounts an emptyDir at
-  `/data` and reads registry credentials from the existing Secret's
+  --state-epochs-file /etc/publisher/state-epochs`. It mounts `/data` (see
+  [Data volume](#data-volume)) and reads registry credentials from the existing Secret's
   `DOLOS_STELAE_REGISTRY_USER` and `DOLOS_STELAE_REGISTRY_PASSWORD` keys into
   the publisher's `DOLOS_STELAE_USER` and `DOLOS_STELAE_PASSWORD`.
 
@@ -30,7 +33,40 @@ Storage, markers, journals, scratch and Mithril downloads stay beneath the
 configured `storage.path`, `/data/db` in the deployed values. Direct PID-1 execution delivers SIGTERM to
 the publisher.
 The pod requires a non-root image user and sets `fsGroup: 65532`, giving the
-image's UID/GID `65532:65532` write access to the `/data` emptyDir.
+image's UID/GID `65532:65532` write access to `/data`.
+
+## Data volume
+
+`/data` holds the publisher's stores, so where it lives sets the restart
+cost.
+
+- **emptyDir** (the default). Every pod restart, eviction included, restores
+  the latest stele. With a three-epoch `max_history` that costs one epoch,
+  and `resources` bounds `/data` through its `ephemeral-storage` request and
+  limit. The preview and preprod values use this mode.
+- **Persistent claim** (`persistence.enabled: true`). `/data` is a
+  ReadWriteOnce claim that outlives the pod: a restarted pod finds its
+  initialization marker and resumes the stores it left, with no restore.
+  The chart creates `<release>-data` of `persistence.size` in
+  `persistence.storageClassName` (empty uses the cluster default), or mounts
+  `persistence.existingClaim` and creates nothing. The pod sets
+  `fsGroupChangePolicy: OnRootMismatch`, so a remount does not re-own the
+  whole store. `ephemeral-storage` no longer covers `/data`; size the claim
+  instead.
+
+A full-history publisher, with `max_history` unset in `dolosToml`, needs
+the persistent claim: from an emptyDir every eviction would restore all of
+history. Mainnet at full history needs about 250 GiB.
+
+On EKS an EBS volume lives in one availability zone, and every later pod is
+scheduled only in that zone. Use a `WaitForFirstConsumer` class, so the
+volume is created where the first pod lands, and make sure the
+`nodeSelector` pool has capacity in that zone; otherwise the pod stays
+Pending. An `existingClaim` must already be in a zone the pool reaches.
+
+The claim survives `helm uninstall`. Installing the same release again
+adopts it. To start the stores over, stop the writer, then delete the claim
+with `kubectl` before the next run.
 
 ## Values
 
@@ -45,6 +81,10 @@ image's UID/GID `65532:65532` write access to the `/data` emptyDir.
 | `image.repository` | Defaults to `ghcr.io/txpipe/stelae-publisher` |
 | `image.tag` | Tested version or `sha-<7>` tag, with no default |
 | `resources` | Network working set, with no default |
+| `persistence.enabled` | Mount `/data` from a claim instead of an emptyDir; default `false` |
+| `persistence.size` | Size of the claim the chart creates, with no default |
+| `persistence.storageClassName` | Class of the created claim; empty uses the cluster default |
+| `persistence.existingClaim` | Claim to mount instead of creating one |
 
 [values.yaml](chart/values.yaml) also exposes transport, secret name, retry
 budget, termination grace period and placement. Initialization fails closed
@@ -60,7 +100,7 @@ helm template stelae-publisher-preprod k8s/dolos-publisher/chart \
 ```
 
 The checks cover direct invocation, the state epochs file and argument,
-genesis opt-in, TLS selection, missing or invalid configuration and
+both `/data` modes, genesis opt-in, TLS selection, missing or invalid configuration and
 accidental use of the legacy Dolos image.
 
 ## Upgrade and rollback

@@ -26,6 +26,52 @@ if grep -Eq -- 'entrypoint.sh|--allow-genesis' "$OUT/default.yaml"; then
     exit 1
 fi
 
+# /data: an emptyDir by default, a kept claim when persistence is on.
+grep -Fx '          emptyDir: {}' "$OUT/default.yaml"
+if grep -Eq 'PersistentVolumeClaim|persistentVolumeClaim|fsGroupChangePolicy' "$OUT/default.yaml"; then
+    echo "default chart rendered a persistent /data" >&2
+    exit 1
+fi
+
+helm lint "$CHART" --values "$VALUES" --set persistence.enabled=true
+helm template publisher "$CHART" --values "$VALUES" \
+    --set persistence.enabled=true >"$OUT/claim.yaml"
+grep -Fx 'kind: PersistentVolumeClaim' "$OUT/claim.yaml"
+grep -Fx '    helm.sh/resource-policy: keep' "$OUT/claim.yaml"
+grep -Fx '  storageClassName: gp3' "$OUT/claim.yaml"
+grep -Fx '      storage: 250Gi' "$OUT/claim.yaml"
+grep -Fx '          persistentVolumeClaim:' "$OUT/claim.yaml"
+grep -Fx '            claimName: publisher-data' "$OUT/claim.yaml"
+grep -Fx '        fsGroupChangePolicy: OnRootMismatch' "$OUT/claim.yaml"
+if grep -Fq 'emptyDir' "$OUT/claim.yaml"; then
+    echo "persistent chart still mounted an emptyDir" >&2
+    exit 1
+fi
+
+helm template publisher "$CHART" --values "$VALUES" \
+    --set persistence.enabled=true \
+    --set persistence.storageClassName= >"$OUT/default-class.yaml"
+if grep -Fq 'storageClassName' "$OUT/default-class.yaml"; then
+    echo "an empty storage class was rendered instead of omitted" >&2
+    exit 1
+fi
+
+helm template publisher "$CHART" --values "$VALUES" \
+    --set persistence.enabled=true \
+    --set persistence.existingClaim=mainnet-history >"$OUT/existing.yaml"
+grep -Fx '            claimName: mainnet-history' "$OUT/existing.yaml"
+if grep -Fq 'kind: PersistentVolumeClaim' "$OUT/existing.yaml"; then
+    echo "an existing claim was also created" >&2
+    exit 1
+fi
+
+if helm template publisher "$CHART" --values "$VALUES" \
+    --set persistence.enabled=true \
+    --set persistence.size= >"$OUT/invalid.yaml" 2>&1; then
+    echo "a created claim without a size was accepted" >&2
+    exit 1
+fi
+
 helm template publisher "$CHART" --values "$VALUES" \
     --set allowGenesisFallback=true >"$OUT/genesis.yaml"
 grep -F -- '- --allow-genesis' "$OUT/genesis.yaml"
