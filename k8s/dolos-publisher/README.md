@@ -97,7 +97,9 @@ Once the claim exists its class is fixed. Naming a class other than the
 one the claim has fails, and so does clearing a named class back to empty,
 even when that class is the cluster default: once a class is named, keep
 naming it. Left empty at the first install, the claim got the cluster
-default, and naming that same class later is no change. The size can only
+default, and naming that same class later is no change; on a cluster with no
+default class it got none and stays Pending, and naming any class then
+succeeds. The size can only
 grow, and only on a Bound claim of a class that sets `allowVolumeExpansion`.
 The one exception, on Kubernetes 1.32 and later: while an expansion has not
 finished, `size` can be lowered again to a value above the claim's current

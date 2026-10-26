@@ -152,6 +152,12 @@ notes --set persistence.enabled=true \
     --set persistence.existingClaim=mainnet-history \
     --set persistence.size= >"$OUT/notes-existing.txt"
 grep -F '\nThe run resumes the stores kept on claim mainnet-history.\n' "$OUT/notes-existing.txt"
+notes --set persistence.existingClaim=mainnet-history >"$OUT/notes-existing-off.txt"
+grep -F 'Initialization restores latest and fails closed.' "$OUT/notes-existing-off.txt"
+if grep -Fq 'resumes the stores' "$OUT/notes-existing-off.txt"; then
+    echo "notes promised an existing claim with persistence off" >&2
+    exit 1
+fi
 for mode in claim existing; do
     if grep -Fq 'Initialization restores latest' "$OUT/notes-$mode.txt"; then
         echo "$mode notes promised a fresh restore" >&2
