@@ -45,8 +45,13 @@ cost.
   and `resources` bounds `/data` through its `ephemeral-storage` request and
   limit. The preview and preprod values use this mode.
 - **Persistent claim** (`persistence.enabled: true`). `/data` is a
-  ReadWriteOnce claim that outlives the pod: a restarted pod finds its
-  initialization marker and resumes the stores it left, with no restore.
+  ReadWriteOnce claim that outlives the pod: a restarted pod resumes the
+  stores it left, with no restore. Initialization checks those stores
+  against the marker the first restore wrote, which records the network and
+  `repo` but not the image, the `max_history` or the store layout. A pod
+  killed during its first restore, after the cursor is committed and before
+  the marker is written, leaves stores without a marker, and later runs
+  accept them unchecked.
   The chart creates `<release>-data` of `persistence.size` in
   `persistence.storageClassName` (empty uses the cluster default), or mounts
   `persistence.existingClaim` and creates nothing. The pod sets
@@ -66,7 +71,21 @@ Pending. An `existingClaim` must already be in a zone the pool reaches.
 
 The claim survives `helm uninstall`. Installing the same release again
 adopts it. To start the stores over, stop the writer, then delete the claim
-with `kubectl` before the next run.
+with `kubectl` before the next run. Start over whenever the kept stores no
+longer fit the release:
+
+- a changed `repo` or network, including a fresh lineage cut into the same
+  repository. A changed `repo` fails every restart until `backoffLimit` on
+  the marker mismatch, and a re-cut would resume stores pruned to the old
+  `max_history`;
+- an image upgrade or rollback whose stores are incompatible. An older WAL
+  fails closed and restarts until `backoffLimit`, and a state or archive
+  layout change is not checked at all.
+
+Once the claim exists its class and size are fixed, except that the size
+can grow where the class allows expansion. Setting `storageClassName` after
+an install that left it empty, or lowering `size`, fails the whole `helm
+upgrade`, the new Job included. Name the class at the first install.
 
 ## Values
 
@@ -108,7 +127,10 @@ accidental use of the legacy Dolos image.
 A Job's pod template is immutable. Bump `run` to create a new Job for an
 upgrade or re-run. Helm also removes the old Job, but that replacement order
 does not guarantee a single writer: stop the previous writer and wait for its
-pod to terminate before starting the next run.
+pod to terminate before starting the next run. With an emptyDir the new Job
+restores from `latest`. With a persistent claim it resumes the kept stores,
+so delete the claim first when they no longer fit (see
+[Data volume](#data-volume)).
 
 Chart 0.3 cannot continue a repository published by chart 0.2. Its
 publisher refuses to restore a stele cut before the Dolos v2 profile, and

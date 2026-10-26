@@ -38,6 +38,7 @@ helm template publisher "$CHART" --values "$VALUES" \
     --set persistence.enabled=true >"$OUT/claim.yaml"
 grep -Fx 'kind: PersistentVolumeClaim' "$OUT/claim.yaml"
 grep -Fx '    helm.sh/resource-policy: keep' "$OUT/claim.yaml"
+grep -Fx '    - ReadWriteOnce' "$OUT/claim.yaml"
 grep -Fx '  storageClassName: gp3' "$OUT/claim.yaml"
 grep -Fx '      storage: 250Gi' "$OUT/claim.yaml"
 grep -Fx '          persistentVolumeClaim:' "$OUT/claim.yaml"
@@ -47,10 +48,17 @@ if grep -Fq 'emptyDir' "$OUT/claim.yaml"; then
     echo "persistent chart still mounted an emptyDir" >&2
     exit 1
 fi
+pvc_name=$(awk '/^kind: PersistentVolumeClaim$/ { pvc = 1 } pvc && /^  name: / { print $2; exit }' "$OUT/claim.yaml")
+claim_name=$(sed -n 's/^ *claimName: //p' "$OUT/claim.yaml")
+if [ -z "$pvc_name" ] || [ "$pvc_name" != "$claim_name" ]; then
+    echo "the Job mounts '$claim_name' but the chart created '$pvc_name'" >&2
+    exit 1
+fi
 
 helm template publisher "$CHART" --values "$VALUES" \
     --set persistence.enabled=true \
     --set persistence.storageClassName= >"$OUT/default-class.yaml"
+grep -Fx 'kind: PersistentVolumeClaim' "$OUT/default-class.yaml"
 if grep -Fq 'storageClassName' "$OUT/default-class.yaml"; then
     echo "an empty storage class was rendered instead of omitted" >&2
     exit 1
@@ -58,7 +66,8 @@ fi
 
 helm template publisher "$CHART" --values "$VALUES" \
     --set persistence.enabled=true \
-    --set persistence.existingClaim=mainnet-history >"$OUT/existing.yaml"
+    --set persistence.existingClaim=mainnet-history \
+    --set persistence.size= >"$OUT/existing.yaml"
 grep -Fx '            claimName: mainnet-history' "$OUT/existing.yaml"
 if grep -Fq 'kind: PersistentVolumeClaim' "$OUT/existing.yaml"; then
     echo "an existing claim was also created" >&2
@@ -69,6 +78,13 @@ if helm template publisher "$CHART" --values "$VALUES" \
     --set persistence.enabled=true \
     --set persistence.size= >"$OUT/invalid.yaml" 2>&1; then
     echo "a created claim without a size was accepted" >&2
+    exit 1
+fi
+
+if helm template publisher "$CHART" --values "$VALUES" \
+    --set persistence.enabled=true \
+    --set persistence.existingclaim=mainnet-history >"$OUT/invalid.yaml" 2>&1; then
+    echo "an unknown persistence key was accepted" >&2
     exit 1
 fi
 

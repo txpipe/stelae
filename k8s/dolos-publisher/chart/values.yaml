@@ -18,8 +18,11 @@
 network: ""
 
 # The deliberate re-run counter. The Job is named <network>-backfill-<run>,
-# so bumping it makes the upgrade create a new Job and remove the old one,
-# paying the restart cost on purpose. A pod template change without a bump
+# so bumping it makes the upgrade create a new Job and remove the old one.
+# With an emptyDir the new Job restores from latest, paying the restart cost
+# on purpose. With persistence it resumes the stores the last run left, so an
+# image change those stores are not compatible with, or a changed repo or
+# network, needs the claim deleted first. A pod template change without a bump
 # fails the upgrade against the Job's immutable template, which is the guard
 # against re-running by accident. See README.md.
 run: ""
@@ -74,8 +77,10 @@ publisherSecretName: stelae-registry-publisher
 persistence:
   enabled: false
   # Required when the chart creates the claim. A network fact, like resources.
+  # Once the claim exists it can only grow.
   size: ""
-  # Empty uses the cluster's default class.
+  # Empty uses the cluster's default class. Fixed once the claim exists: a
+  # later change fails the upgrade.
   storageClassName: ""
   # Mount this claim instead of creating one. The chart never creates or
   # deletes it.

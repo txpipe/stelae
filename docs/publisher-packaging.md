@@ -115,10 +115,12 @@ for an established lineage.
 
 Rollback uses the pinned 0.1 chart and previous Dolos image with another
 bumped `run`, after the Stelae writer has stopped. Do not rely on Helm's
-resource replacement order to prevent overlapping writers. The chart uses
-an emptyDir and restores a compatible published head. If storage becomes
-persistent, discard incompatible scratch/checkpoints and restore fresh when
-storage pins, journal schemas or profile versions differ. An unpublished
-checkpoint is not a rollback source.
+resource replacement order to prevent overlapping writers. By default the
+chart uses an emptyDir and restores a compatible published head. With a
+persistent claim the next run resumes the kept stores instead: delete the
+claim and restore fresh when storage pins, journal schemas or profile
+versions differ (see the chart README's
+[Data volume](../k8s/dolos-publisher/README.md#data-volume)). An
+unpublished checkpoint is not a rollback source.
 
 See the [chart documentation](../k8s/dolos-publisher/README.md) for its values.
