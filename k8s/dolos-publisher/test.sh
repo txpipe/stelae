@@ -40,6 +40,10 @@ data_volume() {
         exit 1
     fi
     doc Job "$1" | under volumes | item data | grep -Fx "$2"
+    if doc Job "$1" | under volumes | item data | grep -Fq readOnly; then
+        echo "$1: volume data is read-only at its source" >&2
+        exit 1
+    fi
 }
 
 helm lint "$CHART" --values "$VALUES"
@@ -110,6 +114,7 @@ helm template publisher "$CHART" --values "$VALUES" \
     --set persistence.existingClaim=mainnet-history \
     --set persistence.size= >"$OUT/existing.yaml"
 grep -Fx '            claimName: mainnet-history' "$OUT/existing.yaml"
+grep -Fx '        fsGroupChangePolicy: OnRootMismatch' "$OUT/existing.yaml"
 if grep -Fq 'kind: PersistentVolumeClaim' "$OUT/existing.yaml"; then
     echo "an existing claim was also created" >&2
     exit 1

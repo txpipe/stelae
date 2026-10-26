@@ -3,8 +3,17 @@
 Follow the run:
   kubectl -n {{ .Release.Namespace }} logs -f job/{{ include "dolos-publisher.jobName" . }}
 
+{{ if .Values.persistence.enabled -}}
+The run resumes the stores kept on claim {{ include "dolos-publisher.claimName" . }}.
+Only a fresh claim restores latest, failing closed. Enable
+allowGenesisFallback only for a verified first publication. Delete the claim
+before the next run when its stores no longer fit the release, and always
+before a rollback away from a suspect image (see Data volume in the chart
+README).
+{{- else -}}
 Initialization restores latest and fails closed. Enable allowGenesisFallback
 only for a verified first publication.
+{{- end }}
 
 Before an upgrade or rollback, stop the previous writer and wait for its pod
 to terminate. Bump run for the new Job. Chart 0.3 reads only steles cut on

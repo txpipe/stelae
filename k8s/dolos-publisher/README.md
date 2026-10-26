@@ -89,16 +89,19 @@ Pending. Start over whenever the kept stores no longer fit the release:
 - an image upgrade or rollback whose stores are incompatible.
   Initialization does not check the image or the state or archive layout of
   kept stores;
-- a rollback away from a suspect image. The kept stores resume at the last
-  boundary that image committed, and the publisher uploads that boundary
-  first, published or not.
+- a rollback away from a suspect image. The rolled-back image continues
+  from the state the suspect image left, and every boundary it publishes
+  afterwards is built on that state.
 
-Once the claim exists its class is fixed, and its size can only grow, and
-only where the class sets `allowVolumeExpansion`. Changing
-`storageClassName` to a class other than the one the claim has (with
-`storageClassName` empty, the cluster default it got at creation), lowering
-`size`, or raising it on a class without expansion makes `helm upgrade`
-report failure. That failure is not atomic: with a bumped `run` the new Job
+Once the claim exists its class is fixed. Any change to the rendered
+`storageClassName` fails, clearing a named class back to empty included,
+even when that class is the cluster default: once a class is named, keep
+naming it. Left empty at the first install, the claim got the cluster
+default, and naming that same class later is no change. The size can only
+grow, and only on a Bound claim of a class that sets `allowVolumeExpansion`.
+Changing the class, lowering `size`, or raising it on a Pending claim or a
+class without expansion makes `helm upgrade` report failure. That failure
+is not atomic: with a bumped `run` the new Job
 is still created and runs on the claim, and the old Job is not removed and
 keeps running, so two writers share the claim. Each further failed upgrade
 adds another Job. To recover, delete the release's backfill Jobs with
@@ -149,6 +152,11 @@ pod to terminate before starting the next run. With an emptyDir the new Job
 restores from `latest`. With a persistent claim it resumes the kept stores,
 so delete the claim first when they no longer fit, and always for a
 rollback away from a suspect image (see [Data volume](#data-volume)).
+
+Rolling back to chart 0.3 drops the claim from the Job: 0.3 accepts the
+`persistence` block but mounts an emptyDir, so a full-history publisher
+restores all of history into ephemeral storage. The claim stays, and a
+later 0.4 install with persistence adopts it again.
 
 Chart 0.3 cannot continue a repository published by chart 0.2. Its
 publisher refuses to restore a stele cut before the Dolos v2 profile, and
