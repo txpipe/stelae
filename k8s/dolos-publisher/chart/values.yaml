@@ -77,10 +77,12 @@ publisherSecretName: stelae-registry-publisher
 persistence:
   enabled: false
   # Required when the chart creates the claim. A network fact, like resources.
-  # Once the claim exists it can only grow.
+  # Once the claim exists it can only grow, and only on a class with
+  # allowVolumeExpansion; anything else fails the upgrade, which still
+  # creates the new Job (see README.md).
   size: ""
-  # Empty uses the cluster's default class. Fixed once the claim exists: a
-  # later change fails the upgrade.
+  # Empty uses the cluster's default class. Fixed once the claim exists:
+  # naming a different class fails the upgrade, as above.
   storageClassName: ""
   # Mount this claim instead of creating one. The chart never creates or
   # deletes it.

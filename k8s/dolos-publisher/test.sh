@@ -7,6 +7,41 @@ VALUES="$ROOT/k8s/dolos-publisher/tests/values.yaml"
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
+# The rendered document of one kind.
+doc() {
+    awk -v kind="$1" '/^---/ { found = 0 } $0 == "kind: " kind { found = 1 } found' "$2"
+}
+
+# The lines nested under the first key of that name.
+under() {
+    awk -v key="$1" '
+        /^ *$/ { next }
+        inside { match($0, /^ */); if (RLENGTH <= depth) exit; print }
+        !inside && $0 ~ "^ *" key ":$" { inside = 1; match($0, /^ */); depth = RLENGTH }
+    '
+}
+
+# The list item that starts with "- name: <name>".
+item() {
+    awk -v name="$1" '
+        /^ *$/ { next }
+        inside { match($0, /^ */); if (RLENGTH <= depth) exit; print }
+        !inside && $0 ~ "^ *- name: " name "$" { inside = 1; print; match($0, /^ */); depth = RLENGTH }
+    '
+}
+
+# The Job mounts its volume named data read-write at /data, and that volume
+# has the expected source line.
+data_volume() {
+    mount=$(doc Job "$1" | under volumeMounts | item data)
+    if ! printf '%s\n' "$mount" | grep -Eq '^ +mountPath: /data$' ||
+        printf '%s\n' "$mount" | grep -Fq readOnly; then
+        echo "$1: /data is not the read-write mount of volume data" >&2
+        exit 1
+    fi
+    doc Job "$1" | under volumes | item data | grep -Fx "$2"
+}
+
 helm lint "$CHART" --values "$VALUES"
 helm template publisher "$CHART" --values "$VALUES" >"$OUT/default.yaml"
 grep -F 'image: ghcr.io/txpipe/stelae-publisher:sha-deadbee' "$OUT/default.yaml"
@@ -32,6 +67,7 @@ if grep -Eq 'PersistentVolumeClaim|persistentVolumeClaim|fsGroupChangePolicy' "$
     echo "default chart rendered a persistent /data" >&2
     exit 1
 fi
+data_volume "$OUT/default.yaml" '          emptyDir: {}'
 
 helm lint "$CHART" --values "$VALUES" --set persistence.enabled=true
 helm template publisher "$CHART" --values "$VALUES" \
@@ -54,6 +90,11 @@ if [ -z "$pvc_name" ] || [ "$pvc_name" != "$claim_name" ]; then
     echo "the Job mounts '$claim_name' but the chart created '$pvc_name'" >&2
     exit 1
 fi
+doc PersistentVolumeClaim "$OUT/claim.yaml" | under metadata | under annotations |
+    grep -Fx '    helm.sh/resource-policy: keep'
+doc PersistentVolumeClaim "$OUT/claim.yaml" | under spec | under resources | under requests |
+    grep -Fx '      storage: 250Gi'
+data_volume "$OUT/claim.yaml" '            claimName: publisher-data'
 
 helm template publisher "$CHART" --values "$VALUES" \
     --set persistence.enabled=true \
@@ -71,6 +112,15 @@ helm template publisher "$CHART" --values "$VALUES" \
 grep -Fx '            claimName: mainnet-history' "$OUT/existing.yaml"
 if grep -Fq 'kind: PersistentVolumeClaim' "$OUT/existing.yaml"; then
     echo "an existing claim was also created" >&2
+    exit 1
+fi
+data_volume "$OUT/existing.yaml" '            claimName: mainnet-history'
+
+helm template publisher "$CHART" --values "$VALUES" \
+    --set persistence.existingClaim=mainnet-history >"$OUT/existing-off.yaml"
+data_volume "$OUT/existing-off.yaml" '          emptyDir: {}'
+if grep -Eq 'PersistentVolumeClaim|persistentVolumeClaim|mainnet-history' "$OUT/existing-off.yaml"; then
+    echo "an existing claim was mounted with persistence off" >&2
     exit 1
 fi
 

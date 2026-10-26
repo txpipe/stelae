@@ -48,10 +48,16 @@ cost.
   ReadWriteOnce claim that outlives the pod: a restarted pod resumes the
   stores it left, with no restore. Initialization checks those stores
   against the marker the first restore wrote, which records the network and
-  `repo` but not the image, the `max_history` or the store layout. A pod
-  killed during its first restore, after the cursor is committed and before
-  the marker is written, leaves stores without a marker, and later runs
-  accept them unchecked.
+  `repo` but not the image, the `max_history` or the store layout. Without
+  a marker nothing is checked, and a pod killed during its first restore
+  leaves none. Killed after the restore committed its cursor, the stores are
+  accepted unchecked by every later run. Killed before, they hold partial
+  rows with no cursor, and the next run restores into them without clearing
+  them. Restarts of the same Job restore the same `repo` again, which is
+  harmless while `latest` is the same stele. Nothing refuses a changed
+  `repo` or network, though: a different stele lands over the stale rows,
+  which then become authoritative. Delete the claim when a first restore
+  did not complete, before the next run.
   The chart creates `<release>-data` of `persistence.size` in
   `persistence.storageClassName` (empty uses the cluster default), or mounts
   `persistence.existingClaim` and creates nothing. The pod sets
@@ -71,21 +77,33 @@ Pending. An `existingClaim` must already be in a zone the pool reaches.
 
 The claim survives `helm uninstall`. Installing the same release again
 adopts it. To start the stores over, stop the writer, then delete the claim
-with `kubectl` before the next run. Start over whenever the kept stores no
-longer fit the release:
+with `kubectl` before the next run. With `existingClaim`, also create that
+claim again, empty, before the next run; until it exists the pod stays
+Pending. Start over whenever the kept stores no longer fit the release:
 
 - a changed `repo` or network, including a fresh lineage cut into the same
-  repository. A changed `repo` fails every restart until `backoffLimit` on
-  the marker mismatch, and a re-cut would resume stores pruned to the old
+  repository. Where the stores carry a marker, a changed `repo` fails every
+  restart until `backoffLimit` on the mismatch; without one nothing refuses
+  it (see above). A re-cut would resume stores pruned to the old
   `max_history`;
-- an image upgrade or rollback whose stores are incompatible. An older WAL
-  fails closed and restarts until `backoffLimit`, and a state or archive
-  layout change is not checked at all.
+- an image upgrade or rollback whose stores are incompatible.
+  Initialization does not check the image or the state or archive layout of
+  kept stores;
+- a rollback away from a suspect image. The kept stores resume at the last
+  boundary that image committed, and the publisher uploads that boundary
+  first, published or not.
 
-Once the claim exists its class and size are fixed, except that the size
-can grow where the class allows expansion. Setting `storageClassName` after
-an install that left it empty, or lowering `size`, fails the whole `helm
-upgrade`, the new Job included. Name the class at the first install.
+Once the claim exists its class is fixed, and its size can only grow, and
+only where the class sets `allowVolumeExpansion`. Changing
+`storageClassName` to a class other than the one the claim has (with
+`storageClassName` empty, the cluster default it got at creation), lowering
+`size`, or raising it on a class without expansion makes `helm upgrade`
+report failure. That failure is not atomic: with a bumped `run` the new Job
+is still created and runs on the claim, and the old Job is not removed and
+keeps running, so two writers share the claim. Each further failed upgrade
+adds another Job. To recover, delete the release's backfill Jobs with
+`kubectl` and wait for their pods to terminate, then fix the values, bump
+`run` and upgrade again. Name the class at the first install.
 
 ## Values
 
@@ -129,8 +147,8 @@ upgrade or re-run. Helm also removes the old Job, but that replacement order
 does not guarantee a single writer: stop the previous writer and wait for its
 pod to terminate before starting the next run. With an emptyDir the new Job
 restores from `latest`. With a persistent claim it resumes the kept stores,
-so delete the claim first when they no longer fit (see
-[Data volume](#data-volume)).
+so delete the claim first when they no longer fit, and always for a
+rollback away from a suspect image (see [Data volume](#data-volume)).
 
 Chart 0.3 cannot continue a repository published by chart 0.2. Its
 publisher refuses to restore a stele cut before the Dolos v2 profile, and
