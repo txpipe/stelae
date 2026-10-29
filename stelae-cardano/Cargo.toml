@@ -27,7 +27,16 @@ tokio = { version = "1.47", features = ["rt", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7.11", features = ["rt"] }
 tracing = "0.1.37"
 
+# The `testing` fixture's, which the publisher's binary tests build stores with.
+dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "e184a965644bcd7a4317097eda94206bd50a35d7", optional = true }
+tempfile = { version = "3.20.0", optional = true }
+toml = { version = "0.8.13", optional = true }
+
+[features]
+testing = ["dep:dolos-testing", "dep:tempfile", "dep:toml"]
+
 [dev-dependencies]
+stelae-cardano = { path = ".", features = ["testing"] }
 dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "e184a965644bcd7a4317097eda94206bd50a35d7" }
 tempfile = "3.20.0"
 toml = "0.8.13"

@@ -1,11 +1,18 @@
-use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
+use std::{
+    io::Write as _,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    sync::Arc,
+};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use miette::{Context as _, IntoDiagnostic as _};
 use stelae::progress::{Event, Observer, Progress};
 use stelae_cardano::{
     backfill, config, initialize,
     publisher::{self, Destination, PublishOutcome},
+    snapshot::{self, Boundary, PlanReport, Published, Verified},
     Auth, EpochRange, Genesis, Point, RegistryAuth, Repository, RestoreSource, RetainedEpochs,
     RootConfig, Selection,
 };
@@ -69,8 +76,20 @@ struct StateEpochsArgs {
 
 impl StateEpochsArgs {
     fn read(&self) -> miette::Result<RetainedEpochs> {
-        config::read_state_epochs(&self.state_epochs_file).into_diagnostic()
+        read_state_epochs(&self.state_epochs_file)
     }
+}
+
+fn read_state_epochs(path: &Path) -> miette::Result<RetainedEpochs> {
+    config::read_state_epochs(path).into_diagnostic()
+}
+
+/// How a command writes its result to stdout; progress and logs go to stderr.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum Format {
+    #[default]
+    Text,
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -83,6 +102,14 @@ enum Command {
     Backfill(BackfillArgs),
     /// Initialize and then run the backfill state machine.
     Run(RunArgs),
+    /// Compute a stele's inscription and identity from the committed stores,
+    /// standing on the first block of an epoch, without writing one.
+    Digest(DigestArgs),
+    /// Check a published stele's digests and, with --reproduce, rebuild every
+    /// layer from the committed stores.
+    Verify(VerifyArgs),
+    /// Print what a published stele contains, without pulling a layer.
+    Inspect(InspectArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -283,6 +310,87 @@ struct PublishArgs {
     require_new: bool,
 }
 
+#[derive(Debug, Args)]
+struct DigestArgs {
+    /// Epochs to build layers for, e.g. `500..520`, `500..=520`, `500..`,
+    /// `..520` or `500`; defaults to every epoch below the cursor, and must
+    /// match what the stele being reproduced was published with.
+    #[arg(long, value_name = "RANGE")]
+    epochs: Option<EpochRange>,
+    /// Epochs whose index layers one archive traversal fills; changes nothing
+    /// about the digest.
+    #[arg(long, value_name = "EPOCHS")]
+    index_band: Option<NonZeroUsize>,
+    /// Layer producers run at once; changes nothing about the digest.
+    #[arg(long, value_name = "N")]
+    producers: Option<NonZeroUsize>,
+    /// Canonical inscription of the stele this one follows, as `inspect
+    /// --format json` or a published `inscription.json` holds it; without it
+    /// the reproduction carries no history, which is a different digest.
+    #[arg(long, value_name = "FILE")]
+    chain_from: Option<PathBuf>,
+    /// Write the canonical inscription to FILE instead of to stdout.
+    #[arg(long, value_name = "FILE")]
+    output: Option<PathBuf>,
+    #[command(flatten)]
+    state_epochs: StateEpochsArgs,
+    /// The inscription is JSON in either format.
+    #[arg(long, value_enum, default_value_t)]
+    format: Format,
+}
+
+#[derive(Debug, Args)]
+struct VerifyArgs {
+    /// Stele to verify: oci://HOST/PATH, or file://DIR for a directory stele.
+    #[arg(long, value_name = "URL")]
+    repo: RestoreSource,
+    /// `latest`, or `epoch-N` for the stele published at the end of epoch N.
+    #[arg(long, default_value = "latest")]
+    point: Point,
+    #[arg(long, action)]
+    insecure: bool,
+    /// Also rebuild every layer from the committed stores, which must stand on
+    /// the first block of the stele's epoch, and require a byte-identical
+    /// inscription. Costs what a publish costs.
+    #[arg(long, action)]
+    reproduce: bool,
+    #[arg(long, value_name = "EPOCHS", requires = "reproduce")]
+    index_band: Option<NonZeroUsize>,
+    #[arg(long, value_name = "N", requires = "reproduce")]
+    producers: Option<NonZeroUsize>,
+    /// Epochs the reproduction builds layers for; must match what the stele
+    /// was published with.
+    #[arg(long, value_name = "RANGE", requires = "reproduce")]
+    epochs: Option<EpochRange>,
+    /// File listing the retained state-dump epochs the reproduction plans
+    /// with, one per line, ascending; required by --reproduce.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "reproduce",
+        required_if_eq("reproduce", "true")
+    )]
+    state_epochs_file: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t)]
+    format: Format,
+}
+
+#[derive(Debug, Args)]
+struct InspectArgs {
+    /// Stele to inspect: oci://HOST/PATH, or file://DIR for a directory stele.
+    #[arg(long, value_name = "URL")]
+    repo: RestoreSource,
+    /// `latest`, or `epoch-N` for the stele published at the end of epoch N.
+    #[arg(long, default_value = "latest")]
+    point: Point,
+    #[arg(long, action)]
+    insecure: bool,
+    /// `json` emits the canonical inscription verbatim, the bytes the identity
+    /// is the sha256 of and what `digest --chain-from` takes.
+    #[arg(long, value_enum, default_value_t)]
+    format: Format,
+}
+
 #[derive(Default)]
 struct ConsoleProgress;
 
@@ -443,10 +551,320 @@ fn run_publish(
     Ok(())
 }
 
-fn main() -> miette::Result<()> {
+/// The stele failed a verification that ran.
+#[derive(Debug)]
+struct Mismatch(snapshot::Error);
+
+impl std::fmt::Display for Mismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for Mismatch {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&self.0)
+    }
+}
+
+impl miette::Diagnostic for Mismatch {}
+
+/// The exit status of a [`Mismatch`], beside 1 for an error and 2 for a usage
+/// error, as Dolos's commands exit.
+const MISMATCH_EXIT: u8 = 3;
+
+fn diagnose(error: snapshot::Error) -> miette::Report {
+    if error.is_mismatch() {
+        miette::Report::new(Mismatch(error))
+    } else {
+        miette::Report::from_err(error)
+    }
+}
+
+fn source_name(source: &RestoreSource) -> String {
+    match source {
+        RestoreSource::Dir(path) => format!("file://{}", path.display()),
+        RestoreSource::Repo(repository) => repository.to_string(),
+    }
+}
+
+fn open_stele(
+    config: &RootConfig,
+    source: &RestoreSource,
+    insecure: bool,
+    auth: ResolveAuth,
+) -> miette::Result<Published> {
+    let auth = match source {
+        RestoreSource::Repo(_) => auth()?,
+        RestoreSource::Dir(_) => Auth::Anonymous,
+    };
+    Published::open(config, source, insecure, auth).map_err(diagnose)
+}
+
+/// Written rather than printed, and flushed: a canonical document carries no
+/// trailing newline, and the flush at exit would discard a write error.
+fn write_stdout(bytes: &[u8]) -> miette::Result<()> {
+    let mut stdout = std::io::stdout();
+    stdout
+        .write_all(bytes)
+        .into_diagnostic()
+        .context("writing to stdout")?;
+    stdout.flush().into_diagnostic().context("flushing stdout")
+}
+
+/// Where the stores stand and what the selection covers, on stderr before
+/// anything slow runs.
+fn report_plan(report: &PlanReport, boundary: &Boundary) {
+    eprintln!("network:  {} ({})", report.network, report.magic);
+    eprintln!("cursor:   {}", report.cursor);
+    eprintln!("sequence: {} (tag {})", report.sequence, report.tag);
+    eprintln!(
+        "boundary: first block of epoch {}, after {}",
+        boundary.epoch, boundary.parent,
+    );
+    eprintln!(
+        "band:     {} epochs per index traversal ({} MiB budgeted)",
+        report.band_epochs, report.band_budget_mib,
+    );
+    match report.epochs {
+        Some(span) => eprintln!(
+            "epochs:   {}..={} ({} of them, slots {}..={})",
+            span.first, span.last, span.count, span.start_slot, span.end_slot,
+        ),
+        None => eprintln!("epochs:   none selected; the state tip only"),
+    }
+    eprintln!(
+        "dumps:    {:?} retained ({} due at this sequence)",
+        report.retained, report.dumps_due,
+    );
+}
+
+fn run_digest(config: &RootConfig, genesis: &Genesis, args: &DigestArgs) -> miette::Result<()> {
+    let selection = Selection {
+        epochs: args.epochs,
+        index_band: args.index_band,
+        producers: args.producers,
+    };
+    let digested = snapshot::with_plan(
+        config,
+        genesis,
+        args.state_epochs.read()?,
+        selection,
+        &report_plan,
+        |source, plan| snapshot::digest(source, plan, args.chain_from.as_deref()),
+    )
+    .map_err(diagnose)?;
+    let document = &digested.document;
+    match digested.history {
+        Some(entries) => eprintln!("history:  {entries} entries"),
+        None => eprintln!("history:  none; this reproduction starts a chain"),
+    }
+    eprintln!("layers:   {}", document.layers);
+    eprintln!(
+        "size:     {} uncompressed bytes",
+        document.uncompressed_size
+    );
+    eprintln!("identity: {}", document.identity);
+
+    match &args.output {
+        Some(path) => {
+            std::fs::write(path, &document.canonical)
+                .into_diagnostic()
+                .with_context(|| format!("writing {}", path.display()))?;
+            eprintln!("wrote {}", path.display());
+            Ok(())
+        }
+        // The canonical document, which hashes to the identity above.
+        None => match args.format {
+            Format::Text | Format::Json => write_stdout(&document.canonical),
+        },
+    }
+}
+
+fn print_verified(name: &str, point: Point, verified: &Verified) {
+    let inscription = &verified.inscription;
+    println!("verified {name} at {point}");
+    println!("sequence: {}", inscription.sequence);
+    match inscription.history.as_slice() {
+        [] => println!("history:  none; this stele starts a chain"),
+        [first, ..] => println!(
+            "history:  {} entries, contiguous back to sequence {}",
+            inscription.history.len(),
+            first.sequence,
+        ),
+    }
+    println!(
+        "layers:   {} streamed and checked ({} compressed bytes)",
+        inscription.layers.len(),
+        verified.compressed_bytes,
+    );
+    println!("identity: {}", verified.identity);
+    println!("checked:  digests only; signatures and chain provenance are phase 5");
+}
+
+fn run_verify(
+    config: &RootConfig,
+    genesis: &Genesis,
+    args: &VerifyArgs,
+    auth: ResolveAuth,
+) -> miette::Result<()> {
+    let stele = open_stele(config, &args.repo, args.insecure, auth)?;
+    let name = source_name(&args.repo);
+    let text = args.format == Format::Text;
+    let transport = || {
+        let verified = stele.verify(args.point)?;
+        if text {
+            print_verified(&name, args.point, &verified);
+        }
+        Ok(verified)
+    };
+
+    let (verified, reproduced) = match &args.state_epochs_file {
+        Some(path) if args.reproduce => {
+            let selection = Selection {
+                epochs: args.epochs,
+                index_band: args.index_band,
+                producers: args.producers,
+            };
+            // Planned before the transport check, so a selection these stores
+            // cannot plan is refused before every blob has been streamed.
+            snapshot::with_plan(
+                config,
+                genesis,
+                read_state_epochs(path)?,
+                selection,
+                &report_plan,
+                |source, plan| {
+                    let verified = transport()?;
+                    let reproduced = snapshot::reproduce(source, plan, &verified.inscription)?;
+                    if text {
+                        println!(
+                            "reproduced: {} layers rebuilt from the local stores; the documents \
+                             are byte-identical ({})",
+                            reproduced.layers.len(),
+                            verified.identity,
+                        );
+                    }
+                    Ok((verified, Some(reproduced.layers.len())))
+                },
+            )
+            .map_err(diagnose)?
+        }
+        _ => (transport().map_err(diagnose)?, None),
+    };
+
+    if !text {
+        let inscription = &verified.inscription;
+        let report = serde_json::json!({
+            "repo": name,
+            "point": args.point.to_string(),
+            "sequence": inscription.sequence,
+            "identity": verified.identity.to_string(),
+            "history": inscription.history.first().map(|first| serde_json::json!({
+                "entries": inscription.history.len(),
+                "first_sequence": first.sequence,
+            })),
+            "layers": inscription.layers.len(),
+            "compressed_bytes": verified.compressed_bytes,
+            "checked": "digests",
+            "reproduced": reproduced.map(|layers| serde_json::json!({ "layers": layers })),
+        });
+        println!("{report}");
+    }
+    Ok(())
+}
+
+fn run_inspect(config: &RootConfig, args: &InspectArgs, auth: ResolveAuth) -> miette::Result<()> {
+    let inspected = open_stele(config, &args.repo, args.insecure, auth)?
+        .inspect(args.point)
+        .map_err(diagnose)?;
+    let inscription = &inspected.inscription;
+
+    if args.format == Format::Json {
+        // The bytes, not a re-encoding: anything else hashes to an identity
+        // nobody published.
+        return write_stdout(&inscription.canonicalize().into_diagnostic()?);
+    }
+
+    let position = snapshot::read_position(&inscription.position)
+        .into_diagnostic()
+        .context("reading the stele's position")?;
+    println!("{} at {}", source_name(&args.repo), args.point);
+    println!("identity: {}", inspected.identity);
+    println!(
+        "profile:  {} v{}",
+        inscription.profile.name, inscription.profile.version
+    );
+    println!("sequence: {}", inscription.sequence);
+    println!(
+        "position: {} (magic {}), epoch {}, {}",
+        position.network.name(),
+        position.network.magic(),
+        position.epoch,
+        position.point,
+    );
+    println!(
+        "compression: {} level {}",
+        inscription.compression.algo, inscription.compression.level
+    );
+    match (inscription.history.first(), inscription.history.last()) {
+        (Some(first), Some(last)) if first.sequence != last.sequence => println!(
+            "history:  {} entries, sequence {} ({}) through sequence {} ({})",
+            inscription.history.len(),
+            first.sequence,
+            first.inscription_digest,
+            last.sequence,
+            last.inscription_digest,
+        ),
+        (Some(only), _) => println!(
+            "history:  1 entry, sequence {} ({})",
+            only.sequence, only.inscription_digest,
+        ),
+        _ => println!("history:  none; this stele starts a chain"),
+    }
+    println!("layers:   {}", inscription.layers.len());
+    let mut records = 0u64;
+    for (descriptor, compressed) in inscription.layers.iter().zip(&inspected.compressed) {
+        records += descriptor.records;
+        // A size the manifest cannot state prints as unknown.
+        let compressed = match compressed {
+            Some(bytes) => bytes.to_string(),
+            None => "?".to_owned(),
+        };
+        println!(
+            "  {:<8} {:>10} records {:>14} bytes {:>14} compressed  {}",
+            descriptor.kind,
+            descriptor.records,
+            descriptor.uncompressed_size,
+            compressed,
+            descriptor.scope,
+        );
+    }
+    println!(
+        "totals:   {} records, {} uncompressed bytes, {} compressed bytes",
+        records,
+        inscription.uncompressed_size(),
+        inspected.total_compressed,
+    );
+    Ok(())
+}
+
+fn main() -> ExitCode {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    tracing_subscriber::fmt().with_target(false).init();
-    execute(Cli::parse(), &|name| std::env::var(name).ok())
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
+    match execute(Cli::parse(), &|name| std::env::var(name).ok()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(report) => {
+            eprintln!("Error: {report:?}");
+            match report.downcast_ref::<Mismatch>() {
+                Some(_) => ExitCode::from(MISMATCH_EXIT),
+                None => ExitCode::FAILURE,
+            }
+        }
+    }
 }
 
 fn execute(cli: Cli, env: Env) -> miette::Result<()> {
@@ -471,6 +889,9 @@ fn execute(cli: Cli, env: Env) -> miette::Result<()> {
             run_initialize(&config, &genesis, &initialize, &observer)?;
             run_backfill(&config, &genesis, &backfill, &observer)
         }
+        Command::Digest(args) => run_digest(&config, &genesis, &args),
+        Command::Verify(args) => run_verify(&config, &genesis, &args, &auth),
+        Command::Inspect(args) => run_inspect(&config, &args, &auth),
     }
 }
 
@@ -666,8 +1087,10 @@ mod tests {
         let epochs = epochs.to_str().unwrap();
         let repo = "oci://registry.invalid/cardano/preview";
 
-        let commands: [&[&str]; 4] = [
+        let commands: [&[&str]; 6] = [
             &["initialize", "--source", repo],
+            &["verify", "--repo", repo],
+            &["inspect", "--repo", repo],
             &["publish", "--repo", repo, "--state-epochs-file", epochs],
             &["backfill", "--repo", repo, "--state-epochs-file", epochs],
             &[

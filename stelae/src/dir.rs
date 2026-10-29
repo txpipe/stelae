@@ -18,8 +18,9 @@
 //! format — `zstd -d < blobs/sha256/<hex> | cbor2diag` prints the records,
 //! which is worth a great deal while a spec is young.
 //!
-//! It is not `dolos snapshot publish --output-dir`: that command belongs to the
-//! Dolos profile and carries its own layer-selection and progress semantics.
+//! It is not `stelae-publisher publish --output-dir`: that command publishes
+//! the Dolos profile and carries its own layer-selection and progress
+//! semantics.
 //!
 //! ## The manifest a directory grew
 //!
