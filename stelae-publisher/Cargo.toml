@@ -11,8 +11,8 @@ name = "stelae-publisher"
 path = "src/main.rs"
 
 [dependencies]
-stelae = { path = "../stelae", version = "=0.3.1", features = ["oci"] }
-stelae-cardano = { path = "../stelae-cardano", version = "=0.3.1" }
+stelae = { path = "../stelae", version = "=0.4.0", features = ["oci"] }
+stelae-cardano = { path = "../stelae-cardano", version = "=0.4.0" }
 
 clap = { version = "4.5.37", features = ["derive"] }
 # The parser Dolos reads a credentials file with, so every file Dolos takes
