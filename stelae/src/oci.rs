@@ -1258,6 +1258,26 @@ fn is_absent(error: &oci_client::errors::OciDistributionError) -> bool {
     }
 }
 
+impl Error {
+    /// Whether a pull failed because the registry served a blob that is not the
+    /// one its descriptor names: bytes that hash to another digest, or more of
+    /// them than the descriptor claims.
+    ///
+    /// A refusal of the stele, where everything else [`Error::Registry`]
+    /// carries is a registry or a disk that could not answer.
+    pub fn is_blob_refusal(&self) -> bool {
+        use oci_client::errors::{DigestError, OciDistributionError as E};
+
+        match self {
+            Error::Registry(E::DigestError(DigestError::VerificationError { .. })) => true,
+            Error::Registry(E::IoError(io)) => io
+                .get_ref()
+                .is_some_and(|inner| inner.is::<BlobPastDescriptor>()),
+            _ => false,
+        }
+    }
+}
+
 /// Whether a failure is one that asking again can fix.
 ///
 /// The counterpart of [`is_absent`], and narrow for the same reason that one
@@ -2589,6 +2609,16 @@ fn blob_stream(
     })
 }
 
+/// The refusal [`Blocking`] raises, typed so that [`Error::is_blob_refusal`]
+/// can tell it from a disk that would not take the bytes: an `AsyncWrite` can
+/// only fail with an `io::Error`, and `pull_blob` hands that on untouched.
+#[derive(Debug, thiserror::Error)]
+#[error("blob {digest} is larger than the {limit} bytes its descriptor claims")]
+struct BlobPastDescriptor {
+    digest: String,
+    limit: u64,
+}
+
 /// A synchronous writer dressed as an asynchronous one, with a ceiling.
 ///
 /// [`oci_client::Client::pull_blob`] writes into a [`tokio::io::AsyncWrite`],
@@ -2643,10 +2673,10 @@ impl<W: Write + Unpin> tokio::io::AsyncWrite for Blocking<'_, W> {
         let room = usize::try_from(this.limit - this.written).unwrap_or(usize::MAX);
 
         if room == 0 && !buf.is_empty() {
-            return Poll::Ready(Err(std::io::Error::other(format!(
-                "blob {} is larger than the {} bytes its descriptor claims",
-                this.digest, this.limit,
-            ))));
+            return Poll::Ready(Err(std::io::Error::other(BlobPastDescriptor {
+                digest: this.digest.clone(),
+                limit: this.limit,
+            })));
         }
 
         // Truncated to the room left, so the ceiling is exact rather than "one
@@ -2765,6 +2795,44 @@ mod tests {
         // would not read reads the same the second time.
         assert!(!is_transient(&Error::Io(std::io::Error::other("staging"))));
         assert!(!is_transient(&Error::LayerNotWritten("earlier".to_owned())));
+    }
+
+    /// A blob the registry got wrong, against a registry or a disk that failed.
+    #[test]
+    fn a_blob_refusal_is_the_blob_and_not_its_transfer() {
+        use tokio::io::AsyncWrite as _;
+
+        let mismatch =
+            OciDistributionError::DigestError(oci_client::errors::DigestError::VerificationError {
+                expected: "sha256:aa".to_owned(),
+                actual: "sha256:bb".to_owned(),
+            });
+        assert!(Error::Registry(mismatch).is_blob_refusal());
+
+        // What the ceiling raises, as `pull_blob` hands it on.
+        let mut sink = Vec::new();
+        let mut blocking = Blocking::new(&mut sink, 2, "sha256:aa", Observer::silent());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let past = match Pin::new(&mut blocking).poll_write(&mut cx, b"abc") {
+            Poll::Ready(Ok(2)) => Pin::new(&mut blocking).poll_write(&mut cx, b"c"),
+            other => panic!("{other:?}"),
+        };
+        let Poll::Ready(Err(past)) = past else {
+            panic!("{past:?}");
+        };
+        assert!(Error::Registry(past.into()).is_blob_refusal());
+
+        for error in [
+            server_error(503),
+            request_error(500),
+            std::io::Error::from(std::io::ErrorKind::StorageFull).into(),
+            OciDistributionError::UnauthorizedError {
+                url: "https://registry.invalid/v2/".to_owned(),
+            },
+        ] {
+            assert!(!Error::Registry(error).is_blob_refusal());
+        }
+        assert!(!Error::Io(std::io::ErrorKind::StorageFull.into()).is_blob_refusal());
     }
 
     /// A recorder for what the retry loop announced.

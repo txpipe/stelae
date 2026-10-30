@@ -62,8 +62,10 @@ type ResolveAuth<'a> = &'a dyn Fn() -> miette::Result<Auth>;
 /// Resolves the identity a command reads `repository` as.
 type ResolveReadAuth<'a> = &'a dyn Fn(&Repository) -> miette::Result<Auth>;
 
-/// The secret half of the credentials.
-#[derive(Default)]
+/// The secret half of the credentials. No `Debug`, so that it cannot be
+/// printed.
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct Secrets {
     password: Option<String>,
     token: Option<String>,
@@ -104,33 +106,24 @@ impl CredentialArgs {
     }
 }
 
-/// Reads a credentials file, saying where it failed and never what it holds:
-/// a parse error would quote the offending line, and that line is a secret.
+/// Reads a credentials file as Dolos does, so a file it takes is taken here,
+/// saying where it failed and never what it holds: a parse error would quote
+/// the offending line, and that line is a secret.
 fn read_secrets(path: &Path) -> miette::Result<Secrets> {
-    let refused = || {
-        miette::miette!(
-            "{} is not a TOML file naming only `password` or `token`",
-            path.display()
-        )
-    };
     let text = std::fs::read_to_string(path)
         .into_diagnostic()
         .with_context(|| format!("reading the registry credentials in {}", path.display()))?;
-    let table: toml::Table = text.parse().map_err(|_| refused())?;
 
-    let mut secrets = Secrets::default();
-    for (key, value) in table {
-        let value = match value {
-            toml::Value::String(value) => value,
-            _ => return Err(refused()),
-        };
-        match key.as_str() {
-            "password" => secrets.password = Some(value),
-            "token" => secrets.token = Some(value),
-            _ => return Err(refused()),
-        }
-    }
-    Ok(secrets)
+    ::config::Config::builder()
+        .add_source(::config::File::from_str(&text, ::config::FileFormat::Toml))
+        .build()
+        .and_then(|file| file.try_deserialize())
+        .map_err(|_| {
+            miette::miette!(
+                "{} is not a TOML file naming only `password` or `token`",
+                path.display()
+            )
+        })
 }
 
 /// The epochs this publisher retains a state dump of: signed input, so every
@@ -1291,11 +1284,19 @@ mod tests {
             args.read_auth_from(env, snapshot::official_reader(&config, repository))
         };
 
+        // The catalog's user, which takes the official password with it.
         let anonymous = CredentialArgs::default();
-        let Auth::Basic { user, password } = read(&anonymous, &official, &|_| None).unwrap() else {
-            panic!("the official repository is read anonymously");
-        };
-        assert!(!user.is_empty() && !password.is_empty());
+        let catalog_user = stelae_cardano::registry_auth(&RegistryAuth::from_inputs(
+            Some("stelae".to_owned()),
+            None,
+            None,
+        ))
+        .unwrap();
+        assert!(matches!(&catalog_user, Auth::Basic { password, .. } if !password.is_empty()));
+        assert_eq!(
+            read(&anonymous, &official, &|_| None).unwrap(),
+            catalog_user
+        );
         assert_eq!(
             read(&anonymous, &other, &|_| None).unwrap(),
             Auth::Anonymous
@@ -1349,12 +1350,45 @@ mod tests {
             Auth::Bearer("ghp_x".to_owned())
         );
 
+        // A scalar Dolos's parser takes as a string is taken here too.
+        std::fs::write(&file, "password = 12345678\n").unwrap();
+        assert_eq!(
+            with_file.auth_from(&|_| None).unwrap(),
+            Auth::Basic {
+                user: "publisher".to_owned(),
+                password: "12345678".to_owned(),
+            }
+        );
+
         // Refused without quoting the line, which is a secret.
-        for document in ["secret = \"hunter2\"\n", "password = hunter2\n"] {
+        for document in [
+            "secret = \"hunter2\"\n",
+            "password = hunter2\n",
+            "[password]\nhunter2 = 1\n",
+        ] {
             std::fs::write(&file, document).unwrap();
             let error = format!("{:?}", with_file.auth_from(&|_| None).unwrap_err());
             assert!(error.contains("naming only"), "{error}");
             assert!(!error.contains("hunter2"), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_credentials_file_is_taken_after_the_command() {
+        for command in ["verify", "inspect"] {
+            let cli = parse(&[
+                command,
+                "--repo",
+                "file:///stele",
+                "--registry-credentials-file",
+                "/run/secrets/stelae.toml",
+            ])
+            .unwrap();
+            assert_eq!(
+                cli.credentials.registry_credentials_file.as_deref(),
+                Some(Path::new("/run/secrets/stelae.toml")),
+                "{command}"
+            );
         }
     }
 }

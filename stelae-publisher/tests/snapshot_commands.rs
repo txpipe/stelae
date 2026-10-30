@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
 
 use stelae::{inscription::Inscription, progress::Observer};
@@ -313,7 +313,11 @@ fn a_directory_without_its_blob_index() {
     let inspected = fixture.run(&["inspect", "--repo", &repo]);
     assert_eq!(code(&inspected), 0, "{}", stderr_words(&inspected));
     let stdout = String::from_utf8(inspected.stdout).unwrap();
-    assert!(stdout.contains("?"), "{stdout}");
+    let totals = stdout
+        .lines()
+        .find(|line| line.starts_with("totals:"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(totals.ends_with(", ? compressed bytes"), "{totals}");
 
     // The scan that rebuilds the index is a verification of every blob.
     let verified = fixture.run(&["verify", "--repo", &repo]);
@@ -372,6 +376,11 @@ fn digest_refuses_a_predecessor_it_cannot_chain_onto() {
     let itself = digest(&fixture.stele.join("inscription.json"));
     assert_eq!(code(&itself), 1, "{}", stderr_words(&itself));
     assert!(itself.stdout.is_empty());
+    assert!(
+        stderr_words(&itself).contains("at or behind the repository's latest"),
+        "{}",
+        stderr_words(&itself)
+    );
 
     let pretty = fixture.node.path().join("pretty.json");
     let document: serde_json::Value = serde_json::from_slice(&fixture.inscription()).unwrap();
@@ -404,4 +413,47 @@ fn a_command_off_the_registry_ignores_its_credentials() {
             .unwrap();
         assert_eq!(code(&output), 0, "{}: {}", args[0], stderr_words(&output));
     }
+}
+
+/// Bytes the directory holds under a blob's name that do not decompress are
+/// the stele's, however the decoder gives up on them.
+#[test]
+fn a_blob_that_does_not_decompress_exits_three() {
+    type Alter = fn(&mut Vec<u8>);
+    let alterations: [(&str, Alter); 4] = [
+        ("truncated", |bytes| bytes.truncate(bytes.len() / 2)),
+        ("emptied", Vec::clear),
+        ("first byte flipped", |bytes| bytes[0] ^= 0xff),
+        ("replaced", |bytes| *bytes = b"not a zstd frame".to_vec()),
+    ];
+    for (alteration, alter) in alterations {
+        let fixture = Fixture::published();
+        let blob = first_blob(&fixture.stele);
+        let mut bytes = std::fs::read(&blob).unwrap();
+        alter(&mut bytes);
+        std::fs::write(&blob, bytes).unwrap();
+
+        let output = fixture.run(&["verify", "--repo", &fixture.repo()]);
+        assert_eq!(code(&output), 3, "{alteration}: {}", stderr_words(&output));
+    }
+}
+
+#[test]
+fn a_json_report_stdout_will_not_take_exits_one() {
+    let fixture = Fixture::published();
+    let mut child = fixture
+        .command(&["verify", "--repo", &fixture.repo(), "--format", "json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Closed before the stores open, so the report's write meets a broken pipe.
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(code(&output), 1, "{}", stderr_words(&output));
+    assert!(
+        stderr_words(&output).contains("writing to stdout"),
+        "{}",
+        stderr_words(&output)
+    );
 }

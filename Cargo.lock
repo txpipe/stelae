@@ -4686,15 +4686,16 @@ name = "stelae-publisher"
 version = "0.3.1"
 dependencies = [
  "clap",
+ "config",
  "miette",
  "rustls",
+ "serde",
  "serde_json",
  "stelae",
  "stelae-cardano",
  "tempfile",
  "tokio",
  "tokio-util",
- "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "url",

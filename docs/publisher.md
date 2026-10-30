@@ -154,11 +154,15 @@ inscription verbatim, what `digest --chain-from` takes; `digest` writes the
 inscription in either format; `verify --format json` is one report object.
 They exit 0 on success, 1 on an error, 2 on a usage error and 3 when `verify`
 refused the stele: a document or layer whose bytes, digests, names or
-encoding disagree, an inscription of another profile, schema or network, a
-broken history, or, under `--reproduce`, a reproduction that differs. A
-check that could not run, because the registry, the disk, the credentials,
-the configuration or the local stores failed, exits 1, as does a `--point`
-a directory stele does not hold and any refusal by `inspect` or `digest`.
+encoding disagree, including a blob a registry serves under another digest
+or past its descriptor's size and a directory blob that does not decompress,
+an inscription of another profile or schema, a broken history, or, under
+`--reproduce`, a stele of another network or sequence than the stores or a
+reproduction that differs. A check that could not run, because the registry,
+the disk, the credentials, the configuration or the local stores failed,
+exits 1, including a record the local stores hold out of order or malformed
+under `--reproduce`, as does a `--point` a directory stele does not hold and
+any refusal by `inspect` or `digest`.
 
 OCI operations run synchronously on the process thread. Mithril calls have a
 separate Tokio runtime. SIGINT and SIGTERM cancel acquisition and are observed

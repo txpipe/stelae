@@ -25,9 +25,11 @@ use dolos_snapshot::{
     DolosProfile, RetainedEpochs,
 };
 use stelae::{
+    digest::digest_reader,
     dir::{SteleDir, BLOB_INDEX_FILE},
     frame::Limits,
-    inscription::Inscription,
+    inscription::{Inscription, LayerDescriptor},
+    transport::BlobIndex,
     SteleReader as _,
 };
 
@@ -90,9 +92,16 @@ impl Error {
 
     /// A verification failure, classified by whether it is the stele's.
     fn verifying(what: impl Into<String>) -> impl FnOnce(dolos_snapshot::Error) -> Self {
+        Self::classified(what, found_wrong)
+    }
+
+    fn classified(
+        what: impl Into<String>,
+        wrong: fn(&dolos_snapshot::Error) -> bool,
+    ) -> impl FnOnce(dolos_snapshot::Error) -> Self {
         let what = what.into();
         move |source| {
-            if found_wrong(&source) {
+            if wrong(&source) {
                 Self::Mismatch { what, source }
             } else {
                 Self::Profile { what, source }
@@ -130,6 +139,8 @@ fn refused_stele(error: &stelae::Error) -> bool {
     use stelae::Error as E;
 
     match error {
+        // The digest check `pull_blob` runs, and the size ceiling beside it.
+        E::Registry(_) => error.is_blob_refusal(),
         E::Json(_)
         | E::NonCanonicalCbor { .. }
         | E::TruncatedCbor { .. }
@@ -163,9 +174,25 @@ fn refused_stele(error: &stelae::Error) -> bool {
         | E::BlobMissing { .. }
         | E::LayerNotWritten(_)
         | E::InvalidRepository { .. }
-        | E::Scratch { .. }
-        | E::Registry(_) => false,
+        | E::Scratch { .. } => false,
     }
+}
+
+/// Whether a reproduction that ran found the stele differing from the local
+/// stores, rather than failing to read them.
+///
+/// Narrower than [`found_wrong`]: a reproduction re-runs the export, and the
+/// export refuses malformed or out-of-order records from the stores it reads
+/// with the same errors a verification raises for a stele's own. The published
+/// documents were held to the profile before the reproduction began, so
+/// whatever else it raises came from the stores.
+fn reproduction_differs(error: &dolos_snapshot::Error) -> bool {
+    use dolos_snapshot::Error as E;
+
+    matches!(
+        error,
+        E::ReproductionMismatch { .. } | E::NetworkMismatch { .. }
+    )
 }
 
 /// Open the stores, plan `selection` over them and establish the boundary
@@ -252,10 +279,16 @@ pub fn reproduce(
     plan: &Plan,
     published: &Inscription,
 ) -> Result<Inscription, Error> {
+    // The one part of the published documents the reproduction reads that the
+    // transport check did not.
+    read_position(&published.position)
+        .map_err(Error::verifying("reading the published stele's position"))?;
+
     snapshot
         .verify_reproduction(published, plan)
-        .map_err(Error::verifying(
+        .map_err(Error::classified(
             "reproducing the published stele from the local stores",
+            reproduction_differs,
         ))
 }
 
@@ -346,7 +379,7 @@ fn read_inscription(dir: &SteleDir) -> Result<Inscription, dolos_snapshot::Error
 /// Compressed sizes come from the blob index, and only from its sidecar: a
 /// directory without one would have every blob read to build it.
 fn inspect_dir(dir: &SteleDir, inscription: Inscription) -> Result<Inspected, stelae::Error> {
-    let compressed = if dir.root().join(BLOB_INDEX_FILE).exists() {
+    let compressed = if dir.root().join(BLOB_INDEX_FILE).try_exists()? {
         let blobs = dir.blob_index()?;
         inscription
             .layers
@@ -379,8 +412,9 @@ fn verify_dir(dir: &SteleDir, inscription: Inscription) -> Result<Verified, dolo
     for descriptor in &inscription.layers {
         let check = || -> Result<u64, stelae::Error> {
             let digests = dir
-                .stream_layer(&blobs, &DolosProfile, descriptor, limits)?
-                .finish()?;
+                .stream_layer(&blobs, &DolosProfile, descriptor, limits)
+                .and_then(|reader| reader.finish())
+                .map_err(|error| undecodable(dir, &blobs, descriptor, error))?;
             if let Some(named) = blobs.blob_for(&descriptor.diff_id) {
                 if digests.blob_digest != named {
                     return Err(stelae::Error::ManifestMismatch(format!(
@@ -403,6 +437,52 @@ fn verify_dir(dir: &SteleDir, inscription: Inscription) -> Result<Verified, dolo
         inscription,
         compressed_bytes,
     })
+}
+
+/// A layer that failed to decompress, held against its blob's name.
+///
+/// zstd reports bytes it cannot decode as `Io`, of the kinds `scan_blobs`
+/// treats as "not a layer", so a truncated or altered blob would read as a disk
+/// that failed. Hashing the blob settles which it is, and costs nothing on the
+/// path that decodes: bytes that differ from their name are a digest mismatch,
+/// and bytes that match it and still do not decode are the published layer's
+/// own. A blob that cannot be read again keeps the original error.
+fn undecodable(
+    dir: &SteleDir,
+    blobs: &BlobIndex,
+    descriptor: &LayerDescriptor,
+    error: stelae::Error,
+) -> stelae::Error {
+    use std::io::ErrorKind as K;
+
+    let stelae::Error::Io(io) = &error else {
+        return error;
+    };
+    if !matches!(io.kind(), K::InvalidData | K::UnexpectedEof | K::Other) {
+        return error;
+    }
+    let Some(named) = blobs.blob_for(&descriptor.diff_id) else {
+        return error;
+    };
+    let Ok((actual, _)) = std::fs::File::open(dir.blob_path(&named))
+        .map_err(stelae::Error::from)
+        .and_then(digest_reader)
+    else {
+        return error;
+    };
+
+    if actual != named {
+        stelae::Error::DigestMismatch {
+            subject: format!("blob {named}"),
+            expected: named.to_string(),
+            actual: actual.to_string(),
+        }
+    } else {
+        stelae::Error::LayerMismatch {
+            kind: descriptor.kind.clone(),
+            reason: format!("its blob {named} is intact and does not decompress: {error}"),
+        }
+    }
 }
 
 /// The configured network's published read-only user, for its official
@@ -440,6 +520,17 @@ mod tests {
             assert!(!Error::verifying("verifying")(error).is_mismatch());
         }
 
+        // A registry or a staging directory that failed is not the stele.
+        for source in [
+            stelae::Error::Registry(std::io::Error::from(std::io::ErrorKind::StorageFull).into()),
+            stelae::Error::Scratch {
+                dir: PathBuf::from("/scratch"),
+                source: std::io::ErrorKind::PermissionDenied.into(),
+            },
+        ] {
+            assert!(!found_wrong(&layer(source)));
+        }
+
         let error = layer(stelae::Error::DigestMismatch {
             subject: "blob".to_owned(),
             expected: "a".to_owned(),
@@ -447,5 +538,32 @@ mod tests {
         });
         assert!(found_wrong(&error));
         assert!(Error::verifying("verifying")(error).is_mismatch());
+    }
+
+    #[test]
+    fn a_reproduction_differs_only_where_it_compared() {
+        let differs = dolos_snapshot::Error::ReproductionMismatch {
+            subject: "sequence".to_owned(),
+            reason: "another".to_owned(),
+        };
+        assert!(reproduction_differs(&differs));
+
+        // What the export raises over records it read from the local stores.
+        for error in [
+            dolos_snapshot::Error::OutOfOrder {
+                kind: "blocks",
+                reason: "a slot went backwards".to_owned(),
+            },
+            dolos_snapshot::Error::Stelae(stelae::Error::RecordTooLarge {
+                offset: 0,
+                required: 2,
+                limit: 1,
+            }),
+        ] {
+            assert!(found_wrong(&error));
+            assert!(!reproduction_differs(&error));
+            let classified = Error::classified("reproducing", reproduction_differs)(error);
+            assert!(!classified.is_mismatch());
+        }
     }
 }
