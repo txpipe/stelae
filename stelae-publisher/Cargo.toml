@@ -15,8 +15,9 @@ stelae = { path = "../stelae", version = "=0.3.1", features = ["oci"] }
 stelae-cardano = { path = "../stelae-cardano", version = "=0.3.1" }
 
 clap = { version = "4.5.37", features = ["derive"] }
-# The parser Dolos reads a credentials file with, so the file means the same
-# to both.
+# The parser Dolos reads a credentials file with, so every file Dolos takes
+# means the same here. The resolved release may parse a newer TOML than
+# Dolos's, so the converse need not hold.
 config = { version = "0.15.19", default-features = false, features = ["toml"] }
 miette = { version = "7.6.0", features = ["fancy"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }

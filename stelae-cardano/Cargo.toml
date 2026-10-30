@@ -38,5 +38,6 @@ testing = ["dep:dolos-testing", "dep:tempfile", "dep:toml"]
 [dev-dependencies]
 stelae-cardano = { path = ".", features = ["testing"] }
 dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "e184a965644bcd7a4317097eda94206bd50a35d7" }
+oci-client = { version = "0.17", default-features = false }
 tempfile = "3.20.0"
 toml = "0.8.13"

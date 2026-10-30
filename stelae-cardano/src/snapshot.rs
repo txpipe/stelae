@@ -25,11 +25,9 @@ use dolos_snapshot::{
     DolosProfile, RetainedEpochs,
 };
 use stelae::{
-    digest::digest_reader,
     dir::{SteleDir, BLOB_INDEX_FILE},
     frame::Limits,
-    inscription::{Inscription, LayerDescriptor},
-    transport::BlobIndex,
+    inscription::Inscription,
     SteleReader as _,
 };
 
@@ -413,8 +411,7 @@ fn verify_dir(dir: &SteleDir, inscription: Inscription) -> Result<Verified, dolo
         let check = || -> Result<u64, stelae::Error> {
             let digests = dir
                 .stream_layer(&blobs, &DolosProfile, descriptor, limits)
-                .and_then(|reader| reader.finish())
-                .map_err(|error| undecodable(dir, &blobs, descriptor, error))?;
+                .and_then(|reader| reader.finish())?;
             if let Some(named) = blobs.blob_for(&descriptor.diff_id) {
                 if digests.blob_digest != named {
                     return Err(stelae::Error::ManifestMismatch(format!(
@@ -437,52 +434,6 @@ fn verify_dir(dir: &SteleDir, inscription: Inscription) -> Result<Verified, dolo
         inscription,
         compressed_bytes,
     })
-}
-
-/// A layer that failed to decompress, held against its blob's name.
-///
-/// zstd reports bytes it cannot decode as `Io`, of the kinds `scan_blobs`
-/// treats as "not a layer", so a truncated or altered blob would read as a disk
-/// that failed. Hashing the blob settles which it is, and costs nothing on the
-/// path that decodes: bytes that differ from their name are a digest mismatch,
-/// and bytes that match it and still do not decode are the published layer's
-/// own. A blob that cannot be read again keeps the original error.
-fn undecodable(
-    dir: &SteleDir,
-    blobs: &BlobIndex,
-    descriptor: &LayerDescriptor,
-    error: stelae::Error,
-) -> stelae::Error {
-    use std::io::ErrorKind as K;
-
-    let stelae::Error::Io(io) = &error else {
-        return error;
-    };
-    if !matches!(io.kind(), K::InvalidData | K::UnexpectedEof | K::Other) {
-        return error;
-    }
-    let Some(named) = blobs.blob_for(&descriptor.diff_id) else {
-        return error;
-    };
-    let Ok((actual, _)) = std::fs::File::open(dir.blob_path(&named))
-        .map_err(stelae::Error::from)
-        .and_then(digest_reader)
-    else {
-        return error;
-    };
-
-    if actual != named {
-        stelae::Error::DigestMismatch {
-            subject: format!("blob {named}"),
-            expected: named.to_string(),
-            actual: actual.to_string(),
-        }
-    } else {
-        stelae::Error::LayerMismatch {
-            kind: descriptor.kind.clone(),
-            reason: format!("its blob {named} is intact and does not decompress: {error}"),
-        }
-    }
 }
 
 /// The configured network's published read-only user, for its official
@@ -538,6 +489,17 @@ mod tests {
         });
         assert!(found_wrong(&error));
         assert!(Error::verifying("verifying")(error).is_mismatch());
+
+        // A registry that served other bytes than the digest it was asked for.
+        let served = layer(stelae::Error::Registry(
+            oci_client::errors::DigestError::VerificationError {
+                expected: "sha256:aa".to_owned(),
+                actual: "sha256:bb".to_owned(),
+            }
+            .into(),
+        ));
+        assert!(found_wrong(&served));
+        assert!(Error::verifying("verifying")(served).is_mismatch());
     }
 
     #[test]
@@ -547,6 +509,12 @@ mod tests {
             reason: "another".to_owned(),
         };
         assert!(reproduction_differs(&differs));
+        assert!(reproduction_differs(
+            &dolos_snapshot::Error::NetworkMismatch {
+                expected: 1,
+                found: 2,
+            }
+        ));
 
         // What the export raises over records it read from the local stores.
         for error in [

@@ -435,7 +435,62 @@ fn a_blob_that_does_not_decompress_exits_three() {
 
         let output = fixture.run(&["verify", "--repo", &fixture.repo()]);
         assert_eq!(code(&output), 3, "{alteration}: {}", stderr_words(&output));
+        assert!(
+            stderr_words(&output).contains("does not decompress"),
+            "{alteration}: {}",
+            stderr_words(&output)
+        );
     }
+
+    // Under their own name, so only the decoder has anything to say about them.
+    let fixture = Fixture::published();
+    let blob = first_blob(&fixture.stele);
+    let bytes = b"not a zstd frame";
+    let renamed = stelae::Digest::compute(bytes).to_hex();
+    std::fs::write(blob.with_file_name(&renamed), bytes).unwrap();
+    std::fs::remove_file(&blob).unwrap();
+    let sidecar = fixture.stele.join(stelae::dir::BLOB_INDEX_FILE);
+    let index = std::fs::read_to_string(&sidecar).unwrap();
+    let named = blob.file_name().unwrap().to_str().unwrap();
+    assert!(index.contains(named));
+    std::fs::write(&sidecar, index.replace(named, &renamed)).unwrap();
+
+    let output = fixture.run(&["verify", "--repo", &fixture.repo()]);
+    assert_eq!(code(&output), 3, "{}", stderr_words(&output));
+    assert!(
+        stderr_words(&output).contains("does not decompress"),
+        "{}",
+        stderr_words(&output)
+    );
+}
+
+/// Plain verify never reads the position; a reproduction does, and refuses
+/// one that names its network wrongly before walking the stores.
+#[test]
+fn a_malformed_position_is_refused_by_a_reproduction() {
+    let fixture = Fixture::published();
+    fixture.rewrite_inscription(|inscription| {
+        inscription.position["network"]["name"] = "not-this-network".into();
+    });
+    let repo = fixture.repo();
+
+    let plain = fixture.run(&["verify", "--repo", &repo]);
+    assert_eq!(code(&plain), 0, "{}", stderr_words(&plain));
+
+    let reproduced = fixture.run(&[
+        "verify",
+        "--repo",
+        &repo,
+        "--reproduce",
+        "--state-epochs-file",
+        fixture.epochs.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&reproduced), 3, "{}", stderr_words(&reproduced));
+    assert!(
+        stderr_words(&reproduced).contains("position"),
+        "{}",
+        stderr_words(&reproduced)
+    );
 }
 
 #[test]

@@ -4653,6 +4653,7 @@ dependencies = [
  "dolos-snapshot",
  "dolos-testing",
  "itertools 0.14.0",
+ "oci-client",
  "pallas",
  "serde",
  "serde_json",

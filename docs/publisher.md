@@ -155,7 +155,7 @@ inscription in either format; `verify --format json` is one report object.
 They exit 0 on success, 1 on an error, 2 on a usage error and 3 when `verify`
 refused the stele: a document or layer whose bytes, digests, names or
 encoding disagree, including a blob a registry serves under another digest
-or past its descriptor's size and a directory blob that does not decompress,
+or past its descriptor's size and a blob that does not decompress,
 an inscription of another profile or schema, a broken history, or, under
 `--reproduce`, a stele of another network or sequence than the stores or a
 reproduction that differs. A check that could not run, because the registry,

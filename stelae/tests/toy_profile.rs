@@ -29,8 +29,8 @@ use stelae::{
     digest::read_blob,
     dir::{BlobIndex, LayerSpec, SteleDir, WrittenLayer},
     frame::{encode, CanonicalCbor, Limits},
-    Compression, Discarding, Error, Inscription, LayerDescriptor, LayerWriter, Profile, RecordSink,
-    SteleReader, SteleWriter,
+    Compression, Discarding, Error, Inscription, LayerDescriptor, LayerReader, LayerWriter,
+    Profile, RecordSink, SteleReader, SteleWriter,
 };
 
 const PROFILE_NAME: &str = "dev.example.toy";
@@ -992,6 +992,64 @@ fn tampering_is_caught_on_read() {
     assert!(
         stele.blob_index().is_err(),
         "a blob that disagrees with its name must not index"
+    );
+}
+
+/// A streamed layer whose bytes do not decompress is refused as that layer,
+/// and a blob that could not be read keeps the reader's own error: the one is
+/// the stele's defect, the other a disk's.
+#[test]
+fn a_blob_that_does_not_decompress_is_refused_as_its_layer() {
+    let temp = tempfile::tempdir().unwrap();
+    let (inscription, _) = write_stele(temp.path());
+
+    let stele = SteleDir::open(temp.path()).unwrap();
+    let descriptor = &inscription.layers[0];
+    let blob = stele
+        .blob_index()
+        .unwrap()
+        .blob_for(&descriptor.diff_id)
+        .unwrap();
+    let bytes = std::fs::read(stele.blob_path(&blob)).unwrap();
+
+    let read = |source: &mut dyn std::io::Read| {
+        LayerReader::new(source, &ToyProfile, descriptor, Limits::default())
+            .and_then(LayerReader::finish)
+    };
+
+    let mut not_zstd = b"not a zstd frame".as_slice();
+    let mut flipped = bytes.clone();
+    flipped[0] ^= 0xff;
+    let mut truncated = &bytes[..bytes.len() - 1];
+
+    for source in [&mut not_zstd, &mut flipped.as_slice(), &mut truncated] {
+        let err = read(source).unwrap_err();
+        assert!(
+            matches!(&err, Error::LayerMismatch { kind, reason }
+                if *kind == descriptor.kind && reason.contains("does not decompress")),
+            "{err:?}"
+        );
+    }
+
+    /// Fails after the first few bytes, as a disk does.
+    struct Failing<'a>(&'a [u8]);
+
+    impl std::io::Read for Failing<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            let n = buf.len().min(self.0.len()).min(8);
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    let err = read(&mut Failing(&bytes[..16])).unwrap_err();
+    assert!(
+        matches!(&err, Error::Io(io) if io.raw_os_error() == Some(5)),
+        "{err:?}"
     );
 }
 

@@ -47,8 +47,9 @@ use crate::{
 };
 
 /// The compressed-blob pipeline, read end to end:
-/// file → [`Tap`] (blob digest) → zstd → [`Meter`] (diffId, ceiling) → records.
-type Pipeline<R> = Meter<zstd::stream::read::Decoder<'static, io::BufReader<Tap<R>>>>;
+/// file → [`Tap`] (blob digest) → [`Source`] → zstd → [`Meter`] (diffId,
+/// ceiling) → records.
+type Pipeline<R> = Meter<zstd::stream::read::Decoder<'static, io::BufReader<Source<Tap<R>>>>>;
 
 /// A layer being read from a compressed blob, one record at a time.
 ///
@@ -88,9 +89,9 @@ impl<R: Read> LayerReader<R> {
         descriptor: &LayerDescriptor,
         limits: Limits,
     ) -> Result<Self, Error> {
-        let tap = Tap::new(source);
+        let tap = Source(Tap::new(source));
         let decoder = zstd::stream::read::Decoder::new(tap)?;
-        let meter = Meter::new(decoder, descriptor.uncompressed_size);
+        let meter = Meter::new(decoder, descriptor.uncompressed_size, &descriptor.kind);
 
         let mut records = RecordReader::with_limits(meter, limits);
 
@@ -172,7 +173,7 @@ impl<R: Read> LayerReader<R> {
         // boundary instead. `BufReader` may hold bytes it read ahead, and those
         // passed through the tap on the way in, so nothing is missed by
         // dropping it.
-        let mut tap = decoder.finish().into_inner();
+        let mut tap = decoder.finish().into_inner().0;
         io::copy(&mut tap, &mut io::sink())?;
 
         let (_, blob_digest, compressed_size) = tap.finish();
@@ -288,15 +289,17 @@ struct Meter<R> {
     hasher: Sha256,
     total: u64,
     limit: u64,
+    kind: String,
 }
 
 impl<R> Meter<R> {
-    fn new(inner: R, limit: u64) -> Self {
+    fn new(inner: R, limit: u64, kind: &str) -> Self {
         Self {
             inner,
             hasher: Sha256::new(),
             total: 0,
             limit,
+            kind: kind.to_owned(),
         }
     }
 
@@ -311,7 +314,10 @@ impl<R> Meter<R> {
 
 impl<R: Read> Read for Meter<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let read = self.inner.read(buf)?;
+        let read = self
+            .inner
+            .read(buf)
+            .map_err(|error| undecodable(error, &self.kind))?;
 
         self.total += read as u64;
 
@@ -325,5 +331,109 @@ impl<R: Read> Read for Meter<R> {
         self.hasher.update(&buf[..read]);
 
         Ok(read)
+    }
+}
+
+/// The blob's reader, below the decoder, with its failures marked.
+///
+/// zstd reports the bytes it cannot decode as `io::Error`s, and hands on the
+/// ones its source raised untouched, so the two are told apart by marking the
+/// source's.
+struct Source<R>(R);
+
+/// A failure of the blob's own reader: a disk, not the bytes on it.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+struct SourceFault(io::Error);
+
+impl<R: Read> Read for Source<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0
+            .read(buf)
+            .map_err(|error| io::Error::new(error.kind(), SourceFault(error)))
+    }
+}
+
+/// What the decoder failed with, as the layer's refusal where it is one.
+///
+/// The source's failures come back as they were raised, and so does a decoder
+/// that could not allocate its window: neither says anything about the blob.
+/// Everything else zstd raises is about the bytes — a corrupt or truncated
+/// frame, or a window larger than a reader will hold — and is refused as a
+/// [`Error::LayerMismatch`], boxed for [`lift`] to take back out.
+fn undecodable(error: io::Error, kind: &str) -> io::Error {
+    if error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<SourceFault>())
+    {
+        return error
+            .into_inner()
+            .expect("checked by the guard")
+            .downcast::<SourceFault>()
+            .expect("checked by the guard")
+            .0;
+    }
+
+    if is_out_of_memory(&error) {
+        return error;
+    }
+
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        Error::LayerMismatch {
+            kind: kind.to_owned(),
+            reason: format!("its blob does not decompress: {error}"),
+        },
+    )
+}
+
+/// The bindings keep only a libzstd error's name, so the allocation failure is
+/// recognized by it.
+fn is_out_of_memory(error: &io::Error) -> bool {
+    use zstd::zstd_safe::{get_error_name, zstd_sys::ZSTD_ErrorCode};
+
+    // libzstd returns an error as its negated code.
+    let code = 0usize.wrapping_sub(ZSTD_ErrorCode::ZSTD_error_memory_allocation as usize);
+
+    error.kind() == io::ErrorKind::Other && error.to_string() == get_error_name(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_decoder_failure_is_the_blobs_unless_it_is_the_machines() {
+        let refused = undecodable(io::Error::other("Unknown frame descriptor"), "notes");
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            matches!(lift(refused.into()), Error::LayerMismatch { kind, .. } if kind == "notes")
+        );
+
+        let truncated = undecodable(
+            io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete frame"),
+            "notes",
+        );
+        assert!(matches!(
+            lift(truncated.into()),
+            Error::LayerMismatch { .. }
+        ));
+
+        // The source's own failure, unmarked and as it was raised.
+        let disk = undecodable(
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                SourceFault(io::Error::from_raw_os_error(13)),
+            ),
+            "notes",
+        );
+        assert_eq!(disk.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(disk.raw_os_error(), Some(13));
+
+        let memory = undecodable(
+            io::Error::other("Allocation error : not enough memory"),
+            "notes",
+        );
+        assert!(matches!(lift(memory.into()), Error::Io(io) if io.kind() == io::ErrorKind::Other));
     }
 }
