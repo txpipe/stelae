@@ -39,7 +39,7 @@ use std::io::{self, Read};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    digest::{Digest, LayerDigests, Tap},
+    digest::{self, decoder_failure, Digest, LayerDigests, Source, Tap},
     frame::{LayerHeader, Limits, RecordReader},
     inscription::LayerDescriptor,
     profile::Profile,
@@ -334,73 +334,28 @@ impl<R: Read> Read for Meter<R> {
     }
 }
 
-/// The blob's reader, below the decoder, with its failures marked.
-///
-/// zstd reports the bytes it cannot decode as `io::Error`s, and hands on the
-/// ones its source raised untouched, so the two are told apart by marking the
-/// source's.
-struct Source<R>(R);
-
-/// A failure of the blob's own reader: a disk, not the bytes on it.
-#[derive(Debug, thiserror::Error)]
-#[error(transparent)]
-struct SourceFault(io::Error);
-
-impl<R: Read> Read for Source<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0
-            .read(buf)
-            .map_err(|error| io::Error::new(error.kind(), SourceFault(error)))
-    }
-}
-
-/// What the decoder failed with, as the layer's refusal where it is one.
-///
-/// The source's failures come back as they were raised, and so does a decoder
-/// that could not allocate its window: neither says anything about the blob.
-/// Everything else zstd raises is about the bytes — a corrupt or truncated
-/// frame, or a window larger than a reader will hold — and is refused as a
-/// [`Error::LayerMismatch`], boxed for [`lift`] to take back out.
+/// What the decoder failed with, as the layer's refusal where it is one: the
+/// blob's failures are a [`Error::LayerMismatch`], boxed for [`lift`] to take
+/// back out, and the rest come back as they were raised.
 fn undecodable(error: io::Error, kind: &str) -> io::Error {
-    if error
-        .get_ref()
-        .is_some_and(|inner| inner.is::<SourceFault>())
-    {
-        return error
-            .into_inner()
-            .expect("checked by the guard")
-            .downcast::<SourceFault>()
-            .expect("checked by the guard")
-            .0;
+    let error = decoder_failure(error);
+
+    match digest::undecodable(&error) {
+        Some(reason) => io::Error::new(
+            io::ErrorKind::InvalidData,
+            Error::LayerMismatch {
+                kind: kind.to_owned(),
+                reason: reason.to_string(),
+            },
+        ),
+        None => error,
     }
-
-    if is_out_of_memory(&error) {
-        return error;
-    }
-
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        Error::LayerMismatch {
-            kind: kind.to_owned(),
-            reason: format!("its blob does not decompress: {error}"),
-        },
-    )
-}
-
-/// The bindings keep only a libzstd error's name, so the allocation failure is
-/// recognized by it.
-fn is_out_of_memory(error: &io::Error) -> bool {
-    use zstd::zstd_safe::{get_error_name, zstd_sys::ZSTD_ErrorCode};
-
-    // libzstd returns an error as its negated code.
-    let code = 0usize.wrapping_sub(ZSTD_ErrorCode::ZSTD_error_memory_allocation as usize);
-
-    error.kind() == io::ErrorKind::Other && error.to_string() == get_error_name(code)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::digest::SourceFault;
 
     #[test]
     fn a_decoder_failure_is_the_blobs_unless_it_is_the_machines() {
@@ -410,14 +365,19 @@ mod tests {
             matches!(lift(refused.into()), Error::LayerMismatch { kind, .. } if kind == "notes")
         );
 
-        let truncated = undecodable(
+        // A truncated frame, and a window larger than the reader will hold:
+        // both are what the blob asks of the decoder.
+        for error in [
             io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete frame"),
-            "notes",
-        );
-        assert!(matches!(
-            lift(truncated.into()),
-            Error::LayerMismatch { .. }
-        ));
+            io::Error::other("Frame requires too much memory for decoding"),
+        ] {
+            let refused = lift(undecodable(error, "notes").into());
+            assert!(
+                matches!(&refused, Error::LayerMismatch { reason, .. }
+                    if reason.starts_with("its blob does not decompress")),
+                "{refused:?}"
+            );
+        }
 
         // The source's own failure, unmarked and as it was raised.
         let disk = undecodable(
@@ -430,10 +390,17 @@ mod tests {
         assert_eq!(disk.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(disk.raw_os_error(), Some(13));
 
-        let memory = undecodable(
-            io::Error::other("Allocation error : not enough memory"),
-            "notes",
-        );
-        assert!(matches!(lift(memory.into()), Error::Io(io) if io.kind() == io::ErrorKind::Other));
+        // The decoder's own failures, as libzstd names them.
+        for name in [
+            "Allocation error : not enough memory",
+            "Operation made no progress over multiple calls, due to output buffer being full",
+            "Operation made no progress over multiple calls, due to input being empty",
+        ] {
+            let error = lift(undecodable(io::Error::other(name), "notes").into());
+            assert!(
+                matches!(&error, Error::Io(io) if io.kind() == io::ErrorKind::Other),
+                "{name}: {error:?}"
+            );
+        }
     }
 }

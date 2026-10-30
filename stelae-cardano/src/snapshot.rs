@@ -337,20 +337,24 @@ impl Published {
 
     /// Check the stele's digests: its documents against each other, then every
     /// blob against both of its digests.
+    ///
+    /// Both sources' failures are classified at one place, so what the
+    /// directory tests hold a refusal to holds for a registry's too.
     pub fn verify(&self, point: Point) -> Result<Verified, Error> {
-        let what = "verifying the stele";
-        match self {
-            Self::Repository(repository) => {
-                repository.verify(point).map_err(Error::verifying(what))
-            }
+        let verified = match self {
+            Self::Repository(repository) => repository.verify(point),
             Self::Directory(dir) => {
-                let inscription = read_inscription(dir).map_err(Error::verifying(what))?;
+                let inscription = read_inscription(dir);
                 // Before any layer streams: the directory holds one stele, and
                 // a point naming another is not a reason to read this one.
-                at_point(dir, &inscription, point)?;
-                verify_dir(dir, inscription).map_err(Error::verifying(what))
+                if let Ok(inscription) = &inscription {
+                    at_point(dir, inscription, point)?;
+                }
+                inscription.and_then(|inscription| verify_dir(dir, inscription))
             }
-        }
+        };
+
+        verified.map_err(Error::verifying("verifying the stele"))
     }
 }
 

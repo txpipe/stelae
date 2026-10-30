@@ -238,11 +238,11 @@ fn digest_blob<R: Read, W: Write>(
     let mut hasher = Sha256::new();
 
     {
-        let mut decoder = zstd::stream::read::Decoder::new(&mut tap)?;
+        let mut decoder = zstd::stream::read::Decoder::new(Source(&mut tap))?;
         let mut buffer = [0u8; 64 * 1024];
 
         loop {
-            let read = read_uninterrupted(&mut decoder, &mut buffer)?;
+            let read = read_uninterrupted(&mut decoder, &mut buffer).map_err(decoder_failure)?;
             if read == 0 {
                 break;
             }
@@ -353,6 +353,81 @@ impl<R: Read> Read for Tap<R> {
         self.bytes += read as u64;
         Ok(read)
     }
+}
+
+/// The blob's reader, below a decoder, with its failures marked.
+///
+/// zstd reports the bytes it cannot decode as `io::Error`s, and hands on the
+/// ones its source raised untouched, so the two are told apart by marking the
+/// source's. `Interrupted` is retried here rather than handed up: the decoder
+/// counts each call that comes back without input towards libzstd's
+/// no-progress limit, so enough signals in a row would read as a broken frame.
+pub(crate) struct Source<R>(pub(crate) R);
+
+/// A failure of the blob's own reader: a disk, not the bytes on it.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(crate) struct SourceFault(pub(crate) std::io::Error);
+
+impl<R: Read> Read for Source<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        read_uninterrupted(&mut self.0, buf)
+            .map_err(|error| std::io::Error::new(error.kind(), SourceFault(error)))
+    }
+}
+
+/// A decoder failure that is the blob's: its bytes are not a layer.
+#[derive(Debug, thiserror::Error)]
+#[error("its blob does not decompress: {0}")]
+pub(crate) struct Undecodable(std::io::Error);
+
+/// What a decoder over a [`Source`] failed with, the blob's failures marked
+/// [`Undecodable`] and kept at their kind.
+///
+/// The source's failures come back as they were raised, and so do the
+/// decoder's own: a window it could not allocate, or calls that made no
+/// progress. Neither says anything about the blob. Everything else zstd raises
+/// is about the bytes — a corrupt or truncated frame, or a window larger than a
+/// reader will hold.
+pub(crate) fn decoder_failure(error: std::io::Error) -> std::io::Error {
+    if error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<SourceFault>())
+    {
+        return error
+            .into_inner()
+            .expect("checked by the guard")
+            .downcast::<SourceFault>()
+            .expect("checked by the guard")
+            .0;
+    }
+
+    if is_the_decoders(&error) {
+        return error;
+    }
+
+    std::io::Error::new(error.kind(), Undecodable(error))
+}
+
+/// The decoder's verdict on the blob, if that is what `error` is.
+pub(crate) fn undecodable(error: &std::io::Error) -> Option<&Undecodable> {
+    error.get_ref()?.downcast_ref()
+}
+
+/// The bindings keep only a libzstd error's name, so the decoder's own
+/// failures are recognized by theirs.
+fn is_the_decoders(error: &std::io::Error) -> bool {
+    use zstd::zstd_safe::{get_error_name, zstd_sys::ZSTD_ErrorCode as Code};
+
+    error.kind() == ErrorKind::Other
+        && [
+            Code::ZSTD_error_memory_allocation,
+            Code::ZSTD_error_noForwardProgress_destFull,
+            Code::ZSTD_error_noForwardProgress_inputEmpty,
+        ]
+        .into_iter()
+        // libzstd returns an error as its negated code.
+        .any(|code| error.to_string() == get_error_name(0usize.wrapping_sub(code as usize)))
 }
 
 #[cfg(test)]
@@ -551,5 +626,34 @@ mod tests {
         let read = scan_blob(blob.as_slice()).unwrap();
         assert_eq!(read.compressed_size, blob.len() as u64);
         assert_eq!(read.blob_digest, Digest::compute(&blob));
+    }
+
+    /// A directory scan skips a blob only on the decoder's verdict on its
+    /// bytes, so this is the line between "not a layer" and a failure.
+    #[test]
+    fn only_the_bytes_make_a_blob_undecodable() {
+        let (blob, _) = write_layer(&sample_sequence(), 9);
+        let undecodable_bytes = |bytes: &[u8]| match scan_blob(bytes) {
+            Err(Error::Io(io)) => undecodable(&io).is_some(),
+            other => panic!("{other:?}"),
+        };
+
+        assert!(undecodable_bytes(b"not a zstd frame"));
+        assert!(undecodable_bytes(&blob[..blob.len() - 1]));
+
+        for decoders in [
+            "Allocation error : not enough memory",
+            "Operation made no progress over multiple calls, due to input being empty",
+        ] {
+            let error = decoder_failure(std::io::Error::other(decoders));
+            assert!(undecodable(&error).is_none(), "{decoders}");
+        }
+
+        let disk = decoder_failure(std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            SourceFault(std::io::Error::from_raw_os_error(5)),
+        ));
+        assert!(undecodable(&disk).is_none());
+        assert_eq!(disk.raw_os_error(), Some(5));
     }
 }
