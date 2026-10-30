@@ -3,7 +3,7 @@ use std::{
     process::{Command, Output},
 };
 
-use stelae::progress::Observer;
+use stelae::{inscription::Inscription, progress::Observer};
 use stelae_cardano::{
     config,
     publisher::{publish_once, Destination},
@@ -48,20 +48,33 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        let config = self.node.config_path();
-        Command::new(env!("CARGO_BIN_EXE_stelae-publisher"))
+        self.command(args).output().unwrap()
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_stelae-publisher"));
+        command
             .arg("--config")
-            .arg(&config)
+            .arg(self.node.config_path())
             .args(args)
             .env_remove("DOLOS_STELAE_USER")
             .env_remove("DOLOS_STELAE_PASSWORD")
-            .env_remove("DOLOS_STELAE_TOKEN")
-            .output()
-            .unwrap()
+            .env_remove("DOLOS_STELAE_TOKEN");
+        command
     }
 
     fn inscription(&self) -> Vec<u8> {
         std::fs::read(self.stele.join("inscription.json")).unwrap()
+    }
+
+    fn rewrite_inscription(&self, edit: impl FnOnce(&mut Inscription)) {
+        let mut inscription = Inscription::parse(&self.inscription()).unwrap();
+        edit(&mut inscription);
+        std::fs::write(
+            self.stele.join("inscription.json"),
+            inscription.canonicalize().unwrap(),
+        )
+        .unwrap();
     }
 }
 
@@ -77,6 +90,22 @@ fn json(output: &Output) -> serde_json::Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+/// Stderr's words, rejoined across miette's wrapping.
+fn stderr_words(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr)
+        .split_whitespace()
+        .filter(|word| *word != "│")
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn flip_a_byte(blob: &Path) {
+    let mut bytes = std::fs::read(blob).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    std::fs::write(blob, bytes).unwrap();
 }
 
 fn first_blob(stele: &Path) -> PathBuf {
@@ -139,11 +168,7 @@ fn verify_exits_zero_on_the_published_directory_and_three_on_an_altered_layer() 
     let report = json(&reproduced);
     assert_eq!(report["reproduced"]["layers"], report["layers"]);
 
-    let blob = first_blob(&fixture.stele);
-    let mut bytes = std::fs::read(&blob).unwrap();
-    let middle = bytes.len() / 2;
-    bytes[middle] ^= 0xff;
-    std::fs::write(&blob, bytes).unwrap();
+    flip_a_byte(&first_blob(&fixture.stele));
 
     let altered = fixture.run(&["verify", "--repo", &repo, "--format", "json"]);
     assert_eq!(
@@ -221,4 +246,162 @@ fn an_unreadable_stele_exits_one_and_a_bad_invocation_two() {
         2
     );
     assert_eq!(code(&fixture.run(&["digest"])), 2);
+}
+
+#[test]
+fn a_blob_whose_bytes_differ_from_its_name_exits_three() {
+    let fixture = Fixture::published();
+    // A skippable zstd frame decompresses to nothing, so the layer still reads
+    // as its descriptor says and only the blob's name disagrees with it.
+    let blob = first_blob(&fixture.stele);
+    let mut bytes = std::fs::read(&blob).unwrap();
+    bytes.extend_from_slice(&[0x50, 0x2a, 0x4d, 0x18, 1, 0, 0, 0, 0]);
+    std::fs::write(&blob, bytes).unwrap();
+
+    let output = fixture.run(&["verify", "--repo", &fixture.repo()]);
+    assert_eq!(code(&output), 3, "{}", stderr_words(&output));
+    assert!(
+        stderr_words(&output).contains("the blob index names this layer's blob"),
+        "{}",
+        stderr_words(&output)
+    );
+}
+
+#[test]
+fn a_non_canonical_inscription_exits_three() {
+    let fixture = Fixture::published();
+    let document: serde_json::Value = serde_json::from_slice(&fixture.inscription()).unwrap();
+    std::fs::write(
+        fixture.stele.join("inscription.json"),
+        serde_json::to_vec_pretty(&document).unwrap(),
+    )
+    .unwrap();
+
+    let output = fixture.run(&["verify", "--repo", &fixture.repo()]);
+    assert_eq!(code(&output), 3, "{}", stderr_words(&output));
+}
+
+#[test]
+fn a_directory_inscription_of_another_profile_is_refused() {
+    let edits: [fn(&mut Inscription); 2] = [
+        |inscription| inscription.profile.version += 1,
+        |inscription| inscription.profile.name = "io.example.other".to_owned(),
+    ];
+    for edit in edits {
+        let fixture = Fixture::published();
+        fixture.rewrite_inscription(edit);
+        let repo = fixture.repo();
+
+        let verified = fixture.run(&["verify", "--repo", &repo]);
+        assert_eq!(code(&verified), 3, "{}", stderr_words(&verified));
+        let inspected = fixture.run(&["inspect", "--repo", &repo]);
+        assert_eq!(code(&inspected), 1, "{}", stderr_words(&inspected));
+    }
+}
+
+#[test]
+fn a_directory_without_its_blob_index() {
+    let fixture = Fixture::published();
+    let repo = fixture.repo();
+    std::fs::remove_file(fixture.stele.join("blobs.json")).unwrap();
+
+    let verified = fixture.run(&["verify", "--repo", &repo]);
+    assert_eq!(code(&verified), 0, "{}", stderr_words(&verified));
+
+    // Inspect reads no blob for sizes it cannot state without reading all.
+    flip_a_byte(&first_blob(&fixture.stele));
+    let inspected = fixture.run(&["inspect", "--repo", &repo]);
+    assert_eq!(code(&inspected), 0, "{}", stderr_words(&inspected));
+    let stdout = String::from_utf8(inspected.stdout).unwrap();
+    assert!(stdout.contains("?"), "{stdout}");
+
+    // The scan that rebuilds the index is a verification of every blob.
+    let verified = fixture.run(&["verify", "--repo", &repo]);
+    assert_eq!(code(&verified), 3, "{}", stderr_words(&verified));
+}
+
+#[test]
+fn a_point_the_directory_does_not_hold_is_refused_before_a_layer_is_read() {
+    let fixture = Fixture::published();
+    flip_a_byte(&first_blob(&fixture.stele));
+
+    let output = fixture.run(&["verify", "--repo", &fixture.repo(), "--point", "epoch-99"]);
+    assert_eq!(code(&output), 1, "{}", stderr_words(&output));
+    assert!(
+        stderr_words(&output).contains("holds one stele"),
+        "{}",
+        stderr_words(&output)
+    );
+}
+
+#[test]
+fn a_blob_that_cannot_be_read_exits_one() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::published();
+    let blob = first_blob(&fixture.stele);
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&blob).is_ok() {
+        // Privileged: permissions do not stop this process.
+        return;
+    }
+
+    let output = fixture.run(&["verify", "--repo", &fixture.repo()]);
+    assert_eq!(code(&output), 1, "{}", stderr_words(&output));
+}
+
+#[test]
+fn digest_refuses_a_predecessor_it_cannot_chain_onto() {
+    let fixture = Fixture::published();
+    let epochs = fixture.epochs.to_str().unwrap();
+    let digest = |chain_from: &Path| {
+        fixture.run(&[
+            "digest",
+            "--state-epochs-file",
+            epochs,
+            "--chain-from",
+            chain_from.to_str().unwrap(),
+        ])
+    };
+
+    let missing = digest(&fixture.node.path().join("missing.json"));
+    assert_eq!(code(&missing), 1, "{}", stderr_words(&missing));
+    assert!(missing.stdout.is_empty());
+
+    // The published stele is at this plan's own sequence, not its predecessor's.
+    let itself = digest(&fixture.stele.join("inscription.json"));
+    assert_eq!(code(&itself), 1, "{}", stderr_words(&itself));
+    assert!(itself.stdout.is_empty());
+
+    let pretty = fixture.node.path().join("pretty.json");
+    let document: serde_json::Value = serde_json::from_slice(&fixture.inscription()).unwrap();
+    std::fs::write(&pretty, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    let re_encoded = digest(&pretty);
+    assert_eq!(code(&re_encoded), 1, "{}", stderr_words(&re_encoded));
+    assert!(
+        stderr_words(&re_encoded).contains("not in canonical form"),
+        "{}",
+        stderr_words(&re_encoded)
+    );
+}
+
+#[test]
+fn a_command_off_the_registry_ignores_its_credentials() {
+    let fixture = Fixture::published();
+    let repo = fixture.repo();
+    let epochs = fixture.epochs.to_str().unwrap();
+
+    let commands: [&[&str]; 3] = [
+        &["verify", "--repo", &repo],
+        &["inspect", "--repo", &repo],
+        &["digest", "--state-epochs-file", epochs],
+    ];
+    for args in commands {
+        let output = fixture
+            .command(args)
+            .env("DOLOS_STELAE_PASSWORD", "secret")
+            .output()
+            .unwrap();
+        assert_eq!(code(&output), 0, "{}: {}", args[0], stderr_words(&output));
+    }
 }

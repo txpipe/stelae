@@ -4,7 +4,8 @@
 //! Every check is the Dolos profile's own. This module opens the stores and the
 //! stele a command names and composes the profile's digest, transport and
 //! reproduction entry points over them. A directory stele has no registry
-//! manifest, so its layers are checked through the protocol reader the way the
+//! manifest, so its inscription is held to the profile the way a registry pull
+//! holds it, and its layers are checked through the protocol reader the way the
 //! profile checks a repository's.
 
 use std::{
@@ -13,16 +14,22 @@ use std::{
 };
 
 use dolos::engine::{BulkReplayError, ReplayWorkspace};
+use dolos_cardano::networks::KnownNetwork;
 use dolos_core::{config::RootConfig, Genesis};
 use dolos_snapshot::{
     export::{Document, First, Following, Plan, Predecessor as _},
     facade::{Selection, SnapshotRepository, SnapshotSource},
     node,
-    registry::{Auth, Point, Tuning},
+    registry::{Auth, Point, Repository, Tuning},
     restore::Source,
     DolosProfile, RetainedEpochs,
 };
-use stelae::{dir::SteleDir, frame::Limits, inscription::Inscription, SteleReader as _};
+use stelae::{
+    dir::{SteleDir, BLOB_INDEX_FILE},
+    frame::Limits,
+    inscription::Inscription,
+    SteleReader as _,
+};
 
 pub use dolos_snapshot::{
     boundary::Boundary,
@@ -94,19 +101,71 @@ impl Error {
     }
 }
 
-/// The failures that are a published stele disagreeing with itself or with the
-/// local stores, as opposed to one that could not be read.
+/// Whether a check refused the published stele's own bytes or documents,
+/// rather than failing to read them or to read the local stores.
+///
+/// A layer's failure is classified by what it wraps: a registry that keeps
+/// answering 503 is not a corrupt layer.
 fn found_wrong(error: &dolos_snapshot::Error) -> bool {
     use dolos_snapshot::Error as E;
 
-    matches!(
-        error,
-        E::LayerVerification { .. }
-            | E::ReproductionMismatch { .. }
-            | E::Stelae(
-                stelae::Error::ManifestMismatch(_) | stelae::Error::NonCanonicalInscription
-            )
-    )
+    match error {
+        E::LayerVerification { source, .. } => found_wrong(source),
+        E::Stelae(error) => refused_stele(error),
+        E::ReproductionMismatch { .. }
+        | E::NetworkMismatch { .. }
+        | E::MalformedInscription { .. }
+        | E::MalformedRecord { .. }
+        | E::OutOfOrder { .. }
+        | E::ScopeMismatch { .. }
+        | E::UnknownDimension(_)
+        | E::UnknownNamespace(_)
+        | E::UnknownExactKind(_) => true,
+        _ => false,
+    }
+}
+
+/// Exhaustive, so a new protocol refusal is classified where it is added.
+fn refused_stele(error: &stelae::Error) -> bool {
+    use stelae::Error as E;
+
+    match error {
+        E::Json(_)
+        | E::NonCanonicalCbor { .. }
+        | E::TruncatedCbor { .. }
+        | E::CborTooDeep { .. }
+        | E::RecordTooLarge { .. }
+        | E::TrailingCbor { .. }
+        | E::MalformedHeader(_)
+        | E::Canonicalization(_)
+        | E::UnsafeInteger { .. }
+        | E::NonIntegerNumber { .. }
+        | E::UnsupportedSchema { .. }
+        | E::UnknownProfile { .. }
+        | E::UnsupportedProfileVersion { .. }
+        | E::HistoryInvariant(_)
+        | E::MalformedRecord { .. }
+        | E::InvalidDigest { .. }
+        | E::InvalidMediaType { .. }
+        | E::InvalidProfileName { .. }
+        | E::InvalidTag { .. }
+        | E::UnknownLayerKind { .. }
+        | E::DigestMismatch { .. }
+        | E::LayerNotFound { .. }
+        | E::LayerMismatch { .. }
+        | E::DecompressedTooLarge { .. }
+        | E::NonCanonicalInscription
+        | E::ManifestMismatch(_)
+        | E::ManifestTooLarge { .. } => true,
+        E::Io(_)
+        | E::CborEncode(_)
+        | E::HistoryBreak { .. }
+        | E::BlobMissing { .. }
+        | E::LayerNotWritten(_)
+        | E::InvalidRepository { .. }
+        | E::Scratch { .. }
+        | E::Registry(_) => false,
+    }
 }
 
 /// Open the stores, plan `selection` over them and establish the boundary
@@ -238,10 +297,9 @@ impl Published {
         match self {
             Self::Repository(repository) => repository.inspect(point).map_err(Error::profile(what)),
             Self::Directory(dir) => {
-                let inspected =
-                    inspect_dir(dir).map_err(|error| Error::profile(what)(error.into()))?;
-                at_point(dir, &inspected.inscription, point)?;
-                Ok(inspected)
+                let inscription = read_inscription(dir).map_err(Error::profile(what))?;
+                at_point(dir, &inscription, point)?;
+                inspect_dir(dir, inscription).map_err(|error| Error::profile(what)(error.into()))
             }
         }
     }
@@ -255,9 +313,11 @@ impl Published {
                 repository.verify(point).map_err(Error::verifying(what))
             }
             Self::Directory(dir) => {
-                let verified = verify_dir(dir).map_err(Error::verifying(what))?;
-                at_point(dir, &verified.inscription, point)?;
-                Ok(verified)
+                let inscription = read_inscription(dir).map_err(Error::verifying(what))?;
+                // Before any layer streams: the directory holds one stele, and
+                // a point naming another is not a reason to read this one.
+                at_point(dir, &inscription, point)?;
+                verify_dir(dir, inscription).map_err(Error::verifying(what))
             }
         }
     }
@@ -275,14 +335,27 @@ fn at_point(dir: &SteleDir, inscription: &Inscription, point: Point) -> Result<(
     }
 }
 
-fn inspect_dir(dir: &SteleDir) -> Result<Inspected, stelae::Error> {
+/// The inscription, refused unless it is this profile's, as a registry pull
+/// refuses it.
+fn read_inscription(dir: &SteleDir) -> Result<Inscription, dolos_snapshot::Error> {
     let inscription = dir.read_inscription()?;
-    let blobs = dir.blob_index()?;
-    let compressed = inscription
-        .layers
-        .iter()
-        .map(|descriptor| dir.compressed_size(&blobs, descriptor))
-        .collect::<Result<Vec<_>, _>>()?;
+    inscription.check_profile(&DolosProfile)?;
+    Ok(inscription)
+}
+
+/// Compressed sizes come from the blob index, and only from its sidecar: a
+/// directory without one would have every blob read to build it.
+fn inspect_dir(dir: &SteleDir, inscription: Inscription) -> Result<Inspected, stelae::Error> {
+    let compressed = if dir.root().join(BLOB_INDEX_FILE).exists() {
+        let blobs = dir.blob_index()?;
+        inscription
+            .layers
+            .iter()
+            .map(|descriptor| dir.compressed_size(&blobs, descriptor))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        vec![None; inscription.layers.len()]
+    };
 
     Ok(Inspected {
         identity: inscription.digest()?,
@@ -295,8 +368,7 @@ fn inspect_dir(dir: &SteleDir) -> Result<Inspected, stelae::Error> {
 /// The profile's repository verification over a directory: each layer
 /// streamed under the profile's record ceiling, held against its descriptor
 /// by the reader, and its bytes against the blob name that places it.
-fn verify_dir(dir: &SteleDir) -> Result<Verified, dolos_snapshot::Error> {
-    let inscription = dir.read_inscription()?;
+fn verify_dir(dir: &SteleDir, inscription: Inscription) -> Result<Verified, dolos_snapshot::Error> {
     let blobs = dir.blob_index()?;
     let limits = Limits {
         max_record: dolos_snapshot::MAX_RECORD,
@@ -331,4 +403,49 @@ fn verify_dir(dir: &SteleDir) -> Result<Verified, dolos_snapshot::Error> {
         inscription,
         compressed_bytes,
     })
+}
+
+/// The configured network's published read-only user, for its official
+/// repository and no other, as Dolos reads it: its password is compiled in and
+/// has no business reaching another registry.
+pub fn official_reader(config: &RootConfig, repository: &Repository) -> Option<&'static str> {
+    let network = KnownNetwork::by_name(&config.chain.network)?;
+    let official: Repository = network.stelae.registry.parse().ok()?;
+
+    (official.registry() == repository.registry() && !network.stelae.user.is_empty())
+        .then_some(network.stelae.user)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layer(source: stelae::Error) -> dolos_snapshot::Error {
+        dolos_snapshot::Error::LayerVerification {
+            kind: "blocks".to_owned(),
+            scope: "epoch 1".to_owned(),
+            source: Box::new(source.into()),
+        }
+    }
+
+    #[test]
+    fn a_layer_is_wrong_by_what_failed_in_it() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::StorageFull,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let error = layer(stelae::Error::Io(kind.into()));
+            assert!(!found_wrong(&error), "{kind:?}");
+            assert!(!Error::verifying("verifying")(error).is_mismatch());
+        }
+
+        let error = layer(stelae::Error::DigestMismatch {
+            subject: "blob".to_owned(),
+            expected: "a".to_owned(),
+            actual: "b".to_owned(),
+        });
+        assert!(found_wrong(&error));
+        assert!(Error::verifying("verifying")(error).is_mismatch());
+    }
 }

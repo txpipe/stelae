@@ -33,13 +33,20 @@ struct Cli {
 /// The registry identity, from the invocation and never from dolos.toml.
 ///
 /// The names are Dolos's own: `--registry-user` / `DOLOS_STELAE_USER`, and the
-/// secret from `DOLOS_STELAE_PASSWORD` or `DOLOS_STELAE_TOKEN`, never an
-/// argument, where it would land in process listings.
-#[derive(Debug, Args, Clone)]
+/// secret from `DOLOS_STELAE_PASSWORD` or `DOLOS_STELAE_TOKEN`, or from
+/// `--registry-credentials-file`, never an argument, where it would land in
+/// process listings.
+#[derive(Debug, Args, Clone, Default)]
 struct CredentialArgs {
-    /// The user to authenticate to the registry as.
+    /// The user to authenticate to the registry as; `verify` and `inspect`
+    /// read the configured network's official repository as its published
+    /// read-only user when none is given.
     #[arg(long, global = true, env = "DOLOS_STELAE_USER", value_name = "USER")]
     registry_user: Option<String>,
+    /// A TOML file naming the registry secret as `password` or `token`, in
+    /// place of DOLOS_STELAE_PASSWORD / DOLOS_STELAE_TOKEN.
+    #[arg(long, global = true, value_name = "PATH")]
+    registry_credentials_file: Option<PathBuf>,
 }
 
 const PASSWORD_ENV: &str = "DOLOS_STELAE_PASSWORD";
@@ -52,17 +59,78 @@ type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
 /// registry.
 type ResolveAuth<'a> = &'a dyn Fn() -> miette::Result<Auth>;
 
+/// Resolves the identity a command reads `repository` as.
+type ResolveReadAuth<'a> = &'a dyn Fn(&Repository) -> miette::Result<Auth>;
+
+/// The secret half of the credentials.
+#[derive(Default)]
+struct Secrets {
+    password: Option<String>,
+    token: Option<String>,
+}
+
 impl CredentialArgs {
     fn auth_from(&self, env: Env) -> miette::Result<Auth> {
+        self.resolve(env, None)
+    }
+
+    /// As Dolos reads a stele: with neither a user nor a token, `official` is
+    /// the user, and the official password comes with it.
+    fn read_auth_from(&self, env: Env, official: Option<&str>) -> miette::Result<Auth> {
+        self.resolve(env, official)
+    }
+
+    fn resolve(&self, env: Env, official: Option<&str>) -> miette::Result<Auth> {
+        let secrets = match &self.registry_credentials_file {
+            Some(path) => read_secrets(path)?,
+            None => Secrets {
+                password: env(PASSWORD_ENV),
+                token: env(TOKEN_ENV),
+            },
+        };
         // An empty value is no secret, as in Dolos.
-        let secret = |name| env(name).filter(|value: &String| !value.is_empty());
-        let inputs = RegistryAuth::from_inputs(
+        let password = secrets.password.filter(|value| !value.is_empty());
+        let token = secrets.token.filter(|value| !value.is_empty());
+        let user = match (
             self.registry_user.clone().filter(|user| !user.is_empty()),
-            secret(PASSWORD_ENV),
-            secret(TOKEN_ENV),
-        );
+            &token,
+        ) {
+            (Some(user), _) => Some(user),
+            (None, None) => official.map(str::to_owned),
+            (None, Some(_)) => None,
+        };
+        let inputs = RegistryAuth::from_inputs(user, password, token);
         stelae_cardano::registry_auth(&inputs).into_diagnostic()
     }
+}
+
+/// Reads a credentials file, saying where it failed and never what it holds:
+/// a parse error would quote the offending line, and that line is a secret.
+fn read_secrets(path: &Path) -> miette::Result<Secrets> {
+    let refused = || {
+        miette::miette!(
+            "{} is not a TOML file naming only `password` or `token`",
+            path.display()
+        )
+    };
+    let text = std::fs::read_to_string(path)
+        .into_diagnostic()
+        .with_context(|| format!("reading the registry credentials in {}", path.display()))?;
+    let table: toml::Table = text.parse().map_err(|_| refused())?;
+
+    let mut secrets = Secrets::default();
+    for (key, value) in table {
+        let value = match value {
+            toml::Value::String(value) => value,
+            _ => return Err(refused()),
+        };
+        match key.as_str() {
+            "password" => secrets.password = Some(value),
+            "token" => secrets.token = Some(value),
+            _ => return Err(refused()),
+        }
+    }
+    Ok(secrets)
 }
 
 /// The epochs this publisher retains a state dump of: signed input, so every
@@ -592,10 +660,10 @@ fn open_stele(
     config: &RootConfig,
     source: &RestoreSource,
     insecure: bool,
-    auth: ResolveAuth,
+    auth: ResolveReadAuth,
 ) -> miette::Result<Published> {
     let auth = match source {
-        RestoreSource::Repo(_) => auth()?,
+        RestoreSource::Repo(repository) => auth(repository)?,
         RestoreSource::Dir(_) => Auth::Anonymous,
     };
     Published::open(config, source, insecure, auth).map_err(diagnose)
@@ -706,7 +774,7 @@ fn run_verify(
     config: &RootConfig,
     genesis: &Genesis,
     args: &VerifyArgs,
-    auth: ResolveAuth,
+    auth: ResolveReadAuth,
 ) -> miette::Result<()> {
     let stele = open_stele(config, &args.repo, args.insecure, auth)?;
     let name = source_name(&args.repo);
@@ -769,12 +837,16 @@ fn run_verify(
             "checked": "digests",
             "reproduced": reproduced.map(|layers| serde_json::json!({ "layers": layers })),
         });
-        println!("{report}");
+        write_stdout(format!("{report}\n").as_bytes())?;
     }
     Ok(())
 }
 
-fn run_inspect(config: &RootConfig, args: &InspectArgs, auth: ResolveAuth) -> miette::Result<()> {
+fn run_inspect(
+    config: &RootConfig,
+    args: &InspectArgs,
+    auth: ResolveReadAuth,
+) -> miette::Result<()> {
     let inspected = open_stele(config, &args.repo, args.insecure, auth)?
         .inspect(args.point)
         .map_err(diagnose)?;
@@ -840,11 +912,16 @@ fn run_inspect(config: &RootConfig, args: &InspectArgs, auth: ResolveAuth) -> mi
             descriptor.scope,
         );
     }
+    // A total over sizes some of which are unknown would understate it.
+    let total_compressed = match inspected.compressed.iter().all(Option::is_some) {
+        true => inspected.total_compressed.to_string(),
+        false => "?".to_owned(),
+    };
     println!(
         "totals:   {} records, {} uncompressed bytes, {} compressed bytes",
         records,
         inscription.uncompressed_size(),
-        inspected.total_compressed,
+        total_compressed,
     );
     Ok(())
 }
@@ -873,6 +950,10 @@ fn execute(cli: Cli, env: Env) -> miette::Result<()> {
         .context("parsing configuration")?;
     let genesis = load_genesis(&config)?;
     let auth = || cli.credentials.auth_from(env);
+    let read_auth = |repository: &Repository| {
+        let official = snapshot::official_reader(&config, repository);
+        cli.credentials.read_auth_from(env, official)
+    };
     let observer = Observer::new(Arc::new(ConsoleProgress));
 
     match cli.command {
@@ -890,8 +971,8 @@ fn execute(cli: Cli, env: Env) -> miette::Result<()> {
             run_backfill(&config, &genesis, &backfill, &observer)
         }
         Command::Digest(args) => run_digest(&config, &genesis, &args),
-        Command::Verify(args) => run_verify(&config, &genesis, &args, &auth),
-        Command::Inspect(args) => run_inspect(&config, &args, &auth),
+        Command::Verify(args) => run_verify(&config, &genesis, &args, &read_auth),
+        Command::Inspect(args) => run_inspect(&config, &args, &read_auth),
     }
 }
 
@@ -1175,13 +1256,12 @@ mod tests {
 
     #[test]
     fn registry_credentials_come_from_the_invocation() {
-        let anonymous = CredentialArgs {
-            registry_user: None,
-        };
+        let anonymous = CredentialArgs::default();
         assert_eq!(anonymous.auth_from(&|_| None).unwrap(), Auth::Anonymous);
 
         let publisher = CredentialArgs {
             registry_user: Some("publisher".to_owned()),
+            ..CredentialArgs::default()
         };
         let password = |name: &str| (name == PASSWORD_ENV).then(|| "secret".to_owned());
         assert_eq!(
@@ -1199,5 +1279,82 @@ mod tests {
         );
         assert!(publisher.auth_from(&token).is_err());
         assert!(anonymous.auth_from(&password).is_err());
+    }
+
+    #[test]
+    fn a_reader_takes_the_official_user_for_the_official_repository_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config::load(Some(Path::new(&node(dir.path())))).unwrap();
+        let official: Repository = "oci://oci.stelae.store/cardano/preview".parse().unwrap();
+        let other: Repository = "oci://registry.invalid/cardano/preview".parse().unwrap();
+        let read = |args: &CredentialArgs, repository: &Repository, env: Env| {
+            args.read_auth_from(env, snapshot::official_reader(&config, repository))
+        };
+
+        let anonymous = CredentialArgs::default();
+        let Auth::Basic { user, password } = read(&anonymous, &official, &|_| None).unwrap() else {
+            panic!("the official repository is read anonymously");
+        };
+        assert!(!user.is_empty() && !password.is_empty());
+        assert_eq!(
+            read(&anonymous, &other, &|_| None).unwrap(),
+            Auth::Anonymous
+        );
+
+        let token = |name: &str| (name == TOKEN_ENV).then(|| "ghp_x".to_owned());
+        assert_eq!(
+            read(&anonymous, &official, &token).unwrap(),
+            Auth::Bearer("ghp_x".to_owned())
+        );
+        let named = CredentialArgs {
+            registry_user: Some("reader".to_owned()),
+            ..CredentialArgs::default()
+        };
+        let password = |name: &str| (name == PASSWORD_ENV).then(|| "secret".to_owned());
+        assert_eq!(
+            read(&named, &official, &password).unwrap(),
+            Auth::Basic {
+                user: "reader".to_owned(),
+                password: "secret".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_credentials_file_takes_the_place_of_the_secret_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("credentials.toml");
+        let with_file = CredentialArgs {
+            registry_user: Some("publisher".to_owned()),
+            registry_credentials_file: Some(file.clone()),
+        };
+        let env_password = |name: &str| (name == PASSWORD_ENV).then(|| "from-env".to_owned());
+
+        std::fs::write(&file, "password = \"from-file\"\n").unwrap();
+        assert_eq!(
+            with_file.auth_from(&env_password).unwrap(),
+            Auth::Basic {
+                user: "publisher".to_owned(),
+                password: "from-file".to_owned(),
+            }
+        );
+
+        let token_file = CredentialArgs {
+            registry_credentials_file: Some(file.clone()),
+            ..CredentialArgs::default()
+        };
+        std::fs::write(&file, "token = \"ghp_x\"\n").unwrap();
+        assert_eq!(
+            token_file.auth_from(&|_| None).unwrap(),
+            Auth::Bearer("ghp_x".to_owned())
+        );
+
+        // Refused without quoting the line, which is a secret.
+        for document in ["secret = \"hunter2\"\n", "password = hunter2\n"] {
+            std::fs::write(&file, document).unwrap();
+            let error = format!("{:?}", with_file.auth_from(&|_| None).unwrap_err());
+            assert!(error.contains("naming only"), "{error}");
+            assert!(!error.contains("hunter2"), "{error}");
+        }
     }
 }

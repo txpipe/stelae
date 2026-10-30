@@ -63,8 +63,8 @@ takes the same way:
 | Retained state-dump epochs | `--state-epochs-file PATH`, one epoch per line, ascending | none: `publish`, `backfill`, `run`, `digest` and `verify --reproduce` require it; an empty file retains the tip alone |
 | Mithril aggregator | `--mithril-aggregator` or `DOLOS_MITHRIL_AGGREGATOR` | the known network's; required for `custom` |
 | Mithril genesis key | `--mithril-genesis-vkey` or `DOLOS_MITHRIL_GENESIS_VKEY` | the known network's; required for `custom` |
-| Registry user | global `--registry-user` or `DOLOS_STELAE_USER` | anonymous |
-| Registry secret | `DOLOS_STELAE_PASSWORD` or `DOLOS_STELAE_TOKEN`, never an argument | none; a user with no secret takes the official registry's read-only password |
+| Registry user | global `--registry-user` or `DOLOS_STELAE_USER` | anonymous; `verify` and `inspect` with no user or token read the configured network's official repository as its published read-only user, as Dolos does |
+| Registry secret | `DOLOS_STELAE_PASSWORD` or `DOLOS_STELAE_TOKEN`, or global `--registry-credentials-file PATH` (a TOML file naming only `password` or `token`, in their place); never an argument | none; a user with no secret takes the official registry's read-only password |
 
 The retained epochs are echoed into every inscription's parameters as signed
 input (decision 0026), so they are validated (ascending, no repeats, no epoch
@@ -139,7 +139,9 @@ stelae-publisher --config dolos.toml verify \
   --reproduce --state-epochs-file state-epochs
 ```
 
-Print a stele's table of contents without pulling a layer:
+Print a stele's table of contents without pulling a layer. A directory stele
+published before `blobs.json` existed reports its compressed sizes as unknown
+rather than reading every blob to find them:
 
 ```sh
 stelae-publisher --config dolos.toml inspect \
@@ -150,8 +152,13 @@ All three take `--format text|json` (default `text`): data on stdout,
 progress and logs on stderr. `inspect --format json` is the canonical
 inscription verbatim, what `digest --chain-from` takes; `digest` writes the
 inscription in either format; `verify --format json` is one report object.
-They exit 0 on success, 1 on an error, 2 on a usage error and 3 when a
-verification ran and the stele failed it.
+They exit 0 on success, 1 on an error, 2 on a usage error and 3 when `verify`
+refused the stele: a document or layer whose bytes, digests, names or
+encoding disagree, an inscription of another profile, schema or network, a
+broken history, or, under `--reproduce`, a reproduction that differs. A
+check that could not run, because the registry, the disk, the credentials,
+the configuration or the local stores failed, exits 1, as does a `--point`
+a directory stele does not hold and any refusal by `inspect` or `digest`.
 
 OCI operations run synchronously on the process thread. Mithril calls have a
 separate Tokio runtime. SIGINT and SIGTERM cancel acquisition and are observed
