@@ -1118,6 +1118,54 @@ fn a_blob_that_does_not_decompress_is_refused_as_its_layer() {
     }
 }
 
+/// The buffered reader keeps a disk's error as the disk's: a blob that opens
+/// but cannot be read is not refused as its layer.
+#[test]
+fn a_blob_that_cannot_be_read_keeps_the_readers_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let (inscription, _) = write_stele(temp.path());
+
+    let stele = SteleDir::open(temp.path()).unwrap();
+    let index = stele.blob_index().unwrap();
+    let descriptor = &inscription.layers[0];
+    let path = stele.blob_path(&index.blob_for(&descriptor.diff_id).unwrap());
+
+    // A directory opens, and its first read fails.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+
+    let err = stele
+        .read_layer(&index, &ToyProfile, descriptor)
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Io(io) if io.raw_os_error().is_some()),
+        "{err:?}"
+    );
+}
+
+/// A blob that is named by its digest but is not a layer is passed over by the
+/// scan, not refused: the room left for other blobs beside the layers.
+#[test]
+fn the_scan_passes_over_a_blob_that_is_not_a_layer() {
+    let temp = tempfile::tempdir().unwrap();
+    let (inscription, _) = write_stele(temp.path());
+
+    let junk = b"not a zstd frame";
+    std::fs::write(
+        temp.path()
+            .join("blobs")
+            .join(stelae::Digest::ALGORITHM)
+            .join(stelae::Digest::compute(junk).to_hex()),
+        junk,
+    )
+    .unwrap();
+
+    let stele = SteleDir::open(temp.path()).unwrap();
+    let scanned = without_sidecar(temp.path(), || stele.blob_index().unwrap());
+
+    assert_eq!(scanned.len(), inscription.layers.len());
+}
+
 /// A seal writes the map, and it is the map the scan would have rebuilt.
 #[test]
 fn a_sealed_directory_states_its_blob_map() {
