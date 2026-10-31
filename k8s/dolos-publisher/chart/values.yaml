@@ -18,8 +18,11 @@
 network: ""
 
 # The deliberate re-run counter. The Job is named <network>-backfill-<run>,
-# so bumping it makes the upgrade create a new Job and remove the old one,
-# paying the restart cost on purpose. A pod template change without a bump
+# so bumping it makes the upgrade create a new Job and remove the old one.
+# With an emptyDir the new Job restores from latest, paying the restart cost
+# on purpose. With persistence it resumes the stores the last run left, so an
+# image change those stores are not compatible with, or a changed repo or
+# network, needs the claim deleted first. A pod template change without a bump
 # fails the upgrade against the Job's immutable template, which is the guard
 # against re-running by accident. See README.md.
 run: ""
@@ -65,9 +68,30 @@ insecure: true
 # Referenced by name, never templated.
 publisherSecretName: stelae-registry-publisher
 
-# Restart budget. Every pod restart costs one epoch by design (/data is an
-# emptyDir; the pod restores from latest), and on spot capacity an eviction
-# counts here too.
+# Where /data lives. Disabled, it is an emptyDir: every pod restart restores
+# from latest, which costs one epoch at a three-epoch max_history. Enabled, it
+# is a PersistentVolumeClaim that survives restarts and evictions, so a
+# restarted pod resumes the stores it left. A full-history publisher
+# (max_history unset) needs it: an emptyDir would restore all of history on
+# every eviction.
+persistence:
+  enabled: false
+  # Required when the chart creates the claim. A network fact, like resources.
+  # Once the claim exists it can only grow, and only while it is Bound on a
+  # class with allowVolumeExpansion; anything else fails the upgrade, which
+  # still creates the new Job. README.md has the one exception, lowering an
+  # unfinished expansion.
+  size: ""
+  # Empty uses the cluster's default class. Fixed once the claim exists:
+  # naming a different class fails the upgrade, as above, and so does
+  # clearing a named class back to empty. Naming the default the claim got
+  # while empty is no change. Once named, keep naming it.
+  storageClassName: ""
+  # Mount this claim instead of creating one. The chart never creates or
+  # deletes it.
+  existingClaim: ""
+
+# Restart budget. On spot capacity an eviction counts here too.
 backoffLimit: 200
 
 # Covers the driver's SIGTERM handler finishing its chunk and flushing the

@@ -15,3 +15,6 @@ dolosToml: |
   [storage]
   path = "/data/db"
 stateEpochs: [3, 200, 646]
+persistence:
+  size: 250Gi
+  storageClassName: gp3
