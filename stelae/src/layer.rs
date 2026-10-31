@@ -39,7 +39,7 @@ use std::io::{self, Read};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    digest::{Digest, LayerDigests, Tap},
+    digest::{self, decoder_failure, Digest, LayerDigests, Source, Tap},
     frame::{LayerHeader, Limits, RecordReader},
     inscription::LayerDescriptor,
     profile::Profile,
@@ -47,8 +47,9 @@ use crate::{
 };
 
 /// The compressed-blob pipeline, read end to end:
-/// file → [`Tap`] (blob digest) → zstd → [`Meter`] (diffId, ceiling) → records.
-type Pipeline<R> = Meter<zstd::stream::read::Decoder<'static, io::BufReader<Tap<R>>>>;
+/// file → [`Tap`] (blob digest) → [`Source`] → zstd → [`Meter`] (diffId,
+/// ceiling) → records.
+type Pipeline<R> = Meter<zstd::stream::read::Decoder<'static, io::BufReader<Source<Tap<R>>>>>;
 
 /// A layer being read from a compressed blob, one record at a time.
 ///
@@ -88,9 +89,9 @@ impl<R: Read> LayerReader<R> {
         descriptor: &LayerDescriptor,
         limits: Limits,
     ) -> Result<Self, Error> {
-        let tap = Tap::new(source);
+        let tap = Source(Tap::new(source));
         let decoder = zstd::stream::read::Decoder::new(tap)?;
-        let meter = Meter::new(decoder, descriptor.uncompressed_size);
+        let meter = Meter::new(decoder, descriptor.uncompressed_size, &descriptor.kind);
 
         let mut records = RecordReader::with_limits(meter, limits);
 
@@ -172,7 +173,7 @@ impl<R: Read> LayerReader<R> {
         // boundary instead. `BufReader` may hold bytes it read ahead, and those
         // passed through the tap on the way in, so nothing is missed by
         // dropping it.
-        let mut tap = decoder.finish().into_inner();
+        let mut tap = decoder.finish().into_inner().0;
         io::copy(&mut tap, &mut io::sink())?;
 
         let (_, blob_digest, compressed_size) = tap.finish();
@@ -288,15 +289,17 @@ struct Meter<R> {
     hasher: Sha256,
     total: u64,
     limit: u64,
+    kind: String,
 }
 
 impl<R> Meter<R> {
-    fn new(inner: R, limit: u64) -> Self {
+    fn new(inner: R, limit: u64, kind: &str) -> Self {
         Self {
             inner,
             hasher: Sha256::new(),
             total: 0,
             limit,
+            kind: kind.to_owned(),
         }
     }
 
@@ -311,7 +314,10 @@ impl<R> Meter<R> {
 
 impl<R: Read> Read for Meter<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let read = self.inner.read(buf)?;
+        let read = self
+            .inner
+            .read(buf)
+            .map_err(|error| undecodable(error, &self.kind))?;
 
         self.total += read as u64;
 
@@ -325,5 +331,76 @@ impl<R: Read> Read for Meter<R> {
         self.hasher.update(&buf[..read]);
 
         Ok(read)
+    }
+}
+
+/// What the decoder failed with, as the layer's refusal where it is one: the
+/// blob's failures are a [`Error::LayerMismatch`], boxed for [`lift`] to take
+/// back out, and the rest come back as they were raised.
+fn undecodable(error: io::Error, kind: &str) -> io::Error {
+    let error = decoder_failure(error);
+
+    match digest::undecodable(&error) {
+        Some(reason) => io::Error::new(
+            io::ErrorKind::InvalidData,
+            Error::LayerMismatch {
+                kind: kind.to_owned(),
+                reason: reason.to_string(),
+            },
+        ),
+        None => error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::digest::SourceFault;
+
+    #[test]
+    fn a_decoder_failure_is_the_blobs_unless_it_is_the_machines() {
+        let refused = undecodable(io::Error::other("Unknown frame descriptor"), "notes");
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            matches!(lift(refused.into()), Error::LayerMismatch { kind, .. } if kind == "notes")
+        );
+
+        // A truncated frame, and a window larger than the reader will hold:
+        // both are what the blob asks of the decoder.
+        for error in [
+            io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete frame"),
+            io::Error::other("Frame requires too much memory for decoding"),
+        ] {
+            let refused = lift(undecodable(error, "notes").into());
+            assert!(
+                matches!(&refused, Error::LayerMismatch { reason, .. }
+                    if reason.starts_with("its blob does not decompress")),
+                "{refused:?}"
+            );
+        }
+
+        // The source's own failure, unmarked and as it was raised.
+        let disk = undecodable(
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                SourceFault(io::Error::from_raw_os_error(13)),
+            ),
+            "notes",
+        );
+        assert_eq!(disk.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(disk.raw_os_error(), Some(13));
+
+        // The decoder's own failures, as libzstd names them.
+        for name in [
+            "Allocation error : not enough memory",
+            "Operation made no progress over multiple calls, due to output buffer being full",
+            "Operation made no progress over multiple calls, due to input being empty",
+        ] {
+            let error = lift(undecodable(io::Error::other(name), "notes").into());
+            assert!(
+                matches!(&error, Error::Io(io) if io.kind() == io::ErrorKind::Other),
+                "{name}: {error:?}"
+            );
+        }
     }
 }

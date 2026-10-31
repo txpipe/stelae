@@ -28,16 +28,23 @@ use stelae::{
 struct Interrupting<'a> {
     remaining: &'a [u8],
     chunk: usize,
-    interrupt_next: bool,
+    burst: usize,
+    pending: usize,
     interruptions: usize,
 }
 
 impl<'a> Interrupting<'a> {
     fn new(bytes: &'a [u8], chunk: usize) -> Self {
+        Self::storm(bytes, chunk, 1)
+    }
+
+    /// `burst` interruptions in a row before every successful read.
+    fn storm(bytes: &'a [u8], chunk: usize, burst: usize) -> Self {
         Self {
             remaining: bytes,
             chunk,
-            interrupt_next: true,
+            burst,
+            pending: burst,
             interruptions: 0,
         }
     }
@@ -45,13 +52,13 @@ impl<'a> Interrupting<'a> {
 
 impl Read for Interrupting<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.interrupt_next {
-            self.interrupt_next = false;
+        if self.pending > 0 {
+            self.pending -= 1;
             self.interruptions += 1;
             return Err(io::Error::new(io::ErrorKind::Interrupted, "signal"));
         }
 
-        self.interrupt_next = true;
+        self.pending = self.burst;
 
         let take = self.chunk.min(buf.len()).min(self.remaining.len());
         buf[..take].copy_from_slice(&self.remaining[..take]);
@@ -163,6 +170,28 @@ fn a_blob_reads_back_identically_through_interruptions() {
     assert_eq!(digests, expected);
 }
 
+/// libzstd gives up on a stream after 16 calls in a row that brought it no
+/// input, and a retried `Interrupted` used to be one of those calls. A burst
+/// past that limit is still a source that has not failed.
+#[test]
+fn a_blob_reads_back_through_a_storm_of_interruptions() {
+    let content = sequence();
+    let blob = layer_blob(&content);
+    let expected = scan_blob(blob.as_slice()).unwrap();
+
+    for burst in [15, 16, 17, 64] {
+        let scanned = scan_blob(Interrupting::storm(&blob, CHUNK, burst)).unwrap();
+        assert_eq!(scanned, expected, "burst {burst}");
+
+        let (read, _) = read_blob(
+            Interrupting::storm(&blob, CHUNK, burst),
+            expected.uncompressed_size,
+        )
+        .unwrap();
+        assert_eq!(read, content, "burst {burst}");
+    }
+}
+
 /// The retry is for `Interrupted` and nothing else: a source that fails for a
 /// real reason still fails, and it fails at the loop that read it.
 #[test]
@@ -176,7 +205,14 @@ fn a_real_io_error_still_ends_the_read() {
     }
 
     assert!(digest_reader(Broken).is_err());
-    assert!(scan_blob(Broken).is_err());
+
+    // Raised under the decoder, and handed back as the source raised it.
+    let err = scan_blob(Broken).unwrap_err();
+    assert!(
+        matches!(&err, stelae::Error::Io(io)
+            if io.kind() == io::ErrorKind::ConnectionReset && io.to_string() == "peer went"),
+        "{err:?}"
+    );
 
     let mut reader = RecordReader::new(Broken);
     assert!(reader.next_record().unwrap().is_err());

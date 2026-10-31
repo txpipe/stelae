@@ -29,8 +29,8 @@ use stelae::{
     digest::read_blob,
     dir::{BlobIndex, LayerSpec, SteleDir, WrittenLayer},
     frame::{encode, CanonicalCbor, Limits},
-    Compression, Discarding, Error, Inscription, LayerDescriptor, LayerWriter, Profile, RecordSink,
-    SteleReader, SteleWriter,
+    Compression, Discarding, Error, Inscription, LayerDescriptor, LayerReader, LayerWriter,
+    Profile, RecordSink, SteleReader, SteleWriter,
 };
 
 const PROFILE_NAME: &str = "dev.example.toy";
@@ -993,6 +993,177 @@ fn tampering_is_caught_on_read() {
         stele.blob_index().is_err(),
         "a blob that disagrees with its name must not index"
     );
+}
+
+/// A layer whose bytes do not decompress is refused as that layer, on both
+/// read paths, and a blob that could not be read keeps the reader's own error:
+/// the one is the stele's defect, the other a disk's.
+#[test]
+fn a_blob_that_does_not_decompress_is_refused_as_its_layer() {
+    let temp = tempfile::tempdir().unwrap();
+    let (inscription, _) = write_stele(temp.path());
+
+    let stele = SteleDir::open(temp.path()).unwrap();
+    let index = stele.blob_index().unwrap();
+    let descriptor = &inscription.layers[0];
+    let path = stele.blob_path(&index.blob_for(&descriptor.diff_id).unwrap());
+    let bytes = std::fs::read(&path).unwrap();
+
+    let read = |source: &mut dyn std::io::Read| {
+        LayerReader::new(source, &ToyProfile, descriptor, Limits::default())
+            .and_then(LayerReader::finish)
+    };
+
+    let refused_as_its_layer = |err: &Error| {
+        matches!(err, Error::LayerMismatch { kind, reason }
+            if *kind == descriptor.kind && reason.contains("does not decompress"))
+    };
+
+    let mut flipped = bytes.clone();
+    flipped[0] ^= 0xff;
+    let altered = [
+        b"not a zstd frame".to_vec(),
+        flipped,
+        bytes[..bytes.len() - 1].to_vec(),
+    ];
+
+    for blob in &altered {
+        let err = read(&mut blob.as_slice()).unwrap_err();
+        assert!(refused_as_its_layer(&err), "{err:?}");
+
+        // In place, where the buffered reader sees the same bytes.
+        std::fs::write(&path, blob).unwrap();
+        let err = read_both_ways(&stele, &index, descriptor).unwrap_err();
+        assert!(refused_as_its_layer(&err), "{err:?}");
+    }
+
+    std::fs::write(&path, &bytes).unwrap();
+
+    /// Fails after the first few bytes, as a disk does, with `error`.
+    struct Failing<'a>(&'a [u8], fn() -> std::io::Error);
+
+    impl std::io::Read for Failing<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return Err((self.1)());
+            }
+            let n = buf.len().min(self.0.len()).min(8);
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    let err = read(&mut Failing(&bytes[..16], || {
+        std::io::Error::from_raw_os_error(5)
+    }))
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Io(io) if io.raw_os_error() == Some(5)),
+        "{err:?}"
+    );
+
+    // The kinds zstd raises for bytes it cannot decode, raised by the disk
+    // instead: still the disk's.
+    for fault in [
+        (|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "short read on the device",
+            )
+        }) as fn() -> std::io::Error,
+        || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad sector"),
+        || std::io::Error::other("Unknown frame descriptor"),
+    ] {
+        let expected = fault();
+        let err = read(&mut Failing(&bytes[..16], fault)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(io)
+                if io.kind() == expected.kind() && io.to_string() == expected.to_string()),
+            "{expected:?}: {err:?}"
+        );
+    }
+
+    /// Interrupted `burst` times before every read, as a source under a storm
+    /// of signals is.
+    struct Interrupting<'a> {
+        bytes: &'a [u8],
+        burst: usize,
+        pending: usize,
+    }
+
+    impl std::io::Read for Interrupting<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pending > 0 {
+                self.pending -= 1;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            self.pending = self.burst;
+            let n = buf.len().min(self.bytes.len()).min(8);
+            buf[..n].copy_from_slice(&self.bytes[..n]);
+            self.bytes = &self.bytes[n..];
+            Ok(n)
+        }
+    }
+
+    // Past libzstd's limit of 16 calls in a row without input.
+    for burst in [15, 16, 17, 64] {
+        let digests = read(&mut Interrupting {
+            bytes: &bytes,
+            burst,
+            pending: burst,
+        })
+        .unwrap();
+        assert_eq!(digests.diff_id, descriptor.diff_id, "burst {burst}");
+    }
+}
+
+/// The buffered reader keeps a disk's error as the disk's: a blob that opens
+/// but cannot be read is not refused as its layer.
+#[test]
+fn a_blob_that_cannot_be_read_keeps_the_readers_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let (inscription, _) = write_stele(temp.path());
+
+    let stele = SteleDir::open(temp.path()).unwrap();
+    let index = stele.blob_index().unwrap();
+    let descriptor = &inscription.layers[0];
+    let path = stele.blob_path(&index.blob_for(&descriptor.diff_id).unwrap());
+
+    // A directory opens, and its first read fails.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+
+    let err = stele
+        .read_layer(&index, &ToyProfile, descriptor)
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Io(io) if io.raw_os_error().is_some()),
+        "{err:?}"
+    );
+}
+
+/// A blob that is named by its digest but is not a layer is passed over by the
+/// scan, not refused: the room left for other blobs beside the layers.
+#[test]
+fn the_scan_passes_over_a_blob_that_is_not_a_layer() {
+    let temp = tempfile::tempdir().unwrap();
+    let (inscription, _) = write_stele(temp.path());
+
+    let junk = b"not a zstd frame";
+    std::fs::write(
+        temp.path()
+            .join("blobs")
+            .join(stelae::Digest::ALGORITHM)
+            .join(stelae::Digest::compute(junk).to_hex()),
+        junk,
+    )
+    .unwrap();
+
+    let stele = SteleDir::open(temp.path()).unwrap();
+    let scanned = without_sidecar(temp.path(), || stele.blob_index().unwrap());
+
+    assert_eq!(scanned.len(), inscription.layers.len());
 }
 
 /// A seal writes the map, and it is the map the scan would have rebuilt.

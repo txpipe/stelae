@@ -77,7 +77,7 @@ pub fn open(
             // Not an operator's knob and deliberately not one: the number that
             // absorbs a registry's transient `5xx` is the transport's own
             // measurement, and an outage longer than it is answered a level up,
-            // where `snapshot backfill` re-runs the whole publish rather than
+            // where `stelae-publisher backfill` re-runs the whole publish rather than
             // dying into a pod restart.
             attempts: stelae::oci::DEFAULT_ATTEMPTS,
             // Nor these, for a related reason: both are facts about the
