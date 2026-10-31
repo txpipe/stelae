@@ -2,11 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-10-30
+
+### 🚀 Features
+
+- [**breaking**] Name payload media types `.stelae.`, accepting `.stele.` for one release (#8)
+- [**breaking**] Move the publisher onto the Dolos v2 configuration (#9)
+
 ## [0.3.1] - 2026-10-21
 
 ### ⚙️ Miscellaneous Tasks
 
 - Raise rustls trust components and move the publisher base to cc-debian13 (#7)
+
+### Release
+
+- V0.3.1
 
 ## [0.3.0] - 2026-09-14
 

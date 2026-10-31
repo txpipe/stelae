@@ -60,17 +60,17 @@ takes the same way:
 
 | Input | Source | Default |
 | --- | --- | --- |
-| Retained state-dump epochs | `--state-epochs-file PATH`, one epoch per line, ascending | none: `publish`, `backfill` and `run` require it; an empty file retains the tip alone |
+| Retained state-dump epochs | `--state-epochs-file PATH`, one epoch per line, ascending | none: `publish`, `backfill`, `run`, `digest` and `verify --reproduce` require it; an empty file retains the tip alone |
 | Mithril aggregator | `--mithril-aggregator` or `DOLOS_MITHRIL_AGGREGATOR` | the known network's; required for `custom` |
 | Mithril genesis key | `--mithril-genesis-vkey` or `DOLOS_MITHRIL_GENESIS_VKEY` | the known network's; required for `custom` |
-| Registry user | global `--registry-user` or `DOLOS_STELAE_USER` | anonymous |
-| Registry secret | `DOLOS_STELAE_PASSWORD` or `DOLOS_STELAE_TOKEN`, never an argument | none; a user with no secret takes the official registry's read-only password |
+| Registry user | global `--registry-user` or `DOLOS_STELAE_USER` | anonymous; `verify` and `inspect` with no user or token read the configured network's official repository as its published read-only user, as Dolos does |
+| Registry secret | `DOLOS_STELAE_PASSWORD` or `DOLOS_STELAE_TOKEN`, or global `--registry-credentials-file PATH` (a TOML file naming only `password` or `token`, in their place); never an argument | none; a user with no secret takes the official registry's read-only password |
 
 The retained epochs are echoed into every inscription's parameters as signed
 input (decision 0026), so they are validated (ascending, no repeats, no epoch
 0) before any store opens. A command that touches no registry (`publish
---output-dir`, `initialize --source file://…`) reads no registry
-credentials. A token and user together, or a password with no
+--output-dir`, `initialize --source file://…`, `digest`, `verify` or
+`inspect` of a `file://` stele) reads no registry credentials. A token and user together, or a password with no
 user, fail through the shared profile credential policy. CLI command names
 belong to this executable; profile names, media types, tags and repository
 identities remain the existing wire values.
@@ -111,6 +111,58 @@ stelae-publisher --config dolos.toml run \
 stores are cleared. `--allow-genesis` is the only genesis fallback and is for
 a deliberately verified first publication. `initialize`, `publish`, and
 `backfill` are also available independently.
+
+### Reading and reproducing steles
+
+`digest`, `verify` and `inspect` replace Dolos's former `snapshot` commands
+over the same profile entry points. `--repo` takes `oci://HOST/PATH` or
+`file://DIR`; registry credentials are resolved only for an `oci://` source.
+
+Compute what the committed stores would publish, writing nothing. The stores
+must stand on the first block of an epoch. The plan is reported on stderr and
+the canonical inscription goes to stdout (or `--output FILE`), so it hashes to
+the identity reported; `--chain-from FILE` extends a predecessor's history:
+
+```sh
+stelae-publisher --config dolos.toml digest \
+  --state-epochs-file state-epochs > stele.json
+```
+
+Check a published stele's digests, every layer streamed against both of its
+digests; `--reproduce` also rebuilds every layer from the committed stores and
+requires a byte-identical inscription, taking `--epochs`, `--index-band`,
+`--producers` and the `--state-epochs-file` the stele was published with:
+
+```sh
+stelae-publisher --config dolos.toml verify \
+  --repo oci://registry.example/cardano/preview --point epoch-1200 \
+  --reproduce --state-epochs-file state-epochs
+```
+
+Print a stele's table of contents without pulling a layer. A directory stele
+published before `blobs.json` existed reports its compressed sizes as unknown
+rather than reading every blob to find them:
+
+```sh
+stelae-publisher --config dolos.toml inspect \
+  --repo oci://registry.example/cardano/preview
+```
+
+All three take `--format text|json` (default `text`): data on stdout,
+progress and logs on stderr. `inspect --format json` is the canonical
+inscription verbatim, what `digest --chain-from` takes; `digest` writes the
+inscription in either format; `verify --format json` is one report object.
+They exit 0 on success, 1 on an error, 2 on a usage error and 3 when `verify`
+refused the stele: a document or layer whose bytes, digests, names or
+encoding disagree, including a blob a registry serves under another digest
+or past its descriptor's size and a blob that does not decompress,
+an inscription of another profile or schema, a broken history, or, under
+`--reproduce`, a stele of another network or sequence than the stores or a
+reproduction that differs. A check that could not run, because the registry,
+the disk, the credentials, the configuration or the local stores failed,
+exits 1, including a record the local stores hold out of order or malformed
+under `--reproduce`, as does a `--point` a directory stele does not hold and
+any refusal by `inspect` or `digest`.
 
 OCI operations run synchronously on the process thread. Mithril calls have a
 separate Tokio runtime. SIGINT and SIGTERM cancel acquisition and are observed

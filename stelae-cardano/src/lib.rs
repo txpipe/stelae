@@ -9,6 +9,9 @@ pub mod backfill;
 pub mod config;
 pub mod initialize;
 pub mod publisher;
+pub mod snapshot;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 pub use dolos::core::{config::RootConfig, Genesis};
 pub use dolos_mithril::MithrilSource;

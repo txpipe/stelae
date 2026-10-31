@@ -7,8 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-stelae = { path = "../stelae", version = "=0.3.1", features = ["oci"] }
-stelae-driver = { path = "../stelae-driver", version = "=0.3.1", features = ["oci"] }
+stelae = { path = "../stelae", version = "=0.4.0", features = ["oci"] }
+stelae-driver = { path = "../stelae-driver", version = "=0.4.0", features = ["oci"] }
 
 # Dolos main with the v2 configuration contract (txpipe/dolos PRs #1466,
 # #1468, #1478 and #1479).
@@ -27,7 +27,17 @@ tokio = { version = "1.47", features = ["rt", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7.11", features = ["rt"] }
 tracing = "0.1.37"
 
+# The `testing` fixture's, which the publisher's binary tests build stores with.
+dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "e184a965644bcd7a4317097eda94206bd50a35d7", optional = true }
+tempfile = { version = "3.20.0", optional = true }
+toml = { version = "0.8.13", optional = true }
+
+[features]
+testing = ["dep:dolos-testing", "dep:tempfile", "dep:toml"]
+
 [dev-dependencies]
+stelae-cardano = { path = ".", features = ["testing"] }
 dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "e184a965644bcd7a4317097eda94206bd50a35d7" }
+oci-client = { version = "0.17", default-features = false }
 tempfile = "3.20.0"
 toml = "0.8.13"

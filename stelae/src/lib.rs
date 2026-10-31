@@ -344,7 +344,7 @@ pub enum Error {
     ///
     /// Distinct from [`Error::Io`], which is the catch-all every other bare
     /// `?` in this crate falls through, because this is the one path an
-    /// operator types on a command line — `dolos snapshot publish
+    /// operator types on a command line — `stelae-publisher publish
     /// --scratch-dir`, `dolos bootstrap stelae --scratch-dir`, or the default
     /// the binary derives from `storage.path`. A typo, an unmounted volume, a
     /// directory owned by somebody else and a path that is already a regular

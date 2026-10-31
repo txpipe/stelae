@@ -4621,7 +4621,7 @@ checksum = "5c0e04424e733e69714ca1bbb9204c1a57f09f5493439520f9f68c132ad25eec"
 
 [[package]]
 name = "stelae"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -4644,7 +4644,7 @@ dependencies = [
 
 [[package]]
 name = "stelae-cardano"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "dolos",
  "dolos-cardano",
@@ -4653,10 +4653,12 @@ dependencies = [
  "dolos-snapshot",
  "dolos-testing",
  "itertools 0.14.0",
+ "oci-client",
  "pallas",
  "serde",
  "serde_json",
  "stelae",
+ "stelae-cardano",
  "stelae-driver",
  "tempfile",
  "thiserror 2.0.20",
@@ -4668,7 +4670,7 @@ dependencies = [
 
 [[package]]
 name = "stelae-driver"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "fs4",
  "minicbor 0.26.5",
@@ -4682,11 +4684,14 @@ dependencies = [
 
 [[package]]
 name = "stelae-publisher"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "clap",
+ "config",
  "miette",
  "rustls",
+ "serde",
+ "serde_json",
  "stelae",
  "stelae-cardano",
  "tempfile",

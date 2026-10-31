@@ -47,7 +47,8 @@ const MOVED_TO_ARGUMENTS: [(&str, &str); 3] = [
     ),
     (
         "stelae",
-        "`--registry-user` / `DOLOS_STELAE_USER`, `DOLOS_STELAE_PASSWORD` and `DOLOS_STELAE_TOKEN`",
+        "`--registry-user` / `DOLOS_STELAE_USER`, `DOLOS_STELAE_PASSWORD`, `DOLOS_STELAE_TOKEN` \
+         and `--registry-credentials-file`",
     ),
 ];
 
@@ -211,6 +212,7 @@ mod tests {
             "DOLOS_STELAE_USER",
             "DOLOS_STELAE_PASSWORD",
             "DOLOS_STELAE_TOKEN",
+            "--registry-credentials-file",
         ] {
             assert!(error.contains(input), "{input}: {error}");
         }

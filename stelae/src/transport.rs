@@ -358,7 +358,7 @@ where
 /// them. Sealing is the same identity a directory returns after writing
 /// `inscription.json`: the sha256 of the canonical document.
 ///
-/// That is the whole of `dolos snapshot digest`. A verifier reproduces a
+/// That is the whole of `stelae-publisher digest`. A verifier reproduces a
 /// published stele's layers from its own stores and compares descriptors,
 /// without provisioning the disk the stele would occupy — hundreds of gigabytes
 /// on mainnet — and without touching a registry.

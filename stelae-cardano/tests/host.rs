@@ -1,72 +1,23 @@
-use std::{cell::Cell, io, sync::Arc};
+use std::{cell::Cell, io};
 
-use dolos::engine::{BulkReplaySession, ReplayWorkspace};
-use dolos_core::{
-    config::{ChainConfig, RootConfig},
-    ChainPoint, Genesis,
-};
+use dolos::engine::ReplayWorkspace;
+use dolos_core::ChainPoint;
 use dolos_snapshot::{export::Plan, source::SnapshotSource};
-use dolos_testing::blocks::make_conway_block_with_prev;
 use stelae::progress::Observer;
 use stelae_cardano::{
     backfill::{self, Driver},
     initialize,
     publisher::{publish_once, Destination, PublishOutcome},
+    testing::Node,
     Auth, MithrilSource, Point, RestoreSource, RetainedEpochs, Selection,
 };
-
-struct Node {
-    root: tempfile::TempDir,
-    config: RootConfig,
-}
-
-impl Node {
-    fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
-        let compatibility = RootConfig::new(ChainConfig::known("preview")).compatibility();
-        let document = format!(
-            r#"
-            compatibility = "{compatibility}"
-
-            [chain]
-            protocol = "cardano"
-            network = "preview"
-
-            [storage]
-            path = {}
-            "#,
-            toml::Value::String(root.path().join("data").display().to_string()),
-        );
-        let path = root.path().join("dolos.toml");
-        std::fs::write(&path, document).unwrap();
-        let config = stelae_cardano::config::load(Some(&path)).unwrap();
-        Self { root, config }
-    }
-
-    /// Replays the last block of epoch 0 and the first of epoch 1, stopping on
-    /// the boundary a stele is cut at.
-    fn replay_to_the_first_boundary(&self) -> (Arc<Genesis>, ChainPoint) {
-        let mut genesis = dolos_cardano::include::preview::load();
-        genesis.force_protocol = Some(9);
-        let epoch_one = genesis.shelley.epoch_length.unwrap() as u64;
-        let genesis = Arc::new(genesis);
-        let (before, block_before) = make_conway_block_with_prev(epoch_one - 1, None, 1);
-        let (boundary, block_boundary) = make_conway_block_with_prev(epoch_one, before.hash(), 2);
-        let mut session = BulkReplaySession::open(&self.config, genesis.clone(), Some(1)).unwrap();
-        session
-            .import_blocks(vec![block_before, block_boundary])
-            .unwrap();
-        session.finish().unwrap();
-        (genesis, boundary)
-    }
-}
 
 #[test]
 fn a_bounded_fixture_publishes_to_a_directory_through_the_new_host() {
     let node = Node::new();
     let (genesis, _) = node.replay_to_the_first_boundary();
 
-    let destination = node.root.path().join("stele");
+    let destination = node.path().join("stele");
     let (_, outcome) = publish_once(
         &node.config,
         &genesis,
@@ -110,7 +61,7 @@ fn retained_state_epochs_reach_the_signed_inscription() {
     let node = Node::new();
     let (genesis, _) = node.replay_to_the_first_boundary();
 
-    let destination = node.root.path().join("stele");
+    let destination = node.path().join("stele");
     let retained = dolos_snapshot::planning::retained_epochs(&[1]).unwrap();
     publish_once(
         &node.config,
@@ -197,7 +148,7 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
             genesis: &genesis,
             retained: &retained,
             mithril: &mithril,
-            download_dir: node.root.path().join("unused"),
+            download_dir: node.path().join("unused"),
             window: 1,
             until_epoch: Some(1),
             skip_validation: false,
@@ -225,7 +176,7 @@ fn cold_start_fails_closed_and_genesis_requires_explicit_opt_in() {
     let node = Node::new();
     let genesis = dolos_cardano::include::preview::load();
     let mut options = initialize::Options {
-        source: RestoreSource::Dir(node.root.path().join("missing-stele")),
+        source: RestoreSource::Dir(node.path().join("missing-stele")),
         point: Point::Latest,
         auth: Auth::Anonymous,
         insecure: false,

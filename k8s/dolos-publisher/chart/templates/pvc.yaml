@@ -1,0 +1,25 @@
+{{/*
+The /data claim, created only when persistence is on and no existingClaim is
+named. Helm keeps it on uninstall: it holds the publisher's stores, and
+deleting it would make the next run restore all of history.
+*/}}
+{{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "dolos-publisher.claimName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dolos-publisher.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- with .Values.persistence.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ required "persistence.size is required when the chart creates the claim" .Values.persistence.size }}
+{{- end }}

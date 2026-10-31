@@ -18,8 +18,9 @@
 //! format — `zstd -d < blobs/sha256/<hex> | cbor2diag` prints the records,
 //! which is worth a great deal while a spec is young.
 //!
-//! It is not `dolos snapshot publish --output-dir`: that command belongs to the
-//! Dolos profile and carries its own layer-selection and progress semantics.
+//! It is not `stelae-publisher publish --output-dir`: that command publishes
+//! the Dolos profile and carries its own layer-selection and progress
+//! semantics.
 //!
 //! ## The manifest a directory grew
 //!
@@ -62,7 +63,7 @@ use serde::{Deserialize, Serialize};
 pub use crate::transport::{BlobIndex, LayerSpec, WrittenLayer};
 
 use crate::{
-    digest::{digest_reader, read_blob, scan_blob, LayerDigests, LayerWriter},
+    digest::{digest_reader, read_blob, scan_blob, undecodable, LayerDigests, LayerWriter},
     frame::{CanonicalCbor, LayerHeader, Limits, SeqReader, SeqWriter},
     inscription::LayerDescriptor,
     layer::{check_header, check_identity, check_record_count, LayerReader},
@@ -362,23 +363,12 @@ fn scan_blobs(root: &Path) -> Result<BlobIndex, Error> {
             }
             // Content-addressed and intact, but not a compressed layer.
             //
-            // Only the kinds zstd raises for input it cannot decode count
-            // as "not a layer": the bindings map every libzstd error code
-            // to `Other`, and a frame that ends early surfaces as
-            // `UnexpectedEof`. A `PermissionDenied` or a device error is a
-            // real failure, and skipping on it would drop a blob that does
-            // exist from the index — resurfacing later as a `LayerNotFound`
-            // that points at the wrong problem.
-            Err(Error::Io(e))
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::InvalidData
-                        | io::ErrorKind::UnexpectedEof
-                        | io::ErrorKind::Other
-                ) =>
-            {
-                continue
-            }
+            // Only the decoder's verdict on the bytes counts as "not a
+            // layer". A `PermissionDenied`, a device error or a decoder that
+            // could not allocate is a real failure, and skipping on it would
+            // drop a blob that does exist from the index — resurfacing later
+            // as a `LayerNotFound` that points at the wrong problem.
+            Err(Error::Io(e)) if undecodable(&e).is_some() => continue,
             Err(e) => return Err(e),
         }
     }
@@ -824,7 +814,15 @@ impl SteleDir {
         let (content, digests) = read_blob(
             self.open_blob(index, descriptor)?,
             descriptor.uncompressed_size,
-        )?;
+        )
+        .map_err(|error| match error {
+            // The refusal the streaming reader gives the same bytes.
+            Error::Io(io) if undecodable(&io).is_some() => Error::LayerMismatch {
+                kind: descriptor.kind.clone(),
+                reason: io.to_string(),
+            },
+            other => other,
+        })?;
 
         check_identity(&digests, descriptor)?;
 

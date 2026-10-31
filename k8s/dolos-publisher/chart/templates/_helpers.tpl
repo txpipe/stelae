@@ -6,6 +6,10 @@
 {{ .Release.Name }}-config
 {{- end -}}
 
+{{- define "dolos-publisher.claimName" -}}
+{{ .Values.persistence.existingClaim | default (printf "%s-data" .Release.Name) }}
+{{- end -}}
+
 {{- define "dolos-publisher.labels" -}}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 app.kubernetes.io/name: {{ .Chart.Name }}
