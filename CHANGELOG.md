@@ -2,12 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-11-01
+
+### 🚀 Features
+
+- Mount the publisher's /data from an optional persistent claim (#10)
+- `stelae-publisher digest | verify | inspect` replace `dolos snapshot` (#13)
+
+### 🐛 Bug Fixes
+
+- *(deps)* Move to zstd 0.14 and update tokio (#12)
+
 ## [0.4.0] - 2026-10-30
 
 ### 🚀 Features
 
 - [**breaking**] Name payload media types `.stelae.`, accepting `.stele.` for one release (#8)
 - [**breaking**] Move the publisher onto the Dolos v2 configuration (#9)
+
+### Release
+
+- V0.4.0
 
 ## [0.3.1] - 2026-10-21
 
