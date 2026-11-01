@@ -13,7 +13,7 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/txpipe/stelae"
 
-# The accepted Dolos publisher-retirement revision pins the released v0.2.0
+# The accepted Dolos publisher-retirement revision pins the released v0.5.0
 # Stelae crates. The publisher is built in this workspace, so patch both names
 # back to these paths: this is what makes the profile's trait and registry
 # types identical to the host's, rather than two same-version crates from
