@@ -985,7 +985,7 @@ mod tests {
     fn node(dir: &Path) -> String {
         let path = dir.join("dolos.toml");
         let document = format!(
-            "compatibility = \"v2-alpha.1\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"preview\"\n[storage]\npath = {:?}\n",
+            "compatibility = \"v2-alpha.2\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"preview\"\n[storage]\npath = {:?}\n",
             dir.join("data").display().to_string(),
         );
         std::fs::write(&path, document).unwrap();

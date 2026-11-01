@@ -12,11 +12,11 @@ stelae-driver = { path = "../stelae-driver", version = "=0.5.0", features = ["oc
 
 # Dolos main with the v2 configuration contract (txpipe/dolos PRs #1466,
 # #1468, #1478 and #1479).
-dolos = { git = "https://github.com/txpipe/dolos", rev = "e184a965644bcd7a4317097eda94206bd50a35d7", default-features = false }
-dolos-cardano = { git = "https://github.com/txpipe/dolos", rev = "e184a965644bcd7a4317097eda94206bd50a35d7" }
-dolos-core = { git = "https://github.com/txpipe/dolos", rev = "e184a965644bcd7a4317097eda94206bd50a35d7" }
-dolos-mithril = { git = "https://github.com/txpipe/dolos", rev = "e184a965644bcd7a4317097eda94206bd50a35d7" }
-dolos-snapshot = { git = "https://github.com/txpipe/dolos", rev = "e184a965644bcd7a4317097eda94206bd50a35d7" }
+dolos = { git = "https://github.com/txpipe/dolos", rev = "c5e4f77e93b53098196df404c5afe33981a056ff", default-features = false }
+dolos-cardano = { git = "https://github.com/txpipe/dolos", rev = "c5e4f77e93b53098196df404c5afe33981a056ff" }
+dolos-core = { git = "https://github.com/txpipe/dolos", rev = "c5e4f77e93b53098196df404c5afe33981a056ff" }
+dolos-mithril = { git = "https://github.com/txpipe/dolos", rev = "c5e4f77e93b53098196df404c5afe33981a056ff" }
+dolos-snapshot = { git = "https://github.com/txpipe/dolos", rev = "c5e4f77e93b53098196df404c5afe33981a056ff" }
 
 itertools = "0.14.0"
 pallas = { version = "1.3.0", features = ["hardano", "phase2", "unstable"] }
@@ -28,7 +28,7 @@ tokio-util = { version = "0.7.11", features = ["rt"] }
 tracing = "0.1.37"
 
 # The `testing` fixture's, which the publisher's binary tests build stores with.
-dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "e184a965644bcd7a4317097eda94206bd50a35d7", optional = true }
+dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "c5e4f77e93b53098196df404c5afe33981a056ff", optional = true }
 tempfile = { version = "3.20.0", optional = true }
 toml = { version = "0.8.13", optional = true }
 
@@ -37,7 +37,7 @@ testing = ["dep:dolos-testing", "dep:tempfile", "dep:toml"]
 
 [dev-dependencies]
 stelae-cardano = { path = ".", features = ["testing"] }
-dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "e184a965644bcd7a4317097eda94206bd50a35d7" }
+dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "c5e4f77e93b53098196df404c5afe33981a056ff" }
 oci-client = { version = "0.17", default-features = false }
 tempfile = "3.20.0"
 toml = "0.8.13"
