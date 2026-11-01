@@ -9,7 +9,7 @@ No command starts or shells out to a Dolos executable.
 ## Source and dependency identity
 
 All Dolos crates in the normal publisher dependency graph are pinned to
-`e184a965644bcd7a4317097eda94206bd50a35d7`, a Dolos `main` revision carrying
+`c5e4f77e93b53098196df404c5afe33981a056ff`, a Dolos `main` revision carrying
 the v2 configuration contract: bootstrap and publisher inputs on the
 invocation ([PR 1466](https://github.com/txpipe/dolos/pull/1466)), the v2
 schema and loader ([PR 1468](https://github.com/txpipe/dolos/pull/1468)),

@@ -50,7 +50,7 @@ custom provenance files.
 
 A candidate is the tuple of the full Stelae commit, committed `Cargo.lock`,
 accepted Dolos revision
-`e184a965644bcd7a4317097eda94206bd50a35d7`, chart source at that same Stelae
+`c5e4f77e93b53098196df404c5afe33981a056ff`, chart source at that same Stelae
 commit, and reviewed values/configuration. Record all of them at handoff. Before
 publication the image digest is intentionally unknown; use the commit as the
 candidate identity, then add the registry digest and attestation after the
