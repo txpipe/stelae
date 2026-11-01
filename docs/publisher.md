@@ -23,7 +23,7 @@ package is imported with default features disabled, so its service features
 are absent from the publisher graph.
 
 The workspace patch for `https://github.com/txpipe/stelae` resolves the
-profile's v0.2.0 dependencies back to the workspace `stelae` and
+profile's v0.5.0 dependencies back to the workspace `stelae` and
 `stelae-driver` packages. This prevents two same-version protocol type
 universes.
 
