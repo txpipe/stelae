@@ -17,7 +17,7 @@
 //! inscription:
 //!
 //! ```text
-//! manifest   artifactType application/vnd.stelae.stele.v1
+//! manifest   artifactType application/vnd.stelae.snapshot.v1
 //!   config   application/vnd.stelae.inscription.v1+json  -> the inscription
 //!   layers[] the profile's media types, in inscription order,
 //!            each annotated with its kind, its diffId and its scope
@@ -2458,7 +2458,8 @@ pub fn manifest_bytes(manifest: &OciImageManifest) -> Result<Vec<u8>, Error> {
     Ok(body)
 }
 
-/// Check that a manifest is a stele's before anything inside it is trusted.
+/// Check that a manifest is a Stelae snapshot's before anything inside it is
+/// trusted.
 fn check_envelope(manifest: &OciImageManifest) -> Result<(), Error> {
     match manifest.artifact_type.as_deref() {
         Some(ARTIFACT_TYPE) => {}
@@ -2473,7 +2474,7 @@ fn check_envelope(manifest: &OciImageManifest) -> Result<(), Error> {
         // the discovery contract advisory.
         None => {
             return Err(Error::ManifestMismatch(format!(
-                "no artifactType; a stele's manifest carries {ARTIFACT_TYPE:?}"
+                "no artifactType; a Stelae snapshot's manifest carries {ARTIFACT_TYPE:?}"
             )))
         }
     }
