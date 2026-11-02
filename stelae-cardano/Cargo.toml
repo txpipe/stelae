@@ -11,9 +11,10 @@ stelae = { path = "../stelae", version = "=0.5.0", features = ["oci"] }
 stelae-driver = { path = "../stelae-driver", version = "=0.5.0", features = ["oci"] }
 
 # The Dolos commit that adopts the Stelae snapshot envelope (txpipe/dolos PR
-# #1553). The v2 profile itself was frozen earlier, at e39a38a3 (PR #1548);
-# this pin moves only the envelope. DOLOS_REVISION in src/lib.rs names the
-# same commit.
+# #1553). The v2 profile itself was frozen earlier, at e39a38a3 (PR #1548).
+# Since then the range also carries PR #1546, which changes the state-datums
+# refcount rule and moves the WAL to v10 (see docs/publisher.md).
+# DOLOS_REVISION in src/lib.rs names the same commit.
 dolos = { git = "https://github.com/txpipe/dolos", rev = "1db3e41fd04bca64bf245f50b54ca656719764ca", default-features = false }
 dolos-cardano = { git = "https://github.com/txpipe/dolos", rev = "1db3e41fd04bca64bf245f50b54ca656719764ca" }
 dolos-core = { git = "https://github.com/txpipe/dolos", rev = "1db3e41fd04bca64bf245f50b54ca656719764ca" }

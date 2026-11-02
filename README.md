@@ -52,6 +52,10 @@ Both are frozen with Dolos v2: protocol version 1 and the
 `io.txpipe.dolos.cardano` profile at version 1. Later changes follow the
 compatibility rules in [`SPEC.md`](SPEC.md#compatibility).
 
+A snapshot's OCI manifest names the envelope `artifactType`
+`application/vnd.stelae.snapshot.v1`. Readers refuse the retired
+`application/vnd.stelae.stele.v1` envelope.
+
 ## Versioning
 
 The two crates version in lockstep, restarting at `0.x` for the protocol's

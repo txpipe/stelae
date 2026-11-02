@@ -50,7 +50,8 @@ custom provenance files.
 
 A candidate is the tuple of the full Stelae commit, committed `Cargo.lock`,
 Dolos revision `1db3e41fd04bca64bf245f50b54ca656719764ca` (the snapshot
-envelope adoption over the frozen v2 profile, see
+envelope adoption, which also carries the `state-datums` refcount change of
+Dolos PR 1546, see
 [publisher.md](publisher.md#source-and-dependency-identity)),
 chart source at that same Stelae
 commit, and reviewed values/configuration. Record all of them at handoff. Before
