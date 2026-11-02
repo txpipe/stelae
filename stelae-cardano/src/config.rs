@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn a_known_network_loads_with_its_embedded_genesis() {
         let (_dir, loaded) = config(
-            "compatibility = \"v2-alpha.1\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"preview\"\n",
+            "compatibility = \"v2-alpha.2\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"preview\"\n",
         );
         let config = loaded.unwrap();
         assert_eq!(genesis(&config).unwrap().network_magic(), 2);
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn an_unknown_network_is_refused_at_load() {
         let (_dir, loaded) = config(
-            "compatibility = \"v2-alpha.1\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"nowhere\"\n",
+            "compatibility = \"v2-alpha.2\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"nowhere\"\n",
         );
         let error = loaded.unwrap_err().to_string();
         assert!(error.contains("unknown network `nowhere`"), "{error}");
@@ -202,7 +202,7 @@ mod tests {
     #[test]
     fn a_moved_section_names_the_publisher_input() {
         let (_dir, loaded) = config(
-            "compatibility = \"v2-alpha.1\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"preview\"\n[snapshot]\nstate_epochs = [1]\n[mithril]\naggregator = \"http://aggregator\"\n[stelae]\nuser = \"publisher\"\n",
+            "compatibility = \"v2-alpha.2\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"preview\"\n[snapshot]\nstate_epochs = [1]\n[mithril]\naggregator = \"http://aggregator\"\n[stelae]\nuser = \"publisher\"\n",
         );
         let error = loaded.unwrap_err().to_string();
         assert!(error.contains("--state-epochs-file"), "{error}");

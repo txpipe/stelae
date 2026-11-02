@@ -49,8 +49,9 @@ custom provenance files.
 ## Candidate identity
 
 A candidate is the tuple of the full Stelae commit, committed `Cargo.lock`,
-accepted Dolos revision
-`e184a965644bcd7a4317097eda94206bd50a35d7`, chart source at that same Stelae
+Dolos revision `e39a38a31665acb1b5e5701bbb2f8c7cb995cef1` (the frozen v2
+profile, see [publisher.md](publisher.md#source-and-dependency-identity)),
+chart source at that same Stelae
 commit, and reviewed values/configuration. Record all of them at handoff. Before
 publication the image digest is intentionally unknown; use the commit as the
 candidate identity, then add the registry digest and attestation after the
@@ -78,53 +79,37 @@ distinct, explicit decisions.
    with no moving `latest` tag.
 4. Record the published digest and verify its provenance with
    `gh attestation verify oci://ghcr.io/txpipe/stelae-publisher@sha256:<digest> --repo txpipe/stelae`.
-   Operations selects the tested image for a separate cutover.
+   Operations selects the tested image for a separate deployment.
 
 Pull requests and branch-based manual runs only build and test. A manual run
 on a version tag follows the same publication path as a tag push. The workflow
 does not create GitHub Releases, tags, or deployments.
 
-## Chart cutover and rollback
+## First publication on the chart
 
-Chart 0.2 runs Stelae only. Existing Dolos deployments stay pinned to chart
-0.1 and their tested image until the operator performs an explicit cutover.
-Chart 0.3 runs a publisher built on the Dolos v2 configuration, which
-neither reads a stele cut by 0.2 nor is read by it. A release moves to 0.3
-as the first publication of a fresh lineage: an emptied repository, a v2
-`dolosToml`, its retained epochs in `stateEpochs`, a matching image,
-`allowGenesisFallback: true` until `latest` nears the tip, and a bumped
-`run`. Deployed onto a repository that still holds a v1 `latest`, 0.3 refuses
-to restore it. With genesis fallback off, it refuses again on every restart
-until `backoffLimit`. With it on, it falls back to genesis and replays silently
-to that `latest` (days on mainnet); then it refuses the v1 predecessor and
-restarts until `backoffLimit`, or completes as up to date when Mithril has not
-certified the next boundary. It uploads nothing either way. It rolls back to
-0.2 with its previous image and v1 configuration only while the repository
-still holds its v1 lineage. The
-[chart README](../k8s/dolos-publisher/README.md#upgrade-and-rollback) has the
-order.
-The chart directory/name remains `dolos-publisher` to preserve release and
-object naming; the legacy shell entrypoint and host selector are removed.
+An image built on the frozen profile publishes a fresh lineage, following
+the order in [publisher.md](publisher.md#first-publication). The chart
+directory and name remain `dolos-publisher` to preserve release and object
+naming.
 
-Keep the previous chart source revision and tested Dolos image available
-([0.1 chart at the predecessor commit](https://github.com/txpipe/stelae/tree/bd4b8c31398986068234ffae323aa5cf820f612c/k8s/dolos-publisher/chart)).
-Stop the old writer and wait for its pod to terminate before upgrading to
-chart 0.2 with the Stelae image and a bumped `run`. Retain the network config,
-repository, credentials and tuning; leave `allowGenesisFallback: false`
-for an established lineage.
+1. Stop every other writer to the repository and wait for its pod to
+   terminate. Helm's resource replacement order does not guarantee a single
+   writer.
+2. Delete every tag in the repository, `latest` first. The first run must
+   find it empty.
+3. Install or upgrade with the candidate's image, the network's v2
+   `dolosToml`, its retained epochs in `stateEpochs`,
+   `allowGenesisFallback: true` and a bumped `run`. The Job replays from
+   genesis and publishes every epoch boundary on the way.
+4. Set `allowGenesisFallback: false` for every later run. Initialization
+   then restores the published `latest`, or resumes the kept stores on a
+   persistent claim, and fails closed if it cannot.
 
-Rollback uses the pinned 0.1 chart and previous Dolos image with another
-bumped `run`, after the Stelae writer has stopped. Do not rely on Helm's
-resource replacement order to prevent overlapping writers. The 0.1 chart
-uses an emptyDir and restores a compatible published head. An unpublished
-checkpoint is not a rollback source.
-
-From chart 0.4 the `/data` volume is an emptyDir by default, and every run
-restores the published head. With a persistent claim the next run resumes
-the kept stores instead, publishing first any boundary they committed but
-did not publish. So a rollback away from a suspect image deletes the claim
-first, as does any change of storage pins, journal schemas or profile
-versions (see the chart README's
-[Data volume](../k8s/dolos-publisher/README.md#data-volume)).
+The `/data` volume is an emptyDir by default, and every run restores the
+published head. With a persistent claim the next run resumes the kept stores
+instead, publishing first any boundary they committed but did not publish.
+So moving away from a suspect image deletes the claim first, as does any
+change of storage pins, journal schemas or profile versions (see the chart
+README's [Data volume](../k8s/dolos-publisher/README.md#data-volume)).
 
 See the [chart documentation](../k8s/dolos-publisher/README.md) for its values.

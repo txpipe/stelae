@@ -30,7 +30,7 @@ Publisher commands (`initialize`, `publish`, `backfill`, `run`, and `digest`,
 `verify` and `inspect` for reading and reproducing published steles),
 configuration precedence and persisted-state contracts are documented in
 [docs/publisher.md](docs/publisher.md). Reproducible image inputs,
-release provenance and the chart upgrade/rollback contract are in
+release provenance and a fresh lineage's first publication on the chart are in
 [docs/publisher-packaging.md](docs/publisher-packaging.md).
 
 The boundary proof lives in the test suite: `stelae/tests/toy_profile.rs`

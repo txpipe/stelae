@@ -25,7 +25,7 @@ pub use dolos_snapshot::{
 };
 
 /// The Dolos revision this publisher reads its configuration and stores with.
-pub const DOLOS_REVISION: &str = "e184a965644bcd7a4317097eda94206bd50a35d7";
+pub const DOLOS_REVISION: &str = "e39a38a31665acb1b5e5701bbb2f8c7cb995cef1";
 
 #[cfg(test)]
 mod dependency_identity {

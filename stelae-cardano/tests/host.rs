@@ -1,4 +1,4 @@
-use std::{cell::Cell, io};
+use std::{cell::Cell, io, path::PathBuf};
 
 use dolos::engine::ReplayWorkspace;
 use dolos_core::ChainPoint;
@@ -54,6 +54,56 @@ fn a_bounded_fixture_publishes_to_a_directory_through_the_new_host() {
     .unwrap();
     assert_eq!(outcome, initialize::Outcome::Restored { sequence: 1 });
     assert!(dolos::storage::has_existing_data(&restored.config).unwrap());
+}
+
+/// A fresh lineage's first stele reproduces itself: the stores it restores
+/// publish the same inscription again.
+#[test]
+fn a_restored_stele_publishes_the_same_inscription() {
+    fn publish(node: &Node, genesis: &dolos_core::Genesis, destination: PathBuf) -> String {
+        let retained = dolos_snapshot::planning::retained_epochs(&[1]).unwrap();
+        let (_, outcome) = publish_once(
+            &node.config,
+            genesis,
+            &retained,
+            Selection::default(),
+            Destination::Directory(destination),
+            false,
+            &Observer::silent(),
+        )
+        .unwrap();
+        let PublishOutcome::Directory { identity, .. } = outcome else {
+            panic!("fixture was not published to the directory");
+        };
+        identity
+    }
+
+    let node = Node::new();
+    let (genesis, _) = node.replay_to_the_first_boundary();
+    let first = node.path().join("first");
+    let published = publish(&node, &genesis, first.clone());
+
+    let restored = Node::new();
+    let outcome = initialize::run(
+        &restored.config,
+        &genesis,
+        &initialize::Options {
+            source: RestoreSource::Dir(first),
+            point: Point::Latest,
+            auth: Auth::Anonymous,
+            insecure: false,
+            scratch_dir: None,
+            skip_space_check: false,
+            resume: false,
+            allow_genesis: false,
+        },
+        &Observer::silent(),
+    )
+    .unwrap();
+    assert_eq!(outcome, initialize::Outcome::Restored { sequence: 1 });
+
+    let republished = publish(&restored, &genesis, restored.path().join("second"));
+    assert_eq!(republished, published);
 }
 
 #[test]

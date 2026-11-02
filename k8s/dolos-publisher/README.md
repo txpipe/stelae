@@ -189,5 +189,6 @@ lineage, that is, before its tags are deleted. Stop the writer, select chart
 way. Never reuse incompatible persistent scratch or an unpublished checkpoint
 across hosts.
 
-Full build, release and rollback details are in
+Full build and release details, and the first publication of a fresh
+lineage, are in
 [publisher-packaging.md](../../docs/publisher-packaging.md).
