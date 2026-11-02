@@ -24,8 +24,10 @@ pub use dolos_snapshot::{
     RetainedEpochs,
 };
 
-/// The Dolos revision this publisher reads its configuration and stores with.
-pub const DOLOS_REVISION: &str = "e39a38a31665acb1b5e5701bbb2f8c7cb995cef1";
+/// The Dolos revision this publisher reads its configuration and stores with:
+/// the Stelae snapshot envelope adoption (txpipe/dolos PR #1553). The v2
+/// profile was frozen earlier, at e39a38a3 (PR #1548).
+pub const DOLOS_REVISION: &str = "1db3e41fd04bca64bf245f50b54ca656719764ca";
 
 #[cfg(test)]
 mod dependency_identity {

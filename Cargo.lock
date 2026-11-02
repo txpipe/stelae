@@ -1188,7 +1188,7 @@ checksum = "780955b8b195a21ab8e4ac6b60dd1dbdcec1dc6c51c0617964b08c81785e12c9"
 [[package]]
 name = "dolos"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e39a38a31665acb1b5e5701bbb2f8c7cb995cef1#e39a38a31665acb1b5e5701bbb2f8c7cb995cef1"
+source = "git+https://github.com/txpipe/dolos?rev=1db3e41fd04bca64bf245f50b54ca656719764ca#1db3e41fd04bca64bf245f50b54ca656719764ca"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1232,7 +1232,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
- "tower 0.4.13",
  "tower-http",
  "tracing",
  "tracing-log",
@@ -1249,7 +1248,7 @@ dependencies = [
 [[package]]
 name = "dolos-cardano"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e39a38a31665acb1b5e5701bbb2f8c7cb995cef1#e39a38a31665acb1b5e5701bbb2f8c7cb995cef1"
+source = "git+https://github.com/txpipe/dolos?rev=1db3e41fd04bca64bf245f50b54ca656719764ca#1db3e41fd04bca64bf245f50b54ca656719764ca"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1275,7 +1274,7 @@ dependencies = [
 [[package]]
 name = "dolos-core"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e39a38a31665acb1b5e5701bbb2f8c7cb995cef1#e39a38a31665acb1b5e5701bbb2f8c7cb995cef1"
+source = "git+https://github.com/txpipe/dolos?rev=1db3e41fd04bca64bf245f50b54ca656719764ca#1db3e41fd04bca64bf245f50b54ca656719764ca"
 dependencies = [
  "bytes",
  "config",
@@ -1302,7 +1301,7 @@ dependencies = [
 [[package]]
 name = "dolos-fjall"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e39a38a31665acb1b5e5701bbb2f8c7cb995cef1#e39a38a31665acb1b5e5701bbb2f8c7cb995cef1"
+source = "git+https://github.com/txpipe/dolos?rev=1db3e41fd04bca64bf245f50b54ca656719764ca#1db3e41fd04bca64bf245f50b54ca656719764ca"
 dependencies = [
  "bincode 1.3.3",
  "dolos-core",
@@ -1320,7 +1319,7 @@ dependencies = [
 [[package]]
 name = "dolos-flatfiles"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e39a38a31665acb1b5e5701bbb2f8c7cb995cef1#e39a38a31665acb1b5e5701bbb2f8c7cb995cef1"
+source = "git+https://github.com/txpipe/dolos?rev=1db3e41fd04bca64bf245f50b54ca656719764ca#1db3e41fd04bca64bf245f50b54ca656719764ca"
 dependencies = [
  "rayon",
  "tempfile",
@@ -1330,7 +1329,7 @@ dependencies = [
 [[package]]
 name = "dolos-mithril"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e39a38a31665acb1b5e5701bbb2f8c7cb995cef1#e39a38a31665acb1b5e5701bbb2f8c7cb995cef1"
+source = "git+https://github.com/txpipe/dolos?rev=1db3e41fd04bca64bf245f50b54ca656719764ca#1db3e41fd04bca64bf245f50b54ca656719764ca"
 dependencies = [
  "mithril-client",
  "tracing",
@@ -1339,7 +1338,7 @@ dependencies = [
 [[package]]
 name = "dolos-redb3"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e39a38a31665acb1b5e5701bbb2f8c7cb995cef1#e39a38a31665acb1b5e5701bbb2f8c7cb995cef1"
+source = "git+https://github.com/txpipe/dolos?rev=1db3e41fd04bca64bf245f50b54ca656719764ca#1db3e41fd04bca64bf245f50b54ca656719764ca"
 dependencies = [
  "bincode 1.3.3",
  "bytes",
@@ -1363,7 +1362,7 @@ dependencies = [
 [[package]]
 name = "dolos-snapshot"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e39a38a31665acb1b5e5701bbb2f8c7cb995cef1#e39a38a31665acb1b5e5701bbb2f8c7cb995cef1"
+source = "git+https://github.com/txpipe/dolos?rev=1db3e41fd04bca64bf245f50b54ca656719764ca#1db3e41fd04bca64bf245f50b54ca656719764ca"
 dependencies = [
  "dolos-cardano",
  "dolos-core",
@@ -1380,7 +1379,7 @@ dependencies = [
 [[package]]
 name = "dolos-testing"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e39a38a31665acb1b5e5701bbb2f8c7cb995cef1#e39a38a31665acb1b5e5701bbb2f8c7cb995cef1"
+source = "git+https://github.com/txpipe/dolos?rev=1db3e41fd04bca64bf245f50b54ca656719764ca#1db3e41fd04bca64bf245f50b54ca656719764ca"
 dependencies = [
  "bech32 0.9.1",
  "crc32fast",
@@ -4055,7 +4054,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
- "tower 0.5.3",
+ "tower",
  "tower-http",
  "tower-service",
  "url",
@@ -5225,7 +5224,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-stream",
- "tower 0.5.3",
+ "tower",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -5251,17 +5250,6 @@ dependencies = [
  "prost 0.14.4",
  "prost-types 0.14.4",
  "tonic 0.14.6",
-]
-
-[[package]]
-name = "tower"
-version = "0.4.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8fa9be0de6cf49e536ce1851f987bd21a43b771b09473c3549a6c853db37c1c"
-dependencies = [
- "tower-layer",
- "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -5295,7 +5283,7 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
- "tower 0.5.3",
+ "tower",
  "tower-layer",
  "tower-service",
  "tracing",

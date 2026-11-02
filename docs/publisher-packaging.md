@@ -49,8 +49,9 @@ custom provenance files.
 ## Candidate identity
 
 A candidate is the tuple of the full Stelae commit, committed `Cargo.lock`,
-Dolos revision `e39a38a31665acb1b5e5701bbb2f8c7cb995cef1` (the frozen v2
-profile, see [publisher.md](publisher.md#source-and-dependency-identity)),
+Dolos revision `1db3e41fd04bca64bf245f50b54ca656719764ca` (the snapshot
+envelope adoption over the frozen v2 profile, see
+[publisher.md](publisher.md#source-and-dependency-identity)),
 chart source at that same Stelae
 commit, and reviewed values/configuration. Record all of them at handoff. Before
 publication the image digest is intentionally unknown; use the commit as the

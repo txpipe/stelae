@@ -9,15 +9,20 @@ No command starts or shells out to a Dolos executable.
 ## Source and dependency identity
 
 Every Dolos crate in the publisher's dependency graph, normal and dev, is
-pinned to `e39a38a31665acb1b5e5701bbb2f8c7cb995cef1`, the merge of
-[PR 1548](https://github.com/txpipe/dolos/pull/1548). That is the commit at
-which the `io.txpipe.dolos.cardano` profile is frozen for Dolos v2: profile
-and payload media-type version 1, payloads named
+pinned to `1db3e41fd04bca64bf245f50b54ca656719764ca`, the merge of
+[PR 1553](https://github.com/txpipe/dolos/pull/1553), which adopts the Stelae
+snapshot envelope `application/vnd.stelae.snapshot.v1`. `DOLOS_REVISION` in
+`stelae-cardano/src/lib.rs` names the same commit.
+
+The `io.txpipe.dolos.cardano` profile was frozen for Dolos v2 earlier, at
+`e39a38a31665acb1b5e5701bbb2f8c7cb995cef1`, the merge of
+[PR 1548](https://github.com/txpipe/dolos/pull/1548): profile and payload
+media-type version 1, payloads named
 `application/vnd.dolos.stelae.{kind}.v1+zstd`, every namespace at schema
-revision 1, and only the epoch-boundary cut publishable. The normative profile
-is [`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/e39a38a31665acb1b5e5701bbb2f8c7cb995cef1/crates/snapshot/PROFILE.md)
-at that commit. `DOLOS_REVISION` in `stelae-cardano/src/lib.rs` names the
-same commit.
+revision 1, and only the epoch-boundary cut publishable. The envelope pin
+changes none of that. The normative profile is
+[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/1db3e41fd04bca64bf245f50b54ca656719764ca/crates/snapshot/PROFILE.md)
+at the pinned commit.
 
 Like every revision since the publisher retirement of
 [PR 1335](https://github.com/txpipe/dolos/pull/1335), the pin retains the
