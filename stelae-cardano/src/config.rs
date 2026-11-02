@@ -9,7 +9,7 @@ use std::path::Path;
 
 use dolos_cardano::networks::ResolvedNetwork;
 use dolos_core::{
-    config::{ConfigError, RootConfig},
+    config::{ConfigError, HistoryMode, RootConfig},
     ChainError, Genesis,
 };
 use dolos_mithril::MithrilSource;
@@ -66,6 +66,32 @@ fn publisher_destination(moved: String) -> String {
 /// configured files and checked against the magic for a custom one.
 pub fn genesis(config: &RootConfig) -> Result<Genesis, ChainError> {
     ResolvedNetwork::resolve(&config.chain)?.genesis()
+}
+
+/// A publisher configured to keep less than the full archive.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "a stele publisher needs `history.mode = \"full\"`, but this configuration keeps {kept}: \
+     Dolos publishes only from an archive that starts at the origin, so the first prune \
+     would stall the lineage"
+)]
+pub struct PartialHistory {
+    kept: &'static str,
+}
+
+/// Refuse a configuration whose archive does not keep every block.
+///
+/// Dolos refuses to cut a boundary from an archive whose first block is past
+/// the origin, so a rolling window publishes until its first prune and then
+/// fails every later publish.
+pub fn require_full_history(config: &RootConfig) -> Result<(), PartialHistory> {
+    match config.history.mode {
+        HistoryMode::Full => Ok(()),
+        HistoryMode::Rolling => Err(PartialHistory {
+            kept: "a rolling window",
+        }),
+        HistoryMode::None => Err(PartialHistory { kept: "no archive" }),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -188,6 +214,30 @@ mod tests {
         );
         let config = loaded.unwrap();
         assert_eq!(genesis(&config).unwrap().network_magic(), 2);
+    }
+
+    #[test]
+    fn only_full_history_publishes() {
+        let (_dir, loaded) = config(
+            "compatibility = \"v2-alpha.2\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"preview\"\n",
+        );
+        require_full_history(&loaded.unwrap()).unwrap();
+
+        for (history, kept) in [
+            (
+                "mode = \"rolling\"\nwindow = { unit = \"slot\", value = 432000 }",
+                "a rolling window",
+            ),
+            ("mode = \"none\"", "no archive"),
+        ] {
+            let (_dir, loaded) = config(&format!(
+                "compatibility = \"v2-alpha.2\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"preview\"\n[history]\n{history}\n"
+            ));
+            let error = require_full_history(&loaded.unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(kept), "{error}");
+        }
     }
 
     #[test]

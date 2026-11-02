@@ -98,7 +98,7 @@ naming.
 2. Delete every tag in the repository, `latest` first. The first run must
    find it empty.
 3. Install or upgrade with the candidate's image, the network's v2
-   `dolosToml`, its retained epochs in `stateEpochs`,
+   `dolosToml` with full history (no `[history]` window), its retained epochs in `stateEpochs`,
    `allowGenesisFallback: true` and a bumped `run`. The Job replays from
    genesis and publishes every epoch boundary on the way.
 4. Set `allowGenesisFallback: false` for every later run. Initialization
@@ -106,7 +106,8 @@ naming.
    persistent claim, and fails closed if it cannot.
 
 The `/data` volume is an emptyDir by default, and every run restores the
-published head. With a persistent claim the next run resumes the kept stores
+published head, all of history. A mainnet publisher needs the persistent
+claim. With a persistent claim the next run resumes the kept stores
 instead, publishing first any boundary they committed but did not publish.
 So moving away from a suspect image deletes the claim first, as does any
 change of storage pins, journal schemas or profile versions (see the chart

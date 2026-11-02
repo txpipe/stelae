@@ -65,8 +65,13 @@ loader: the file named by global `--config`, else `./dolos.toml`, with
 `DOLOS_STORAGE__PATH`) overriding it. Unknown fields are rejected, and so is a
 network the Dolos catalog does not know. A known network (`mainnet`,
 `preprod`, `preview`) takes its embedded genesis; a `custom` one names its
-genesis files under `[chain.cardano.genesis]`. The rolling `history.window`
-bounds how much chain history a restore reads.
+genesis files under `[chain.cardano.genesis]`.
+
+A publisher keeps the full archive: `[history] mode` stays `"full"`, its
+default. Dolos cuts a boundary only from an archive whose first block is the
+chain's origin, so a `rolling` window would publish until its first prune and
+then refuse every later boundary. `initialize`, `backfill` and `run` refuse a
+`rolling` or `none` history before they open a store.
 
 What Dolos takes from an invocation rather than from that file, the publisher
 takes the same way:
@@ -220,6 +225,9 @@ history forward, so the first stele is the only one published without a
 predecessor.
 
 1. Stop every other writer to the repository and wait for it to exit.
+   Configure the node with full history (see
+   [Configuration](#configuration)); its stores grow with the chain, to
+   about 250 GiB on mainnet.
 2. Delete every tag in the repository, `latest` first, so no earlier pin's
    stele is restored or chained onto.
 3. Start the first run with `--allow-genesis`. Initialization finds no

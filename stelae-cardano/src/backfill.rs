@@ -311,6 +311,7 @@ pub fn run(
     cancel: CancellationToken,
     observer: &stelae::progress::Observer,
 ) -> Result<Outcome, Error> {
+    crate::config::require_full_history(config).map_err(Error::caller)?;
     require_synchronous_context()?;
     let download_dir = options
         .download_dir

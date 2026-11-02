@@ -10,8 +10,8 @@ repository.workspace = true
 stelae = { path = "../stelae", version = "=0.5.0", features = ["oci"] }
 stelae-driver = { path = "../stelae-driver", version = "=0.5.0", features = ["oci"] }
 
-# Dolos main with the v2 configuration contract (txpipe/dolos PRs #1466,
-# #1468, #1478 and #1479).
+# The Dolos commit at which the v2 profile is frozen (txpipe/dolos PR #1548);
+# DOLOS_REVISION in src/lib.rs names the same commit.
 dolos = { git = "https://github.com/txpipe/dolos", rev = "e39a38a31665acb1b5e5701bbb2f8c7cb995cef1", default-features = false }
 dolos-cardano = { git = "https://github.com/txpipe/dolos", rev = "e39a38a31665acb1b5e5701bbb2f8c7cb995cef1" }
 dolos-core = { git = "https://github.com/txpipe/dolos", rev = "e39a38a31665acb1b5e5701bbb2f8c7cb995cef1" }

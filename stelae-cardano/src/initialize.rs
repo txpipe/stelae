@@ -214,6 +214,7 @@ pub fn run(
     options: &Options,
     observer: &Observer,
 ) -> Result<Outcome, AnyError> {
+    crate::config::require_full_history(config)?;
     validate_storage_path(&config.storage.path)?;
     std::fs::create_dir_all(&config.storage.path)?;
 
@@ -313,8 +314,10 @@ mod tests {
             resume: false,
             allow_genesis: false,
         };
-        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/image");
-        let rolling = crate::config::load(Some(&image.join("preview-smoke.toml"))).unwrap();
+        let mut rolling = crate::RootConfig::new(dolos_core::config::ChainConfig::known("preview"));
+        rolling.history = dolos_core::config::HistoryConfig::rolling(
+            dolos_core::config::HistoryWindow::slots(432_000),
+        );
         let genesis = crate::config::genesis(&rolling).unwrap();
         assert_eq!(
             restoring(&rolling, &genesis, &options).max_history,

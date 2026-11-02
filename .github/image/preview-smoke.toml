@@ -10,7 +10,3 @@ network = "preview"
 
 [storage]
 path = "/data/db"
-
-[history]
-mode = "rolling"
-window = { unit = "slot", value = 432000 }

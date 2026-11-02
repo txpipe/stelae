@@ -253,3 +253,30 @@ fn cold_start_fails_closed_and_genesis_requires_explicit_opt_in() {
         initialize::Outcome::Genesis
     );
 }
+
+#[test]
+fn a_rolling_history_is_refused_before_any_store_opens() {
+    let node = Node::new();
+    let genesis = dolos_cardano::include::preview::load();
+    let mut config = node.config.clone();
+    config.storage.path = node.path().join("rolling");
+    config.history = dolos_core::config::HistoryConfig::rolling(
+        dolos_core::config::HistoryWindow::slots(432_000),
+    );
+    let options = initialize::Options {
+        source: RestoreSource::Dir(node.path().join("missing-stele")),
+        point: Point::Latest,
+        auth: Auth::Anonymous,
+        insecure: false,
+        scratch_dir: None,
+        skip_space_check: false,
+        resume: false,
+        allow_genesis: true,
+    };
+
+    let error = initialize::run(&config, &genesis, &options, &Observer::silent())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("history.mode = \"full\""), "{error}");
+    assert!(!config.storage.path.exists());
+}
