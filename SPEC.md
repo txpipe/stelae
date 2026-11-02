@@ -16,11 +16,10 @@ requirement.
 **Status: frozen.** Protocol version 1, as this document describes it, is
 frozen with Dolos v2, and so is the Dolos profile at version 1
 ([`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/main/crates/snapshot/PROFILE.md)).
-Changes from here on follow the [compatibility](#compatibility) rules of
-TxPipe decision 0026: within a version, writers may append numbered optional
-fields and readers skip fields they do not know; field indexes are never
-renumbered or repurposed; and anything else — an added enum variant included
-— is a breaking change that takes a version bump.
+Changes from here on follow the [compatibility](#compatibility) rules: the
+inscription schema and the envelope media types stay fail-closed, so any
+change to them takes a protocol version bump; only payload record content
+may grow within a version, and only as that section describes.
 
 ## Overview
 
@@ -375,7 +374,16 @@ Three version axes move independently and must be kept coherent:
    vendor-owned. Within a version, a profile is expected to treat `.v{n}` as
    a contract on record content rather than an exact-byte pin, with the
    profile's schema-revision map (in `parameters`) pinning the bytes; the
-   details are each profile's to specify.
+   details are each profile's to specify. Within a payload version, writers
+   may append numbered optional fields and readers skip fields they do not
+   know; field indexes are never renumbered or repurposed; anything else —
+   an added enum variant included — is a breaking change that takes a
+   version bump.
+
+These additive rules apply to payload record content only. The inscription
+and the envelope types are not extensible within protocol version 1:
+verifiers reject unknown generic top-level inscription keys, and extension
+happens only inside `position`, `parameters` and `scope`.
 
 ## Implementation notes
 
