@@ -280,3 +280,43 @@ fn a_rolling_history_is_refused_before_any_store_opens() {
     assert!(error.contains("history.mode = \"full\""), "{error}");
     assert!(!config.storage.path.exists());
 }
+
+#[test]
+fn a_rolling_history_is_refused_before_backfill_creates_anything() {
+    let node = Node::new();
+    let genesis = dolos_cardano::include::preview::load();
+    let mut config = node.config.clone();
+    config.storage.path = node.path().join("rolling");
+    config.history = dolos_core::config::HistoryConfig::rolling(
+        dolos_core::config::HistoryWindow::slots(432_000),
+    );
+    let options = backfill::Options {
+        repository: "oci://registry.invalid/cardano/preview".parse().unwrap(),
+        auth: Auth::Anonymous,
+        insecure: false,
+        scratch_dir: None,
+        concurrency: None,
+        verify_carried: false,
+        download_dir: None,
+        window: 1,
+        until_epoch: None,
+        skip_validation: false,
+        mithril: MithrilSource {
+            aggregator: "http://unused.invalid".to_owned(),
+            genesis_vkey: String::new(),
+        },
+        retained: RetainedEpochs::default(),
+    };
+
+    let error = backfill::run(
+        &config,
+        &genesis,
+        &options,
+        tokio_util::sync::CancellationToken::new(),
+        &Observer::silent(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("history.mode = \"full\""), "{error}");
+    assert!(!config.storage.path.exists());
+}
