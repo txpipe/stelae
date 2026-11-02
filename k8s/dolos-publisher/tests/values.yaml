@@ -8,7 +8,7 @@ resources:
   requests:
     cpu: "1"
 dolosToml: |
-  compatibility = "v2-alpha.1"
+  compatibility = "v2-alpha.2"
   [chain]
   protocol = "cardano"
   network = "preview"

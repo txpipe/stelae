@@ -1,4 +1,4 @@
-use std::{cell::Cell, io};
+use std::{cell::Cell, io, path::PathBuf};
 
 use dolos::engine::ReplayWorkspace;
 use dolos_core::ChainPoint;
@@ -54,6 +54,56 @@ fn a_bounded_fixture_publishes_to_a_directory_through_the_new_host() {
     .unwrap();
     assert_eq!(outcome, initialize::Outcome::Restored { sequence: 1 });
     assert!(dolos::storage::has_existing_data(&restored.config).unwrap());
+}
+
+/// A fresh lineage's first stele reproduces itself: the stores it restores
+/// publish the same inscription again.
+#[test]
+fn a_restored_stele_publishes_the_same_inscription() {
+    fn publish(node: &Node, genesis: &dolos_core::Genesis, destination: PathBuf) -> String {
+        let retained = dolos_snapshot::planning::retained_epochs(&[1]).unwrap();
+        let (_, outcome) = publish_once(
+            &node.config,
+            genesis,
+            &retained,
+            Selection::default(),
+            Destination::Directory(destination),
+            false,
+            &Observer::silent(),
+        )
+        .unwrap();
+        let PublishOutcome::Directory { identity, .. } = outcome else {
+            panic!("fixture was not published to the directory");
+        };
+        identity
+    }
+
+    let node = Node::new();
+    let (genesis, _) = node.replay_to_the_first_boundary();
+    let first = node.path().join("first");
+    let published = publish(&node, &genesis, first.clone());
+
+    let restored = Node::new();
+    let outcome = initialize::run(
+        &restored.config,
+        &genesis,
+        &initialize::Options {
+            source: RestoreSource::Dir(first),
+            point: Point::Latest,
+            auth: Auth::Anonymous,
+            insecure: false,
+            scratch_dir: None,
+            skip_space_check: false,
+            resume: false,
+            allow_genesis: false,
+        },
+        &Observer::silent(),
+    )
+    .unwrap();
+    assert_eq!(outcome, initialize::Outcome::Restored { sequence: 1 });
+
+    let republished = publish(&restored, &genesis, restored.path().join("second"));
+    assert_eq!(republished, published);
 }
 
 #[test]
@@ -202,4 +252,71 @@ fn cold_start_fails_closed_and_genesis_requires_explicit_opt_in() {
         initialize::run(&node.config, &genesis, &options, &Observer::silent()).unwrap(),
         initialize::Outcome::Genesis
     );
+}
+
+#[test]
+fn a_rolling_history_is_refused_before_any_store_opens() {
+    let node = Node::new();
+    let genesis = dolos_cardano::include::preview::load();
+    let mut config = node.config.clone();
+    config.storage.path = node.path().join("rolling");
+    config.history = dolos_core::config::HistoryConfig::rolling(
+        dolos_core::config::HistoryWindow::slots(432_000),
+    );
+    let options = initialize::Options {
+        source: RestoreSource::Dir(node.path().join("missing-stele")),
+        point: Point::Latest,
+        auth: Auth::Anonymous,
+        insecure: false,
+        scratch_dir: None,
+        skip_space_check: false,
+        resume: false,
+        allow_genesis: true,
+    };
+
+    let error = initialize::run(&config, &genesis, &options, &Observer::silent())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("history.mode = \"full\""), "{error}");
+    assert!(!config.storage.path.exists());
+}
+
+#[test]
+fn a_rolling_history_is_refused_before_backfill_creates_anything() {
+    let node = Node::new();
+    let genesis = dolos_cardano::include::preview::load();
+    let mut config = node.config.clone();
+    config.storage.path = node.path().join("rolling");
+    config.history = dolos_core::config::HistoryConfig::rolling(
+        dolos_core::config::HistoryWindow::slots(432_000),
+    );
+    let options = backfill::Options {
+        repository: "oci://registry.invalid/cardano/preview".parse().unwrap(),
+        auth: Auth::Anonymous,
+        insecure: false,
+        scratch_dir: None,
+        concurrency: None,
+        verify_carried: false,
+        download_dir: None,
+        window: 1,
+        until_epoch: None,
+        skip_validation: false,
+        mithril: MithrilSource {
+            aggregator: "http://unused.invalid".to_owned(),
+            genesis_vkey: String::new(),
+        },
+        retained: RetainedEpochs::default(),
+    };
+
+    let error = backfill::run(
+        &config,
+        &genesis,
+        &options,
+        tokio_util::sync::CancellationToken::new(),
+        &Observer::silent(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("history.mode = \"full\""), "{error}");
+    assert!(!config.storage.path.exists());
 }
