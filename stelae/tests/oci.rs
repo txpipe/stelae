@@ -111,6 +111,14 @@ use stelae::{
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
+/// The envelope a Stelae snapshot's manifest carries, spelled out rather than
+/// read from [`stelae::ARTIFACT_TYPE`], so moving the constant and the reader
+/// together cannot pass these tests.
+const SNAPSHOT_ENVELOPE: &str = "application/vnd.stelae.snapshot.v1";
+
+/// The envelope identifier releases before v2 wrote. Refused, with no alias.
+const RETIRED_ENVELOPE: &str = "application/vnd.stelae.stele.v1";
+
 /// Held by every test that spawns a registry.
 ///
 /// Two reasons, and the second is the one that would otherwise be found the
@@ -302,7 +310,7 @@ fn the_manifest_shape_is_frozen() {
     assert_eq!(
         String::from_utf8(body).unwrap(),
         concat!(
-            r#"{"artifactType":"application/vnd.stelae.stele.v1","#,
+            r#"{"artifactType":"application/vnd.stelae.snapshot.v1","#,
             r#""config":{"digest":"sha256:aeb1754e4a744864cd811f4f8a0dfaefe2599c5161521e605c094c9a1407b441","#,
             r#""mediaType":"application/vnd.stelae.inscription.v1+json","size":875},"#,
             r#""layers":[{"annotations":{"#,
@@ -443,6 +451,16 @@ fn a_manifest_that_is_not_a_steles_is_refused() {
     let err = read_manifest(&foreign, &inscription).unwrap_err();
     assert!(
         matches!(&err, Error::ManifestMismatch(m) if m.contains("artifactType is")),
+        "{err:?}"
+    );
+
+    // The envelope earlier releases wrote is foreign now: no alias reads it.
+    let mut retired = manifest.clone();
+    retired.artifact_type = Some(RETIRED_ENVELOPE.to_owned());
+    let err = read_manifest(&retired, &inscription).unwrap_err();
+    assert!(
+        matches!(&err, Error::ManifestMismatch(m)
+            if m.contains("artifactType is") && m.contains(RETIRED_ENVELOPE)),
         "{err:?}"
     );
 
@@ -840,6 +858,88 @@ impl Fixture {
         self.registry_staging_in(repository, None)
     }
 
+    /// Where `repository` lives on this fixture's registry: as named on a
+    /// container, under the run's namespace on a deployment.
+    fn path(&self, repository: &str) -> String {
+        match &self.server {
+            Server::Container { .. } => repository.to_owned(),
+            Server::Remote { namespace, .. } => format!("{namespace}/{repository}"),
+        }
+    }
+
+    /// The manifest stored under `tag`, exactly as the registry serves it.
+    ///
+    /// Through the registry client directly rather than through [`Registry`],
+    /// so what a test reads here has not been through the reader under test.
+    fn manifest_raw(&self, repository: &str, tag: &str) -> Vec<u8> {
+        let (runtime, client, reference, auth) = self.raw(repository, tag);
+
+        let (body, _digest) = runtime
+            .block_on(client.pull_manifest_raw(
+                &reference,
+                &auth,
+                &[oci_client::manifest::OCI_IMAGE_MEDIA_TYPE],
+            ))
+            .expect("the registry serves the manifest");
+
+        body.to_vec()
+    }
+
+    /// Store `body` under `tag`, bypassing every check the writer makes.
+    ///
+    /// The way to put a manifest the writer would never produce in front of
+    /// the real reader.
+    fn put_manifest_raw(&self, repository: &str, tag: &str, body: Vec<u8>) {
+        let (runtime, client, reference, auth) = self.raw(repository, tag);
+
+        runtime.block_on(client.store_auth_if_needed(reference.resolve_registry(), &auth));
+        runtime
+            .block_on(client.push_manifest_raw(
+                &reference,
+                body,
+                http::HeaderValue::from_static(oci_client::manifest::OCI_IMAGE_MEDIA_TYPE),
+            ))
+            .expect("the registry accepts the manifest");
+    }
+
+    fn raw(
+        &self,
+        repository: &str,
+        tag: &str,
+    ) -> (
+        tokio::runtime::Runtime,
+        oci_client::Client,
+        oci_client::Reference,
+        oci_client::secrets::RegistryAuth,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let client = oci_client::Client::new(oci_client::client::ClientConfig {
+            protocol: if self.tls {
+                oci_client::client::ClientProtocol::Https
+            } else {
+                oci_client::client::ClientProtocol::Http
+            },
+            ..Default::default()
+        });
+
+        let reference =
+            oci_client::Reference::with_tag(self.address(), self.path(repository), tag.to_owned());
+
+        let auth = match self.credentials() {
+            Auth::Basic { user, password } => {
+                oci_client::secrets::RegistryAuth::Basic(user, password)
+            }
+            Auth::Bearer(token) => oci_client::secrets::RegistryAuth::Bearer(token),
+            Auth::Anonymous => oci_client::secrets::RegistryAuth::Anonymous,
+        };
+
+        (runtime, client, reference, auth)
+    }
+
     /// The same transport, with the publish path's concurrency named.
     ///
     /// Only the tests whose subject is the concurrency itself set it; every
@@ -924,10 +1024,7 @@ impl Fixture {
         auth: Auth,
         set: impl FnOnce(&mut Options),
     ) -> Registry {
-        let repository = match &self.server {
-            Server::Container { .. } => repository.to_owned(),
-            Server::Remote { namespace, .. } => format!("{namespace}/{repository}"),
-        };
+        let repository = self.path(repository);
 
         let mut options = Options {
             insecure: !self.tls,
@@ -1203,6 +1300,76 @@ fn a_stele_survives_the_round_trip() {
 
     let err = registry.pull(&Other, "latest").unwrap_err();
     assert!(matches!(err, Error::UnknownProfile { .. }), "{err:?}");
+}
+
+/// What the writer stores is a Stelae snapshot's envelope, read back off the
+/// registry byte for byte and through the reader.
+#[test]
+#[ignore = "spawns a registry"]
+fn the_registry_holds_a_snapshot_envelope() {
+    let _serial = exclusive();
+
+    let fixture = Fixture::spawn();
+    let registry = fixture.registry("stelae/envelope");
+
+    let published = write_stele(&registry, 3);
+
+    let raw: serde_json::Value =
+        serde_json::from_slice(&fixture.manifest_raw("stelae/envelope", "latest")).unwrap();
+    assert_eq!(raw["artifactType"], SNAPSHOT_ENVELOPE);
+
+    let latest = registry.pull_latest(&ToyProfile).unwrap();
+    assert_eq!(
+        latest.manifest().artifact_type.as_deref(),
+        Some(SNAPSHOT_ENVELOPE)
+    );
+    assert_eq!(latest.read_inscription().unwrap(), published);
+}
+
+/// A manifest bearing the retired envelope is refused by the real reader,
+/// though everything else about it is a valid snapshot the registry holds.
+#[test]
+#[ignore = "spawns a registry"]
+fn the_retired_envelope_is_refused_off_the_registry() {
+    let _serial = exclusive();
+
+    let fixture = Fixture::spawn();
+    let registry = fixture.registry("stelae/retired");
+
+    let published = write_stele(&registry, 3);
+    let valid = registry
+        .pull_latest(&ToyProfile)
+        .unwrap()
+        .manifest()
+        .clone();
+
+    // Only the envelope moves: the same config and layers, which the registry
+    // already holds, under the moving tag.
+    let mut retired = valid;
+    retired.artifact_type = Some(RETIRED_ENVELOPE.to_owned());
+    fixture.put_manifest_raw(
+        "stelae/retired",
+        "latest",
+        manifest_bytes(&retired).unwrap(),
+    );
+
+    let raw: serde_json::Value =
+        serde_json::from_slice(&fixture.manifest_raw("stelae/retired", "latest")).unwrap();
+    assert_eq!(raw["artifactType"], RETIRED_ENVELOPE);
+
+    let err = registry.pull_latest(&ToyProfile).unwrap_err();
+    assert!(
+        matches!(&err, Error::ManifestMismatch(m)
+            if m.contains("artifactType is") && m.contains(RETIRED_ENVELOPE)),
+        "{err:?}"
+    );
+
+    // The sequence tag still names the snapshot as written, so the refusal is
+    // the envelope's and nothing else's.
+    let by_sequence = registry
+        .pull_sequence(&ToyProfile, published.sequence)
+        .unwrap();
+    assert_eq!(by_sequence.read_inscription().unwrap(), published);
 }
 
 /// Done criterion 2: the second push moves only what the registry lacks, and

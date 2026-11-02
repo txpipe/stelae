@@ -79,10 +79,13 @@ pub use transport::{
     WrittenLayer,
 };
 
-/// Artifact type of a stele manifest. Generic tooling discovers stelae of every
-/// profile by filtering on this; the inscription's `profile` field
-/// discriminates.
-pub const ARTIFACT_TYPE: &str = "application/vnd.stelae.stele.v1";
+/// Artifact type of a Stelae snapshot's manifest. Generic tooling discovers
+/// snapshots of every profile by filtering on this; the inscription's `profile`
+/// field discriminates.
+///
+/// The only envelope a reader accepts. The identifier releases before v2 wrote
+/// is refused like any foreign type: no alias, no migration.
+pub const ARTIFACT_TYPE: &str = "application/vnd.stelae.snapshot.v1";
 
 /// Media type of the inscription (the OCI config blob).
 pub const INSCRIPTION_MEDIA_TYPE: &str = "application/vnd.stelae.inscription.v1+json";
