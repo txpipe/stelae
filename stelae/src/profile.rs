@@ -232,7 +232,9 @@ impl MediaType {
         // Kinds are dot-free, so of several infixes the rightmost one still
         // followed by a `.v` segment splits vendor from kind: a vendor label or
         // a kind named after either spelling stays where it is. Without such a
-        // split, the leftmost one reports what the rest is missing. Comparing
+        // split, the leftmost `.stelae.` (else the leftmost infix) reports what
+        // the rest is missing, so a vendor label `stele` is not mistaken for
+        // the retired infix. Comparing
         // against the last `.v` once keeps this linear in untrusted input.
         let last_version = body.rfind(".v");
 
@@ -246,6 +248,7 @@ impl MediaType {
         let (at, infix) = splits
             .clone()
             .rfind(|&(at, infix)| last_version.is_some_and(|v| v >= at + infix.len()))
+            .or_else(|| splits.clone().find(|&(_, infix)| infix == STELAE_INFIX))
             .or_else(|| splits.clone().next())
             .ok_or_else(|| invalid("expected `.stelae.` between the vendor and the kind"))?;
 
@@ -489,6 +492,12 @@ mod tests {
             (
                 "application/vnd..stelae.x.stelae.blocks+zstd",
                 "empty vendor",
+            ),
+            // A vendor label `stele` without a version is missing the version,
+            // not using the retired infix.
+            (
+                "application/vnd.org.stele.acme.stelae.blocks+zstd",
+                "`.v{n}`",
             ),
             // The last `.v` starts right where the rightmost tail does.
             (
