@@ -21,8 +21,8 @@
 //! 1. Payload media types are
 //!    `application/vnd.{vendor}.stelae.{kind}.v{n}+{codec}` and carry a vendor
 //!    slot the publisher controls. `vnd.stelae.*` is reserved for the
-//!    protocol's envelope types and is never a payload type. The `.stele.`
-//!    spelling still parses for one release and is then removed.
+//!    protocol's envelope types and is never a payload type. The retired
+//!    `.stele.` spelling is refused with an error naming `.stelae.`.
 //! 2. Profile names are reverse-DNS and vendor-owned.
 //! 3. The protocol never parses layer bodies or a profile's opaque objects. An
 //!    unknown profile is a clean refusal, never a partial restore.
@@ -194,8 +194,8 @@ pub fn validate_tag(tag: &str) -> Result<(), Error> {
 /// `application/vnd.{vendor}.stelae.{kind}.v{n}+{codec}`.
 ///
 /// The protocol parses these to enforce the coexistence rules. It does not
-/// build them and does not attach meaning to `kind` or `codec`. Parsing also
-/// accepts the deprecated `.stele.` infix; `Display` always writes `.stelae.`.
+/// build them and does not attach meaning to `kind` or `codec`. The retired
+/// `.stele.` infix is refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaType {
     pub vendor: String,
@@ -207,8 +207,8 @@ pub struct MediaType {
 const MEDIA_TYPE_PREFIX: &str = "application/vnd.";
 const STELAE_INFIX: &str = ".stelae.";
 
-/// Deprecated spelling of [`STELAE_INFIX`], accepted for one release.
-const DEPRECATED_STELE_INFIX: &str = ".stele.";
+/// Retired spelling of [`STELAE_INFIX`], recognized only to refuse it.
+const RETIRED_STELE_INFIX: &str = ".stele.";
 
 impl MediaType {
     pub fn parse(value: &str) -> Result<Self, Error> {
@@ -237,17 +237,25 @@ impl MediaType {
         let last_version = body.rfind(".v");
 
         let splits = body.match_indices('.').filter_map(|(at, _)| {
-            [STELAE_INFIX, DEPRECATED_STELE_INFIX]
+            [STELAE_INFIX, RETIRED_STELE_INFIX]
                 .into_iter()
                 .find(|infix| body[at..].starts_with(infix))
-                .map(|infix| (at, at + infix.len()))
+                .map(|infix| (at, infix))
         });
 
-        let (at, tail_at) = splits
+        let (at, infix) = splits
             .clone()
-            .rfind(|&(_, tail_at)| last_version.is_some_and(|v| v >= tail_at))
+            .rfind(|&(at, infix)| last_version.is_some_and(|v| v >= at + infix.len()))
             .or_else(|| splits.clone().next())
             .ok_or_else(|| invalid("expected `.stelae.` between the vendor and the kind"))?;
+
+        if infix == RETIRED_STELE_INFIX {
+            return Err(invalid(
+                "the `.stele.` infix is no longer accepted; write `.stelae.`",
+            ));
+        }
+
+        let tail_at = at + infix.len();
 
         let (vendor, tail) = (&body[..at], &body[tail_at..]);
 
@@ -354,23 +362,28 @@ mod tests {
         }
     }
 
-    /// The deprecated `.stele.` spelling parses to the same value and is
-    /// written back in the current one.
+    /// The retired `.stele.` spelling is refused wherever it would have
+    /// split vendor from kind, and the error names the current spelling.
     #[test]
-    fn deprecated_infix_parses_and_displays_as_stelae() {
-        for (old, new) in [
-            (
-                "application/vnd.dolos.stele.blocks.v1+zstd",
-                "application/vnd.dolos.stelae.blocks.v1+zstd",
-            ),
-            (
-                "application/vnd.io.txpipe.stele.state.v2+cbor",
-                "application/vnd.io.txpipe.stelae.state.v2+cbor",
-            ),
+    fn refuses_the_retired_stele_infix() {
+        for raw in [
+            "application/vnd.dolos.stele.blocks.v1+zstd",
+            "application/vnd.io.txpipe.stele.state.v2+cbor",
+            "application/vnd.acme.stele.stelae.v1+zstd",
+            "application/vnd.org.stelae.stele.blocks.v1+zstd",
+            "application/vnd.org.stelae.stele.votes.v1+zstd",
+            "application/vnd.stelae.stele.blocks.v1+zstd",
+            "application/vnd.io.vendor.stele.blocks+zstd",
+            "application/vnd.acme.stele.Foo.stele.blocks+zstd",
+            "application/vnd..stele.x.stele.blocks+zstd",
+            "application/vnd.acme.stele.x.stele..v1+zstd",
         ] {
-            let parsed = MediaType::parse(old).unwrap();
-            assert_eq!(parsed, MediaType::parse(new).unwrap());
-            assert_eq!(parsed.to_string(), new);
+            let err = MediaType::parse(raw).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidMediaType { reason, .. }
+                    if reason.contains("`.stele.`") && reason.contains("`.stelae.`")),
+                "{raw}: {err:?}"
+            );
         }
     }
 
@@ -379,16 +392,11 @@ mod tests {
     #[test]
     fn a_kind_or_vendor_label_may_be_named_after_either_infix() {
         for (raw, vendor, kind) in [
-            (
-                "application/vnd.acme.stele.stelae.v1+zstd",
-                "acme",
-                "stelae",
-            ),
             ("application/vnd.acme.stelae.stele.v1+zstd", "acme", "stele"),
             (
-                "application/vnd.org.stelae.stele.blocks.v1+zstd",
-                "org.stelae",
-                "blocks",
+                "application/vnd.acme.stelae.stelae.v1+zstd",
+                "acme",
+                "stelae",
             ),
             (
                 "application/vnd.org.stelae.stelae.blocks.v1+zstd",
@@ -402,7 +410,7 @@ mod tests {
             ),
             // A `.v` inside the kind comes before the version's.
             (
-                "application/vnd.org.stelae.stele.votes.v1+zstd",
+                "application/vnd.org.stelae.stelae.votes.v1+zstd",
                 "org.stelae",
                 "votes",
             ),
@@ -414,13 +422,12 @@ mod tests {
     }
 
     /// The reserved-vendor rule is the one that makes third-party coexistence
-    /// safe, so it is checked in both spellings.
+    /// safe.
     #[test]
     fn rejects_the_reserved_vendor_slot() {
         for raw in [
             "application/vnd.stelae.stelae.blocks.v1+zstd",
             "application/vnd.stelae.inscription.stelae.x.v1+zstd",
-            "application/vnd.stelae.stele.blocks.v1+zstd",
         ] {
             let err = MediaType::parse(raw).unwrap_err();
             assert!(
@@ -465,7 +472,6 @@ mod tests {
         for (raw, expected) in [
             ("application/vnd.dolos.blocks.v1+zstd", "`.stelae.`"),
             ("application/vnd.acme.stelae.votes+zstd", "`.v{n}`"),
-            ("application/vnd.io.vendor.stele.blocks+zstd", "`.v{n}`"),
             ("application/vnd.acme.stelae.v1+zstd", "`.v{n}`"),
             (
                 "application/vnd.acme.stelae.foo.bar.v1+zstd",
@@ -481,20 +487,14 @@ mod tests {
                 "`.v{n}`",
             ),
             (
-                "application/vnd.acme.stele.Foo.stele.blocks+zstd",
-                "`.v{n}`",
-            ),
-            (
                 "application/vnd..stelae.x.stelae.blocks+zstd",
                 "empty vendor",
             ),
-            ("application/vnd..stele.x.stele.blocks+zstd", "empty vendor"),
             // The last `.v` starts right where the rightmost tail does.
             (
                 "application/vnd.acme.stelae.x.stelae..v1+zstd",
                 "empty kind",
             ),
-            ("application/vnd.acme.stele.x.stele..v1+zstd", "empty kind"),
         ] {
             let err = MediaType::parse(raw).unwrap_err();
             assert!(

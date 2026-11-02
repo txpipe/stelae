@@ -44,8 +44,13 @@ Stelae publisher and registry.
 ## Specification
 
 The normative specification is [`SPEC.md`](SPEC.md). The Dolos profile's own
-half — its layer kinds, cut point, and pipelines — lives with Dolos, in
-[ADR-004](https://github.com/txpipe/dolos/blob/main/adrs/004_stelae_snapshots.md).
+half — its layer kinds, record shapes, cut point, and pipelines — lives with
+Dolos, in
+[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/main/crates/snapshot/PROFILE.md).
+
+Both are frozen with Dolos v2: protocol version 1 and the
+`io.txpipe.dolos.cardano` profile at version 1. Later changes follow the
+compatibility rules in [`SPEC.md`](SPEC.md#compatibility).
 
 ## Versioning
 

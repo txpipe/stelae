@@ -13,6 +13,15 @@ normative. Where a rule needs an example, the Dolos profile
 (`io.txpipe.dolos.cardano`) supplies it, as illustration and never as
 requirement.
 
+**Status: frozen.** Protocol version 1, as this document describes it, is
+frozen with Dolos v2, and so is the Dolos profile at version 1
+([`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/main/crates/snapshot/PROFILE.md)).
+Changes from here on follow the [compatibility](#compatibility) rules of
+TxPipe decision 0026: within a version, writers may append numbered optional
+fields and readers skip fields they do not know; field indexes are never
+renumbered or repurposed; and anything else — an added enum variant included
+— is a breaking change that takes a version bump.
+
 ## Overview
 
 A **stele** (*stele*: a standing inscribed slab) is one published artifact set
@@ -61,9 +70,7 @@ Normative rules for coexistence:
 
 1. Payload media types must carry a vendor slot the publisher controls.
    `vnd.stelae.*` is reserved for envelope types and is never a payload type —
-   Stelae defines no payload format. The `.stele.` infix is a deprecated
-   spelling of `.stelae.`: clients still accept it in this release, and the
-   next release removes it.
+   Stelae defines no payload format.
 2. Profile names are reverse-DNS and vendor-owned (the first profile is
    `io.txpipe.dolos.cardano`, version 1). The short token in media types
    follows IANA `vnd.` custom.
