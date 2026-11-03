@@ -5,10 +5,9 @@ The publisher restores its latest stele, replays to epoch boundaries,
 publishes, prunes, and exits at the aggregator tip. The operator maintains
 network values and owns deployment, first publication and monitoring.
 
-Chart 0.3 runs a publisher built on the Dolos v2 configuration: `dolosToml`
-is a v2 file and the retained state epochs are their own value. Releases on
-chart 0.2 keep their v1 configuration until rewritten for 0.3. There is no
-host selector. The directory and chart name stay
+The chart runs a publisher built on the Dolos v2 configuration: `dolosToml`
+is a v2 file keeping full history and the retained state epochs are their
+own value. There is no host selector. The directory and chart name stay
 `dolos-publisher` to preserve release and object naming.
 
 ## Rendered resources
@@ -41,14 +40,14 @@ image's UID/GID `65532:65532` write access to `/data`.
 cost.
 
 - **emptyDir** (the default). Every pod restart, eviction included, restores
-  the latest stele. With a three-epoch `max_history` that costs one epoch,
-  and `resources` bounds `/data` through its `ephemeral-storage` request and
-  limit. The preview and preprod values use this mode.
+  the latest stele, all of history, and `resources` bounds `/data` through
+  its `ephemeral-storage` request and limit, which must hold the whole
+  archive. It suits only a network whose history restores quickly.
 - **Persistent claim** (`persistence.enabled: true`). `/data` is a
   ReadWriteOnce claim that outlives the pod: a restarted pod resumes the
   stores it left, with no restore. Initialization checks those stores
   against the marker the first restore wrote, which records the network and
-  `repo` but not the image, the `max_history` or the store layout. Without
+  `repo` but not the image or the store layout. Without
   a marker nothing is checked, and a pod killed during its first restore
   leaves none. Killed after the restore committed its cursor, the stores are
   accepted unchecked by every later run. Killed before, they hold partial
@@ -65,9 +64,13 @@ cost.
   whole store. `ephemeral-storage` no longer covers `/data`; size the claim
   instead.
 
-A full-history publisher, with `max_history` unset in `dolosToml`, needs
-the persistent claim: from an emptyDir every eviction would restore all of
-history. Mainnet at full history needs about 250 GiB.
+Every publisher keeps full history: `dolosToml` leaves `[history]` at its
+default `mode = "full"`. Dolos cuts a boundary only from an archive that
+starts at the chain's origin, so the publisher refuses a `rolling` or `none`
+history before it opens a store; a rolling window would publish until its
+first prune and then fail every later run. Mainnet at full history needs
+about 250 GiB and the persistent claim: from an emptyDir every eviction
+would restore all of it.
 
 On EKS an EBS volume lives in one availability zone, and every later pod is
 scheduled only in that zone. Use a `WaitForFirstConsumer` class, so the
@@ -84,11 +87,10 @@ Pending. Start over whenever the kept stores no longer fit the release:
 - a changed `repo` or network, including a fresh lineage cut into the same
   repository. Where the stores carry a marker, a changed `repo` fails every
   restart until `backoffLimit` on the mismatch; without one nothing refuses
-  it (see above). A re-cut would resume stores pruned to the old
-  `max_history`;
-- an image upgrade or rollback whose stores are incompatible.
-  Initialization does not check the image or the state or archive layout of
-  kept stores;
+  it (see above). A re-cut would resume the old lineage's stores;
+- an image upgrade or rollback whose stores are incompatible. Initialization
+  refuses stores the image's Dolos will not open, and fails every restart
+  until `backoffLimit`, but does not check the image itself;
 - a rollback away from a suspect image. The rolled-back image continues
   from the state the suspect image left, and every boundary it publishes
   afterwards is built on that state.
@@ -163,31 +165,14 @@ Rolling back to chart 0.3 drops the claim from the Job: 0.3 accepts the
 restores all of history into ephemeral storage. The claim stays, and a
 later 0.4 install with persistence adopts it again.
 
-Chart 0.3 cannot continue a repository published by chart 0.2. Its
-publisher refuses to restore a stele cut before the Dolos v2 profile, and
-chart 0.2 refuses one cut by 0.3, so a release moves to 0.3 by starting a
-fresh lineage. Stop the writer and delete every tag in the repository,
-`latest` first. Then set a publisher image built on the v2 configuration,
-rewrite `dolosToml` in the v2 schema, move its `[snapshot] state_epochs`
-list unchanged into `stateEpochs`, set `allowGenesisFallback: true` and bump
-`run`. The Job replays from genesis. Once `latest` is near the chain tip,
-set `allowGenesisFallback: false` and bump `run` again. Never deploy 0.3
-before the repository is empty. The Job refuses to restore the old `latest`.
-With genesis fallback off, it clears its store and refuses again on every
-restart until `backoffLimit`. With it on, it starts from genesis instead and
-replays silently: every boundary up to the old `latest` reports nothing to
-publish, which lasts days on mainnet. At the next boundary it refuses the v1
-predecessor and restarts until `backoffLimit`; if Mithril has not certified
-that boundary yet, the Job instead completes, reporting the repository up to
-date. Either way it uploads nothing, so the old lineage stays intact. The
-Secret and tuning values stay as they are.
+An image on a new Dolos profile pin cannot continue a repository cut by an
+earlier one: restoring or chaining onto an older stele is unsupported, so the
+move starts a fresh lineage in an emptied repository, as
+[First publication on the chart](../../docs/publisher-packaging.md#first-publication-on-the-chart)
+describes. Rollback to the earlier image works only while the repository
+still holds its lineage, that is, before its tags are deleted. Never reuse
+incompatible persistent scratch or an unpublished checkpoint across images.
 
-Rollback to chart 0.2 works only while the repository still holds its v1
-lineage, that is, before its tags are deleted. Stop the writer, select chart
-0.2 with its previous image and v1 `dolosToml`, and bump `run` again. Once a
-0.3 Job has published, going back to 0.2 needs a fresh v1 lineage in the same
-way. Never reuse incompatible persistent scratch or an unpublished checkpoint
-across hosts.
-
-Full build, release and rollback details are in
+Full build and release details, and the first publication of a fresh
+lineage, are in
 [publisher-packaging.md](../../docs/publisher-packaging.md).

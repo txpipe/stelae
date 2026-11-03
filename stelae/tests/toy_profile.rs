@@ -922,25 +922,25 @@ fn a_foreign_profile_is_refused() {
     assert!(matches!(err, Error::UnknownLayerKind { .. }), "{err:?}");
 }
 
-/// A stele written with the deprecated `.stele.` infix is still this profile's
-/// stele, on both the read and the publish side, while the profile itself now
-/// names its layers `.stelae.`.
+/// A stele written with the retired `.stele.` infix is refused, on both the
+/// read and the publish side, with an error naming `.stelae.`.
 #[test]
-fn a_deprecated_infix_layer_passes_the_profile_checks() {
+fn a_retired_infix_layer_is_refused() {
     let temp = tempfile::tempdir().unwrap();
     let (mut inscription, _) = write_stele(temp.path());
 
     for layer in &mut inscription.layers {
         layer.media_type = layer.media_type.replace(".stelae.", ".stele.");
     }
-    assert!(inscription
-        .layers
-        .iter()
-        .any(|layer| layer.media_type == "application/vnd.example.stele.notes.v1+zstd"));
 
-    inscription.validate().unwrap();
-    inscription.check_profile(&ToyProfile).unwrap();
-    inscription.check_profile_strict(&ToyProfile).unwrap();
+    let names_stelae = |err: &Error| matches!(err, Error::InvalidMediaType { reason, .. } if reason.contains("`.stelae.`"));
+
+    let err = inscription.validate().unwrap_err();
+    assert!(names_stelae(&err), "{err:?}");
+    let err = inscription.check_profile(&ToyProfile).unwrap_err();
+    assert!(names_stelae(&err), "{err:?}");
+    let err = inscription.check_profile_strict(&ToyProfile).unwrap_err();
+    assert!(names_stelae(&err), "{err:?}");
 }
 
 /// Tampering is caught on both halves of a stele: the document, whose bytes are

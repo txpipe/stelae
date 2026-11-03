@@ -30,7 +30,7 @@ Publisher commands (`initialize`, `publish`, `backfill`, `run`, and `digest`,
 `verify` and `inspect` for reading and reproducing published steles),
 configuration precedence and persisted-state contracts are documented in
 [docs/publisher.md](docs/publisher.md). Reproducible image inputs,
-release provenance and the chart upgrade/rollback contract are in
+release provenance and a fresh lineage's first publication on the chart are in
 [docs/publisher-packaging.md](docs/publisher-packaging.md).
 
 The boundary proof lives in the test suite: `stelae/tests/toy_profile.rs`
@@ -44,8 +44,17 @@ Stelae publisher and registry.
 ## Specification
 
 The normative specification is [`SPEC.md`](SPEC.md). The Dolos profile's own
-half — its layer kinds, cut point, and pipelines — lives with Dolos, in
-[ADR-004](https://github.com/txpipe/dolos/blob/main/adrs/004_stelae_snapshots.md).
+half — its layer kinds, record shapes, cut point, and pipelines — lives with
+Dolos, in
+[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/main/crates/snapshot/PROFILE.md).
+
+Both are frozen with Dolos v2: protocol version 1 and the
+`io.txpipe.dolos.cardano` profile at version 1. Later changes follow the
+compatibility rules in [`SPEC.md`](SPEC.md#compatibility).
+
+A snapshot's OCI manifest names the envelope `artifactType`
+`application/vnd.stelae.snapshot.v1`. Readers refuse the retired
+`application/vnd.stelae.stele.v1` envelope.
 
 ## Versioning
 

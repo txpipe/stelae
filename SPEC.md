@@ -13,6 +13,14 @@ normative. Where a rule needs an example, the Dolos profile
 (`io.txpipe.dolos.cardano`) supplies it, as illustration and never as
 requirement.
 
+**Status: frozen.** Protocol version 1, as this document describes it, is
+frozen with Dolos v2, and so is the Dolos profile at version 1
+([`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/main/crates/snapshot/PROFILE.md)).
+Changes from here on follow the [compatibility](#compatibility) rules: the
+inscription schema and the envelope media types stay fail-closed, so any
+change to them takes a protocol version bump; only payload record content
+may grow within a version, and only as that section describes.
+
 ## Overview
 
 A **stele** (*stele*: a standing inscribed slab) is one published artifact set
@@ -52,7 +60,7 @@ are vendor-owned:
 
 | Role | Media type | Owner |
 |---|---|---|
-| Artifact type (manifest) | `application/vnd.stelae.stele.v1` | protocol |
+| Artifact type (a snapshot's manifest) | `application/vnd.stelae.snapshot.v1` | protocol |
 | Config blob (the inscription) | `application/vnd.stelae.inscription.v1+json` | protocol |
 | Signature (referrer artifact) | `application/vnd.stelae.signature.v1` | protocol |
 | Layer payloads | `application/vnd.{vendor}.stelae.{kind}.v{n}+{codec}` | vendor |
@@ -61,9 +69,7 @@ Normative rules for coexistence:
 
 1. Payload media types must carry a vendor slot the publisher controls.
    `vnd.stelae.*` is reserved for envelope types and is never a payload type —
-   Stelae defines no payload format. The `.stele.` infix is a deprecated
-   spelling of `.stelae.`: clients still accept it in this release, and the
-   next release removes it.
+   Stelae defines no payload format.
 2. Profile names are reverse-DNS and vendor-owned (the first profile is
    `io.txpipe.dolos.cardano`, version 1). The short token in media types
    follows IANA `vnd.` custom.
@@ -212,8 +218,9 @@ direct restore.
 
 - One repository per (profile, dataset). The protocol requires an immutable
   tag per sequence plus a moving `latest`; the profile renders the strings.
-- `artifactType: application/vnd.stelae.stele.v1`; layer media types per the
-  profile; three annotations per layer, named below.
+- `artifactType: application/vnd.stelae.snapshot.v1` — the envelope names one
+  Stelae snapshot; layer media types per the profile; three annotations per
+  layer, named below.
 
 ### The manifest
 
@@ -222,7 +229,7 @@ conforming publisher writes exactly the fields below, and a conforming client
 refuses anything else.
 
 - `schemaVersion: 2`; `mediaType: application/vnd.oci.image.manifest.v1+json`;
-  `artifactType: application/vnd.stelae.stele.v1`.
+  `artifactType: application/vnd.stelae.snapshot.v1`.
 - `config` is the inscription's descriptor: `mediaType` is
   `application/vnd.stelae.inscription.v1+json`, `digest` is the sha256 of the
   canonical inscription bytes — the same digest independent parties reproduce
@@ -273,7 +280,10 @@ A client refuses a manifest — before any blob is fetched — when:
   strips the OCI 1.1 discovery field has published something a client cannot
   recognize as a stele, and reading it anyway would make the discovery
   contract advisory.
-- `artifactType` is present and is not `application/vnd.stelae.stele.v1`.
+- `artifactType` is present and is not `application/vnd.stelae.snapshot.v1`.
+  The envelope identifier releases before v2 wrote is one such value: it has
+  no alias and no migration path, and a manifest bearing it is refused like
+  any foreign type.
 - the config descriptor's media type is not the inscription's.
 - the manifest's layer count differs from the inscription's.
 - a layer carries no `store.stelae.layer.diffId` annotation, so nothing says
@@ -368,7 +378,16 @@ Three version axes move independently and must be kept coherent:
    vendor-owned. Within a version, a profile is expected to treat `.v{n}` as
    a contract on record content rather than an exact-byte pin, with the
    profile's schema-revision map (in `parameters`) pinning the bytes; the
-   details are each profile's to specify.
+   details are each profile's to specify. Within a payload version, writers
+   may append numbered optional fields and readers skip fields they do not
+   know; field indexes are never renumbered or repurposed; anything else —
+   an added enum variant included — is a breaking change that takes a
+   version bump.
+
+These additive rules apply to payload record content only. The inscription
+and the envelope types are not extensible within protocol version 1:
+verifiers reject unknown generic top-level inscription keys, and extension
+happens only inside `position`, `parameters` and `scope`.
 
 ## Implementation notes
 

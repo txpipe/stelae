@@ -8,24 +8,49 @@ No command starts or shells out to a Dolos executable.
 
 ## Source and dependency identity
 
-All Dolos crates in the normal publisher dependency graph are pinned to
-`c5e4f77e93b53098196df404c5afe33981a056ff`, a Dolos `main` revision carrying
-the v2 configuration contract: bootstrap and publisher inputs on the
-invocation ([PR 1466](https://github.com/txpipe/dolos/pull/1466)), the v2
-schema and loader ([PR 1468](https://github.com/txpipe/dolos/pull/1468)),
-store lifecycle ([PR 1479](https://github.com/txpipe/dolos/pull/1479)) and
-the Fjall `standard` preset ([PR 1478](https://github.com/txpipe/dolos/pull/1478)).
-Like every revision since the publisher retirement of
-[PR 1335](https://github.com/txpipe/dolos/pull/1335), it retains the headless
-ledger, storage, profile, restore and repository facades but contains no
-publisher command, backfill loop or publisher policy module. The root `dolos`
-package is imported with default features disabled, so its service features
-are absent from the publisher graph.
+Every Dolos crate in the publisher's dependency graph, normal and dev, is
+pinned to `1db3e41fd04bca64bf245f50b54ca656719764ca`, the merge of
+[PR 1553](https://github.com/txpipe/dolos/pull/1553), which adopts the Stelae
+snapshot envelope `application/vnd.stelae.snapshot.v1`. `DOLOS_REVISION` in
+`stelae-cardano/src/lib.rs` names the same commit.
 
-The workspace patch for `https://github.com/txpipe/stelae` resolves the
-profile's v0.5.0 dependencies back to the workspace `stelae` and
-`stelae-driver` packages. This prevents two same-version protocol type
-universes.
+The `io.txpipe.dolos.cardano` profile was frozen for Dolos v2 earlier, at
+`e39a38a31665acb1b5e5701bbb2f8c7cb995cef1`, the merge of
+[PR 1548](https://github.com/txpipe/dolos/pull/1548): profile and payload
+media-type version 1, payloads named
+`application/vnd.dolos.stelae.{kind}.v1+zstd`, every namespace at schema
+revision 1, and only the epoch-boundary cut publishable. The pin keeps all
+of that, but it is not the baseline plus the envelope alone: the range also
+carries [PR 1546](https://github.com/txpipe/dolos/pull/1546), which changes
+how `state-datums` counts hash-datum outputs and moves the WAL to version 10.
+Initialization does not refuse stores synced at an earlier pin (opening them
+only wipes their WAL), so delete a kept claim before the upgrade, as for any
+storage pin change (see
+[publisher-packaging.md](publisher-packaging.md)). The normative profile is
+[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/1db3e41fd04bca64bf245f50b54ca656719764ca/crates/snapshot/PROFILE.md)
+at the pinned commit.
+
+Like every revision since the publisher retirement of
+[PR 1335](https://github.com/txpipe/dolos/pull/1335), the pin retains the
+headless ledger, storage, profile, restore and repository facades but
+contains no publisher command, backfill loop or publisher policy module. The
+root `dolos` package is imported with default features disabled, so its
+service features are absent from the publisher graph.
+
+The pinned profile depends on Stelae at `55d5270`, the snapshot envelope
+rename ([PR 17](https://github.com/txpipe/stelae/pull/17)), versioned `0.5.0`.
+The workspace patch for `https://github.com/txpipe/stelae` resolves those
+dependencies back to the workspace `stelae` and `stelae-driver` packages, so
+the profile and the publisher share one set of protocol types instead of two
+of the same version. A Dolos pin whose Stelae reference carries a different
+protocol from this workspace needs that skew resolved before it is pinned; the
+patch would otherwise hide it.
+
+Steles cut against an earlier pin are not part of this lineage: the frozen
+profile renamed its payload media types and reset every schema revision to
+1, and restoring or
+chaining onto an older stele is unsupported. A repository that holds one
+starts over (see [First publication](#first-publication)).
 
 The lockfile is committed. These commands verify the intended graph:
 
@@ -52,8 +77,13 @@ loader: the file named by global `--config`, else `./dolos.toml`, with
 `DOLOS_STORAGE__PATH`) overriding it. Unknown fields are rejected, and so is a
 network the Dolos catalog does not know. A known network (`mainnet`,
 `preprod`, `preview`) takes its embedded genesis; a `custom` one names its
-genesis files under `[chain.cardano.genesis]`. The rolling `history.window`
-bounds how much chain history a restore reads.
+genesis files under `[chain.cardano.genesis]`.
+
+A publisher keeps the full archive: `[history] mode` stays `"full"`, its
+default. Dolos cuts a boundary only from an archive whose first block is the
+chain's origin, so a `rolling` window would publish until its first prune and
+then refuse every later boundary. `initialize`, `backfill` and `run` refuse a
+`rolling` or `none` history before they open a store.
 
 What Dolos takes from an invocation rather than from that file, the publisher
 takes the same way:
@@ -196,8 +226,32 @@ The backfill state machine preserves these rules from the accepted Dolos host:
 - retain two immutable files of cleanup/download margin using the configured
   network's genesis chunk geometry;
 - retry transient repository work in place using the publication journal;
-- retain the `--state-epochs-file` epochs and the profile's existing plan,
-  schema, media-type, compression and journal identities.
+- retain the `--state-epochs-file` epochs, and the plan, schema, media-type,
+  compression and journal identities of the pinned profile.
+
+## First publication
+
+A fresh lineage starts from an empty repository and replays from genesis.
+Every inscription after the first names its predecessor and carries its
+history forward, so the first stele is the only one published without a
+predecessor.
+
+1. Stop every other writer to the repository and wait for it to exit.
+   Configure the node with full history (see
+   [Configuration](#configuration)); its stores grow with the chain, to
+   about 250 GiB on mainnet.
+2. Delete every tag in the repository, `latest` first, so no earlier pin's
+   stele is restored or chained onto.
+3. Start the first run with `--allow-genesis`. Initialization finds no
+   `latest`, opts into genesis and replays from block 0, publishing each
+   epoch boundary before it replays past it.
+4. Run every later invocation without `--allow-genesis`. Initialization then
+   restores the published `latest` (or reuses the committed stores) and
+   fails closed if it cannot, instead of silently replaying from genesis.
+
+On the chart these are `allowGenesisFallback: true` for the first run and
+`false` from the next one on; see
+[publisher-packaging.md](publisher-packaging.md#first-publication-on-the-chart).
 
 ## Final ownership boundary
 
@@ -207,10 +261,10 @@ journal policy. It composes Dolos's supported `SnapshotRepository`,
 `Publishing` and `SnapshotSource` facades; it does not import a Dolos publisher
 or backfill API.
 
-The image build, release identities, chart cutover and compatible rollback
-are documented in [publisher-packaging.md](publisher-packaging.md). Building a
-candidate does not publish, deploy, modify a network source, or claim production
-parity; operational cutover remains a separate step.
+The image build, release identities and a fresh lineage's first run on the
+chart are documented in [publisher-packaging.md](publisher-packaging.md).
+Building a candidate does not publish, deploy or modify a network source;
+deployment remains a separate step.
 
 The local OCI and host-policy evidence is documented in
 [publisher-verification.md](publisher-verification.md).
