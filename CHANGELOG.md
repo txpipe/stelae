@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-11-03
+
+### 🚀 Features
+
+- [**breaking**] Pin the frozen Dolos v2 profile at e39a38a3 (#15)
+- [**breaking**] Name the OCI envelope a snapshot (#17)
+- [**breaking**] Refuse the `.stele.` infix and freeze SPEC at protocol v1 (#16)
+
+### 🐛 Bug Fixes
+
+- *(deps)* Move the dolos pin to c5e4f77e and clear the cargo deny advisories (#14)
+
 ## [0.5.0] - 2026-11-01
 
 ### 🚀 Features
@@ -12,6 +24,10 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - *(deps)* Move to zstd 0.14 and update tokio (#12)
+
+### Release
+
+- V0.5.0
 
 ## [0.4.0] - 2026-10-30
 
