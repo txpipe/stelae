@@ -9,15 +9,26 @@ No command starts or shells out to a Dolos executable.
 ## Source and dependency identity
 
 Every Dolos crate in the publisher's dependency graph, normal and dev, is
-pinned to `e39a38a31665acb1b5e5701bbb2f8c7cb995cef1`, the merge of
-[PR 1548](https://github.com/txpipe/dolos/pull/1548). That is the commit at
-which the `io.txpipe.dolos.cardano` profile is frozen for Dolos v2: profile
-and payload media-type version 1, payloads named
+pinned to `1db3e41fd04bca64bf245f50b54ca656719764ca`, the merge of
+[PR 1553](https://github.com/txpipe/dolos/pull/1553), which adopts the Stelae
+snapshot envelope `application/vnd.stelae.snapshot.v1`. `DOLOS_REVISION` in
+`stelae-cardano/src/lib.rs` names the same commit.
+
+The `io.txpipe.dolos.cardano` profile was frozen for Dolos v2 earlier, at
+`e39a38a31665acb1b5e5701bbb2f8c7cb995cef1`, the merge of
+[PR 1548](https://github.com/txpipe/dolos/pull/1548): profile and payload
+media-type version 1, payloads named
 `application/vnd.dolos.stelae.{kind}.v1+zstd`, every namespace at schema
-revision 1, and only the epoch-boundary cut publishable. The normative profile
-is [`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/e39a38a31665acb1b5e5701bbb2f8c7cb995cef1/crates/snapshot/PROFILE.md)
-at that commit. `DOLOS_REVISION` in `stelae-cardano/src/lib.rs` names the
-same commit.
+revision 1, and only the epoch-boundary cut publishable. The pin keeps all
+of that, but it is not the baseline plus the envelope alone: the range also
+carries [PR 1546](https://github.com/txpipe/dolos/pull/1546), which changes
+how `state-datums` counts hash-datum outputs and moves the WAL to version 10.
+Initialization does not refuse stores synced at an earlier pin (opening them
+only wipes their WAL), so delete a kept claim before the upgrade, as for any
+storage pin change (see
+[publisher-packaging.md](publisher-packaging.md)). The normative profile is
+[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/1db3e41fd04bca64bf245f50b54ca656719764ca/crates/snapshot/PROFILE.md)
+at the pinned commit.
 
 Like every revision since the publisher retirement of
 [PR 1335](https://github.com/txpipe/dolos/pull/1335), the pin retains the
@@ -26,13 +37,14 @@ contains no publisher command, backfill loop or publisher policy module. The
 root `dolos` package is imported with default features disabled, so its
 service features are absent from the publisher graph.
 
-The pinned profile depends on Stelae `v0.5.0`. The workspace patch for
-`https://github.com/txpipe/stelae` resolves those dependencies back to the
-workspace `stelae` and `stelae-driver` packages, so the profile and the
-publisher share one set of protocol types instead of two of the same version.
-A Dolos pin whose Stelae tag carries a different protocol from this workspace
-needs that skew resolved before it is pinned; the patch would otherwise hide
-it.
+The pinned profile depends on Stelae at `55d5270`, the snapshot envelope
+rename ([PR 17](https://github.com/txpipe/stelae/pull/17)), versioned `0.5.0`.
+The workspace patch for `https://github.com/txpipe/stelae` resolves those
+dependencies back to the workspace `stelae` and `stelae-driver` packages, so
+the profile and the publisher share one set of protocol types instead of two
+of the same version. A Dolos pin whose Stelae reference carries a different
+protocol from this workspace needs that skew resolved before it is pinned; the
+patch would otherwise hide it.
 
 Steles cut against an earlier pin are not part of this lineage: the frozen
 profile renamed its payload media types and reset every schema revision to
