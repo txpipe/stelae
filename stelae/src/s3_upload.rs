@@ -196,3 +196,47 @@ mod tests {
         assert!(Upload::new(config, "cardano/preprod").is_err());
     }
 }
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    /// Explicit live check of the actual S3 multipart protocol, with one
+    /// uniquely named blob removed after successful readback.
+    #[test]
+    #[ignore = "requires STELAE_TEST_DIRECT_S3_CONFIG and creates a temporary S3 object"]
+    fn direct_s3_multipart_round_trip() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let path =
+            std::env::var("STELAE_TEST_DIRECT_S3_CONFIG").expect("explicit S3 configuration");
+        let config: Config = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let upload =
+                Upload::new(config, &format!("staging/direct-multipart-{unique}")).unwrap();
+            let bytes = vec![42u8; 9 * 1024 * 1024];
+            let digest = Digest::compute(&bytes);
+            let mut file = tempfile::tempfile().unwrap();
+            std::io::Write::write_all(&mut file, &bytes).unwrap();
+            std::io::Seek::rewind(&mut file).unwrap();
+            upload
+                .file(&digest, file, bytes.len() as u64)
+                .await
+                .unwrap();
+            let actual = upload
+                .store
+                .get(&upload.key(&digest))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let matches = actual.as_ref() == bytes.as_slice();
+            upload.store.delete(&upload.key(&digest)).await.unwrap();
+            assert!(matches, "multipart bytes differ");
+        });
+    }
+}
