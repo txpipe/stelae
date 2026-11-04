@@ -69,6 +69,7 @@ pub fn open(
     Ok(Registry::open(
         repository,
         Options {
+            direct_s3: tuning.direct_s3,
             insecure,
             scratch_dir: Some(scratch_dir),
             auth,
@@ -100,8 +101,10 @@ pub fn open(
 /// are facts a publish cannot be run without, and these two are a default and
 /// an escape hatch. A restore or an inspection passes [`Tuning::default`] and
 /// means it.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Tuning {
+    /// Direct S3 uploads for Zot-compatible blob storage.
+    pub direct_s3: Option<Box<stelae::oci::s3_upload::Config>>,
     /// How many layer round trips run at once; `None` is
     /// [`DEFAULT_CONCURRENCY`].
     pub concurrency: Option<NonZeroUsize>,

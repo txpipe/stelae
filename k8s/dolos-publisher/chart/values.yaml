@@ -103,3 +103,6 @@ tolerations: []
 
 # No default: the working set is a network fact.
 resources: {}
+
+# Optional Secret containing direct-s3.json; uploads blobs directly into Zot storage.
+directS3SecretName: ""

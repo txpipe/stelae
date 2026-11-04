@@ -291,6 +291,7 @@ fn a_rolling_history_is_refused_before_backfill_creates_anything() {
         dolos_core::config::HistoryWindow::slots(432_000),
     );
     let options = backfill::Options {
+        direct_s3: None,
         repository: "oci://registry.invalid/cardano/preview".parse().unwrap(),
         auth: Auth::Anonymous,
         insecure: false,

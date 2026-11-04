@@ -17,6 +17,7 @@ readme = "../README.md"
 # normal --all-features` must still match nothing `^dolos(-|$)`.
 oci = [
     "dep:bytes",
+    "dep:object_store",
     "dep:futures-util",
     "dep:http",
     "dep:oci-client",
@@ -120,6 +121,8 @@ http = { version = "1", optional = true }
 # for the same reason: a blob's digest is only known once its last byte has
 # gone past, in either direction.
 tempfile = { version = "3.20.0", optional = true }
+
+object_store = { version = "0.14.2", optional = true, default-features = false, features = ["aws-base", "reqwest", "ring"] }
 
 [dev-dependencies]
 # The peak-allocation test instruments the global allocator, the same idiom the
