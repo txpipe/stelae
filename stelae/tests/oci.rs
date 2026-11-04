@@ -2770,7 +2770,8 @@ fn annotation_keys_are_ordered() {
     );
 }
 
-/// Explicitly opted-in live test; uploads only into the fixture's fresh staging repository.
+/// Explicitly opted-in live test; uploads only into the fixture's fresh staging
+/// repository.
 #[test]
 #[ignore]
 fn direct_s3_blobs_are_readable_through_zot() {

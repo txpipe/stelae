@@ -215,7 +215,8 @@ impl InitializeArgs {
 
 #[derive(Debug, Args, Clone)]
 struct BackfillArgs {
-    /// Direct blob uploads to Zot-compatible S3 storage; JSON config with credentials.
+    /// Direct blob uploads to Zot-compatible S3 storage; JSON config with
+    /// credentials.
     #[arg(long, value_name = "PATH")]
     direct_s3_config: Option<PathBuf>,
     /// OCI repository to extend.
@@ -347,7 +348,8 @@ impl RunArgs {
 #[derive(Debug, Args)]
 #[command(group(clap::ArgGroup::new("destination").required(true).args(["output_dir", "repo"])))]
 struct PublishArgs {
-    /// Direct blob uploads to Zot-compatible S3 storage; JSON config with credentials.
+    /// Direct blob uploads to Zot-compatible S3 storage; JSON config with
+    /// credentials.
     #[arg(long, value_name = "PATH", requires = "repo")]
     direct_s3_config: Option<PathBuf>,
     #[arg(long)]
