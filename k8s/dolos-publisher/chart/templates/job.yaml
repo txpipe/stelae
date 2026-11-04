@@ -53,6 +53,10 @@ spec:
             {{- if .Values.allowGenesisFallback }}
             - --allow-genesis
             {{- end }}
+            {{- if .Values.directS3SecretName }}
+            - --direct-s3-config
+            - /run/direct-s3/direct-s3.json
+            {{- end }}
           env:
             - name: DOLOS_STELAE_USER
               valueFrom:
@@ -67,11 +71,25 @@ spec:
           resources:
             {{- required "resources is required" .Values.resources | toYaml | nindent 12 }}
           volumeMounts:
+            {{- if .Values.directS3SecretName }}
+            - name: direct-s3
+              mountPath: /run/direct-s3
+              readOnly: true
+            {{- end }}
             - name: data
               mountPath: /data
             - name: {{ .Values.network }}-config
               mountPath: /etc/publisher
       volumes:
+        {{- if .Values.directS3SecretName }}
+        - name: direct-s3
+          secret:
+            secretName: {{ .Values.directS3SecretName | quote }}
+            defaultMode: 0440
+            items:
+              - key: direct-s3.json
+                path: direct-s3.json
+        {{- end }}
         - name: data
           {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:

@@ -2769,3 +2769,33 @@ fn annotation_keys_are_ordered() {
         vec![DIFF_ID_ANNOTATION, KIND_ANNOTATION, SCOPE_ANNOTATION]
     );
 }
+
+/// Explicitly opted-in live test; uploads only into the fixture's fresh staging repository.
+#[test]
+#[ignore]
+fn direct_s3_blobs_are_readable_through_zot() {
+    let _exclusive = exclusive();
+    let Ok(path) = std::env::var("STELAE_TEST_DIRECT_S3_CONFIG") else {
+        eprintln!("direct S3 live check skipped: STELAE_TEST_DIRECT_S3_CONFIG is unset");
+        return;
+    };
+    let config: stelae::oci::s3_upload::Config =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let fixture = Fixture::spawn();
+    eprintln!("direct object repository: {}", fixture.path("direct-s3"));
+    let registry = fixture.open("direct-s3", None, fixture.credentials(), |o| {
+        o.direct_s3 = Some(Box::new(config))
+    });
+    let inscription = write_stele(&registry, 3);
+    let latest = registry.pull_latest(&ToyProfile).unwrap();
+    assert_eq!(latest.read_inscription().unwrap(), inscription);
+    let directory = tempfile::tempdir().unwrap();
+    let disk = SteleDir::create(directory.path()).unwrap();
+    let expected = write_stele(&disk, 3);
+    assert_eq!(
+        records_of(&latest, &inscription),
+        records_of(&disk, &expected)
+    );
+    let again = write_stele(&registry, 3);
+    assert_eq!(again, inscription);
+}

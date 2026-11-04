@@ -268,3 +268,60 @@ deployment remains a separate step.
 
 The local OCI and host-policy evidence is documented in
 [publisher-verification.md](publisher-verification.md).
+
+## Direct S3 blob uploads to Zot (opt-in)
+
+`publish --repo`, `backfill` and `run` accept `--direct-s3-config PATH`.
+The file is JSON containing `endpoint`, `bucket`, `prefix`, `region`,
+`access_key_id` and `secret_access_key`. Keep it outside source control,
+readable only by the publisher identity; mount it from a Secret in Kubernetes.
+It is read by the binary, not discovered from environment by the protocol.
+Set Helm `directS3SecretName` to that Secret name (key `direct-s3.json`);
+changing the publisher pod template requires the usual run-counter bump.
+Malformed configuration diagnostics and Debug output do not print credentials.
+The endpoint must use HTTPS. R2's region is `auto`.
+
+This mode targets **Zot with deduplication and garbage collection disabled**.
+`prefix` is the actual physical object prefix before the repository name,
+without the repository itself. For the operated bucket-root layout it is `""`.
+If the registry's S3 driver duplicates a configured prefix, include both copies
+here. Prove the mapping against an isolated repository before operational use.
+A wrong mapping makes manifest validation fail; there is no automatic fallback.
+
+```text
+stelae-publisher --config dolos.toml run \
+  --repo oci://registry.example/cardano/preprod \
+  --state-epochs-file state-epochs \
+  --direct-s3-config /run/secrets/direct-s3.json --concurrency 4
+```
+
+The existing concurrency bound covers both transports. Layers and the canonical
+inscription are uploaded directly to `<prefix>/<repository>/blobs/sha256/<hex>`.
+Files are SHA256/size checked before upload; large files use multipart uploads
+with bounded buffers and abort on failure. Existing objects are checked for
+size before reuse. Multipart ETags are not treated as SHA256 digests. S3 request
+retries are handled by the storage client; publication failures still prevent
+sealing and remain eligible for the host's existing retry/resume behavior.
+
+The registry still handles predecessor reads, carried-layer verification,
+manifest validation, immutable epoch tags and `latest`. A failed blob upload
+never reaches manifest sealing. This preserves the snapshot/manifest format,
+profile identity, lineage and ordinary OCI readers. Because Zot commits the
+metadata through its API, this hybrid mode needs no out-of-band index writes
+or metadata rebuild. It requires S3 credentials in addition to the registry
+credentials and is not compatible with arbitrary registry storage layouts.
+
+The live opt-in transport test is:
+
+```text
+STELAE_TEST_REGISTRY_URL=oci.example.com \
+STELAE_TEST_DIRECT_S3_CONFIG=/run/secrets/direct-s3.json \
+cargo test --locked -p stelae --all-features --test oci \
+  direct_s3_blobs_are_readable_through_zot -- --ignored --nocapture
+```
+
+Provide registry credentials through the fixture's documented environment
+variables. The test creates a fresh staging repository, publishes through S3,
+and reads the inscription and layer records back through ordinary Zot/OCI.
+It measures correctness, not mainnet-scale throughput; do not switch a running
+publisher on the strength of this test alone.

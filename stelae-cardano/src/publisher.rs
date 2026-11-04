@@ -98,7 +98,7 @@ impl Publisher {
             scratch,
             registry::record_path_in(&config.storage.path),
             publish.rebuild,
-            publish.tuning,
+            publish.tuning.clone(),
         )
     }
 
@@ -202,6 +202,7 @@ impl backfill::Publish for BackfillPublisher<'_> {
 pub enum Destination {
     Directory(PathBuf),
     Repository {
+        direct_s3: Option<Box<stelae::oci::s3_upload::Config>>,
         repository: Repository,
         auth: Auth,
         insecure: bool,
@@ -268,6 +269,7 @@ pub fn publish_once(
                 }
             }
             Destination::Repository {
+                direct_s3,
                 repository,
                 auth,
                 insecure,
@@ -284,6 +286,7 @@ pub fn publish_once(
                     scratch_dir: scratch_dir.as_deref(),
                     rebuild,
                     tuning: Tuning {
+                        direct_s3,
                         concurrency,
                         verify_adopted: verify_carried,
                     },

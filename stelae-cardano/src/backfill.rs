@@ -278,6 +278,7 @@ pub struct Driver<'a, W: Workspace> {
 
 #[derive(Debug, Clone)]
 pub struct Options {
+    pub direct_s3: Option<Box<stelae::oci::s3_upload::Config>>,
     pub repository: dolos_snapshot::registry::Repository,
     pub auth: Auth,
     pub insecure: bool,
@@ -326,6 +327,7 @@ pub fn run(
         scratch_dir: options.scratch_dir.as_deref(),
         rebuild: false,
         tuning: dolos_snapshot::registry::Tuning {
+            direct_s3: options.direct_s3.clone(),
             concurrency: options.concurrency,
             verify_adopted: options.verify_carried,
         },

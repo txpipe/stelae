@@ -210,3 +210,14 @@ for invalid in image.repository=ghcr.io/txpipe/dolos repo= dolosToml= run=retry-
         exit 1
     fi
 done
+
+# Direct upload remains opt-in and credentials are referenced, never rendered.
+helm template publisher "$CHART" --values "$VALUES" \
+    --set directS3SecretName=publisher-direct-s3 >"$OUT/direct.yaml"
+doc Job "$OUT/direct.yaml" | grep -F -- '--direct-s3-config'
+doc Job "$OUT/direct.yaml" | grep -F 'secretName: "publisher-direct-s3"'
+doc Job "$OUT/direct.yaml" | grep -F 'key: direct-s3.json'
+if grep -Fq -- '--direct-s3-config' "$OUT/default.yaml"; then
+    echo 'default publisher unexpectedly enables direct S3' >&2
+    exit 1
+fi

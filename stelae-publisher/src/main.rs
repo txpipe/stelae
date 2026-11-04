@@ -215,6 +215,9 @@ impl InitializeArgs {
 
 #[derive(Debug, Args, Clone)]
 struct BackfillArgs {
+    /// Direct blob uploads to Zot-compatible S3 storage; JSON config with credentials.
+    #[arg(long, value_name = "PATH")]
+    direct_s3_config: Option<PathBuf>,
     /// OCI repository to extend.
     #[arg(long, value_name = "OCI_URL")]
     repo: Repository,
@@ -268,6 +271,7 @@ impl BackfillArgs {
             "Mithril aggregator"
         );
         Ok(backfill::Options {
+            direct_s3: read_direct_s3(self.direct_s3_config.as_deref())?,
             repository: self.repo.clone(),
             auth: auth()?,
             insecure: self.insecure,
@@ -343,6 +347,9 @@ impl RunArgs {
 #[derive(Debug, Args)]
 #[command(group(clap::ArgGroup::new("destination").required(true).args(["output_dir", "repo"])))]
 struct PublishArgs {
+    /// Direct blob uploads to Zot-compatible S3 storage; JSON config with credentials.
+    #[arg(long, value_name = "PATH", requires = "repo")]
+    direct_s3_config: Option<PathBuf>,
     #[arg(long)]
     output_dir: Option<PathBuf>,
     #[arg(long, value_name = "OCI_URL")]
@@ -552,6 +559,9 @@ fn run_publish(
     auth: ResolveAuth,
     observer: &Observer,
 ) -> miette::Result<()> {
+    if args.output_dir.is_some() && args.direct_s3_config.is_some() {
+        return Err(miette::miette!("--direct-s3-config requires --repo"));
+    }
     let retained = args.state_epochs.read()?;
     let selection = Selection {
         epochs: args.epochs,
@@ -561,6 +571,7 @@ fn run_publish(
     let destination = match (&args.output_dir, &args.repo) {
         (Some(path), None) => Destination::Directory(path.clone()),
         (None, Some(repository)) => Destination::Repository {
+            direct_s3: read_direct_s3(args.direct_s3_config.as_deref())?,
             repository: repository.clone(),
             auth: auth()?,
             insecure: args.insecure,
@@ -1390,5 +1401,33 @@ mod tests {
                 "{command}"
             );
         }
+    }
+}
+
+/// Do not render parser diagnostics: they can quote credential values.
+fn read_direct_s3(
+    path: Option<&Path>,
+) -> miette::Result<Option<Box<stelae::oci::s3_upload::Config>>> {
+    path.map(|path| {
+        let bytes = std::fs::read(path).into_diagnostic()?;
+        serde_json::from_slice(&bytes)
+            .map_err(|_| miette::miette!("invalid direct S3 configuration"))
+    })
+    .transpose()
+}
+
+#[cfg(test)]
+mod direct_s3_cli_tests {
+    #[test]
+    fn invalid_credentials_are_never_quoted_by_parse_errors() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            br#"{"secret_access_key":"do-not-print-me","unexpected":true}"#,
+        )
+        .unwrap();
+        let error = super::read_direct_s3(Some(file.path())).unwrap_err();
+        assert_eq!(error.to_string(), "invalid direct S3 configuration");
+        assert!(!format!("{error:?}").contains("do-not-print-me"));
     }
 }

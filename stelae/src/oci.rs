@@ -467,6 +467,8 @@ const RETRY_DELAY: Duration = Duration::from_millis(500);
 /// How to reach a registry.
 #[derive(Debug, Clone)]
 pub struct Options {
+    /// Optional direct blob storage; manifests and tags still use OCI.
+    pub direct_s3: Option<Box<s3_upload::Config>>,
     /// Talk to the registry over plaintext HTTP rather than HTTPS.
     ///
     /// For a registry on a loopback address — a test fixture, or a mirror
@@ -559,6 +561,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            direct_s3: None,
             insecure: false,
             scratch_dir: None,
             auth: Auth::default(),
@@ -702,6 +705,7 @@ pub struct Registry {
 }
 
 struct Shared {
+    direct_s3: Option<Arc<s3_upload::Upload>>,
     runtime: tokio::runtime::Runtime,
     client: Client,
     /// Registry and repository. The tag is a placeholder — blob operations do
@@ -905,6 +909,11 @@ impl Registry {
 
         Ok(Self {
             shared: Arc::new(Shared {
+                direct_s3: options
+                    .direct_s3
+                    .map(|c| s3_upload::Upload::new(*c, reference.repository()))
+                    .transpose()?
+                    .map(Arc::new),
                 runtime,
                 client,
                 repository: reference,
@@ -1682,11 +1691,32 @@ impl Shared {
         let state = Arc::clone(&self.state);
         let resident = Arc::clone(&self.resident);
         let monolithic_max = self.monolithic_max;
+        let direct_s3 = self.direct_s3.clone();
 
         self.defer(async move {
             let _permit = permit;
             let named = digest.to_string();
 
+            if let Some(upload) = direct_s3 {
+                let present = upload.exists(&digest, size).await?;
+                observer.emit(Event::Blob {
+                    moved: !present,
+                    bytes: size,
+                });
+                if !present {
+                    upload.file(&digest, rewound(&staged)?, size).await?;
+                    observer.emit(Event::Bytes(size));
+                }
+                let mut state = lock(&state);
+                if present {
+                    state.transfer.layers_skipped += 1;
+                    state.transfer.bytes_skipped += size;
+                } else {
+                    state.transfer.layers_uploaded += 1;
+                    state.transfer.bytes_uploaded += size;
+                }
+                return Ok(());
+            }
             let present = retrying_async(attempts, &observer, || {
                 let client = client.clone();
                 let repository = repository.clone();
@@ -1846,6 +1876,9 @@ impl Shared {
     /// magnitude and by being one document, not by a budget shared with the
     /// layers.
     fn put_bytes(&self, digest: &Digest, bytes: Vec<u8>) -> Result<(), Error> {
+        if let Some(upload) = &self.direct_s3 {
+            return self.runtime.block_on(upload.bytes(digest, bytes));
+        }
         if self.blob_exists(digest)? {
             return Ok(());
         }
@@ -3162,3 +3195,6 @@ mod tests {
         scratch_in(None).expect("the platform temporary directory is unusable");
     }
 }
+
+#[path = "s3_upload.rs"]
+pub mod s3_upload;
