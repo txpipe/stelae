@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.2] - 2026-11-04
+
+### 🚀 Features
+
+- Support opt-in direct S3 uploads to Zot blob storage (#18)
+
 ## [0.5.1] - 2026-11-03
 
 ### 🚀 Features
@@ -13,6 +19,10 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - *(deps)* Move the dolos pin to c5e4f77e and clear the cargo deny advisories (#14)
+
+### Release
+
+- V0.5.1
 
 ## [0.5.0] - 2026-11-01
 
