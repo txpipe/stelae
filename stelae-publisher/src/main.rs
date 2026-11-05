@@ -361,8 +361,6 @@ struct PublishArgs {
     #[arg(long)]
     epochs: Option<EpochRange>,
     #[arg(long)]
-    index_band: Option<NonZeroUsize>,
-    #[arg(long)]
     producers: Option<NonZeroUsize>,
     #[arg(long, action, conflicts_with = "output_dir")]
     rebuild: bool,
@@ -387,13 +385,13 @@ struct DigestArgs {
     /// match what the stele being reproduced was published with.
     #[arg(long, value_name = "RANGE")]
     epochs: Option<EpochRange>,
-    /// Epochs whose index layers one archive traversal fills; changes nothing
-    /// about the digest.
-    #[arg(long, value_name = "EPOCHS")]
-    index_band: Option<NonZeroUsize>,
     /// Layer producers run at once; changes nothing about the digest.
     #[arg(long, value_name = "N")]
     producers: Option<NonZeroUsize>,
+    /// Where the index runs spool while the digest is computed; defaults to
+    /// the storage path's `scratch` directory.
+    #[arg(long, value_name = "PATH")]
+    scratch_dir: Option<PathBuf>,
     /// Canonical inscription of the stele this one follows, as `inspect
     /// --format json` or a published `inscription.json` holds it; without it
     /// the reproduction carries no history, which is a different digest.
@@ -424,10 +422,12 @@ struct VerifyArgs {
     /// inscription. Costs what a publish costs.
     #[arg(long, action)]
     reproduce: bool,
-    #[arg(long, value_name = "EPOCHS", requires = "reproduce")]
-    index_band: Option<NonZeroUsize>,
     #[arg(long, value_name = "N", requires = "reproduce")]
     producers: Option<NonZeroUsize>,
+    /// Where the index runs spool while the stele is reproduced; defaults to
+    /// the storage path's `scratch` directory.
+    #[arg(long, value_name = "PATH", requires = "reproduce")]
+    scratch_dir: Option<PathBuf>,
     /// Epochs the reproduction builds layers for; must match what the stele
     /// was published with.
     #[arg(long, value_name = "RANGE", requires = "reproduce")]
@@ -567,7 +567,6 @@ fn run_publish(
     let retained = args.state_epochs.read()?;
     let selection = Selection {
         epochs: args.epochs,
-        index_band: args.index_band,
         producers: args.producers,
     };
     let destination = match (&args.output_dir, &args.repo) {
@@ -696,10 +695,6 @@ fn report_plan(report: &PlanReport, boundary: &Boundary) {
         "boundary: first block of epoch {}, after {}",
         boundary.epoch, boundary.parent,
     );
-    eprintln!(
-        "band:     {} epochs per index traversal ({} MiB budgeted)",
-        report.band_epochs, report.band_budget_mib,
-    );
     match report.epochs {
         Some(span) => eprintln!(
             "epochs:   {}..={} ({} of them, slots {}..={})",
@@ -716,7 +711,6 @@ fn report_plan(report: &PlanReport, boundary: &Boundary) {
 fn run_digest(config: &RootConfig, genesis: &Genesis, args: &DigestArgs) -> miette::Result<()> {
     let selection = Selection {
         epochs: args.epochs,
-        index_band: args.index_band,
         producers: args.producers,
     };
     let digested = snapshot::with_plan(
@@ -724,6 +718,7 @@ fn run_digest(config: &RootConfig, genesis: &Genesis, args: &DigestArgs) -> miet
         genesis,
         args.state_epochs.read()?,
         selection,
+        args.scratch_dir.as_deref(),
         &report_plan,
         |source, plan| snapshot::digest(source, plan, args.chain_from.as_deref()),
     )
@@ -797,7 +792,6 @@ fn run_verify(
         Some(path) if args.reproduce => {
             let selection = Selection {
                 epochs: args.epochs,
-                index_band: args.index_band,
                 producers: args.producers,
             };
             // Planned before the transport check, so a selection these stores
@@ -807,6 +801,7 @@ fn run_verify(
                 genesis,
                 read_state_epochs(path)?,
                 selection,
+                args.scratch_dir.as_deref(),
                 &report_plan,
                 |source, plan| {
                     let verified = transport()?;
@@ -1008,6 +1003,44 @@ mod tests {
     /// A password with no user: refused wherever credentials are resolved.
     fn orphan_password(name: &str) -> Option<String> {
         (name == PASSWORD_ENV).then(|| "secret".to_owned())
+    }
+
+    #[test]
+    fn the_band_flag_is_gone() {
+        for command in ["publish", "digest", "verify"] {
+            let error = parse(&[command, "--index-band", "4"]).err().unwrap();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn digest_and_reproduction_take_a_scratch_directory() {
+        let cli = parse(&[
+            "digest",
+            "--state-epochs-file",
+            "unused",
+            "--scratch-dir",
+            "/spool",
+        ])
+        .unwrap();
+        let Command::Digest(digest) = cli.command else {
+            unreachable!("parsed a digest")
+        };
+        assert_eq!(digest.scratch_dir, Some(PathBuf::from("/spool")));
+
+        // Only a reproduction spools.
+        let plain = parse(&[
+            "verify",
+            "--repo",
+            "file:///stele",
+            "--scratch-dir",
+            "/spool",
+        ]);
+        assert!(plain.is_err());
     }
 
     #[test]

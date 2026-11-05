@@ -173,6 +173,8 @@ impl backfill::Publish for BackfillPublisher<'_> {
     }
 
     fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {
+        let scratch = node::scratch_dir(&self.config.storage, self.settings.scratch_dir);
+        let plan = &plan.clone().with_scratch(scratch);
         let publisher =
             Publisher::open(self.config, &self.settings).map_err(backfill::Error::caller)?;
         let standing = publisher.standing(plan).map_err(backfill::Error::caller)?;
@@ -247,11 +249,17 @@ pub fn publish_once(
         dolos::engine::ReplayWorkspace::open(config, std::sync::Arc::new(genesis.clone()))?;
     let result = (|| {
         let snapshot = workspace.snapshot();
-        let plan = snapshot.selected_plan(
-            u64::from(genesis.network_magic()),
-            retained.clone(),
-            selection,
-        )?;
+        let scratch = match &destination {
+            Destination::Repository { scratch_dir, .. } => scratch_dir.as_deref(),
+            Destination::Directory(_) => None,
+        };
+        let plan = snapshot
+            .selected_plan(
+                u64::from(genesis.network_magic()),
+                retained.clone(),
+                selection,
+            )?
+            .with_scratch(node::scratch_dir(&config.storage, scratch));
         let report = PlanReport::read(&plan)?;
         let outcome = match destination {
             Destination::Directory(path) => {

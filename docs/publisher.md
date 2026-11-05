@@ -1,18 +1,23 @@
 # Stelae Cardano publisher
 
 `stelae-publisher` owns the Cardano publisher process. Its
-`stelae-cardano` integration crate contains the publish-before-advance loop and
-repository policy; Dolos supplies the ledger engine, storage backends, Mithril
+`stelae-cardano` integration crate contains the backfill loop and repository
+policy; Dolos supplies the ledger engine, storage backends, Mithril
 client and `io.txpipe.dolos.cardano` profile through supported library facades.
 No command starts or shells out to a Dolos executable.
 
 ## Source and dependency identity
 
 Every Dolos crate in the publisher's dependency graph, normal and dev, is
-pinned to `1db3e41fd04bca64bf245f50b54ca656719764ca`, the merge of
-[PR 1553](https://github.com/txpipe/dolos/pull/1553), which adopts the Stelae
-snapshot envelope `application/vnd.stelae.snapshot.v1`. `DOLOS_REVISION` in
-`stelae-cardano/src/lib.rs` names the same commit.
+pinned to `bf66dcc66cd65228539c8401e291807e947c61ec`, the merge of
+[PR 1564](https://github.com/txpipe/dolos/pull/1564), which adds boundary
+preparation and staged export. An ordinary export is now a batch of one over
+that machinery, with the same canonical output. `DOLOS_REVISION` in
+`stelae-cardano/src/lib.rs` names the same commit. Since the earlier pin,
+`1db3e41f`, no store contract, WAL version or profile version has changed, so
+stores synced at that pin carry over. The Stelae snapshot envelope
+`application/vnd.stelae.snapshot.v1` came earlier, with
+[PR 1553](https://github.com/txpipe/dolos/pull/1553).
 
 The `io.txpipe.dolos.cardano` profile was frozen for Dolos v2 earlier, at
 `e39a38a31665acb1b5e5701bbb2f8c7cb995cef1`, the merge of
@@ -27,8 +32,9 @@ Initialization does not refuse stores synced at an earlier pin (opening them
 only wipes their WAL), so delete a kept claim before the upgrade, as for any
 storage pin change (see
 [publisher-packaging.md](publisher-packaging.md)). The normative profile is
-[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/1db3e41fd04bca64bf245f50b54ca656719764ca/crates/snapshot/PROFILE.md)
-at the pinned commit.
+[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/bf66dcc66cd65228539c8401e291807e947c61ec/crates/snapshot/PROFILE.md)
+at the pinned commit, and the preparation contract this host consumes is
+[`docs/contracts/export-preparation.md`](https://github.com/txpipe/dolos/blob/bf66dcc66cd65228539c8401e291807e947c61ec/docs/contracts/export-preparation.md).
 
 Like every revision since the publisher retirement of
 [PR 1335](https://github.com/txpipe/dolos/pull/1335), the pin retains the
@@ -123,9 +129,10 @@ stelae-publisher --config dolos.toml publish \
   --concurrency 4
 ```
 
-`publish` preserves epoch selection, index-band and producer tuning,
-`--rebuild`, `--verify-carried`, `--dry-run`, and `--require-new`. An
-up-to-date repository is a successful no-op unless `--require-new` is set.
+`publish` preserves epoch selection and producer tuning, `--rebuild`,
+`--verify-carried`, `--dry-run`, and `--require-new`. An up-to-date repository
+is a successful no-op unless `--require-new` is set. `--index-band` is gone:
+staging fills every window from one traversal.
 
 Initialize empty stores and then backfill:
 
@@ -160,8 +167,8 @@ stelae-publisher --config dolos.toml digest \
 
 Check a published stele's digests, every layer streamed against both of its
 digests; `--reproduce` also rebuilds every layer from the committed stores and
-requires a byte-identical inscription, taking `--epochs`, `--index-band`,
-`--producers` and the `--state-epochs-file` the stele was published with:
+requires a byte-identical inscription, taking `--epochs`, `--producers` and
+the `--state-epochs-file` the stele was published with:
 
 ```sh
 stelae-publisher --config dolos.toml verify \
@@ -177,6 +184,11 @@ rather than reading every blob to find them:
 stelae-publisher --config dolos.toml inspect \
   --repo oci://registry.example/cardano/preview
 ```
+
+Every export spools its index runs, reproductions included, under `--scratch-dir`
+(default `<storage.path>/scratch`). `digest` and `verify --reproduce` take it as
+`publish` does. A mainnet first publish spools tens of gigabytes, and the
+directory must be writable by no one but the user running the command.
 
 All three take `--format text|json` (default `text`): data on stdout,
 progress and logs on stderr. `inspect --format json` is the canonical

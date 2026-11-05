@@ -73,6 +73,7 @@ impl Fixture {
             &self.genesis,
             retained,
             Selection::default(),
+            None,
             &|_, _| {},
             then,
         )
