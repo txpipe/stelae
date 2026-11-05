@@ -9,14 +9,17 @@ use dolos_snapshot::{
     node,
     planning::PlanReport,
     registry::{
-        self, Auth, Preview, Published, Publishing, Repository, SnapshotRepository, Tuning,
+        self, Auth, Point, Preview, Published, Publishing, Repository, SnapshotRepository, Tuning,
     },
     RetainedEpochs,
 };
 use stelae::progress::Observer;
 use stelae_driver::Standing;
 
-use crate::backfill;
+use crate::{
+    backfill,
+    batch::{self, Committed},
+};
 
 /// Resolved repository publication settings.
 pub struct RepositoryPublish<'a> {
@@ -125,6 +128,19 @@ impl Publisher {
         self.repository.standing(plan)
     }
 
+    /// What the repository really holds, as a stele that follows it would name
+    /// it.
+    pub fn latest(&self, plan: &Plan) -> Result<Option<Committed>, dolos_snapshot::Error> {
+        if self.standing(plan)? == Standing::Empty {
+            return Ok(None);
+        }
+        let latest = self.repository.inspect(Point::Latest)?;
+        Ok(Some(Committed {
+            sequence: latest.inscription.sequence,
+            identity: latest.identity.to_string(),
+        }))
+    }
+
     pub fn preflight(&self) -> Result<(), dolos_snapshot::Error> {
         self.repository.preflight()
     }
@@ -170,6 +186,12 @@ impl backfill::Publish for BackfillPublisher<'_> {
             "publishing pending boundary"
         );
         Ok(())
+    }
+
+    fn latest(&self, plan: &Plan) -> Result<Option<Committed>, backfill::Error> {
+        Publisher::open(self.config, &self.settings)
+            .and_then(|publisher| publisher.latest(plan))
+            .map_err(backfill::Error::caller)
     }
 
     fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {
@@ -245,6 +267,9 @@ pub fn publish_once(
     dry_run: bool,
     observer: &Observer,
 ) -> Result<(PlanReport, PublishOutcome), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    if matches!(destination, Destination::Repository { .. }) && !dry_run {
+        batch::refuse_pending(&config.storage.path)?;
+    }
     let workspace =
         dolos::engine::ReplayWorkspace::open(config, std::sync::Arc::new(genesis.clone()))?;
     let result = (|| {

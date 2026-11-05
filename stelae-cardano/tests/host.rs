@@ -5,8 +5,8 @@ use dolos_core::ChainPoint;
 use dolos_snapshot::{export::Plan, source::SnapshotSource};
 use stelae::progress::Observer;
 use stelae_cardano::{
-    backfill::{self, Driver},
-    initialize,
+    backfill::{self, Batching, Driver},
+    batch, initialize,
     publisher::{publish_once, Destination, PublishOutcome},
     testing::Node,
     Auth, MithrilSource, Point, RestoreSource, RetainedEpochs, Selection,
@@ -168,6 +168,10 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
                 Ok(())
             }
         }
+
+        fn latest(&self, _: &Plan) -> Result<Option<batch::Committed>, backfill::Error> {
+            unreachable!("a batch of one never asks")
+        }
     }
 
     let node = Node::new();
@@ -182,6 +186,8 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
         .enable_all()
         .build()
         .unwrap();
+
+    let observer = Observer::silent();
 
     for fail in [true, false] {
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -205,9 +211,17 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
             runtime: runtime.handle().clone(),
             cancel,
             mithril_feedback: &|| None,
+            beacon: &|| unreachable!("the publish decides this run"),
             replay: &(),
             open_workspace: &open_workspace,
             publish: &publish,
+            batching: Batching {
+                limits: batch::Limits::ONE,
+                storage_path: node.config.storage.path.clone(),
+                repository: "oci://registry.invalid/cardano/preview".to_owned(),
+                room: &|_, _| true,
+                observer: &observer,
+            },
         };
         assert_eq!(driver.run().is_err(), fail);
         assert!(publish.called.get());
@@ -307,6 +321,7 @@ fn a_rolling_history_is_refused_before_backfill_creates_anything() {
             genesis_vkey: String::new(),
         },
         retained: RetainedEpochs::default(),
+        limits: batch::Limits::ONE,
     };
 
     let error = backfill::run(
@@ -319,5 +334,49 @@ fn a_rolling_history_is_refused_before_backfill_creates_anything() {
     .unwrap_err()
     .to_string();
     assert!(error.contains("history.mode = \"full\""), "{error}");
+    assert!(!config.storage.path.exists());
+}
+
+/// A prepared batch has nowhere to go until ordered publication arrives, so no
+/// host entry point starts one.
+#[test]
+fn a_batch_above_one_is_gated_before_anything_opens() {
+    let node = Node::new();
+    let genesis = dolos_cardano::include::preview::load();
+    let mut config = node.config.clone();
+    config.storage.path = node.path().join("gated");
+    let options = backfill::Options {
+        direct_s3: None,
+        repository: "oci://registry.invalid/cardano/preview".parse().unwrap(),
+        auth: Auth::Anonymous,
+        insecure: false,
+        scratch_dir: None,
+        concurrency: None,
+        verify_carried: false,
+        download_dir: None,
+        window: 1,
+        until_epoch: None,
+        skip_validation: false,
+        mithril: MithrilSource {
+            aggregator: "http://unused.invalid".to_owned(),
+            genesis_vkey: String::new(),
+        },
+        retained: RetainedEpochs::default(),
+        limits: batch::Limits {
+            max_epochs: std::num::NonZeroU64::new(2).unwrap(),
+            scratch: u64::MAX,
+            reserve_per_epoch: 0,
+        },
+    };
+
+    let error = backfill::run(
+        &config,
+        &genesis,
+        &options,
+        tokio_util::sync::CancellationToken::new(),
+        &Observer::silent(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, backfill::Error::BatchingGated), "{error}");
     assert!(!config.storage.path.exists());
 }

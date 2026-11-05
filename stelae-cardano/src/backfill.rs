@@ -1,9 +1,17 @@
 //! Stelae-owned Cardano backfill state machine.
 //!
-//! Every iteration publishes the committed boundary before it advances,
-//! prunes only after that publish succeeds, downloads bounded Mithril windows,
-//! and closes the replay engine on every result. This is intentionally a
-//! sequential relocation of the Dolos publisher loop at `DOLOS_REVISION`.
+//! A batch of one publishes the committed boundary before it advances and
+//! prunes only after that publish succeeds. A larger batch prepares each
+//! boundary durably instead and replays on until [`crate::batch`] closes it, so
+//! the cursor may pass the published sequence only over journaled work. Both
+//! download bounded Mithril windows and close the replay engine on every
+//! result.
+//!
+//! Ordering at a prepared boundary: capture while the importing session still
+//! holds the block's index delta, finish that session so the stores are
+//! durable, journal the bundle, and only then remove consumed immutable files
+//! or start replaying. Nothing pending reads an immutable file: bundles and the
+//! archive hold it all, and a replay after a lost bundle downloads them again.
 
 use std::{
     path::{Path, PathBuf},
@@ -11,15 +19,28 @@ use std::{
 };
 
 use dolos::engine::{BulkReplaySession, ReplayWorkspace};
-use dolos_core::{config::RootConfig, BlockSlot, ChainPoint, Genesis, RawBlock, ReplayProgress};
+use dolos_core::{
+    config::RootConfig, ArchiveIndexDelta, BlockSlot, ChainPoint, Genesis, RawBlock, ReplayProgress,
+};
 use dolos_mithril as mithril;
 use dolos_mithril::{mithril_client::feedback::FeedbackReceiver, MithrilSource};
-use dolos_snapshot::{export::Plan, registry::Auth, source::SnapshotSource, RetainedEpochs};
+use dolos_snapshot::{
+    export::Plan,
+    prepare::{self, Bundle, IndexTail},
+    registry::Auth,
+    source::SnapshotSource,
+    RetainedEpochs,
+};
 use itertools::Itertools as _;
+use stelae::progress::Observer;
+use stelae_driver::Standing;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::publisher::{BackfillPublisher, RepositoryPublish};
+use crate::{
+    batch::{self, Admission, Batch, Committed, Flush, Frontiers, Limits, Position},
+    publisher::{BackfillPublisher, PolicyError, RepositoryPublish},
+};
 
 const IMPORT_CHUNK: usize = 100;
 const IMMUTABLE_FILE_MARGIN: u64 = 2;
@@ -72,6 +93,19 @@ pub enum Error {
         "interrupted by a shutdown signal; the stores are consistent and a rerun resumes here"
     )]
     Interrupted,
+    #[error(transparent)]
+    Batch(#[from] batch::Error),
+    #[error(
+        "a batch can't hold one boundary: it holds {used} bytes and needs {needed} more within \
+         its scratch budget and on the volume. Nothing is lost: make room or raise the budget \
+         and rerun"
+    )]
+    NoRoom { needed: u64, used: u64 },
+    #[error(
+        "--batch-epochs above 1 is not active yet: publishing a prepared batch arrives with \
+         ordered publication and recovery"
+    )]
+    BatchingGated,
 }
 
 impl Error {
@@ -88,6 +122,8 @@ pub trait Workspace {
 }
 
 pub trait Session {
+    fn snapshot(&self) -> impl SnapshotSource + '_;
+    fn boundary_index_delta(&self) -> Option<&ArchiveIndexDelta>;
     fn committed_position(&self) -> Result<Option<ChainPoint>, Error>;
     fn import_blocks(&mut self, blocks: Vec<RawBlock>) -> Result<ReplayProgress, Error>;
     fn prune_history(&mut self) -> Result<u64, Error>;
@@ -111,6 +147,14 @@ impl Workspace for ReplayWorkspace<'_> {
 }
 
 impl Session for BulkReplaySession {
+    fn snapshot(&self) -> impl SnapshotSource + '_ {
+        self.snapshot()
+    }
+
+    fn boundary_index_delta(&self) -> Option<&ArchiveIndexDelta> {
+        self.boundary_index_delta()
+    }
+
     fn committed_position(&self) -> Result<Option<ChainPoint>, Error> {
         self.committed_position().map_err(Error::caller)
     }
@@ -134,6 +178,9 @@ pub trait Replay {
         let _ = slot;
     }
     fn round_finished(&self) {}
+    fn frontiers(&self, frontiers: &Frontiers) {
+        let _ = frontiers;
+    }
 }
 
 impl Replay for () {}
@@ -144,22 +191,43 @@ pub trait Publish {
         Ok(())
     }
     fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), Error>;
+    /// The repository's latest stele as `plan` finds it: what a batch follows.
+    fn latest(&self, plan: &Plan) -> Result<Option<Committed>, Error>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    UntilEpoch { sequence: u64 },
+    UntilEpoch {
+        sequence: u64,
+    },
     UpToDate,
+    /// Every boundary of a closed batch is prepared and journaled, and nothing
+    /// of it is published.
+    BatchReady {
+        flush: Flush,
+        frontiers: Frontiers,
+    },
 }
 
 enum Step {
     Extend { target: u64, prune: bool },
     Done { sequence: u64 },
+    Ready(Flush),
 }
 enum Advance {
-    Boundary { cursor_slot: u64 },
-    MithrilExhausted,
+    Boundary {
+        cursor_slot: u64,
+        capture: Option<Capture>,
+    },
+    MithrilExhausted {
+        cursor: Option<ChainPoint>,
+    },
     Cancelled,
+}
+enum Capture {
+    Bundle(Box<Bundle>),
+    AlreadyPublished,
+    OutOfSpace,
 }
 enum Import {
     Boundary,
@@ -271,9 +339,30 @@ pub struct Driver<'a, W: Workspace> {
     pub runtime: tokio::runtime::Handle,
     pub cancel: CancellationToken,
     pub mithril_feedback: &'a dyn Fn() -> Option<Arc<dyn FeedbackReceiver>>,
+    /// The highest immutable file the source offers; `None` when cancelled.
+    pub beacon: &'a dyn Fn() -> Result<Option<u64>, Error>,
     pub replay: &'a dyn Replay,
     pub open_workspace: &'a dyn Fn() -> Result<W, Error>,
     pub publish: &'a dyn Publish,
+    pub batching: Batching<'a>,
+}
+
+/// How a run batches, and what it needs to beyond a batch of one.
+pub struct Batching<'a> {
+    pub limits: Limits,
+    pub storage_path: PathBuf,
+    pub repository: String,
+    /// Whether the batch's volume has this many bytes free.
+    pub room: &'a dyn Fn(&Path, u64) -> bool,
+    pub observer: &'a Observer,
+}
+
+/// Refuse a batch above one until a prepared batch can be published.
+pub fn gate(limits: &Limits) -> Result<(), Error> {
+    match limits.is_one() {
+        true => Ok(()),
+        false => Err(Error::BatchingGated),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +380,7 @@ pub struct Options {
     pub skip_validation: bool,
     pub mithril: MithrilSource,
     pub retained: RetainedEpochs,
+    pub limits: Limits,
 }
 
 fn require_synchronous_context() -> Result<(), Error> {
@@ -312,6 +402,7 @@ pub fn run(
     cancel: CancellationToken,
     observer: &stelae::progress::Observer,
 ) -> Result<Outcome, Error> {
+    gate(&options.limits)?;
     crate::config::require_full_history(config).map_err(Error::caller)?;
     require_synchronous_context()?;
     let download_dir = options
@@ -338,6 +429,26 @@ pub fn run(
         observer,
     };
     let genesis = Arc::new(genesis.clone());
+    let aborting = cancel.clone();
+    let handle = runtime.handle().clone();
+    let beacon = || {
+        stelae_driver::retry::transient(
+            "listing mithril snapshots",
+            &|| aborting.is_cancelled(),
+            || {
+                handle.block_on(async {
+                    tokio::select! {
+                        result = mithril::latest_immutable_file(&options.mithril) => result.map(Some),
+                        _ = aborting.cancelled() => Ok(None),
+                    }
+                })
+            },
+        )
+        .map_err(|error| Error::Mithril {
+            what: "listing mithril snapshots",
+            reason: error.to_string(),
+        })
+    };
     let driver = Driver::<ReplayWorkspace> {
         genesis: &genesis,
         retained: &options.retained,
@@ -349,12 +460,32 @@ pub fn run(
         runtime: runtime.handle().clone(),
         cancel,
         mithril_feedback: &|| None,
+        beacon: &beacon,
         replay: &(),
         open_workspace: &|| ReplayWorkspace::open(config, genesis.clone()).map_err(Error::caller),
         publish: &publisher,
+        batching: Batching {
+            limits: options.limits,
+            storage_path: config.storage.path.clone(),
+            repository: options.repository.to_string(),
+            room: &batch::volume_has_room,
+            observer,
+        },
     };
     driver.run()
 }
+
+/// What the stores showed when a batched run looked at them.
+struct Reconciled {
+    cursor: Option<ChainPoint>,
+    epoch: Option<u64>,
+    /// The repository already holds the sequence the stores stand in.
+    published: bool,
+    capture: Option<Capture>,
+}
+
+/// The repository's latest stele, once a batch may follow it.
+struct Latest(Option<Committed>);
 
 fn finish_both<T>(work: Result<T, Error>, finish: Result<(), Error>) -> Result<T, Error> {
     match (work, finish) {
@@ -386,20 +517,286 @@ impl<W: Workspace> Driver<'_, W> {
             "derived immutable chunk size from genesis"
         );
 
+        if !self.batching.limits.is_one() {
+            return self.run_batched(width);
+        }
+        batch::refuse_pending(&self.batching.storage_path)?;
+
         loop {
             if self.aborted() {
                 return Err(Error::Interrupted);
             }
             let (target, prune) = match self.publish_pending()? {
                 Step::Done { sequence } => return Ok(Outcome::UntilEpoch { sequence }),
+                Step::Ready(_) => unreachable!("a batch of one has nothing to close"),
                 Step::Extend { target, prune } => (target, prune),
             };
-            match self.extend(target, prune, width)? {
-                Advance::Boundary { cursor_slot } => {
+            match self.extend(target, prune, width, None)? {
+                Advance::Boundary { cursor_slot, .. } => {
                     cleanup_consumed(&immutable_dir, cursor_slot, width)?
                 }
-                Advance::MithrilExhausted => return Ok(Outcome::UpToDate),
+                Advance::MithrilExhausted { .. } => return Ok(Outcome::UpToDate),
                 Advance::Cancelled => return Err(Error::Interrupted),
+            }
+        }
+    }
+
+    fn run_batched(&self, width: u64) -> Result<Outcome, Error> {
+        let immutable_dir = self.immutable_dir();
+        let mut batch = self.open_batch()?;
+        let mut unchecked = !batch.is_empty();
+        // Before replay moves: past here a lost bundle is only found at the end.
+        batch.bundles()?;
+
+        loop {
+            if self.aborted() {
+                return Err(Error::Interrupted);
+            }
+            let (target, prune) = match self.settle(&mut batch, &mut unchecked)? {
+                Step::Done { sequence } => return Ok(Outcome::UntilEpoch { sequence }),
+                Step::Ready(flush) => return Ok(self.ready(&batch, flush)),
+                Step::Extend { target, prune } => (target, prune),
+            };
+            match self.extend(target, prune, width, Some(&mut batch))? {
+                Advance::Boundary {
+                    cursor_slot,
+                    capture,
+                } => {
+                    if let Some(flush) = self.settle_capture(&mut batch, capture)? {
+                        return Ok(self.ready(&batch, flush));
+                    }
+                    cleanup_consumed(&immutable_dir, cursor_slot, width)?;
+                }
+                Advance::MithrilExhausted { cursor } => {
+                    if batch.is_empty() {
+                        return Ok(Outcome::UpToDate);
+                    }
+                    // The epoch in progress stays unpublished: it has no boundary.
+                    batch.close(Flush::EndOfSource, cursor.as_ref())?;
+                    return Ok(self.ready(&batch, Flush::EndOfSource));
+                }
+                Advance::Cancelled => return Err(Error::Interrupted),
+            }
+        }
+    }
+
+    fn open_batch(&self) -> Result<Batch, Error> {
+        let source = batch::Source {
+            repository: self.batching.repository.clone(),
+            network_magic: u64::from(self.genesis.network_magic()),
+            store_contract: dolos_core::compat::SUPPORTED_CONTRACTS[0].to_owned(),
+            mutable_slots: dolos_cardano::mutable_slots(self.genesis),
+            retained: self.retained.as_slice().to_vec(),
+            dolos_revision: crate::DOLOS_REVISION.to_owned(),
+        };
+        let dir = batch::dir_in(&self.batching.storage_path);
+        Ok(Batch::open(dir, self.batching.limits, source)?)
+    }
+
+    fn ready(&self, batch: &Batch, flush: Flush) -> Outcome {
+        self.report(batch);
+        Outcome::BatchReady {
+            flush,
+            frontiers: batch.frontiers(),
+        }
+    }
+
+    fn report(&self, batch: &Batch) {
+        let frontiers = batch.frontiers();
+        info!(
+            published = ?frontiers.published,
+            prepared = ?frontiers.prepared,
+            staged = ?frontiers.staged,
+            replay = ?frontiers.replay,
+            "batch frontiers"
+        );
+        self.replay.frontiers(&frontiers);
+    }
+
+    fn plan(&self, source: &dyn SnapshotSource) -> Result<Plan, Error> {
+        source
+            .plan(
+                u64::from(self.genesis.network_magic()),
+                self.retained.clone(),
+            )
+            .map_err(Error::Planning)
+    }
+
+    fn latest(&self, plan: &Plan) -> Result<Option<Committed>, Error> {
+        stelae_driver::retry::transient(
+            "reading the repository's latest stele",
+            &|| self.aborted(),
+            || self.publish.latest(plan),
+        )
+    }
+
+    /// Hold the stores to the journal and capture a boundary they stand on with
+    /// no bundle yet, which only a restart reaches. Then decide, from what the
+    /// batch holds, whether replay may advance.
+    fn settle(&self, batch: &mut Batch, unchecked: &mut bool) -> Result<Step, Error> {
+        let workspace = (self.open_workspace)()?;
+        let result = self.reconcile(&workspace.snapshot(), batch, unchecked);
+        let reconciled = finish_both(result, workspace.finish())?;
+
+        if let Some(flush) = self.settle_capture(batch, reconciled.capture)? {
+            return Ok(Step::Ready(flush));
+        }
+        if let Some(flush) = batch.ready() {
+            return Ok(Step::Ready(flush));
+        }
+
+        let sequence = reconciled.epoch.unwrap_or(0);
+        let until = self.until_epoch;
+        if batch.is_empty() && reconciled.published && until.is_some_and(|until| sequence >= until)
+        {
+            return Ok(Step::Done { sequence });
+        }
+
+        let last = batch.last_sequence();
+        let until_reached = last.is_some_and(|last| until.is_some_and(|until| last >= until));
+        let dir = batch::dir_in(&self.batching.storage_path);
+        let room = |bytes| (self.batching.room)(&dir, bytes);
+        match batch.admit(until_reached, &room)? {
+            Admission::Advance => Ok(Step::Extend {
+                target: target_epoch(reconciled.epoch),
+                prune: batch.is_empty() && reconciled.published,
+            }),
+            Admission::Flush(flush) => {
+                batch.close(flush, reconciled.cursor.as_ref())?;
+                Ok(Step::Ready(flush))
+            }
+            Admission::NoRoom { needed, used } => Err(Error::NoRoom { needed, used }),
+        }
+    }
+
+    fn reconcile(
+        &self,
+        source: &dyn SnapshotSource,
+        batch: &mut Batch,
+        unchecked: &mut bool,
+    ) -> Result<Reconciled, Error> {
+        let cursor = source.committed_position().map_err(Error::Planning)?;
+        let epoch = match &cursor {
+            None => None,
+            Some(cursor) => Some(source.epoch().map_err(Error::Planning)?.ok_or(
+                Error::UnanchoredCursor {
+                    slot: cursor.slot(),
+                },
+            )?),
+        };
+        let position = batch.position(cursor.as_ref(), epoch.unwrap_or(0))?;
+        let mut reconciled = Reconciled {
+            cursor,
+            epoch,
+            published: false,
+            capture: None,
+        };
+        let Some(sequence) = epoch.filter(|epoch| *epoch > 0) else {
+            return Ok(reconciled);
+        };
+        let plan = self.plan(source)?;
+
+        if *unchecked {
+            batch.check_predecessor(self.latest(&plan)?)?;
+            *unchecked = false;
+        }
+        if batch.ready().is_some() {
+            return Ok(reconciled);
+        }
+
+        let capture = match (batch.is_empty(), position) {
+            (false, Position::Within) => false,
+            (false, Position::NextEpoch) => match source.boundary(&plan) {
+                Ok(_) => true,
+                Err(dolos_snapshot::Error::NotABoundary { .. }) => {
+                    return Err(batch.unrepresented(sequence).into())
+                }
+                Err(error) => return Err(Error::Planning(error)),
+            },
+            (true, _) => {
+                reconciled.published = self.unpublished(&plan, sequence)?.is_none();
+                !reconciled.published
+            }
+        };
+        if capture {
+            warn!(
+                sequence,
+                "capturing a boundary this process did not import: the index tail takes a \
+                 whole-index traversal"
+            );
+            reconciled.capture = Some(self.capture(batch, source, IndexTail::Traverse)?);
+        }
+        Ok(reconciled)
+    }
+
+    /// What a batch beginning at `sequence` would follow, or `None` when the
+    /// repository already holds that sequence.
+    fn unpublished(&self, plan: &Plan, sequence: u64) -> Result<Option<Latest>, Error> {
+        let latest = self.latest(plan)?;
+        match Standing::read(latest.as_ref().map(|latest| latest.sequence), sequence) {
+            Standing::UpToDate { .. } => Ok(None),
+            Standing::Empty | Standing::Next { .. } => Ok(Some(Latest(latest))),
+            Standing::Ahead { latest, distance } => {
+                Err(Error::caller(PolicyError::PublishWouldGap {
+                    latest,
+                    sequence,
+                    distance,
+                }))
+            }
+        }
+    }
+
+    /// Capture the boundary `source` stands on. The bundle is complete when
+    /// this returns, and the caller journals it once the stores are durable.
+    fn capture(
+        &self,
+        batch: &mut Batch,
+        source: &dyn SnapshotSource,
+        tail: IndexTail<'_>,
+    ) -> Result<Capture, Error> {
+        let plan = self.plan(source)?;
+        if batch.is_empty() {
+            match self.unpublished(&plan, plan.sequence)? {
+                None => return Ok(Capture::AlreadyPublished),
+                Some(Latest(latest)) => batch.begin(latest),
+            }
+        }
+        let request = prepare::Request {
+            store_contract: batch.source().store_contract.clone(),
+            mutable_slots: batch.source().mutable_slots,
+            tail,
+        };
+        info!(sequence = plan.sequence, cursor = %plan.cursor, "preparing boundary");
+        let captured =
+            source.prepare_boundary(batch.store(), &plan, &request, self.batching.observer);
+        match captured {
+            Ok(bundle) => Ok(Capture::Bundle(Box::new(bundle))),
+            Err(error) if batch::out_of_space(&error) => Ok(Capture::OutOfSpace),
+            Err(error) => Err(batch::Error::Preparing(Box::new(error)).into()),
+        }
+    }
+
+    /// Journal a capture, or close the batch on a full volume. An empty batch
+    /// has nothing to flush, and its boundary is captured again on a rerun.
+    fn settle_capture(
+        &self,
+        batch: &mut Batch,
+        capture: Option<Capture>,
+    ) -> Result<Option<Flush>, Error> {
+        match capture {
+            Some(Capture::Bundle(bundle)) => {
+                batch.record(&bundle)?;
+                self.report(batch);
+                Ok(None)
+            }
+            Some(Capture::AlreadyPublished) | None => Ok(None),
+            Some(Capture::OutOfSpace) if batch.is_empty() => Err(Error::NoRoom {
+                needed: batch.limits().reserve_per_epoch,
+                used: batch.used()?,
+            }),
+            Some(Capture::OutOfSpace) => {
+                batch.close(Flush::DiskPressure, None)?;
+                Ok(Some(Flush::DiskPressure))
             }
         }
     }
@@ -452,10 +849,16 @@ impl<W: Workspace> Driver<'_, W> {
         })
     }
 
-    fn extend(&self, target: u64, prune: bool, width: u64) -> Result<Advance, Error> {
+    fn extend(
+        &self,
+        target: u64,
+        prune: bool,
+        width: u64,
+        batch: Option<&mut Batch>,
+    ) -> Result<Advance, Error> {
         let workspace = (self.open_workspace)()?;
         let mut session = workspace.start(target)?;
-        let result = self.advance_session(&mut session, prune, width);
+        let result = self.advance_session(&mut session, prune, width, batch);
         finish_both(result, session.finish())
     }
 
@@ -464,6 +867,7 @@ impl<W: Workspace> Driver<'_, W> {
         session: &mut W::Session,
         prune: bool,
         width: u64,
+        batch: Option<&mut Batch>,
     ) -> Result<Advance, Error> {
         let immutable_dir = self.immutable_dir();
         if prune {
@@ -473,7 +877,21 @@ impl<W: Workspace> Driver<'_, W> {
         self.replay.round_started();
         let result = self.advance_loop(session, &immutable_dir, width);
         self.replay.round_finished();
-        result
+        match (result?, batch) {
+            (Advance::Boundary { .. }, Some(_)) if self.aborted() => Ok(Advance::Cancelled),
+            (Advance::Boundary { cursor_slot, .. }, Some(batch)) => {
+                let tail = match session.boundary_index_delta() {
+                    Some(delta) => IndexTail::Delta(delta),
+                    None => IndexTail::Traverse,
+                };
+                let capture = self.capture(batch, &session.snapshot(), tail)?;
+                Ok(Advance::Boundary {
+                    cursor_slot,
+                    capture: Some(capture),
+                })
+            }
+            (advance, _) => Ok(advance),
+        }
     }
 
     fn advance_loop(
@@ -492,34 +910,22 @@ impl<W: Workspace> Driver<'_, W> {
                         .committed_position()?
                         .map(|point| point.slot())
                         .unwrap_or_default();
-                    return Ok(Advance::Boundary { cursor_slot });
+                    return Ok(Advance::Boundary {
+                        cursor_slot,
+                        capture: None,
+                    });
                 }
                 Import::Cancelled => return Ok(Advance::Cancelled),
                 Import::Exhausted => {}
             }
 
-            let Some(beacon) = stelae_driver::retry::transient(
-                "listing mithril snapshots",
-                &|| self.aborted(),
-                || {
-                    self.runtime.block_on(async {
-                    tokio::select! {
-                        result = mithril::latest_immutable_file(self.mithril) => result.map(Some),
-                        _ = self.cancel.cancelled() => Ok(None),
-                    }
-                })
-                },
-            )
-            .map_err(|error| Error::Mithril {
-                what: "listing mithril snapshots",
-                reason: error.to_string(),
-            })?
-            else {
+            let Some(beacon) = (self.beacon)()? else {
                 return Ok(Advance::Cancelled);
             };
 
             let highest = mithril::highest_existing_immutable(immutable_dir);
-            let cursor_slot = session.committed_position()?.map(|point| point.slot());
+            let cursor = session.committed_position()?;
+            let cursor_slot = cursor.as_ref().map(ChainPoint::slot);
             let resume = resume_file(highest, cursor_slot, width);
             if let Some(lag) =
                 resume_lag(resume, cursor_slot, width).filter(|lag| *lag > self.window)
@@ -532,7 +938,7 @@ impl<W: Workspace> Driver<'_, W> {
                 );
             }
             let Some((start, end)) = next_window(resume, self.window, beacon) else {
-                return Ok(Advance::MithrilExhausted);
+                return Ok(Advance::MithrilExhausted { cursor });
             };
             let fetch = mithril::Fetch {
                 download_dir: &self.download_dir,

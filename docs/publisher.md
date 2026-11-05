@@ -224,6 +224,7 @@ The following paths are part of restart compatibility:
 | `<storage.path>/.stelae-publisher-initialized.json` | source, storage path, network magic and restore/genesis decision for cold start |
 | `<storage.path>/scratch` | default OCI staging directory |
 | `<storage.path>/mithril/immutable` | default bounded Mithril download window |
+| `<storage.path>/.stelae-batch/` | a prepared batch's journal, bundles and staged runs; see [Prepared batches](#prepared-batches) |
 
 Before any cleanup, initialization requires an absolute storage path below a
 filesystem root. A marker is accepted only when its storage path, network
@@ -240,6 +241,79 @@ The backfill state machine preserves these rules from the accepted Dolos host:
 - retry transient repository work in place using the publication journal;
 - retain the `--state-epochs-file` epochs, and the plan, schema, media-type,
   compression and journal identities of the pinned profile.
+
+## Prepared batches
+
+**Not active yet.** `--batch-epochs` above 1 is refused, because a prepared batch
+can't be published until ordered publication and recovery are integrated. The
+state machine below is in place and tested through the library, and `run`,
+`backfill` and `publish` all stay on a batch of one until then.
+
+A batch prepares several boundaries before it publishes any, so one index
+traversal serves them all. Replay may stand past the repository's latest stele
+only while every sequence in between is a complete bundle the journal names.
+
+| Control | Meaning |
+| --- | --- |
+| `--batch-epochs N` | Boundaries in a batch. 1, the default, captures nothing and publishes before it advances. |
+| `--batch-scratch-mib M` | What a batch may hold on disk: bundles and staged runs. Required above one epoch. |
+| `--batch-reserve-mib M` | Kept free per prepared boundary to stage and finalize it. Required above one epoch. |
+
+Defaults above one epoch are not chosen yet: they wait for complete-pipeline
+measurements.
+
+### State transitions
+
+1. **Admit.** Before replay leaves a boundary, the batch must have room for what
+   it holds, and for one more boundary estimated at the largest so far. Both the
+   budget and the volume's free space are held to that.
+2. **Replay** to the next boundary. Nothing prunes while a batch holds anything,
+   and nothing is published.
+3. **Capture** while the session that imported the boundary is open, because it
+   holds the block's index delta.
+4. **Close the session**, so the stores are durable.
+5. **Journal** the bundle, and only then remove consumed immutable files. Pending
+   work reads none of them, and a replay after a lost bundle downloads them again.
+6. **Close the batch** with the reason it stopped growing, or go back to 1.
+
+| A batch closes on | At |
+| --- | --- |
+| `epoch-limit` | the last boundary `--batch-epochs` allows |
+| `until-epoch` | the boundary `--until-epoch` names |
+| `scratch-budget` | the last boundary before the next would cross the budget |
+| `disk-pressure` | the last boundary before the next would not fit the volume, or a capture that filled it |
+| `end-of-source` | the last captured boundary. The epoch in progress has none and stays unpublished. |
+
+A closed batch stays closed across restarts, whatever the controls say then.
+
+### Progress
+
+Each journal write logs and reports the frontiers: `published`, the repository's
+latest stele when the batch began; `prepared`, the last journaled sequence;
+`staged`, where the runs were staged from; `replay`, the slot the stores reached;
+and `horizon`, the oldest slot the archive has to keep for the batch.
+
+### What a restart does
+
+| The stores stand | The run |
+| --- | --- |
+| in the last prepared epoch, at or past its boundary | continues replay; nothing is captured again |
+| on the next boundary, uncaptured | captures it with an index traversal, because the delta died with the process: at most one per restart |
+| past that, or further on | refuses: nothing holds the sequences in between |
+| behind the journal's replay frontier | refuses: the stores were rebuilt or rolled back |
+
+These refuse too, and none is repaired automatically: a repository whose latest
+stele is not the one the batch follows, a journal or bundle that is missing or
+damaged, and another repository, network, store contract, retained list or Dolos
+revision than the batch was prepared from. A batch of one and a repository
+`publish` refuse to run past a pending batch. The recovery in every case is to
+restore the stores from the repository's latest stele and delete
+`<storage.path>/.stelae-batch` to replay those sequences. Clearing the storage
+path takes the batch with it.
+
+Cancelling keeps all of it: a shutdown signal neither publishes nor manufactures
+a boundary, and a rerun continues. Not even one boundary fitting is a recoverable
+stop too: make room or raise the budget and rerun.
 
 ## First publication
 

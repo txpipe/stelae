@@ -6,6 +6,7 @@
 //! `stelae` and `stelae-driver`, which have no Cardano dependency.
 
 pub mod backfill;
+pub mod batch;
 pub mod config;
 pub mod initialize;
 pub mod publisher;

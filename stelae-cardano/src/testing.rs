@@ -8,7 +8,7 @@ use std::{
 
 use dolos::engine::BulkReplaySession;
 use dolos_core::{
-    config::{ChainConfig, RootConfig},
+    config::{CardanoConfig, ChainConfig, CustomUtxo, GenesisConfig, RootConfig, UpstreamConfig},
     ChainPoint, Genesis,
 };
 use dolos_testing::blocks::make_conway_block_with_prev;
@@ -44,6 +44,19 @@ impl Node {
 
     pub fn path(&self) -> &Path {
         self.root.path()
+    }
+
+    /// Put the node on a chain seeding `utxos` over the preview genesis, which
+    /// a replay of synthetic blocks spends from.
+    pub fn on_custom_chain(&mut self, magic: u32, utxos: Vec<CustomUtxo>) {
+        dolos_cardano::include::preview::save(self.path()).unwrap();
+        self.config.chain = ChainConfig::custom(CardanoConfig {
+            magic,
+            is_testnet: true,
+            genesis: GenesisConfig::in_dir(self.path()),
+            custom_utxos: utxos,
+        });
+        self.config.upstream = Some(UpstreamConfig::peer("unused.invalid:3001"));
     }
 
     pub fn config_path(&self) -> PathBuf {
