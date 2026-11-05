@@ -474,6 +474,7 @@ impl<'a> Rig<'a> {
             retained: &retained,
             mithril: &mithril,
             download_dir: self.download.clone(),
+            scratch: self.node.path().join("spool"),
             window: 1,
             until_epoch,
             skip_validation: true,

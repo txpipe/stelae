@@ -149,6 +149,7 @@ fn retained_state_epochs_reach_the_signed_inscription() {
 fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
     struct Publisher {
         expected: ChainPoint,
+        scratch: PathBuf,
         fail: bool,
         called: Cell<bool>,
         cancel: tokio_util::sync::CancellationToken,
@@ -158,6 +159,7 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
         fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {
             assert_eq!(plan.sequence, 1);
             assert_eq!(plan.retained.as_slice(), &[1]);
+            assert_eq!(plan.scratch.as_ref(), Some(&self.scratch));
             assert_eq!(
                 source.committed_position().unwrap(),
                 Some(self.expected.clone())
@@ -197,6 +199,7 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
         let cancel = tokio_util::sync::CancellationToken::new();
         let publish = Publisher {
             expected: boundary.clone(),
+            scratch: node.path().join("spool"),
             fail,
             called: Cell::new(false),
             cancel: cancel.clone(),
@@ -209,6 +212,7 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
             retained: &retained,
             mithril: &mithril,
             download_dir: node.path().join("unused"),
+            scratch: node.path().join("spool"),
             window: 1,
             until_epoch: Some(1),
             skip_validation: false,

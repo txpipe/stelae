@@ -26,6 +26,7 @@ use dolos_mithril as mithril;
 use dolos_mithril::{mithril_client::feedback::FeedbackReceiver, MithrilSource};
 use dolos_snapshot::{
     export::Plan,
+    node,
     prepare::{self, Bundle, IndexTail},
     registry::Auth,
     source::SnapshotSource,
@@ -333,6 +334,8 @@ pub struct Driver<'a, W: Workspace> {
     pub retained: &'a RetainedEpochs,
     pub mithril: &'a MithrilSource,
     pub download_dir: PathBuf,
+    /// Where an export spools its index runs.
+    pub scratch: PathBuf,
     pub window: u64,
     pub until_epoch: Option<u64>,
     pub skip_validation: bool,
@@ -454,6 +457,7 @@ pub fn run(
         retained: &options.retained,
         mithril: &options.mithril,
         download_dir,
+        scratch: node::scratch_dir(&config.storage, options.scratch_dir.as_deref()),
         window: options.window,
         until_epoch: options.until_epoch,
         skip_validation: options.skip_validation,
@@ -826,12 +830,7 @@ impl<W: Workspace> Driver<'_, W> {
                 prune: false,
             });
         }
-        let plan = source
-            .plan(
-                u64::from(self.genesis.network_magic()),
-                self.retained.clone(),
-            )
-            .map_err(Error::Planning)?;
+        let plan = self.plan(source)?.with_scratch(self.scratch.clone());
         self.publish.announce(&plan)?;
         stelae_driver::retry::transient(
             "publishing the pending sequence",

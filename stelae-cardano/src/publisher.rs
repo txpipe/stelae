@@ -195,8 +195,6 @@ impl backfill::Publish for BackfillPublisher<'_> {
     }
 
     fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {
-        let scratch = node::scratch_dir(&self.config.storage, self.settings.scratch_dir);
-        let plan = &plan.clone().with_scratch(scratch);
         let publisher =
             Publisher::open(self.config, &self.settings).map_err(backfill::Error::caller)?;
         let standing = publisher.standing(plan).map_err(backfill::Error::caller)?;
