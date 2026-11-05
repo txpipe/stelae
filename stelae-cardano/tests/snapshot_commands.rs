@@ -80,6 +80,31 @@ impl Fixture {
     }
 }
 
+/// A reproduction spools where it is told to, by default under the stores.
+#[test]
+fn a_digest_spools_under_the_scratch_directory_it_names() {
+    let node = Node::new();
+    let (genesis, _) = node.replay_to_the_first_boundary();
+    let named = node.path().join("spool");
+    for (scratch, expected) in [
+        (None, node.config.storage.path.join("scratch")),
+        (Some(named.as_path()), named.clone()),
+    ] {
+        assert!(!expected.exists());
+        snapshot::with_plan(
+            &node.config,
+            &genesis,
+            retained(),
+            Selection::default(),
+            scratch,
+            &|_, _| {},
+            |source, plan| snapshot::digest(source, plan, None),
+        )
+        .unwrap();
+        assert!(expected.is_dir(), "{}", expected.display());
+    }
+}
+
 fn blobs(stele: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(stele.join("blobs").join("sha256"))
         .unwrap()

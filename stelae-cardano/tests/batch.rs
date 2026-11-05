@@ -514,6 +514,10 @@ impl<'a> Rig<'a> {
     }
 
     fn batch(&self) -> Batch {
+        self.batch_under(limits(16))
+    }
+
+    fn batch_under(&self, limits: Limits) -> Batch {
         let source = batch::Source {
             repository: REPOSITORY.to_owned(),
             network_magic: MAGIC.into(),
@@ -523,7 +527,7 @@ impl<'a> Rig<'a> {
             dolos_revision: stelae_cardano::DOLOS_REVISION.to_owned(),
         };
         let dir = batch::dir_in(&self.node.config.storage.path);
-        Batch::open(dir, limits(16), source).unwrap()
+        Batch::open(dir, limits, source).unwrap()
     }
 
     fn cursor(&self) -> ChainPoint {
@@ -1012,6 +1016,48 @@ fn a_lost_or_damaged_bundle_stops_the_batch_with_its_recovery() {
         assert_eq!(rig.cursor(), at, "{what}");
         assert_eq!(rig.sequences(), [1, 2, 3], "{what}");
     }
+}
+
+/// Staging gets what the budget has left after the bundles, and a staging that
+/// can't fit leaves the batch to retry rather than marking it staged.
+#[test]
+fn staging_is_bounded_by_what_the_budget_has_left() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(4), None));
+
+    let prepared = tree_bytes(&batch::dir_in(&rig.node.config.storage.path).join("prepared"));
+    let mut tight = rig.batch_under(Limits {
+        scratch: prepared + 1,
+        ..limits(4)
+    });
+
+    let workspace = ReplayWorkspace::open(&rig.node.config, chain.genesis.clone()).unwrap();
+    let snapshot = workspace.snapshot();
+    let observer = Observer::silent();
+    let error = match tight.stage(&snapshot, &First, &observer) {
+        Err(error) => error,
+        Ok(_) => panic!("staged within one byte"),
+    };
+    assert!(
+        matches!(
+            &error,
+            batch::Error::Preparing(source)
+                if matches!(
+                    **source,
+                    dolos_snapshot::Error::Staging(
+                        dolos_snapshot::staging::Refusal::ScratchExceeded { .. }
+                    )
+                )
+        ),
+        "{error}"
+    );
+    assert_eq!(rig.batch().frontiers().staged, None);
+
+    rig.batch().stage(&snapshot, &First, &observer).unwrap();
+    assert!(rig.batch().frontiers().staged.is_some());
+    drop(snapshot);
+    workspace.finish().unwrap();
 }
 
 /// A sound bundle holding other layers is not the one the journal vouched for.

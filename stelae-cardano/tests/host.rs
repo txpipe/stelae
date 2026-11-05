@@ -34,6 +34,10 @@ fn a_bounded_fixture_publishes_to_a_directory_through_the_new_host() {
     };
     assert!(layers > 0);
     assert!(destination.join("inscription.json").is_file());
+    assert!(
+        node.config.storage.path.join("scratch").is_dir(),
+        "the index runs spool under the storage path, not the system's"
+    );
 
     let restored = Node::new();
     let outcome = initialize::run(
