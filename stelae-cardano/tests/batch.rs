@@ -182,12 +182,17 @@ struct Calls {
     poison_finish_at: Cell<Option<u64>>,
     /// Fail the close of the session aiming at this epoch for another reason.
     break_finish_at: Cell<Option<u64>>,
+    /// Fail the close of the session aiming at this epoch with what a close on
+    /// a full volume really says.
+    full_finish_at: Cell<Option<u64>>,
     /// Fail the next close of a workspace as a store whose worker failed.
     poison_workspace_close: Cell<bool>,
     /// Fail the next check of the stores as a full volume.
     check_full: Cell<bool>,
     /// Fail the next workspace to open as a full volume.
     open_full: Cell<bool>,
+    /// Fail the workspace to open after this many more, as a full volume.
+    open_full_after: Cell<Option<u32>>,
     /// Fail the next session to start as a full volume.
     start_full: Cell<bool>,
     /// Fail the next prune as a full volume.
@@ -198,6 +203,11 @@ struct Calls {
 
 /// What a store says once a background worker has failed.
 const POISONED: &str = "state error: internal store error: fjall error: FjallError: Poisoned";
+
+/// What a real close said when the WAL's checkpoint, its one foreground write,
+/// met the full volume.
+const CLOSE_ON_FULL_VOLUME: &str = "finishing replay: persisting replay checkpoint: IO error: I/O \
+     error: No space left on device (os error 28)";
 
 fn full_volume() -> backfill::Error {
     backfill::Error::caller(io::Error::from(io::ErrorKind::StorageFull))
@@ -443,6 +453,13 @@ impl Session for CountedSession<'_> {
             finish?;
             return Err(poisoned());
         }
+        if self.calls.full_finish_at.get() == Some(self.target) {
+            self.calls.full_finish_at.set(None);
+            finish?;
+            return Err(backfill::Error::caller(io::Error::other(
+                CLOSE_ON_FULL_VOLUME,
+            )));
+        }
         if self.calls.break_finish_at.get() == Some(self.target) {
             self.calls.break_finish_at.set(None);
             finish?;
@@ -545,6 +562,14 @@ impl<'a> Rig<'a> {
         let open_workspace = || {
             if calls.open_full.replace(false) {
                 return Err(full_volume());
+            }
+            match calls.open_full_after.get() {
+                Some(0) => {
+                    calls.open_full_after.set(None);
+                    return Err(full_volume());
+                }
+                Some(more) => calls.open_full_after.set(Some(more - 1)),
+                None => {}
             }
             Ok(CountedWorkspace {
                 inner: ReplayWorkspace::open(&self.node.config, self.chain.genesis.clone())
@@ -2070,6 +2095,40 @@ fn a_failed_close_stops_unless_a_capture_ran_out_on_the_same_volume() {
     assert_eq!(rig.batch().ready(), None);
 }
 
+/// The close can say the volume is full itself, when its own write is the first
+/// to meet it, with no worker failed. The batch closes the same.
+#[test]
+fn a_close_reporting_a_full_volume_keeps_a_capture_that_ran_out() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.full_at.set(Some(3));
+    rig.calls.full_finish_at.set(Some(3));
+
+    let (flush, frontiers) = ready(rig.run(limits(9), None));
+    assert_eq!(flush, Flush::DiskPressure);
+    assert_eq!(frontiers.prepared, Some(2));
+}
+
+/// Every open a run makes reads a full volume the same way.
+#[test]
+fn a_full_volume_at_any_open_is_the_same_stop() {
+    let chain = Chain::spanning(12);
+    let mut raw = Vec::new();
+    for (what, batching, opens_before) in [
+        ("extending a batch of one", Limits::ONE, 1),
+        ("settling a batch", limits(9), 0),
+        ("extending a batch", limits(9), 1),
+    ] {
+        let rig = Rig::new(&chain);
+        rig.calls.open_full_after.set(Some(opens_before));
+        let error = rig.run(batching, None).unwrap_err();
+        if !matches!(error, backfill::Error::ReplayFilledVolume(_)) {
+            raw.push(format!("{what}: {error}"));
+        }
+    }
+    assert!(raw.is_empty(), "{raw:?}");
+}
+
 /// A capture a restart took closes over a workspace rather than a session.
 #[test]
 fn a_failed_workspace_close_keeps_a_capture_that_ran_out() {
@@ -2268,6 +2327,76 @@ fn stores_keeping_no_archive_pass() {
     rig.node.config.history = dolos_core::config::HistoryConfig::none();
     state_cursor_at(&rig, block_point(&chain, 1));
     refuses_archive_behind(&rig).unwrap();
+}
+
+/// A stop between ESTART's commit and the epoch's first block leaves a cursor
+/// with no hash that nothing anchors again, so its refusal says how to recover.
+#[test]
+fn a_cursor_estart_left_names_how_to_recover() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.source_ends_after(2);
+    assert_eq!(rig.run(Limits::ONE, Some(1)).unwrap(), Outcome::UpToDate);
+    state_cursor_at(&rig, ChainPoint::Slot(block_point(&chain, 2).slot()));
+    rig.restart_with_the_whole_source();
+
+    for batching in [Limits::ONE, limits(3)] {
+        let message = rig.run(batching, None).unwrap_err().to_string();
+        assert!(message.contains("latest stele"), "{message}");
+        assert!(message.contains("--allow-genesis"), "{message}");
+    }
+}
+
+/// An archive no other process sees can't be behind anything, and clearing
+/// can't help.
+#[test]
+fn an_ephemeral_archive_is_not_called_a_gap() {
+    let chain = Chain::spanning(12);
+    let mut rig = Rig::new(&chain);
+    rig.node.config.storage.archive.kind = dolos_core::config::StoreType::Ephemeral;
+    state_cursor_at(&rig, block_point(&chain, 1));
+    refuses_archive_behind(&rig).unwrap();
+}
+
+/// Replay rewrites the blocks ahead only up to the next boundary. Past that the
+/// check still passes, and the boundary refuses the publish.
+#[test]
+fn an_archive_past_the_next_boundary_refuses_the_publish() {
+    use dolos_core::{ArchiveStore as _, ArchiveWriter as _};
+
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.source_ends_after(2);
+    assert_eq!(rig.run(Limits::ONE, Some(1)).unwrap(), Outcome::UpToDate);
+
+    let archive = dolos::storage::open_archive_store(&rig.node.config).unwrap();
+    let writer = archive.start_writer().unwrap();
+    for index in 2..=4 {
+        writer
+            .apply(&block_point(&chain, index), &chain.blocks[index])
+            .unwrap();
+    }
+    writer.commit().unwrap();
+    archive.shutdown().unwrap();
+    drop(archive);
+
+    refuses_archive_behind(&rig).unwrap();
+    rig.restart_with_the_whole_source();
+    assert_eq!(
+        rig.run(Limits::ONE, Some(1)).unwrap(),
+        Outcome::UntilEpoch { sequence: 1 }
+    );
+
+    let workspace = ReplayWorkspace::open(&rig.node.config, chain.genesis.clone()).unwrap();
+    let snapshot = workspace.snapshot();
+    let plan = snapshot.plan(MAGIC.into(), retained()).unwrap();
+    let error = snapshot.digest_document(&plan, &First).unwrap_err();
+    drop(snapshot);
+    workspace.finish().unwrap();
+    assert!(
+        error.to_string().contains("runs on past the cursor"),
+        "{error}"
+    );
 }
 
 /// What an archive-first commit order would leave. It heals as the same block

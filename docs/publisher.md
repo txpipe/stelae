@@ -251,45 +251,62 @@ keeps no WAL, so a kill or a full volume between the two leaves the state cursor
 past blocks the archive never got. Replaying on closes the difference with those
 blocks missing: the stele cut from there restores without complaint, and every
 later stele inherits the hole. So `run` and `backfill` compare the cursor with the
-archive's tip before anything else, on a batch of one and a larger batch alike, and
-refuse while the tip is behind. An archive ahead of the cursor passes, because
-replay writes the same blocks again.
+archive's tip before replaying or publishing anything, on a batch of one and a
+larger batch alike, and refuse while the tip is behind. An archive ahead of the
+cursor passes. Replay writes the same blocks again, which heals it only up to the
+next boundary: past that a publish refuses, saying the archive runs on past the
+cursor, until the stores are replaced.
 
-The refusal repeats until the stores are replaced, and nothing repairs them: clear
-the storage path and any store configured outside it, then restore the stores from
-the repository's latest stele. A repository with no stele has nothing to restore,
-so clear them the same way and run with `--allow-genesis`.
+The refusal repeats until the stores are replaced, and nothing repairs imported
+stores: clear the storage path and any store configured outside it, then restore
+the stores from the repository's latest stele. A repository with no stele has
+nothing to restore, so clear them the same way and run with `--allow-genesis`.
+Stores a node synced differ: they keep a WAL, so a Dolos restart catches the archive
+up, and their documented route, `publish` and `digest`, doesn't meet this check.
+
+A stop between an epoch's opening and its first block leaves a cursor with no block
+hash, past the archive. The check has nothing to compare and passes it, and nothing
+anchors that cursor again, so every run then refuses as it reads the cursor, naming
+the same recovery.
 
 This can't vouch for stores that crossed a gap on an earlier build. Once later
 imports bring the tip level with the cursor, the hole sits inside the archive and
 the two compare equal. It also compares slots, so a Byron main block lost beside
 its boundary block at one slot passes. The chart reruns a failed publisher by itself
-(`restartPolicy: OnFailure`, `backoffLimit`), so on a persistent claim nobody read
-the stop before that rerun: steles from a publisher restarted on a kept claim
-before this check are unchecked by it.
+(`restartPolicy: OnFailure`, `backoffLimit`) in the same pod, so `/data` survives
+that rerun on an emptyDir as well as on a claim, and nobody read the stop first:
+steles from a publisher rerun in place before this check are unchecked by it.
 
 ### A volume that fills
 
 A replay or a store's close that fills the volume stops the run: make room and
-rerun. If the state passed the archive on the way, the rerun refuses, as above.
+rerun. If the state passed the archive on the way, the rerun refuses, as above. A
+capture that ran out on the same volume is the exception: it closes the batch.
 
 Three cases read differently:
 
-- **A background worker filling it.** The run sees only `FjallError: Poisoned`, and
-  the log holds the worker's error as `Worker #N crashed`. A failing disk reads the
-  same, so that stop asks you to check both and doesn't call the volume full. Each
-  store's close also waits up to a minute for flushes a dead worker will never
-  finish, so on a volume still full a rerun can take minutes to stop.
+- **A write or a background worker failing.** The run sees only
+  `FjallError: Poisoned`, and the log holds the error, such as `Worker #N crashed` or
+  `persist failed`. A failing disk reads the same, so that stop asks you to check
+  both and doesn't call the volume full. Each store's close also waits up to a minute
+  for flushes a dead worker will never finish, so on a volume still full a rerun can
+  take minutes to stop.
 - **A hang.** On the pinned fjall, backpressure and shutdown can wait on workers
-  that have already died, and making room doesn't wake them. That was seen on real
-  full volumes below the publisher, not through a whole run. The process stays up
+  that have already died, and making room doesn't wake them. A rerun can park at its
+  first store close, with or without the check above, when the room is below what
+  one compaction writes. No figure is measured for mainnet. The process stays up
   using no CPU, which consumes no `backoffLimit`, and the chart has no liveness probe
-  or deadline. Kill it, make room and rerun.
+  or deadline. Kill it, then rerun with room for one compaction: a rerun with less
+  parks again.
 - **A download filling it.** The Mithril client reports only the locations it
   tried, so the failed fetch adds the free bytes of the download directory: read a
   low figure as a full volume. A stopped download can also leave partial or absent
   files below the highest one, which a rerun doesn't fetch again, so make room, empty
-  the immutable directory and rerun.
+  the immutable directory and rerun. That can't help once a rerun has imported across
+  an absent file next to an epoch's start, which the chart's own restart can do: every
+  run then refuses before any fetch, saying the archive has a gap there. Clear the
+  storage path and any store configured outside it, then restore from the repository's
+  latest stele.
 
 ## Prepared batches
 

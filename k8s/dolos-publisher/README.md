@@ -42,7 +42,9 @@ cost.
 - **emptyDir** (the default). Every pod restart, eviction included, restores
   the latest stele, all of history, and `resources` bounds `/data` through
   its `ephemeral-storage` request and limit, which must hold the whole
-  archive. It suits only a network whose history restores quickly.
+  archive. A failed container reruns in the same pod and keeps `/data`;
+  deleting the pod or bumping `run` starts over. It suits only a network whose
+  history restores quickly.
 - **Persistent claim** (`persistence.enabled: true`). `/data` is a
   ReadWriteOnce claim that outlives the pod: a restarted pod resumes the
   stores it left, with no restore. Initialization checks those stores
@@ -95,9 +97,13 @@ Pending. Start over whenever the kept stores no longer fit the release:
   from the state the suspect image left, and every boundary it publishes
   afterwards is built on that state;
 - stores whose state passed the archive, which a kill or a full volume can
-  leave. Every restart refuses them until `backoffLimit`. The check can't
-  vouch for stores that crossed a gap on an image without it (see
-  [publisher.md](../../docs/publisher.md#stores-whose-state-passed-the-archive)).
+  leave, including a cursor with no block hash. Every restart refuses them
+  until `backoffLimit`. The check can't vouch for stores that crossed a gap
+  on an image without it (see
+  [publisher.md](../../docs/publisher.md#stores-whose-state-passed-the-archive));
+- stores a rerun imported across an absent file next to an epoch's start.
+  Every restart refuses them before any fetch, saying the archive has a gap
+  there (see [publisher.md](../../docs/publisher.md#a-volume-that-fills)).
 
 Once the claim exists its class is fixed. Naming a class other than the
 one the claim has fails, and so does clearing a named class back to empty,

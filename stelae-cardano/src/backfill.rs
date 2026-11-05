@@ -21,7 +21,7 @@ use std::{
 
 use dolos::engine::{BulkReplaySession, ReplayWorkspace};
 use dolos_core::{
-    config::{RootConfig, StorageConfig},
+    config::{RootConfig, StorageConfig, StoreType},
     ArchiveIndexDelta, BlockSlot, ChainPoint, Genesis, RawBlock, ReplayProgress,
 };
 use dolos_mithril as mithril;
@@ -86,7 +86,10 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
-    #[error("state cursor at slot {slot} has no block hash, cannot walk the immutable db from it")]
+    #[error(
+        "the state store's cursor at slot {slot} has no block hash: a stop between an epoch's \
+         opening and its first block leaves this, and nothing anchors it again. {START_OVER}"
+    )]
     UnanchoredCursor { slot: BlockSlot },
     #[error(
         "the fetched immutable window {start:05}..={end:05} did not advance the downloaded files \
@@ -120,15 +123,15 @@ pub enum Error {
     #[error("the stores ran out of room: {0}. Make room and rerun. {IF_THE_STATE_PASSED}")]
     ReplayFilledVolume(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error(
-        "a store stopped taking writes: {0}. A background worker failed, which a full volume or a \
-         failing disk causes, and this log holds its error as a crashed worker. Check both, then \
-         rerun. {IF_THE_STATE_PASSED}"
+        "a store stopped taking writes: {0}. A write or a background worker failed, which a full \
+         volume or a failing disk causes, and this log holds its error, such as `Worker #N \
+         crashed` or `persist failed`. Check both, then rerun. {IF_THE_STATE_PASSED}"
     )]
     StorePoisoned(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error(
-        "the state store stands at slot {cursor} and the archive's last block is at {tip:?}: the \
-         state passed blocks the archive never got, and replaying on would leave them out of \
-         every stele. {START_OVER}"
+        "the state store stands at slot {cursor} and {}: the state passed blocks the archive \
+         never got, and replaying on would leave them out of every stele. {START_OVER}",
+        archive_end(.tip)
     )]
     ArchiveBehind {
         cursor: BlockSlot,
@@ -139,6 +142,13 @@ pub enum Error {
          ordered publication and recovery"
     )]
     BatchingGated,
+}
+
+fn archive_end(tip: &Option<BlockSlot>) -> String {
+    match tip {
+        Some(slot) => format!("the archive's last block is at slot {slot}"),
+        None => "the archive holds no block".to_owned(),
+    }
 }
 
 impl Error {
@@ -169,7 +179,7 @@ impl Error {
 /// state first and an import keeps no WAL to catch the archive up from, so
 /// replaying on would close the difference and leave those blocks out of every
 /// stele. Only a block's commit moves a hashed cursor, and an archive ahead of
-/// it heals as the same blocks import again.
+/// it heals as the same blocks import again, up to the next boundary.
 ///
 /// This can't see a gap later imports already closed.
 pub fn refuse_archive_behind(config: &RootConfig, genesis: Arc<Genesis>) -> Result<(), Error> {
@@ -180,7 +190,7 @@ pub fn refuse_archive_behind(config: &RootConfig, genesis: Arc<Genesis>) -> Resu
         .map_err(Error::caller)?
         .finish()
         .map_err(Error::caller)?;
-    if !config.keeps_archive() {
+    if !config.keeps_archive() || config.storage.archive.kind == StoreType::Ephemeral {
         return Ok(());
     }
 
@@ -373,10 +383,10 @@ fn fetch_failure(error: &dyn std::fmt::Display, download_dir: &Path) -> String {
     let dir = download_dir.display();
     match stelae_driver::preflight::available(download_dir) {
         Some(free) => {
-            format!("{error}. {dir} has {free} bytes free, and a full volume fails this way too")
+            format!("{error}. {dir} has {free} bytes free: a low figure can mean a full volume")
         }
         None => format!(
-            "{error}. The free space at {dir} can't be read, and a full volume fails this way too"
+            "{error}. The free space at {dir} can't be read, so a full volume can't be ruled out"
         ),
     }
 }
@@ -612,13 +622,24 @@ fn finish_both<T>(work: Result<T, Error>, finish: Result<(), Error>) -> Result<T
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         // A store that hit a full volume stays poisoned, so its close fails too.
         (Err(replay), Err(shutdown)) if replay.fills_stores() => {
-            warn!(%shutdown, "closing the stores after replay filled the volume");
+            warn!(%shutdown, "closing the stores after a store stopped the replay");
             Err(replay)
         }
         (Err(replay), Err(shutdown)) => Err(Error::ReplayAndShutdown {
             replay: Box::new(replay),
             shutdown: Box::new(shutdown),
         }),
+    }
+}
+
+/// The epoch the stores stand in, which a cursor with no hash can't give.
+fn anchored_epoch(source: &dyn SnapshotSource, slot: BlockSlot) -> Result<u64, Error> {
+    match source.epoch() {
+        Ok(Some(epoch)) => Ok(epoch),
+        Ok(None) | Err(dolos_snapshot::Error::UnanchoredPoint(_)) => {
+            Err(Error::UnanchoredCursor { slot })
+        }
+        Err(error) => Err(Error::Planning(error)),
     }
 }
 
@@ -821,11 +842,7 @@ impl<W: Workspace> Driver<'_, W> {
         let cursor = source.committed_position().map_err(Error::Planning)?;
         let epoch = match &cursor {
             None => None,
-            Some(cursor) => Some(source.epoch().map_err(Error::Planning)?.ok_or(
-                Error::UnanchoredCursor {
-                    slot: cursor.slot(),
-                },
-            )?),
+            Some(cursor) => Some(anchored_epoch(source, cursor.slot())?),
         };
         let position = batch.position(cursor.as_ref(), epoch.unwrap_or(0))?;
         let mut reconciled = Reconciled {
@@ -965,12 +982,7 @@ impl<W: Workspace> Driver<'_, W> {
                 prune: false,
             });
         };
-        let epoch = source
-            .epoch()
-            .map_err(Error::Planning)?
-            .ok_or(Error::UnanchoredCursor {
-                slot: cursor.slot(),
-            })?;
+        let epoch = anchored_epoch(source, cursor.slot())?;
         if epoch == 0 {
             return Ok(Step::Extend {
                 target: target_epoch(Some(epoch)),
@@ -1343,6 +1355,32 @@ mod tests {
     }
 
     #[test]
+    fn a_gap_says_where_the_archive_ends() {
+        let text = |tip| Error::ArchiveBehind { cursor: 200, tip }.to_string();
+        assert!(
+            text(Some(101)).contains("the archive's last block is at slot 101:"),
+            "{}",
+            text(Some(101))
+        );
+        assert!(
+            text(None).contains("the archive holds no block:"),
+            "{}",
+            text(None)
+        );
+    }
+
+    /// fjall's words name no cause, so the stop says where the cause is.
+    #[test]
+    fn a_failed_worker_says_where_its_cause_is_logged() {
+        let message = Error::StorePoisoned(std::io::Error::other("poisoned").into()).to_string();
+        assert!(message.contains("this log holds its error"), "{message}");
+        assert!(message.contains("Worker #N crashed"), "{message}");
+        assert!(message.contains("persist failed"), "{message}");
+        assert!(message.contains("Check both, then rerun"), "{message}");
+        assert!(message.contains(IF_THE_STATE_PASSED), "{message}");
+    }
+
+    #[test]
     fn a_failed_fetch_says_what_its_volume_holds() {
         let dir = tempfile::tempdir().unwrap();
         let reason = fetch_failure(&"All locations failed", dir.path());
@@ -1352,6 +1390,18 @@ mod tests {
             "{reason}"
         );
         assert!(reason.contains("bytes free"), "{reason}");
+    }
+
+    /// Most failed fetches have nothing to do with the disk, so the words leave
+    /// that to the figure.
+    #[test]
+    fn a_failed_fetch_doesnt_blame_a_volume_it_cant_see_is_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let reason = fetch_failure(&"certificate does not match", dir.path());
+        assert!(
+            reason.ends_with("bytes free: a low figure can mean a full volume"),
+            "{reason}"
+        );
     }
 
     #[test]
