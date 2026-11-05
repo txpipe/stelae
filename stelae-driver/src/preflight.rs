@@ -95,6 +95,12 @@ impl Need {
     }
 }
 
+/// The free bytes on the volume that holds, or will hold, `path`, for a failure
+/// to report. `None` when nothing can say.
+pub fn available(path: &Path) -> Option<u64> {
+    fs4::available_space(probe_of(path)?).ok()
+}
+
 /// Refuse a run whose measured needs cannot fit; warn about the rest.
 ///
 /// The single entry point for both directions. Needs landing on one volume are
@@ -279,6 +285,14 @@ fn same_volume(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_space_is_read_from_the_nearest_ancestor_that_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(available(temp.path()).is_some());
+        assert!(available(&temp.path().join("not/yet")).is_some());
+        assert_eq!(available(Path::new("relative-with-no-ancestor")), None);
+    }
 
     /// The whole of the free-space policy, over needs that share one volume.
     ///

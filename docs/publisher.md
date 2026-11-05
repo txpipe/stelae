@@ -267,6 +267,27 @@ the two compare equal. The chart reruns a failed publisher by itself
 the stop before that rerun: steles from a publisher restarted on a kept claim
 before this check are unchecked by it.
 
+### A volume that fills
+
+A replay or a store's close that fills the volume stops the run: make room and
+rerun. If the state passed the archive on the way, the rerun refuses, as above.
+
+Three cases read differently:
+
+- **A background worker filling it.** The run sees only `FjallError: Poisoned`, and
+  the log holds the worker's error as `Worker #N crashed`. A failing disk reads the
+  same, so that stop asks you to check both and doesn't call the volume full.
+- **A hang.** On the pinned fjall, backpressure and shutdown can wait on workers
+  that have already died, and making room doesn't wake them. That was seen on real
+  full volumes below the publisher, not through a whole run. The process stays up
+  using no CPU, which consumes no `backoffLimit`, and the chart has no liveness probe
+  or deadline. Kill it, make room and rerun.
+- **A download filling it.** The Mithril client reports only the locations it
+  tried, so the failed fetch adds the free bytes of the download directory: read a
+  low figure as a full volume. A stopped download can also leave partial or absent
+  files below the highest one, which a rerun doesn't fetch again, so make room, empty
+  the immutable directory and rerun.
+
 ## Prepared batches
 
 **Not active yet.** `--batch-epochs` above 1 is refused, because a prepared batch
@@ -294,9 +315,8 @@ measurements.
    budget and the volume's free space are held to that. Nothing but the reserve
    stands for what replay and its download add, so size it to include them.
 2. **Replay** to the next boundary. Nothing prunes while a batch holds anything,
-   and nothing is published. A replay that fills the volume anyway stops
-   recoverably: what is journaled stands, and a rerun closes the batch if the
-   volume is still short of what the reserve asks.
+   and nothing is published. For a replay that fills the volume anyway, see
+   [A volume that fills](#a-volume-that-fills).
 3. **Capture** while the session that imported the boundary is open, because it
    holds the block's index delta.
 4. **Close the session**, so the stores are durable.

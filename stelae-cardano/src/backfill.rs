@@ -50,6 +50,9 @@ const IMMUTABLE_FILE_MARGIN: u64 = 2;
 const SLOTS_PER_SECURITY_PARAM: u64 = 10;
 const FALLBACK_SLOTS_PER_IMMUTABLE_FILE: u64 = 21_600;
 
+const IF_THE_STATE_PASSED: &str =
+    "If the state passed the archive on the way, the rerun refuses and says how to recover";
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{0}")]
@@ -114,12 +117,14 @@ pub enum Error {
          and rerun"
     )]
     NoRoom { needed: u64, used: u64 },
-    #[error(
-        "replay filled the volume: {0}. The stores and anything a batch journaled stand. Make \
-         room and rerun, or rerun as it is to close a batch holding boundaries, and count what an \
-         epoch's replay and download add in --batch-reserve-mib"
-    )]
+    #[error("replay filled the volume: {0}. Make room and rerun. {IF_THE_STATE_PASSED}")]
     ReplayFilledVolume(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error(
+        "a store stopped taking writes: {0}. A background worker failed, which a full volume or a \
+         failing disk causes, and this log holds its error as a crashed worker. Check both, then \
+         rerun. {IF_THE_STATE_PASSED}"
+    )]
+    StorePoisoned(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error(
         "the state store stands at slot {cursor} and the archive's last block is at {tip:?}: the \
          state passed blocks the archive never got, and replaying on would leave them out of \
@@ -141,14 +146,22 @@ impl Error {
         Self::Caller(source.into())
     }
 
-    /// A replay that failed on a full volume is a recoverable stop.
+    /// Name the stop when a store failed on a full volume or a failed worker.
+    /// `Poisoned` also covers a real fsync failure, so it isn't read as full.
     fn in_replay(self) -> Self {
         match self {
             Self::Caller(source) if batch::reports_full_volume(&*source) => {
                 Self::ReplayFilledVolume(source)
             }
+            Self::Caller(source) if batch::reports_poisoned(&*source) => {
+                Self::StorePoisoned(source)
+            }
             other => other,
         }
+    }
+
+    fn fills_stores(&self) -> bool {
+        matches!(self, Self::ReplayFilledVolume(_) | Self::StorePoisoned(_))
     }
 }
 
@@ -356,6 +369,20 @@ fn fetch_advanced(before: Option<u64>, after: Option<u64>) -> bool {
 
 fn consumed_below(cursor_slot: u64, width: u64) -> u64 {
     (cursor_slot / width).saturating_sub(IMMUTABLE_FILE_MARGIN)
+}
+
+/// Why a fetch failed, and what its volume holds. The client names only the
+/// locations it tried, and a full volume's error goes to a logger nobody reads.
+fn fetch_failure(error: &dyn std::fmt::Display, download_dir: &Path) -> String {
+    let dir = download_dir.display();
+    match stelae_driver::preflight::available(download_dir) {
+        Some(free) => {
+            format!("{error}. {dir} has {free} bytes free, and a full volume fails this way too")
+        }
+        None => format!(
+            "{error}. The free space at {dir} can't be read, and a full volume fails this way too"
+        ),
+    }
 }
 
 fn dir_contents(immutable_dir: &Path) -> String {
@@ -588,7 +615,7 @@ fn finish_both<T>(work: Result<T, Error>, finish: Result<(), Error>) -> Result<T
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         // A store that hit a full volume stays poisoned, so its close fails too.
-        (Err(replay @ Error::ReplayFilledVolume(_)), Err(shutdown)) => {
+        (Err(replay), Err(shutdown)) if replay.fills_stores() => {
             warn!(%shutdown, "closing the stores after replay filled the volume");
             Err(replay)
         }
@@ -599,12 +626,28 @@ fn finish_both<T>(work: Result<T, Error>, finish: Result<(), Error>) -> Result<T
     }
 }
 
+/// A capture that ran out of room still closes its batch when the stores' close
+/// fails the same way: the journal names only what earlier closes made durable.
+fn close_after_capture(capture: Option<&Capture>, finish: Result<(), Error>) -> Result<(), Error> {
+    match finish {
+        Err(error) if matches!(capture, Some(Capture::OutOfSpace)) && error.fills_stores() => {
+            warn!(%error, "closing the stores after a capture filled the volume");
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 impl<W: Workspace> Driver<'_, W> {
     fn immutable_dir(&self) -> PathBuf {
         self.download_dir.join("immutable")
     }
     fn aborted(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    fn open(&self) -> Result<W, Error> {
+        (self.open_workspace)().map_err(Error::in_replay)
     }
 
     pub fn run(&self) -> Result<Outcome, Error> {
@@ -736,9 +779,11 @@ impl<W: Workspace> Driver<'_, W> {
     /// no bundle yet, which only a restart reaches. Then decide, from what the
     /// batch holds, whether replay may advance.
     fn settle(&self, batch: &mut Batch, unchecked: &mut bool) -> Result<Step, Error> {
-        let workspace = (self.open_workspace)()?;
+        let workspace = self.open()?;
         let result = self.reconcile(&workspace.snapshot(), batch, unchecked);
-        let reconciled = finish_both(result, workspace.finish())?;
+        let capture = result.as_ref().ok().and_then(|r| r.capture.as_ref());
+        let finish = close_after_capture(capture, workspace.finish().map_err(Error::in_replay));
+        let reconciled = finish_both(result, finish)?;
 
         if let Some(flush) = self.settle_capture(batch, reconciled.capture)? {
             return Ok(Step::Ready(flush));
@@ -875,7 +920,10 @@ impl<W: Workspace> Driver<'_, W> {
             source.prepare_boundary(batch.store(), &plan, &request, self.batching.observer);
         match captured {
             Ok(bundle) => Ok(Capture::Bundle(Box::new(bundle))),
-            Err(error) if batch::out_of_space(&error) => Ok(Capture::OutOfSpace),
+            Err(error) if batch::out_of_space(&error) => {
+                warn!(%error, sequence = plan.sequence, "a capture ran out of room, and what it wrote goes");
+                Ok(Capture::OutOfSpace)
+            }
             Err(error) => Err(batch::Error::Preparing(Box::new(error)).into()),
         }
     }
@@ -909,9 +957,9 @@ impl<W: Workspace> Driver<'_, W> {
     }
 
     fn publish_pending(&self) -> Result<Step, Error> {
-        let workspace = (self.open_workspace)()?;
+        let workspace = self.open()?;
         let result = self.plan_pending(&workspace.snapshot());
-        finish_both(result, workspace.finish())
+        finish_both(result, workspace.finish().map_err(Error::in_replay))
     }
 
     fn plan_pending(&self, source: &dyn SnapshotSource) -> Result<Step, Error> {
@@ -969,10 +1017,15 @@ impl<W: Workspace> Driver<'_, W> {
         width: u64,
         batch: Option<&mut Batch>,
     ) -> Result<Advance, Error> {
-        let workspace = (self.open_workspace)()?;
-        let mut session = workspace.start(target)?;
+        let workspace = self.open()?;
+        let mut session = workspace.start(target).map_err(Error::in_replay)?;
         let result = self.advance_session(&mut session, prune, width, batch);
-        finish_both(result, session.finish().map_err(Error::in_replay))
+        let capture = match &result {
+            Ok(Advance::Boundary { capture, .. }) => capture.as_ref(),
+            _ => None,
+        };
+        let finish = close_after_capture(capture, session.finish().map_err(Error::in_replay));
+        finish_both(result, finish)
     }
 
     fn advance_session(
@@ -984,7 +1037,7 @@ impl<W: Workspace> Driver<'_, W> {
     ) -> Result<Advance, Error> {
         let immutable_dir = self.immutable_dir();
         if prune {
-            let rounds = session.prune_history()?;
+            let rounds = session.prune_history().map_err(Error::in_replay)?;
             info!(rounds, "housekeeping drained after publication");
         }
         self.replay.round_started();
@@ -1070,7 +1123,7 @@ impl<W: Workspace> Driver<'_, W> {
                 }),
             ).map_err(|error| Error::Mithril {
                 what: "fetching a mithril immutable window",
-                reason: error.to_string(),
+                reason: fetch_failure(&error, &self.download_dir),
             })?;
             if fetched.is_none() {
                 return Ok(Advance::Cancelled);
@@ -1272,6 +1325,37 @@ mod tests {
         let filled = Error::ReplayFilledVolume(std::io::Error::other("full").into());
         let error = finish_both::<()>(Err(filled), Err(Error::EmptyWindow)).unwrap_err();
         assert!(matches!(error, Error::ReplayFilledVolume(_)), "{error}");
+
+        let poisoned = Error::StorePoisoned(std::io::Error::other("poisoned").into());
+        let error = finish_both::<()>(Err(poisoned), Err(Error::EmptyWindow)).unwrap_err();
+        assert!(matches!(error, Error::StorePoisoned(_)), "{error}");
+    }
+
+    #[test]
+    fn a_failed_worker_is_named_without_calling_the_volume_full() {
+        let poisoned = Error::caller(std::io::Error::other(
+            "state error: internal store error: fjall error: FjallError: Poisoned",
+        ));
+        let stop = poisoned.in_replay();
+        assert!(matches!(stop, Error::StorePoisoned(_)), "{stop}");
+        let message = stop.to_string();
+        assert!(
+            message.contains("a full volume or a failing disk"),
+            "{message}"
+        );
+        assert!(!message.contains("filled the volume"), "{message}");
+    }
+
+    #[test]
+    fn a_failed_fetch_says_what_its_volume_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let reason = fetch_failure(&"All locations failed", dir.path());
+        assert!(reason.starts_with("All locations failed. "), "{reason}");
+        assert!(
+            reason.contains(&dir.path().display().to_string()),
+            "{reason}"
+        );
+        assert!(reason.contains("bytes free"), "{reason}");
     }
 
     #[test]

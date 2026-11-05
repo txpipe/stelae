@@ -57,7 +57,8 @@ pub struct Limits {
     pub max_epochs: NonZeroU64,
     /// Bytes this batch may hold on disk: its bundles and its staged runs.
     pub scratch: u64,
-    /// Bytes kept free per prepared boundary for staging and finalizing it.
+    /// Bytes kept free per prepared boundary: for staging and finalizing it,
+    /// and for what an epoch's replay and download add to this volume.
     pub reserve_per_epoch: u64,
 }
 
@@ -789,16 +790,30 @@ pub fn reports_full_volume(error: &(dyn std::error::Error + 'static)) -> bool {
         "disk quota exceeded",
         "disc quota exceeded",
     ];
+    in_chain(error, &|error| {
+        let typed = error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| fills_volume(error.kind()));
+        let text = error.to_string().to_lowercase();
+        typed || WORDS.iter().any(|words| text.contains(words))
+    })
+}
+
+/// Whether a store refused work because a background worker failed. fjall says
+/// no more than that, whatever the worker hit.
+pub fn reports_poisoned(error: &(dyn std::error::Error + 'static)) -> bool {
+    in_chain(error, &|error| {
+        error.to_string().contains("FjallError: Poisoned")
+    })
+}
+
+fn in_chain(
+    error: &(dyn std::error::Error + 'static),
+    found: &dyn Fn(&(dyn std::error::Error + 'static)) -> bool,
+) -> bool {
     let mut next = Some(error);
     while let Some(error) = next {
-        if error
-            .downcast_ref::<io::Error>()
-            .is_some_and(|error| fills_volume(error.kind()))
-        {
-            return true;
-        }
-        let text = error.to_string().to_lowercase();
-        if WORDS.iter().any(|words| text.contains(words)) {
+        if found(error) {
             return true;
         }
         next = error.source();
@@ -1169,6 +1184,24 @@ mod tests {
         let other = Wrapped(io::ErrorKind::PermissionDenied.into());
         assert!(!reports_full_volume(&other));
         assert!(!reports_full_volume(&io::Error::other("broken invariant")));
+    }
+
+    /// What the stores give when a worker failed. It also covers a failed
+    /// fsync, so it says nothing of the volume, and a lock's poison is
+    /// something else.
+    #[test]
+    fn a_failed_worker_is_read_by_its_words_and_isnt_a_full_volume() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("wrapped")]
+        struct Wrapped(#[source] io::Error);
+
+        let text = "state error: internal store error: fjall error: FjallError: Poisoned";
+        assert!(reports_poisoned(&io::Error::other(text)));
+        assert!(reports_poisoned(&Wrapped(io::Error::other(text))));
+        assert!(!reports_full_volume(&io::Error::other(text)));
+
+        let lock = io::Error::other("poisoned lock: another task failed inside");
+        assert!(!reports_poisoned(&lock));
     }
 
     #[test]

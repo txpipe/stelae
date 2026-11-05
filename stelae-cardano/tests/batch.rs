@@ -176,6 +176,33 @@ struct Calls {
     /// Fail the session's close as a full volume, once this sequence is
     /// captured.
     finish_full_after: Cell<Option<u64>>,
+    /// Fail the import aiming at this epoch as a store whose worker failed.
+    poison_import_at: Cell<Option<u64>>,
+    /// Fail the close of the session aiming at this epoch that way.
+    poison_finish_at: Cell<Option<u64>>,
+    /// Fail the close of the session aiming at this epoch for another reason.
+    break_finish_at: Cell<Option<u64>>,
+    /// Fail the next close of a workspace as a store whose worker failed.
+    poison_workspace_close: Cell<bool>,
+    /// Fail the next workspace to open as a full volume.
+    open_full: Cell<bool>,
+    /// Fail the next session to start as a full volume.
+    start_full: Cell<bool>,
+    /// Fail the next prune as a full volume.
+    prune_full: Cell<bool>,
+    /// The highest immutable file the source offers.
+    beacon: Cell<u64>,
+}
+
+/// What a store says once a background worker has failed.
+const POISONED: &str = "state error: internal store error: fjall error: FjallError: Poisoned";
+
+fn full_volume() -> backfill::Error {
+    backfill::Error::caller(io::Error::from(io::ErrorKind::StorageFull))
+}
+
+fn poisoned() -> backfill::Error {
+    backfill::Error::caller(io::Error::other(POISONED))
 }
 
 /// A cancellation token a restarted run gets afresh, as a new process would.
@@ -333,6 +360,10 @@ impl<'a> Workspace for CountedWorkspace<'a> {
     }
 
     fn start(self, target_epoch: u64) -> Result<Self::Session, backfill::Error> {
+        if self.calls.start_full.replace(false) {
+            self.inner.finish().map_err(backfill::Error::caller)?;
+            return Err(full_volume());
+        }
         self.calls.sessions.set(self.calls.sessions.get() + 1);
         let inner = self
             .inner
@@ -347,7 +378,12 @@ impl<'a> Workspace for CountedWorkspace<'a> {
     }
 
     fn finish(self) -> Result<(), backfill::Error> {
-        self.inner.finish().map_err(backfill::Error::caller)
+        let finish = self.inner.finish().map_err(backfill::Error::caller);
+        if self.calls.poison_workspace_close.replace(false) {
+            finish?;
+            return Err(poisoned());
+        }
+        finish
     }
 }
 
@@ -372,9 +408,11 @@ impl Session for CountedSession<'_> {
     fn import_blocks(&mut self, blocks: Vec<RawBlock>) -> Result<ReplayProgress, backfill::Error> {
         if self.calls.import_full_at.get() == Some(self.target) {
             self.calls.import_full_at.set(None);
-            return Err(backfill::Error::caller(io::Error::from(
-                io::ErrorKind::StorageFull,
-            )));
+            return Err(full_volume());
+        }
+        if self.calls.poison_import_at.get() == Some(self.target) {
+            self.calls.poison_import_at.set(None);
+            return Err(poisoned());
         }
         let progress = self
             .inner
@@ -388,6 +426,9 @@ impl Session for CountedSession<'_> {
     }
 
     fn prune_history(&mut self) -> Result<u64, backfill::Error> {
+        if self.calls.prune_full.replace(false) {
+            return Err(full_volume());
+        }
         self.calls.pruned.set(self.calls.pruned.get() + 1);
         self.inner.prune_history().map_err(backfill::Error::caller)
     }
@@ -395,13 +436,23 @@ impl Session for CountedSession<'_> {
     fn finish(self) -> Result<(), backfill::Error> {
         (self.after_capture)(self.calls);
         let finish = self.inner.finish().map_err(backfill::Error::caller);
+        if self.calls.poison_finish_at.get() == Some(self.target) {
+            self.calls.poison_finish_at.set(None);
+            finish?;
+            return Err(poisoned());
+        }
+        if self.calls.break_finish_at.get() == Some(self.target) {
+            self.calls.break_finish_at.set(None);
+            finish?;
+            return Err(backfill::Error::caller(io::Error::other(
+                "the stores would not close",
+            )));
+        }
         let last = self.calls.prepared.borrow().last().copied();
         if last.is_some() && self.calls.finish_full_after.get() == last {
             self.calls.finish_full_after.set(None);
             finish?;
-            return Err(backfill::Error::caller(io::Error::from(
-                io::ErrorKind::StorageFull,
-            )));
+            return Err(full_volume());
         }
         if last.is_some() && self.calls.fail_finish_after.get() == last {
             self.calls.fail_finish_after.set(None);
@@ -490,6 +541,9 @@ impl<'a> Rig<'a> {
             }
         };
         let open_workspace = || {
+            if calls.open_full.replace(false) {
+                return Err(full_volume());
+            }
             Ok(CountedWorkspace {
                 inner: ReplayWorkspace::open(&self.node.config, self.chain.genesis.clone())
                     .map_err(backfill::Error::caller)?,
@@ -512,13 +566,14 @@ impl<'a> Rig<'a> {
             runtime: self.runtime.handle().clone(),
             cancel: calls.cancel.get(),
             mithril_feedback: &|| None,
-            // The source offers nothing the db does not already hold.
+            // Unless a test says otherwise, the source offers nothing the db does
+            // not already hold.
             beacon: &|| {
                 if calls.cancel_at_end_of_source.replace(false) {
                     calls.cancel.get().cancel();
                     return Ok(None);
                 }
-                Ok(Some(0))
+                Ok(Some(calls.beacon.get()))
             },
             replay: &replay,
             open_workspace: &open_workspace,
@@ -1761,7 +1816,9 @@ fn a_close_on_a_full_volume_drops_a_bundle_the_journal_never_named() {
 }
 
 /// A replay filling the volume is a recoverable stop, and a rerun on the short
-/// volume closes what the batch holds.
+/// volume closes a batch holding more than one boundary. The stop itself says
+/// only what holds whatever the batch: the stores may not stand, a batch of one
+/// has no reserve, and a rerun with one boundary held doesn't close.
 #[test]
 fn a_replay_filling_the_volume_stops_recoverably() {
     let chain = Chain::spanning(12);
@@ -1777,7 +1834,12 @@ fn a_replay_filling_the_volume_stops_recoverably() {
         matches!(error, backfill::Error::ReplayFilledVolume(_)),
         "{error}"
     );
-    assert!(error.to_string().contains("--batch-reserve-mib"), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("Make room and rerun"), "{message}");
+    assert!(message.contains("the rerun refuses"), "{message}");
+    for promise in ["stand", "as it is", "--batch-reserve-mib"] {
+        assert!(!message.contains(promise), "{message}");
+    }
     assert_eq!(rig.sequences(), [1, 2]);
     assert_eq!(rig.batch().ready(), None);
 
@@ -1805,6 +1867,169 @@ fn a_session_close_filling_the_volume_stops_recoverably() {
     let (_, frontiers) = ready(rig.run(limits(4), None));
     assert_eq!(frontiers.prepared, Some(4));
     assert_eq!(*rig.calls.traversed.borrow(), [3]);
+}
+
+/// A batch of one has no batch to close and no reserve to raise, and the same
+/// stop holds: with room made the rerun goes on.
+#[test]
+fn a_batch_of_one_filling_the_volume_stops_the_same_way() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.import_full_at.set(Some(2));
+
+    let error = rig.run(Limits::ONE, Some(2)).unwrap_err();
+    assert!(
+        matches!(error, backfill::Error::ReplayFilledVolume(_)),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("--batch"), "{error}");
+
+    assert_eq!(
+        rig.run(Limits::ONE, Some(2)).unwrap(),
+        Outcome::UntilEpoch { sequence: 2 }
+    );
+}
+
+/// A worker's failure reaches the import and the close alike, as one stop that
+/// doesn't call the volume full, and the rerun goes on.
+#[test]
+fn a_failed_worker_stops_the_run_once() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.poison_import_at.set(Some(3));
+    rig.calls.poison_finish_at.set(Some(3));
+
+    let error = rig.run(limits(9), None).unwrap_err();
+    assert!(
+        matches!(error, backfill::Error::StorePoisoned(_)),
+        "{error}"
+    );
+    assert_eq!(rig.sequences(), [1, 2]);
+
+    let (_, frontiers) = ready(rig.run(limits(4), None));
+    assert_eq!(frontiers.prepared, Some(4));
+}
+
+/// The close of a capture that ran out can fail the same way, and the batch
+/// still closes on what earlier closes made durable.
+#[test]
+fn a_failed_close_keeps_a_capture_that_ran_out() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.full_at.set(Some(3));
+    rig.calls.poison_finish_at.set(Some(3));
+
+    let (flush, frontiers) = ready(rig.run(limits(9), None));
+    assert_eq!(flush, Flush::DiskPressure);
+    assert_eq!(frontiers.prepared, Some(2));
+}
+
+/// The same close with no capture lost is no reason to go on, and neither is a
+/// close that failed for another reason.
+#[test]
+fn a_failed_close_stops_unless_a_capture_ran_out_on_the_same_volume() {
+    let chain = Chain::spanning(12);
+
+    let rig = Rig::new(&chain);
+    rig.calls.poison_finish_at.set(Some(3));
+    let error = rig.run(limits(9), None).unwrap_err();
+    assert!(
+        matches!(error, backfill::Error::StorePoisoned(_)),
+        "{error}"
+    );
+    assert_eq!(rig.sequences(), [1, 2]);
+    assert_eq!(rig.batch().ready(), None);
+
+    let rig = Rig::new(&chain);
+    rig.calls.full_at.set(Some(3));
+    rig.calls.break_finish_at.set(Some(3));
+    let error = rig.run(limits(9), None).unwrap_err();
+    assert!(matches!(error, backfill::Error::Caller(_)), "{error}");
+    assert_eq!(rig.batch().ready(), None);
+}
+
+/// A capture a restart took closes over a workspace rather than a session.
+#[test]
+fn a_failed_workspace_close_keeps_a_capture_that_ran_out() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.cancel_at_boundary.set(Some(3));
+    assert!(matches!(
+        rig.run(limits(9), None),
+        Err(backfill::Error::Interrupted)
+    ));
+    assert_eq!(rig.sequences(), [1, 2]);
+    rig.calls.cancel.restart();
+
+    rig.calls.full_at.set(Some(3));
+    rig.calls.poison_workspace_close.set(true);
+    let (flush, frontiers) = ready(rig.run(limits(9), None));
+    assert_eq!(flush, Flush::DiskPressure);
+    assert_eq!(frontiers.prepared, Some(2));
+}
+
+/// Every place a run touches the stores reads their failure the same way, on a
+/// batch of one and a larger one alike.
+#[test]
+fn a_store_failing_anywhere_in_a_run_is_the_same_stop() {
+    let chain = Chain::spanning(12);
+
+    type Fault = (&'static str, fn(&Calls));
+    let filling: [Fault; 3] = [
+        ("opening", |calls| calls.open_full.set(true)),
+        ("starting", |calls| calls.start_full.set(true)),
+        ("pruning", |calls| calls.prune_full.set(true)),
+    ];
+    for (what, fault) in filling {
+        let rig = Rig::new(&chain);
+        assert_eq!(
+            rig.run(Limits::ONE, Some(1)).unwrap(),
+            Outcome::UntilEpoch { sequence: 1 }
+        );
+        fault(&rig.calls);
+        let error = rig.run(Limits::ONE, Some(2)).unwrap_err();
+        assert!(
+            matches!(error, backfill::Error::ReplayFilledVolume(_)),
+            "{what}: {error}"
+        );
+        assert_eq!(
+            rig.run(Limits::ONE, Some(2)).unwrap(),
+            Outcome::UntilEpoch { sequence: 2 },
+            "{what}"
+        );
+    }
+
+    for batching in [Limits::ONE, limits(9)] {
+        let rig = Rig::new(&chain);
+        rig.source_ends_after(2);
+        assert!(rig.run(batching, None).is_ok());
+        rig.calls.poison_workspace_close.set(true);
+        let error = rig.run(batching, None).unwrap_err();
+        assert!(
+            matches!(error, backfill::Error::StorePoisoned(_)),
+            "{error}"
+        );
+    }
+}
+
+/// The client names only the locations it tried, whatever filled the volume, so
+/// the failure carries what the volume holds. Takes the retries' whole backoff.
+#[test]
+fn a_failed_download_says_what_its_volume_holds() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    std::fs::remove_dir_all(rig.download.join("immutable")).unwrap();
+    rig.calls.beacon.set(100);
+
+    let error = rig.run(Limits::ONE, None).unwrap_err();
+    assert!(matches!(error, backfill::Error::Mithril { .. }), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("bytes free"), "{message}");
+    assert!(
+        message.contains(&rig.download.display().to_string()),
+        "{message}"
+    );
 }
 
 /// Where `index`'s block stands, as a commit of it would leave the cursor.
