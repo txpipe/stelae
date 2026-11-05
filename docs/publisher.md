@@ -277,7 +277,9 @@ Three cases read differently:
 
 - **A background worker filling it.** The run sees only `FjallError: Poisoned`, and
   the log holds the worker's error as `Worker #N crashed`. A failing disk reads the
-  same, so that stop asks you to check both and doesn't call the volume full.
+  same, so that stop asks you to check both and doesn't call the volume full. Each
+  store's close also waits up to a minute for flushes a dead worker will never
+  finish, so on a volume still full a rerun can take minutes to stop.
 - **A hang.** On the pinned fjall, backpressure and shutdown can wait on workers
   that have already died, and making room doesn't wake them. That was seen on real
   full volumes below the publisher, not through a whole run. The process stays up
