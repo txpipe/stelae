@@ -34,7 +34,10 @@ impl Fixture {
             &genesis,
             &retained(),
             Selection::default(),
-            Destination::Directory(stele.clone()),
+            Destination::Directory {
+                path: stele.clone(),
+                scratch_dir: None,
+            },
             false,
             &Observer::silent(),
         )

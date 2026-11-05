@@ -31,11 +31,23 @@ const BATCH_DIR: &str = ".stelae-batch";
 const JOURNAL_FILE: &str = "journal.json";
 const PREPARED_DIR: &str = "prepared";
 const STAGING_DIR: &str = "staging";
+const BEGAN_FILE: &str = ".stelae-batch-began.json";
 
 /// Where a publisher keeps its batch. Inside the storage path because it is
 /// recovery data for those stores, and clearing them has to take it too.
 pub fn dir_in(storage_path: &Path) -> PathBuf {
     storage_path.join(BATCH_DIR)
+}
+
+/// What a batch over an empty repository leaves beside the stores, outside the
+/// batch: the first sequence they may pass unpublished. No stele can restore
+/// those stores, so without this a lost batch reads as a deliberate first stele
+/// further on. Clearing the storage path takes it too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Began {
+    format: u32,
+    first: u64,
 }
 
 /// The controls bounding a batch. The epoch count and the scratch budget are
@@ -175,13 +187,13 @@ pub enum Position {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("batch journal at {path}: {source}")]
+    #[error("batch at {path}: {source}")]
     Io {
         path: PathBuf,
         #[source]
         source: io::Error,
     },
-    #[error("batch journal at {path} is unreadable ({reason}). {REPLAY}")]
+    #[error("the batch record at {path} is unreadable ({reason}). {REPLAY}")]
     Corrupt { path: PathBuf, reason: String },
     #[error(
         "the batch at {path} was prepared from another {what}: run the build and configuration \
@@ -190,6 +202,16 @@ pub enum Error {
     SourceChanged { path: PathBuf, what: &'static str },
     #[error("sequence {sequence} of the batch at {path} can't be used: {source}. {REPLAY}")]
     BundleLost {
+        sequence: u64,
+        path: PathBuf,
+        #[source]
+        source: Box<dolos_snapshot::Error>,
+    },
+    #[error(
+        "sequence {sequence} of the batch at {path} can't be read, and may be intact: {source}. \
+         Fix what stops this process reading it and rerun"
+    )]
+    BundleUnreadable {
         sequence: u64,
         path: PathBuf,
         #[source]
@@ -231,13 +253,27 @@ pub enum Error {
          --batch-epochs that prepared it"
     )]
     Pending { prepared: usize, path: PathBuf },
+    #[error(
+        "the repository is empty and these stores stand at sequence {sequence}, past the sequence \
+         {first} a batch began from, as {path} records. Nothing holds what it prepared, and a \
+         history starting here would leave those sequences out: {REPLAY_FROM_GENESIS}"
+    )]
+    HistoryLost {
+        first: u64,
+        sequence: u64,
+        path: PathBuf,
+    },
     #[error("preparing a boundary")]
     Preparing(#[source] Box<dolos_snapshot::Error>),
 }
 
-/// The one recovery from losing what only a batch holds.
+/// The recovery from losing what only a batch holds.
 const REPLAY: &str = "Nothing else holds those boundaries: restore the stores from the \
-                      repository's latest stele and delete the batch to replay them";
+                      repository's latest stele and delete the batch to replay them. A repository \
+                      with no stele has nothing to restore, so clear the storage path and run \
+                      with --allow-genesis";
+
+const REPLAY_FROM_GENESIS: &str = "clear the storage path and run with --allow-genesis";
 
 fn io_at(path: &Path) -> impl FnOnce(io::Error) -> Error + '_ {
     move |source| Error::Io {
@@ -278,6 +314,58 @@ pub fn refuse_pending(storage_path: &Path) -> Result<(), Error> {
         }),
         _ => Ok(()),
     }
+}
+
+/// Refuse to start a history at `sequence` when a batch over an empty
+/// repository began before it. Only an empty repository asks this: any other
+/// refuses the gap on its own.
+pub fn refuse_lost_history(storage_path: &Path, sequence: u64) -> Result<(), Error> {
+    let path = storage_path.join(BEGAN_FILE);
+    match read_began(&path)? {
+        Some(first) if sequence > first => Err(Error::HistoryLost {
+            first,
+            sequence,
+            path,
+        }),
+        _ => Ok(()),
+    }
+}
+
+fn read_began(path: &Path) -> Result<Option<u64>, Error> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_at(path)(error)),
+    };
+    let corrupt = |reason: String| Error::Corrupt {
+        path: path.to_owned(),
+        reason,
+    };
+    let began: Began =
+        serde_json::from_slice(&bytes).map_err(|error| corrupt(error.to_string()))?;
+    if began.format != JOURNAL_FORMAT {
+        return Err(corrupt(format!(
+            "format {}, this build reads {JOURNAL_FORMAT}",
+            began.format
+        )));
+    }
+    Ok(Some(began.first))
+}
+
+/// Write `bytes` to `path` so that a crash leaves the old file or the new one.
+fn write_durably(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let partial = path.with_extension("partial");
+    let write = || -> io::Result<()> {
+        let mut file = File::create(&partial)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&partial, path)?;
+        match path.parent() {
+            Some(parent) => sync_dir(parent),
+            None => Ok(()),
+        }
+    };
+    write().map_err(io_at(path))
 }
 
 /// What a bundle holds: every layer's descriptor, and the boundary it stands
@@ -385,9 +473,31 @@ impl Batch {
         }
     }
 
-    /// Pin what the batch about to begin follows.
-    pub fn begin(&mut self, predecessor: Option<Committed>) {
+    /// Pin what the batch about to begin at `sequence` follows. Over an empty
+    /// repository this starts a history, so it refuses to where a batch already
+    /// passed sequences, and otherwise records where this one begins, durably
+    /// and before replay can pass it.
+    pub fn begin(
+        &mut self,
+        storage_path: &Path,
+        sequence: u64,
+        predecessor: Option<Committed>,
+    ) -> Result<(), Error> {
+        if predecessor.is_none() {
+            refuse_lost_history(storage_path, sequence)?;
+            let path = storage_path.join(BEGAN_FILE);
+            if read_began(&path)? != Some(sequence) {
+                let began = Began {
+                    format: JOURNAL_FORMAT,
+                    first: sequence,
+                };
+                let bytes =
+                    serde_json::to_vec(&began).map_err(|error| io_at(&path)(error.into()))?;
+                write_durably(&path, &bytes)?;
+            }
+        }
         self.predecessor = predecessor;
+        Ok(())
     }
 
     /// Refuse a repository that moved since the batch began.
@@ -441,14 +551,26 @@ impl Batch {
             .iter()
             .map(|prepared| {
                 let sequence = prepared.sequence;
-                let bundle = self
-                    .store
-                    .load(sequence)
-                    .map_err(|source| Error::BundleLost {
-                        sequence,
-                        path: self.dir.clone(),
-                        source: Box::new(source),
-                    })?;
+                let bundle = self.store.load(sequence).map_err(|source| {
+                    let path = self.dir.clone();
+                    let unreadable = matches!(
+                        source,
+                        dolos_snapshot::Error::Preparation(prepare::Refusal::Io(_))
+                    );
+                    let source = Box::new(source);
+                    match unreadable {
+                        true => Error::BundleUnreadable {
+                            sequence,
+                            path,
+                            source,
+                        },
+                        false => Error::BundleLost {
+                            sequence,
+                            path,
+                            source,
+                        },
+                    }
+                })?;
                 let found = bundle_identity(&bundle);
                 if found != prepared.bundle {
                     return Err(Error::BundleChanged {
@@ -463,17 +585,21 @@ impl Batch {
 
     fn save(&self) -> Result<(), Error> {
         let path = self.dir.join(JOURNAL_FILE);
-        let partial = self.dir.join(format!("{JOURNAL_FILE}.partial"));
         let bytes =
             serde_json::to_vec_pretty(&self.journal).map_err(|error| io_at(&path)(error.into()))?;
-        let write = || -> io::Result<()> {
-            let mut file = File::create(&partial)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(&partial, &path)?;
-            sync_dir(&self.dir)
-        };
-        write().map_err(io_at(&path))
+        write_durably(&path, &bytes)
+    }
+
+    /// Drop what a failed capture left, so the batch is charged only for what
+    /// the journal names: payloads with no bundle, and a bundle it never named.
+    pub fn sweep(&self) -> Result<(), Error> {
+        let store = |error| Error::Preparing(Box::new(error));
+        for sequence in self.store.sequences().map_err(store)? {
+            if self.prepared().iter().all(|p| p.sequence != sequence) {
+                self.store.release(sequence).map_err(store)?;
+            }
+        }
+        self.store.sweep().map_err(store)
     }
 
     /// Journal a complete bundle, once the stores that reached it are durable.
@@ -639,10 +765,39 @@ pub fn out_of_space(error: &dolos_snapshot::Error) -> bool {
         E::Stelae(stelae::Error::Io(source)) => source,
         _ => return false,
     };
+    fills_volume(source.kind())
+}
+
+fn fills_volume(kind: io::ErrorKind) -> bool {
     matches!(
-        source.kind(),
+        kind,
         io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded
     )
+}
+
+/// Whether anything in `error`'s chain says the volume is full. The stores hand
+/// their errors on as text, so what has no type left is read by its words.
+pub fn reports_full_volume(error: &(dyn std::error::Error + 'static)) -> bool {
+    const WORDS: [&str; 3] = [
+        "no space left on device",
+        "disk quota exceeded",
+        "disc quota exceeded",
+    ];
+    let mut next = Some(error);
+    while let Some(error) = next {
+        if error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| fills_volume(error.kind()))
+        {
+            return true;
+        }
+        let text = error.to_string().to_lowercase();
+        if WORDS.iter().any(|words| text.contains(words)) {
+            return true;
+        }
+        next = error.source();
+    }
+    false
 }
 
 #[cfg(test)]
@@ -899,7 +1054,7 @@ mod tests {
             sequence,
             identity: format!("sha256:{sequence}"),
         };
-        batch.begin(Some(at(3)));
+        batch.begin(dir.path(), 4, Some(at(3))).unwrap();
         batch.check_predecessor(Some(at(3))).unwrap();
         for found in [
             Some(at(4)),
@@ -914,6 +1069,93 @@ mod tests {
                 Err(Error::PredecessorMoved { .. })
             ));
         }
+    }
+
+    #[test]
+    fn a_capture_that_overshot_the_budget_flushes_what_it_holds() {
+        // Past the budget before anything else is asked of it: the batch closes
+        // on two boundaries rather than refusing as if it couldn't hold one.
+        let dir = tempfile::tempdir().unwrap();
+        let held = [prepared(1, 100), prepared(2, 900)];
+        let batch = batch_holding(dir.path(), limits(9, 500, 10), &held, 1000);
+        assert_eq!(
+            batch.admit(false, &|_| true).unwrap(),
+            Admission::Flush(Flush::ScratchBudget)
+        );
+    }
+
+    #[test]
+    fn the_next_boundary_is_estimated_at_the_largest_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = [prepared(1, 100), prepared(2, 10)];
+        // Used 110; three reserves of 10 and the largest yet, 100: 240 in all.
+        let at = |scratch| {
+            batch_holding(dir.path(), limits(9, scratch, 10), &held, 110)
+                .admit(false, &|_| true)
+                .unwrap()
+        };
+        assert_eq!(at(239), Admission::Flush(Flush::ScratchBudget));
+        assert_eq!(at(240), Admission::Advance);
+    }
+
+    #[test]
+    fn a_history_is_refused_only_past_where_a_batch_began() {
+        let dir = tempfile::tempdir().unwrap();
+        refuse_lost_history(dir.path(), 9).unwrap();
+
+        let mut batch = batch_holding(dir.path(), limits(9, u64::MAX, 0), &[], 0);
+        batch.begin(dir.path(), 4, None).unwrap();
+        refuse_lost_history(dir.path(), 4).unwrap();
+        assert!(matches!(
+            refuse_lost_history(dir.path(), 5),
+            Err(Error::HistoryLost {
+                first: 4,
+                sequence: 5,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_batch_following_a_stele_records_no_beginning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut batch = batch_holding(dir.path(), limits(9, u64::MAX, 0), &[], 0);
+        let latest = Committed {
+            sequence: 3,
+            identity: "sha256:3".to_owned(),
+        };
+        batch.begin(dir.path(), 4, Some(latest)).unwrap();
+        refuse_lost_history(dir.path(), 9).unwrap();
+    }
+
+    #[test]
+    fn a_damaged_beginning_is_refused_rather_than_read_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(BEGAN_FILE), b"{").unwrap();
+        assert!(matches!(
+            refuse_lost_history(dir.path(), 1),
+            Err(Error::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn a_full_volume_is_read_through_the_chain_and_the_words() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("wrapped")]
+        struct Wrapped(#[source] io::Error);
+
+        let typed = Wrapped(io::ErrorKind::StorageFull.into());
+        assert!(reports_full_volume(&typed));
+
+        // What the stores really give: their errors flattened into text.
+        let text = io::Error::other("state error: IO: No space left on device (os error 28)");
+        assert!(reports_full_volume(&text));
+        let quota = io::Error::other("Disk quota exceeded (os error 122)");
+        assert!(reports_full_volume(&quota));
+
+        let other = Wrapped(io::ErrorKind::PermissionDenied.into());
+        assert!(!reports_full_volume(&other));
+        assert!(!reports_full_volume(&io::Error::other("broken invariant")));
     }
 
     #[test]

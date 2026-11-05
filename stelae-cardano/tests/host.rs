@@ -23,7 +23,10 @@ fn a_bounded_fixture_publishes_to_a_directory_through_the_new_host() {
         &genesis,
         &RetainedEpochs::default(),
         Selection::default(),
-        Destination::Directory(destination.clone()),
+        Destination::Directory {
+            path: destination.clone(),
+            scratch_dir: None,
+        },
         false,
         &Observer::silent(),
     )
@@ -71,7 +74,10 @@ fn a_restored_stele_publishes_the_same_inscription() {
             genesis,
             &retained,
             Selection::default(),
-            Destination::Directory(destination),
+            Destination::Directory {
+                path: destination,
+                scratch_dir: None,
+            },
             false,
             &Observer::silent(),
         )
@@ -122,7 +128,10 @@ fn retained_state_epochs_reach_the_signed_inscription() {
         &genesis,
         &retained,
         Selection::default(),
-        Destination::Directory(destination.clone()),
+        Destination::Directory {
+            path: destination.clone(),
+            scratch_dir: None,
+        },
         false,
         &Observer::silent(),
     )

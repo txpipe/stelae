@@ -167,6 +167,15 @@ struct Calls {
     cancel_at_boundary: Cell<Option<u64>>,
     /// Cancel when the source runs out, which leaves replay in mid-epoch.
     cancel_at_end_of_source: Cell<bool>,
+    /// Write this sequence's payloads, then fail as a full volume before its
+    /// marker stands: what a later shard hitting ENOSPC leaves behind.
+    payload_then_full: Cell<Option<u64>>,
+    prepared_root: RefCell<Option<PathBuf>>,
+    /// Fail the import aiming at this epoch as a full volume.
+    import_full_at: Cell<Option<u64>>,
+    /// Fail the session's close as a full volume, once this sequence is
+    /// captured.
+    finish_full_after: Cell<Option<u64>>,
 }
 
 /// A cancellation token a restarted run gets afresh, as a new process would.
@@ -251,6 +260,15 @@ impl<S: SnapshotSource> SnapshotSource for Counted<'_, S> {
         request: &prepare::Request<'_>,
         observer: &Observer,
     ) -> Result<Bundle, dolos_snapshot::Error> {
+        if self.calls.payload_then_full.get() == Some(plan.sequence) {
+            self.calls.payload_then_full.set(None);
+            self.inner
+                .prepare_boundary(store, plan, request, observer)?;
+            let root = self.calls.prepared_root.borrow().clone().unwrap();
+            std::fs::remove_file(root.join("bundles").join(format!("{}.json", plan.sequence)))
+                .unwrap();
+            return Err(prepare::Refusal::Io(io::ErrorKind::StorageFull.into()).into());
+        }
         if self.calls.full_at.get() == Some(plan.sequence) {
             self.calls.full_at.set(None);
             return Err(prepare::Refusal::Io(io::ErrorKind::StorageFull.into()).into());
@@ -352,6 +370,12 @@ impl Session for CountedSession<'_> {
     }
 
     fn import_blocks(&mut self, blocks: Vec<RawBlock>) -> Result<ReplayProgress, backfill::Error> {
+        if self.calls.import_full_at.get() == Some(self.target) {
+            self.calls.import_full_at.set(None);
+            return Err(backfill::Error::caller(io::Error::from(
+                io::ErrorKind::StorageFull,
+            )));
+        }
         let progress = self
             .inner
             .import_blocks(blocks)
@@ -372,6 +396,13 @@ impl Session for CountedSession<'_> {
         (self.after_capture)(self.calls);
         let finish = self.inner.finish().map_err(backfill::Error::caller);
         let last = self.calls.prepared.borrow().last().copied();
+        if last.is_some() && self.calls.finish_full_after.get() == last {
+            self.calls.finish_full_after.set(None);
+            finish?;
+            return Err(backfill::Error::caller(io::Error::from(
+                io::ErrorKind::StorageFull,
+            )));
+        }
         if last.is_some() && self.calls.fail_finish_after.get() == last {
             self.calls.fail_finish_after.set(None);
             finish?;
@@ -1223,6 +1254,91 @@ fn consumed_input_goes_only_after_the_journal_names_the_boundary() {
     assert_eq!(files.first(), Some(&40), "{files:?}");
 }
 
+/// Stand the stores on `stop`'s boundary with no batch: what a restore of the
+/// repository's latest stele, or a batch of one, leaves behind.
+fn stand_on(rig: &Rig<'_>, stop: u64) {
+    let mut session =
+        BulkReplaySession::open(&rig.node.config, rig.chain.genesis.clone(), Some(stop)).unwrap();
+    let progress = session.import_blocks(rig.chain.blocks.clone()).unwrap();
+    assert!(progress.is_boundary(), "stop {stop}: {progress:?}");
+    session.finish().unwrap();
+}
+
+fn repository_at(rig: &Rig<'_>, sequence: u64) {
+    *rig.repository.latest.borrow_mut() = Some(Committed {
+        sequence,
+        identity: format!("sha256:{sequence}"),
+    });
+}
+
+fn batch_dir(rig: &Rig<'_>) -> PathBuf {
+    batch::dir_in(&rig.node.config.storage.path)
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    let status = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(from)
+        .arg(to)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// Stores on boundary 1 with 1 published, a copy of them standing for what a
+/// restore of the repository's latest gives, and a batch of 2..=4 prepared.
+fn batch_over_a_held_repository(rig: &Rig<'_>) -> PathBuf {
+    assert_eq!(
+        rig.run(Limits::ONE, Some(1)).unwrap(),
+        Outcome::UntilEpoch { sequence: 1 }
+    );
+    repository_at(rig, 1);
+    let kept = rig.node.path().join("kept");
+    copy_tree(&rig.node.config.storage.path, &kept);
+    let (_, frontiers) = ready(rig.run(limits(3), None));
+    assert_eq!(frontiers.prepared, Some(4));
+    assert_eq!(rig.sequences(), [2, 3, 4]);
+    kept
+}
+
+fn restore_stores(rig: &Rig<'_>, kept: &Path) {
+    let data = &rig.node.config.storage.path;
+    std::fs::remove_dir_all(data).unwrap();
+    copy_tree(kept, data);
+    assert!(!batch_dir(rig).exists());
+}
+
+fn stage_under(rig: &Rig<'_>, limits: Limits) -> Result<u64, batch::Error> {
+    let workspace = ReplayWorkspace::open(&rig.node.config, rig.chain.genesis.clone()).unwrap();
+    let snapshot = workspace.snapshot();
+    let observer = Observer::silent();
+    let mut batch = rig.batch_under(limits);
+    let staged = batch
+        .stage(&snapshot, &First, &observer)
+        .map(|staged| staged.report().bytes);
+    drop(snapshot);
+    workspace.finish().unwrap();
+    staged
+}
+
+/// A registry holding nothing: it answers every request with a 404.
+fn empty_registry() -> String {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    format!("oci://127.0.0.1:{port}/cardano/test")
+}
+
 fn tree_bytes(path: &Path) -> u64 {
     let mut total = 0;
     for entry in std::fs::read_dir(path).unwrap().flatten() {
@@ -1233,4 +1349,688 @@ fn tree_bytes(path: &Path) -> u64 {
         };
     }
     total
+}
+
+/// The journal is gone, and the bundles it named with it as far as anyone can
+/// tell: an empty repository has no gap to refuse by.
+#[test]
+fn a_lost_journal_on_an_empty_repository_refuses() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    let (_, frontiers) = ready(rig.run(limits(4), None));
+    assert_eq!(frontiers.prepared, Some(4));
+
+    std::fs::remove_file(batch_dir(&rig).join("journal.json")).unwrap();
+    assert!(batch_dir(&rig).join("prepared/bundles/1.json").exists());
+
+    let error = rig.run(limits(4), None).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            backfill::Error::Batch(batch::Error::HistoryLost {
+                first: 1,
+                sequence: 4,
+                ..
+            })
+        ),
+        "{error}"
+    );
+    assert!(error.to_string().contains("--allow-genesis"), "{error}");
+    assert!(rig.sequences().is_empty());
+    assert_eq!(*rig.calls.prepared.borrow(), [1, 2, 3, 4]);
+}
+
+/// Deleting the batch is the recovery over a held repository, so it is the step
+/// an operator can reach for over an empty one too.
+#[test]
+fn a_deleted_batch_on_an_empty_repository_refuses() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(4), None));
+
+    std::fs::remove_dir_all(batch_dir(&rig)).unwrap();
+
+    let error = rig.run(limits(4), None).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            backfill::Error::Batch(batch::Error::HistoryLost { .. })
+        ),
+        "{error}"
+    );
+    assert_eq!(*rig.calls.prepared.borrow(), [1, 2, 3, 4]);
+}
+
+#[test]
+fn a_batch_of_one_after_a_deleted_batch_publishes_nothing() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(4), None));
+
+    std::fs::remove_dir_all(batch_dir(&rig)).unwrap();
+
+    let error = rig.run(Limits::ONE, Some(4)).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            backfill::Error::Batch(batch::Error::HistoryLost { .. })
+        ),
+        "{error}"
+    );
+    assert_eq!(rig.calls.published.get(), 0);
+}
+
+/// A repository publish reads the same record, once the repository is empty.
+#[test]
+fn a_repository_publish_after_a_deleted_batch_publishes_nothing() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(4), None));
+
+    std::fs::remove_dir_all(batch_dir(&rig)).unwrap();
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let publish = |dry_run| {
+        stelae_cardano::publisher::publish_once(
+            &rig.node.config,
+            &chain.genesis,
+            &retained(),
+            stelae_cardano::Selection::default(),
+            stelae_cardano::publisher::Destination::Repository {
+                direct_s3: None,
+                repository: empty_registry().parse().unwrap(),
+                auth: stelae_cardano::Auth::Anonymous,
+                insecure: true,
+                scratch_dir: None,
+                rebuild: false,
+                concurrency: None,
+                verify_carried: false,
+                require_new: false,
+            },
+            dry_run,
+            &Observer::silent(),
+        )
+    };
+    let error = publish(false).unwrap_err();
+    assert!(error.to_string().contains("--allow-genesis"), "{error}");
+
+    // A dry run publishes nothing, so it has nothing to refuse here.
+    let previewed = publish(true).map(|_| ()).map_err(|error| error.to_string());
+    assert!(
+        !previewed.is_err_and(|error| error.contains("--allow-genesis")),
+        "a dry run stops at the record"
+    );
+}
+
+/// Over a held repository the gap refuses on its own, and nothing else is
+/// asked.
+#[test]
+fn a_deleted_batch_over_a_held_repository_refuses_the_gap() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    batch_over_a_held_repository(&rig);
+
+    std::fs::remove_dir_all(batch_dir(&rig)).unwrap();
+
+    let error = rig.run(limits(3), None).unwrap_err();
+    assert!(error.to_string().contains("gap"), "{error}");
+}
+
+/// A batch of one over a record it hasn't passed is the same first stele.
+#[test]
+fn a_first_capture_that_failed_leaves_the_first_stele_possible() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.full_at.set(Some(1));
+    assert!(matches!(
+        rig.run(limits(2), None),
+        Err(backfill::Error::NoRoom { .. })
+    ));
+
+    assert_eq!(
+        rig.run(Limits::ONE, Some(1)).unwrap(),
+        Outcome::UntilEpoch { sequence: 1 }
+    );
+    assert_eq!(rig.calls.published.get(), 1);
+}
+
+/// Once the repository holds a stele, the record has nothing left to say.
+#[test]
+fn the_record_of_a_beginning_is_inert_over_a_held_repository() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.full_at.set(Some(1));
+    assert!(rig.run(limits(2), None).is_err());
+    assert_eq!(
+        rig.run(Limits::ONE, Some(1)).unwrap(),
+        Outcome::UntilEpoch { sequence: 1 }
+    );
+    repository_at(&rig, 1);
+
+    assert_eq!(
+        rig.run(Limits::ONE, Some(2)).unwrap(),
+        Outcome::UntilEpoch { sequence: 2 }
+    );
+    assert_eq!(rig.calls.published.get(), 3);
+}
+
+/// Clearing the storage path, the recovery the refusal names, takes the record.
+#[test]
+fn clearing_the_storage_path_starts_a_history_again() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(4), None));
+
+    dolos::storage::clear_storage(&rig.node.config.storage.path).unwrap();
+    rig.restart_with_the_whole_source();
+
+    let (_, frontiers) = ready(rig.run(limits(4), None));
+    assert_eq!(frontiers.prepared, Some(4));
+    assert_eq!(rig.sequences(), [1, 2, 3, 4]);
+}
+
+/// A window a lost replay left behind can't continue a restored one, and the
+/// refusal says which directory to empty.
+#[test]
+fn a_replay_over_a_surviving_immutable_dir_names_the_directory() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    let kept = batch_over_a_held_repository(&rig);
+
+    restore_stores(&rig, &kept);
+    let error = rig.run(limits(3), None).unwrap_err();
+    assert!(
+        matches!(error, backfill::Error::StaleWindow { .. }),
+        "{error}"
+    );
+    let immutable = rig.download.join("immutable");
+    assert!(
+        error.to_string().contains(immutable.to_str().unwrap()),
+        "{error}"
+    );
+
+    // Past the directory, replay reaches the source, which offers nothing here.
+    std::fs::remove_dir_all(&immutable).unwrap();
+    assert_eq!(rig.run(limits(3), None).unwrap(), Outcome::UpToDate);
+}
+
+/// The same from a cleared store, the route for an empty repository.
+#[test]
+fn a_genesis_replay_over_a_surviving_immutable_dir_names_the_directory() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(4), None));
+
+    dolos::storage::clear_storage(&rig.node.config.storage.path).unwrap();
+    let error = rig.run(limits(4), None).unwrap_err();
+    assert!(
+        matches!(error, backfill::Error::StaleWindow { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("first block"), "{error}");
+}
+
+/// Only the stale directory stands in the way: restored stores with their files
+/// replay the same sequences.
+#[test]
+fn restored_stores_with_their_files_replay_the_batch() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    let kept = batch_over_a_held_repository(&rig);
+
+    restore_stores(&rig, &kept);
+    rig.restart_with_the_whole_source();
+    let (_, frontiers) = ready(rig.run(limits(3), None));
+    assert_eq!(frontiers.prepared, Some(4));
+    assert_eq!(rig.sequences(), [2, 3, 4]);
+}
+
+/// Every route the refusal names for a batch nothing holds, and what
+/// `initialize` does for each.
+#[test]
+fn the_recovery_names_a_route_for_an_empty_repository() {
+    use stelae_cardano::initialize::{self, Outcome as Init};
+
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(3), None));
+
+    std::fs::remove_file(batch_dir(&rig).join("prepared/bundles/2.json")).unwrap();
+    let message = rig.run(limits(3), None).unwrap_err().to_string();
+    assert!(message.contains("delete the batch"), "{message}");
+    assert!(message.contains("clear the storage path"), "{message}");
+    assert!(message.contains("--allow-genesis"), "{message}");
+
+    let options = |allow_genesis| initialize::Options {
+        source: dolos_snapshot::restore::Source::Dir(rig.node.path().join("no-stele")),
+        point: dolos_snapshot::facade::Point::Latest,
+        auth: stelae_cardano::Auth::Anonymous,
+        insecure: false,
+        scratch_dir: None,
+        skip_space_check: true,
+        resume: false,
+        allow_genesis,
+    };
+    let observer = Observer::silent();
+
+    let at = rig.cursor();
+    let existing =
+        initialize::run(&rig.node.config, &chain.genesis, &options(false), &observer).unwrap();
+    assert_eq!(existing, Init::Existing);
+    assert_eq!(rig.cursor(), at);
+
+    dolos::storage::clear_storage(&rig.node.config.storage.path).unwrap();
+    let refused =
+        initialize::run(&rig.node.config, &chain.genesis, &options(false), &observer).unwrap_err();
+    assert!(
+        refused.to_string().contains("refusing genesis"),
+        "{refused}"
+    );
+    assert_eq!(
+        initialize::run(&rig.node.config, &chain.genesis, &options(true), &observer).unwrap(),
+        Init::Genesis
+    );
+}
+
+/// `Io` is the machine: the bundle may be intact, so nothing advises discarding
+/// it, and with the machine fixed the batch goes on.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_intact_bundle_is_not_called_lost() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(3), None));
+
+    let manifest = batch_dir(&rig).join("prepared/bundles/2.json");
+    let set =
+        |mode| std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(mode)).unwrap();
+    set(0o000);
+    let outcome = rig.run(limits(3), None);
+    set(0o644);
+    let error = outcome.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            backfill::Error::Batch(batch::Error::BundleUnreadable { sequence: 2, .. })
+        ),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("delete the batch"), "{error}");
+
+    let (_, frontiers) = ready(rig.run(limits(3), None));
+    assert_eq!(frontiers.prepared, Some(3));
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_journal_or_batch_is_reported_as_io() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(3), None));
+
+    let dir = batch_dir(&rig);
+    let journal = dir.join("journal.json");
+    let set = |path: &Path, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    set(&journal, 0o000);
+    let outcome = rig.run(limits(3), None);
+    set(&journal, 0o644);
+    let error = outcome.unwrap_err();
+    assert!(
+        matches!(error, backfill::Error::Batch(batch::Error::Io { .. })),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("delete the batch"), "{error}");
+
+    set(&dir, 0o000);
+    let outcome = rig.run(limits(3), None);
+    set(&dir, 0o755);
+    let error = outcome.unwrap_err();
+    assert!(!error.to_string().contains("delete the batch"), "{error}");
+}
+
+/// What the volume can't hold mustn't starve the flush it closes for.
+#[test]
+fn a_failed_capture_leaves_no_payload_to_starve_the_flush() {
+    let chain = Chain::spanning(12);
+
+    let clean = Rig::new(&chain);
+    clean.calls.full_at.set(Some(3));
+    let (flush, _) = ready(clean.run(limits(9), None));
+    assert_eq!(flush, Flush::DiskPressure);
+    let clean_prepared = tree_bytes(&batch_dir(&clean).join("prepared"));
+    let clean_needs = stage_under(&clean, limits(9)).unwrap();
+
+    let rig = Rig::new(&chain);
+    *rig.calls.prepared_root.borrow_mut() = Some(batch_dir(&rig).join("prepared"));
+    rig.calls.payload_then_full.set(Some(3));
+    let (flush, frontiers) = ready(rig.run(limits(9), None));
+    assert_eq!(flush, Flush::DiskPressure);
+    assert_eq!(frontiers.prepared, Some(2));
+    let prepared = tree_bytes(&batch_dir(&rig).join("prepared"));
+    assert!(prepared <= clean_prepared + 256, "{prepared}");
+
+    // Room for exactly what the journaled batch needs, plus slack for capture ids.
+    let budget = Limits {
+        scratch: clean_prepared + clean_needs + 256,
+        ..limits(9)
+    };
+    stage_under(&rig, budget).unwrap();
+}
+
+/// A failed first capture has nothing to flush, and charges a rerun nothing.
+#[test]
+fn a_failed_first_capture_leaves_no_payload_behind() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    *rig.calls.prepared_root.borrow_mut() = Some(batch_dir(&rig).join("prepared"));
+    rig.calls.payload_then_full.set(Some(1));
+
+    let error = rig.run(limits(2), None).unwrap_err();
+    assert!(
+        matches!(error, backfill::Error::NoRoom { used: 0, .. }),
+        "{error}"
+    );
+}
+
+/// A bundle the journal never named goes too: nothing vouches for it.
+#[test]
+fn a_close_on_a_full_volume_drops_a_bundle_the_journal_never_named() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+
+    rig.calls.fail_finish_after.set(Some(3));
+    rig.run(limits(9), None).unwrap_err();
+    assert_eq!(rig.sequences(), [1, 2]);
+    assert_eq!(rig.batch().store().sequences().unwrap(), [1, 2, 3]);
+
+    rig.calls.full_at.set(Some(3));
+    let (flush, frontiers) = ready(rig.run(limits(9), None));
+    assert_eq!(flush, Flush::DiskPressure);
+    assert_eq!(frontiers.prepared, Some(2));
+    assert_eq!(rig.batch().store().sequences().unwrap(), [1, 2]);
+    rig.batch().bundles().unwrap();
+}
+
+/// A replay filling the volume is a recoverable stop, and a rerun on the short
+/// volume closes what the batch holds.
+#[test]
+fn a_replay_filling_the_volume_stops_recoverably() {
+    let chain = Chain::spanning(12);
+    let mut rig = Rig::new(&chain);
+    rig.calls.import_full_at.set(Some(3));
+    let reserving = Limits {
+        reserve_per_epoch: 1000,
+        ..limits(9)
+    };
+
+    let error = rig.run(reserving, None).unwrap_err();
+    assert!(
+        matches!(error, backfill::Error::ReplayFilledVolume(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("--batch-reserve-mib"), "{error}");
+    assert_eq!(rig.sequences(), [1, 2]);
+    assert_eq!(rig.batch().ready(), None);
+
+    rig.room = Box::new(|_, bytes| bytes <= 2000);
+    let (flush, frontiers) = ready(rig.run(reserving, None));
+    assert_eq!(flush, Flush::DiskPressure);
+    assert_eq!(frontiers.prepared, Some(2));
+}
+
+/// A close that runs out of room is the same stop as a replay that does, and
+/// the capture it lost is taken again on the rerun.
+#[test]
+fn a_session_close_filling_the_volume_stops_recoverably() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.finish_full_after.set(Some(3));
+
+    let error = rig.run(limits(9), None).unwrap_err();
+    assert!(
+        matches!(error, backfill::Error::ReplayFilledVolume(_)),
+        "{error}"
+    );
+    assert_eq!(rig.sequences(), [1, 2]);
+
+    let (_, frontiers) = ready(rig.run(limits(4), None));
+    assert_eq!(frontiers.prepared, Some(4));
+    assert_eq!(*rig.calls.traversed.borrow(), [3]);
+}
+
+/// Another failure while replaying stays what it was.
+#[test]
+fn only_a_full_volume_is_read_as_one_during_replay() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.fail_finish_after.set(Some(2));
+    let error = rig.run(limits(9), None).unwrap_err();
+    assert!(matches!(error, backfill::Error::Caller(_)), "{error}");
+}
+
+/// Stores further than one sequence past the repository can't begin a batch:
+/// the first publication would leave a gap.
+#[test]
+fn stores_past_the_repository_begin_no_batch() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    stand_on(&rig, 3);
+    repository_at(&rig, 1);
+
+    let error = rig.run(limits(4), None).unwrap_err();
+    assert!(error.to_string().contains("gap"), "{error}");
+    assert!(rig.calls.prepared.borrow().is_empty());
+    assert!(rig.sequences().is_empty());
+}
+
+/// A batch over a non-empty repository follows its latest stele: at every
+/// boundary, in the journal, in the frontiers and across a restart.
+#[test]
+fn a_batch_keeps_following_the_stele_it_began_over() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    stand_on(&rig, 2);
+    repository_at(&rig, 1);
+
+    let (_, frontiers) = ready(rig.run(limits(3), None));
+    assert_eq!(rig.sequences(), [2, 3, 4]);
+    assert_eq!(frontiers.published, Some(1));
+    assert_eq!(*rig.calls.traversed.borrow(), [2]);
+
+    assert_eq!(
+        rig.batch().frontiers().published,
+        Some(1),
+        "the journal holds what the batch follows"
+    );
+
+    // A closed batch restarts over the same repository, and nothing moved.
+    ready(rig.run(limits(3), None));
+    assert_eq!(*rig.calls.prepared.borrow(), [2, 3, 4]);
+}
+
+/// A node the repository already holds at `until_epoch` has nothing to do.
+#[test]
+fn stores_already_published_at_until_epoch_are_done() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    stand_on(&rig, 2);
+    repository_at(&rig, 2);
+
+    assert_eq!(
+        rig.run(limits(4), Some(2)).unwrap(),
+        Outcome::UntilEpoch { sequence: 2 }
+    );
+    assert_eq!(rig.calls.sessions.get(), 0, "replay never started");
+    assert!(rig.calls.prepared.borrow().is_empty());
+    assert!(rig.sequences().is_empty());
+}
+
+/// Sequences the repository holds are replayed, pruned behind and never
+/// prepared, and the batch begins after the last of them.
+#[test]
+fn a_batch_begins_after_what_the_repository_already_holds() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    stand_on(&rig, 2);
+    repository_at(&rig, 3);
+
+    let (_, frontiers) = ready(rig.run(limits(2), None));
+    assert_eq!(*rig.calls.prepared.borrow(), [4, 5], "3 is already held");
+    assert_eq!(rig.sequences(), [4, 5]);
+    assert_eq!(frontiers.published, Some(3));
+    assert_eq!(rig.calls.pruned.get(), 2, "after each published boundary");
+    assert_eq!(rig.calls.published.get(), 0);
+}
+
+/// Only a full volume closes a batch. Any other failed capture is a failed run:
+/// it closes nothing and flushes nothing.
+#[test]
+fn a_capture_failing_for_another_reason_fails_the_run() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+
+    // Stands on 3 with a bundle the journal doesn't name yet, then damaged.
+    rig.calls.fail_finish_after.set(Some(3));
+    rig.run(limits(9), None).unwrap_err();
+    assert_eq!(rig.sequences(), [1, 2]);
+    let dir = batch::dir_in(&rig.node.config.storage.path);
+    std::fs::write(dir.join("prepared/bundles/3.json"), b"{").unwrap();
+
+    let error = rig.run(limits(9), None).unwrap_err();
+    assert!(
+        matches!(error, backfill::Error::Batch(batch::Error::Preparing(_))),
+        "{error}"
+    );
+    assert_eq!(rig.sequences(), [1, 2]);
+    assert_eq!(rig.batch().ready(), None, "the batch did not close");
+}
+
+/// A sound bundle standing on the recorded boundary and holding other layers:
+/// the bundle changes here, where
+/// a_bundle_that_is_not_the_one_recorded_is_refused changes the journal's
+/// record of it.
+#[test]
+fn a_sound_bundle_with_other_layers_on_the_same_boundary_is_refused() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(3), None));
+
+    let batch = rig.batch();
+    let recorded = batch.store().load(3).unwrap();
+    let dir = batch::dir_in(&rig.node.config.storage.path);
+    std::fs::remove_file(dir.join("prepared/bundles/3.json")).unwrap();
+
+    let workspace = ReplayWorkspace::open(&rig.node.config, chain.genesis.clone()).unwrap();
+    let snapshot = workspace.snapshot();
+    let mut plan = snapshot.plan(MAGIC.into(), retained()).unwrap();
+    plan.epochs.retain(|window| window.epoch == 3);
+    let request = prepare::Request {
+        store_contract: batch.source().store_contract.clone(),
+        mutable_slots: batch.source().mutable_slots,
+        tail: prepare::IndexTail::Traverse,
+    };
+    let other = snapshot
+        .prepare_boundary(batch.store(), &plan, &request, &Observer::silent())
+        .unwrap();
+    assert_eq!(other.cursor(), recorded.cursor(), "the same boundary");
+    assert!(other.layers().count() < recorded.layers().count());
+    drop(snapshot);
+    workspace.finish().unwrap();
+
+    let error = rig.run(limits(3), None).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            backfill::Error::Batch(batch::Error::BundleChanged { sequence: 3, .. })
+        ),
+        "{error}"
+    );
+}
+
+/// A batch closed with the stores on a boundary it never captured stays closed:
+/// no traversal, and no growth on the volume that just filled.
+#[test]
+fn a_batch_closed_behind_the_stores_stays_closed() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.full_at.set(Some(3));
+    let (flush, _) = ready(rig.run(limits(9), None));
+    assert_eq!(flush, Flush::DiskPressure);
+    assert_eq!(rig.sequences(), [1, 2]);
+
+    let (flush, frontiers) = ready(rig.run(limits(9), None));
+    assert_eq!(flush, Flush::DiskPressure);
+    assert_eq!(frontiers.prepared, Some(2));
+    assert_eq!(rig.sequences(), [1, 2]);
+    assert_eq!(*rig.calls.prepared.borrow(), [1, 2]);
+    assert!(rig.calls.traversed.borrow().is_empty());
+}
+
+/// Free space is really measured, and a shortfall really refuses.
+#[test]
+fn free_space_is_measured() {
+    let node = Node::new();
+    assert!(batch::volume_has_room(node.path(), 0));
+    assert!(!batch::volume_has_room(node.path(), u64::MAX));
+}
+
+/// What admission measures is the volume holding the batch.
+#[test]
+fn admission_measures_the_volume_holding_the_batch() {
+    let chain = Chain::spanning(12);
+    let mut rig = Rig::new(&chain);
+    let seen = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+    let record = seen.clone();
+    rig.room = Box::new(move |path, _| {
+        record.borrow_mut().push(path.to_owned());
+        true
+    });
+
+    ready(rig.run(limits(2), None));
+
+    let dir = batch::dir_in(&rig.node.config.storage.path);
+    let seen = seen.borrow();
+    assert!(!seen.is_empty());
+    assert!(seen.iter().all(|path| *path == dir), "{seen:?}");
+}
+
+/// Consumed files outlast the session that captured the boundary, because until
+/// it closes the stores may fall back to a cursor that still reads them.
+#[test]
+fn consumed_input_outlasts_the_session_that_captured_the_boundary() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+
+    // 2 is captured and its session fails to close, so the last cleanup was at
+    // 1, whose first block is in file 20. Files 20 and 30 lead to 2.
+    rig.calls.fail_finish_after.set(Some(2));
+    rig.run(limits(9), None).unwrap_err();
+    assert_eq!(rig.sequences(), [1]);
+    let files = rig.immutable_files();
+    assert_eq!(files.first(), Some(&20), "{files:?}");
+}
+
+/// A failed read of what the batch holds says the batch, not its journal.
+#[cfg(unix)]
+#[test]
+fn a_scan_failure_does_not_blame_the_journal() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let chain = Chain::spanning(6);
+    let rig = Rig::new(&chain);
+    drop(rig.batch());
+
+    let blobs = batch_dir(&rig).join("prepared/blobs/sha256");
+    std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let outcome = rig.run(limits(2), None);
+    std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let message = outcome.err().map(|error| error.to_string()).unwrap();
+    assert!(!message.contains("journal"), "{message}");
 }

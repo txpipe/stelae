@@ -11,7 +11,8 @@
 //! holds the block's index delta, finish that session so the stores are
 //! durable, journal the bundle, and only then remove consumed immutable files
 //! or start replaying. Nothing pending reads an immutable file: bundles and the
-//! archive hold it all, and a replay after a lost bundle downloads them again.
+//! archive hold it all, and a replay after a lost bundle downloads them again,
+//! once a window left from the lost replay is out of the way.
 
 use std::{
     path::{Path, PathBuf},
@@ -20,7 +21,8 @@ use std::{
 
 use dolos::engine::{BulkReplaySession, ReplayWorkspace};
 use dolos_core::{
-    config::RootConfig, ArchiveIndexDelta, BlockSlot, ChainPoint, Genesis, RawBlock, ReplayProgress,
+    config::{RootConfig, StorageConfig},
+    ArchiveIndexDelta, BlockSlot, ChainPoint, Genesis, RawBlock, ReplayProgress,
 };
 use dolos_mithril as mithril;
 use dolos_mithril::{mithril_client::feedback::FeedbackReceiver, MithrilSource};
@@ -61,6 +63,16 @@ pub enum Error {
     },
     #[error("iterating the local immutable db: {0}")]
     ImmutableDb(String),
+    #[error(
+        "the immutable directory {dir} holds {contents}, and not where the stores stand ({at}). A \
+         window left from another replay can't continue this one: empty it and rerun, and what \
+         this replay needs downloads again"
+    )]
+    StaleWindow {
+        dir: PathBuf,
+        contents: String,
+        at: String,
+    },
     #[error("reading block data: {0}")]
     BlockData(String),
     #[error("{what}: {reason}")]
@@ -103,6 +115,12 @@ pub enum Error {
     )]
     NoRoom { needed: u64, used: u64 },
     #[error(
+        "replay filled the volume: {0}. The stores and anything a batch journaled stand. Make \
+         room and rerun, or rerun as it is to close a batch holding boundaries, and count what an \
+         epoch's replay and download add in --batch-reserve-mib"
+    )]
+    ReplayFilledVolume(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error(
         "--batch-epochs above 1 is not active yet: publishing a prepared batch arrives with \
          ordered publication and recovery"
     )]
@@ -112,6 +130,16 @@ pub enum Error {
 impl Error {
     pub fn caller(source: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>) -> Self {
         Self::Caller(source.into())
+    }
+
+    /// A replay that failed on a full volume is a recoverable stop.
+    fn in_replay(self) -> Self {
+        match self {
+            Self::Caller(source) if batch::reports_full_volume(&*source) => {
+                Self::ReplayFilledVolume(source)
+            }
+            other => other,
+        }
     }
 }
 
@@ -386,6 +414,13 @@ pub struct Options {
     pub limits: Limits,
 }
 
+impl Options {
+    /// Where a run spools its index runs.
+    fn spool(&self, storage: &StorageConfig) -> PathBuf {
+        node::scratch_dir(storage, self.scratch_dir.as_deref())
+    }
+}
+
 fn require_synchronous_context() -> Result<(), Error> {
     if tokio::runtime::Handle::try_current().is_ok() {
         Err(Error::AsyncRuntimeContext)
@@ -457,7 +492,7 @@ pub fn run(
         retained: &options.retained,
         mithril: &options.mithril,
         download_dir,
-        scratch: node::scratch_dir(&config.storage, options.scratch_dir.as_deref()),
+        scratch: options.spool(&config.storage),
         window: options.window,
         until_epoch: options.until_epoch,
         skip_validation: options.skip_validation,
@@ -495,6 +530,11 @@ fn finish_both<T>(work: Result<T, Error>, finish: Result<(), Error>) -> Result<T
     match (work, finish) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        // A store that hit a full volume stays poisoned, so its close fails too.
+        (Err(replay @ Error::ReplayFilledVolume(_)), Err(shutdown)) => {
+            warn!(%shutdown, "closing the stores after replay filled the volume");
+            Err(replay)
+        }
         (Err(replay), Err(shutdown)) => Err(Error::ReplayAndShutdown {
             replay: Box::new(replay),
             shutdown: Box::new(shutdown),
@@ -762,7 +802,9 @@ impl<W: Workspace> Driver<'_, W> {
         if batch.is_empty() {
             match self.unpublished(&plan, plan.sequence)? {
                 None => return Ok(Capture::AlreadyPublished),
-                Some(Latest(latest)) => batch.begin(latest),
+                Some(Latest(latest)) => {
+                    batch.begin(&self.batching.storage_path, plan.sequence, latest)?
+                }
             }
         }
         let request = prepare::Request {
@@ -794,11 +836,14 @@ impl<W: Workspace> Driver<'_, W> {
                 Ok(None)
             }
             Some(Capture::AlreadyPublished) | None => Ok(None),
-            Some(Capture::OutOfSpace) if batch.is_empty() => Err(Error::NoRoom {
-                needed: batch.limits().reserve_per_epoch,
-                used: batch.used()?,
-            }),
             Some(Capture::OutOfSpace) => {
+                batch.sweep()?;
+                if batch.is_empty() {
+                    return Err(Error::NoRoom {
+                        needed: batch.limits().reserve_per_epoch,
+                        used: batch.used()?,
+                    });
+                }
                 batch.close(Flush::DiskPressure, None)?;
                 Ok(Some(Flush::DiskPressure))
             }
@@ -831,6 +876,7 @@ impl<W: Workspace> Driver<'_, W> {
             });
         }
         let plan = self.plan(source)?.with_scratch(self.scratch.clone());
+        self.refuse_lost_history(&plan)?;
         self.publish.announce(&plan)?;
         stelae_driver::retry::transient(
             "publishing the pending sequence",
@@ -848,6 +894,16 @@ impl<W: Workspace> Driver<'_, W> {
         })
     }
 
+    /// Over an empty repository, a stele here would start a history. Refuse if
+    /// a batch passed sequences before it. Only that reads the repository,
+    /// and a repository holding anything refuses a gap itself.
+    fn refuse_lost_history(&self, plan: &Plan) -> Result<(), Error> {
+        match batch::refuse_lost_history(&self.batching.storage_path, plan.sequence) {
+            Err(error) if self.latest(plan)?.is_none() => Err(error.into()),
+            _ => Ok(()),
+        }
+    }
+
     fn extend(
         &self,
         target: u64,
@@ -858,7 +914,7 @@ impl<W: Workspace> Driver<'_, W> {
         let workspace = (self.open_workspace)()?;
         let mut session = workspace.start(target)?;
         let result = self.advance_session(&mut session, prune, width, batch);
-        finish_both(result, session.finish())
+        finish_both(result, session.finish().map_err(Error::in_replay))
     }
 
     fn advance_session(
@@ -980,7 +1036,10 @@ impl<W: Workspace> Driver<'_, W> {
         session: &mut W::Session,
         immutable_dir: &Path,
     ) -> Result<Import, Error> {
-        use pallas::network::miniprotocols::Point;
+        use pallas::{
+            interop::hardano::storage::immutable::{self, Error as Reader},
+            network::miniprotocols::Point,
+        };
 
         if !immutable_dir.is_dir() || mithril::highest_existing_immutable(immutable_dir).is_none() {
             return Ok(Import::Exhausted);
@@ -995,11 +1054,20 @@ impl<W: Workspace> Driver<'_, W> {
                     .map_err(|_| Error::UnanchoredCursor { slot })?
             }
         };
-        let mut blocks = pallas::interop::hardano::storage::immutable::read_blocks_from_point(
-            immutable_dir,
-            point.clone(),
-        )
-        .map_err(|error| Error::ImmutableDb(error.to_string()))?;
+        let mut blocks =
+            immutable::read_blocks_from_point(immutable_dir, point.clone()).map_err(|error| {
+                match error {
+                    Reader::CannotFindBlock(_) | Reader::OriginMissing => Error::StaleWindow {
+                        dir: immutable_dir.to_owned(),
+                        contents: dir_contents(immutable_dir),
+                        at: match &point {
+                            Point::Origin => "the chain's first block".to_owned(),
+                            Point::Specific(slot, _) => format!("slot {slot}"),
+                        },
+                    },
+                    other => Error::ImmutableDb(other.to_string()),
+                }
+            })?;
         if point != Point::Origin {
             blocks.next();
         }
@@ -1007,7 +1075,9 @@ impl<W: Workspace> Driver<'_, W> {
             let batch: Vec<_> = batch
                 .try_collect()
                 .map_err(|error| Error::BlockData(error.to_string()))?;
-            let progress = session.import_blocks(batch.into_iter().map(Arc::new).collect())?;
+            let progress = session
+                .import_blocks(batch.into_iter().map(Arc::new).collect())
+                .map_err(Error::in_replay)?;
             self.replay.reached(progress.position().slot());
             if progress.is_boundary() {
                 return Ok(Import::Boundary);
@@ -1126,6 +1196,54 @@ mod tests {
                 "lock",
             ]
         );
+    }
+
+    #[test]
+    fn only_a_replay_on_a_full_volume_is_a_recoverable_stop() {
+        let full = Error::caller(std::io::Error::other(
+            "state error: IO: No space left on device (os error 28)",
+        ));
+        assert!(matches!(full.in_replay(), Error::ReplayFilledVolume(_)));
+
+        let broken = Error::caller(std::io::Error::other("broken invariant"));
+        assert!(matches!(broken.in_replay(), Error::Caller(_)));
+    }
+
+    #[test]
+    fn a_close_failing_after_replay_filled_the_volume_is_the_same_stop() {
+        let filled = Error::ReplayFilledVolume(std::io::Error::other("full").into());
+        let error = finish_both::<()>(Err(filled), Err(Error::EmptyWindow)).unwrap_err();
+        assert!(matches!(error, Error::ReplayFilledVolume(_)), "{error}");
+    }
+
+    #[test]
+    fn a_run_spools_under_the_scratch_directory_it_is_given() {
+        let storage = StorageConfig {
+            path: PathBuf::from("/data"),
+            ..Default::default()
+        };
+        let storage = &storage;
+        let options = |scratch_dir: Option<&str>| Options {
+            direct_s3: None,
+            repository: "oci://registry.invalid/cardano/preview".parse().unwrap(),
+            auth: Auth::Anonymous,
+            insecure: false,
+            scratch_dir: scratch_dir.map(PathBuf::from),
+            concurrency: None,
+            verify_carried: false,
+            download_dir: None,
+            window: 1,
+            until_epoch: None,
+            skip_validation: true,
+            mithril: MithrilSource {
+                aggregator: String::new(),
+                genesis_vkey: String::new(),
+            },
+            retained: dolos_snapshot::planning::retained_epochs(&[1]).unwrap(),
+            limits: Limits::ONE,
+        };
+        assert_eq!(options(Some("/spool")).spool(storage), Path::new("/spool"));
+        assert_eq!(options(None).spool(storage), storage.path.join("scratch"));
     }
 
     #[test]

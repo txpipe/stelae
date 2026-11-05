@@ -400,7 +400,7 @@ struct PublishArgs {
     rebuild: bool,
     #[arg(long, action, conflicts_with = "output_dir")]
     insecure: bool,
-    #[arg(long, conflicts_with = "output_dir")]
+    #[arg(long)]
     scratch_dir: Option<PathBuf>,
     #[arg(long, conflicts_with = "output_dir")]
     concurrency: Option<NonZeroUsize>,
@@ -609,7 +609,10 @@ fn run_publish(
         producers: args.producers,
     };
     let destination = match (&args.output_dir, &args.repo) {
-        (Some(path), None) => Destination::Directory(path.clone()),
+        (Some(path), None) => Destination::Directory {
+            path: path.clone(),
+            scratch_dir: args.scratch_dir.clone(),
+        },
         (None, Some(repository)) => Destination::Repository {
             direct_s3: read_direct_s3(args.direct_s3_config.as_deref())?,
             repository: repository.clone(),

@@ -4803,6 +4803,7 @@ dependencies = [
  "itertools 0.14.0",
  "oci-client",
  "pallas",
+ "rustls",
  "serde",
  "serde_json",
  "stelae",

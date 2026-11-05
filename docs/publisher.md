@@ -187,8 +187,9 @@ stelae-publisher --config dolos.toml inspect \
 
 Every export spools its index runs, reproductions included, under `--scratch-dir`
 (default `<storage.path>/scratch`). `digest` and `verify --reproduce` take it as
-`publish` does. A mainnet first publish spools tens of gigabytes, and the
-directory must be writable by no one but the user running the command.
+`publish` does, to a repository or to `--output-dir`. A mainnet first publish
+spools tens of gigabytes, and the directory must be writable by no one but the
+user running the command.
 
 All three take `--format text|json` (default `text`): data on stdout,
 progress and logs on stderr. `inspect --format json` is the canonical
@@ -225,6 +226,7 @@ The following paths are part of restart compatibility:
 | `<storage.path>/scratch` | default OCI staging directory |
 | `<storage.path>/mithril/immutable` | default bounded Mithril download window |
 | `<storage.path>/.stelae-batch/` | a prepared batch's journal, bundles and staged runs; see [Prepared batches](#prepared-batches) |
+| `<storage.path>/.stelae-batch-began.json` | the sequence a batch over an empty repository began at, kept outside the batch; see [What a restart does](#what-a-restart-does) |
 
 Before any cleanup, initialization requires an absolute storage path below a
 filesystem root. A marker is accepted only when its storage path, network
@@ -257,7 +259,7 @@ only while every sequence in between is a complete bundle the journal names.
 | --- | --- |
 | `--batch-epochs N` | Boundaries in a batch. 1, the default, captures nothing and publishes before it advances. |
 | `--batch-scratch-mib M` | What a batch may hold on disk: bundles and staged runs. Required above one epoch. |
-| `--batch-reserve-mib M` | Kept free per prepared boundary to stage and finalize it. Required above one epoch. |
+| `--batch-reserve-mib M` | Kept free per prepared boundary: what staging and finalizing it take, and what an epoch's replay and download add to this volume. Required above one epoch. |
 
 Defaults above one epoch are not chosen yet: they wait for complete-pipeline
 measurements.
@@ -266,14 +268,18 @@ measurements.
 
 1. **Admit.** Before replay leaves a boundary, the batch must have room for what
    it holds, and for one more boundary estimated at the largest so far. Both the
-   budget and the volume's free space are held to that.
+   budget and the volume's free space are held to that. Nothing but the reserve
+   stands for what replay and its download add, so size it to include them.
 2. **Replay** to the next boundary. Nothing prunes while a batch holds anything,
-   and nothing is published.
+   and nothing is published. A replay that fills the volume anyway stops
+   recoverably: what is journaled stands, and a rerun closes the batch if the
+   volume is still short of what the reserve asks.
 3. **Capture** while the session that imported the boundary is open, because it
    holds the block's index delta.
 4. **Close the session**, so the stores are durable.
 5. **Journal** the bundle, and only then remove consumed immutable files. Pending
-   work reads none of them, and a replay after a lost bundle downloads them again.
+   work reads none of them, and a replay after a lost bundle downloads them again,
+   once the window the lost replay left is gone: see the recovery below.
 6. **Close the batch** with the reason it stopped growing, or go back to 1.
 
 | A batch closes on | At |
@@ -281,7 +287,7 @@ measurements.
 | `epoch-limit` | the last boundary `--batch-epochs` allows |
 | `until-epoch` | the boundary `--until-epoch` names |
 | `scratch-budget` | the last boundary before the next would cross the budget |
-| `disk-pressure` | the last boundary before the next would not fit the volume, or a capture that filled it |
+| `disk-pressure` | the last boundary before the next would not fit the volume, or a capture that filled it, whose payloads go so the batch is charged only for what its journal names |
 | `end-of-source` | the last captured boundary. The epoch in progress has none and stays unpublished. |
 
 A closed batch stays closed across restarts, whatever the controls say then.
@@ -306,10 +312,29 @@ These refuse too, and none is repaired automatically: a repository whose latest
 stele is not the one the batch follows, a journal or bundle that is missing or
 damaged, and another repository, network, store contract, retained list or Dolos
 revision than the batch was prepared from. A batch of one and a repository
-`publish` refuse to run past a pending batch. The recovery in every case is to
-restore the stores from the repository's latest stele and delete
-`<storage.path>/.stelae-batch` to replay those sequences. Clearing the storage
-path takes the batch with it.
+`publish` refuse to run past a pending batch. A bundle the machine can't read
+right now, through permissions or a failing disk, may be intact: that refusal says
+so, and a rerun goes on once it is readable.
+
+The recovery depends on what the repository holds:
+
+- **It holds a stele.** Restore the stores from its latest stele and delete
+  `<storage.path>/.stelae-batch` to replay those sequences.
+- **It is empty.** There is nothing to restore, and deleting the batch alone
+  refuses: clear the storage path and run with `--allow-genesis`. Clearing it takes
+  the batch with it.
+
+A download window left from the lost replay can't continue a restored one. With
+`--download-dir` outside the storage path, or a restore that leaves `mithril/`, the
+run refuses and names the immutable directory: empty it and rerun, and what the
+replay needs downloads again.
+
+A batch over an empty repository records where it began in
+`<storage.path>/.stelae-batch-began.json`, outside the batch. A history can't start
+past that sequence while the repository is empty, on a batch of one or a repository
+`publish` as well, because a stele there would leave out sequences only the batch
+held. The record means nothing once the repository holds a stele. Delete it only
+to start a history past those sequences on purpose.
 
 Cancelling keeps all of it: a shutdown signal neither publishes nor manufactures
 a boundary, and a rerun continues. Not even one boundary fitting is a recoverable

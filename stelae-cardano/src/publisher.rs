@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use dolos_core::config::RootConfig;
+use dolos_core::config::{RootConfig, StorageConfig};
 use dolos_snapshot::{
     export::Plan,
     facade::SnapshotSource,
@@ -222,7 +222,10 @@ impl backfill::Publish for BackfillPublisher<'_> {
 
 #[derive(Debug, Clone)]
 pub enum Destination {
-    Directory(PathBuf),
+    Directory {
+        path: PathBuf,
+        scratch_dir: Option<PathBuf>,
+    },
     Repository {
         direct_s3: Option<Box<stelae::oci::s3_upload::Config>>,
         repository: Repository,
@@ -234,6 +237,14 @@ pub enum Destination {
         verify_carried: bool,
         require_new: bool,
     },
+}
+
+impl Destination {
+    /// Where this publish spools its index runs.
+    fn spool(&self, storage: &StorageConfig) -> PathBuf {
+        let (Self::Directory { scratch_dir, .. } | Self::Repository { scratch_dir, .. }) = self;
+        node::scratch_dir(storage, scratch_dir.as_deref())
+    }
 }
 
 #[derive(Debug)]
@@ -272,20 +283,17 @@ pub fn publish_once(
         dolos::engine::ReplayWorkspace::open(config, std::sync::Arc::new(genesis.clone()))?;
     let result = (|| {
         let snapshot = workspace.snapshot();
-        let scratch = match &destination {
-            Destination::Repository { scratch_dir, .. } => scratch_dir.as_deref(),
-            Destination::Directory(_) => None,
-        };
+        let spool = destination.spool(&config.storage);
         let plan = snapshot
             .selected_plan(
                 u64::from(genesis.network_magic()),
                 retained.clone(),
                 selection,
             )?
-            .with_scratch(node::scratch_dir(&config.storage, scratch));
+            .with_scratch(spool);
         let report = PlanReport::read(&plan)?;
         let outcome = match destination {
-            Destination::Directory(path) => {
+            Destination::Directory { path, .. } => {
                 if dry_run {
                     PublishOutcome::DryRun {
                         sequence: plan.sequence,
@@ -326,7 +334,10 @@ pub fn publish_once(
                 let standing = publisher.standing(&plan)?;
                 match Next::read(standing, plan.sequence, require_new)? {
                     Next::Nothing(message) => PublishOutcome::Nothing(message),
-                    Next::First | Next::After { .. } => {
+                    next @ (Next::First | Next::After { .. }) => {
+                        if next == Next::First && !dry_run {
+                            batch::refuse_lost_history(&config.storage.path, plan.sequence)?;
+                        }
                         publisher.preflight()?;
                         if dry_run {
                             let _preview = publisher.preview(&plan, &snapshot)?;
@@ -365,6 +376,41 @@ pub fn publish_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_publish_spools_under_the_scratch_directory_it_is_given() {
+        let storage = StorageConfig {
+            path: PathBuf::from("/data"),
+            ..Default::default()
+        };
+        let storage = &storage;
+        let repository = |scratch_dir: Option<&str>| Destination::Repository {
+            direct_s3: None,
+            repository: "oci://registry.invalid/cardano/preview".parse().unwrap(),
+            auth: Auth::Anonymous,
+            insecure: false,
+            scratch_dir: scratch_dir.map(PathBuf::from),
+            rebuild: false,
+            concurrency: None,
+            verify_carried: false,
+            require_new: false,
+        };
+        let directory = |scratch_dir: Option<&str>| Destination::Directory {
+            path: PathBuf::from("/stele"),
+            scratch_dir: scratch_dir.map(PathBuf::from),
+        };
+        let default = storage.path.join("scratch");
+        assert_eq!(
+            repository(Some("/spool")).spool(storage),
+            Path::new("/spool")
+        );
+        assert_eq!(repository(None).spool(storage), default);
+        assert_eq!(
+            directory(Some("/spool")).spool(storage),
+            Path::new("/spool")
+        );
+        assert_eq!(directory(None).spool(storage), default);
+    }
 
     #[test]
     fn repository_standing_maps_to_first_next_noop_and_refusal() {

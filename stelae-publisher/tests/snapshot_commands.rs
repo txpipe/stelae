@@ -31,7 +31,10 @@ impl Fixture {
             &genesis,
             &config::read_state_epochs(&epochs).unwrap(),
             Selection::default(),
-            Destination::Directory(stele.clone()),
+            Destination::Directory {
+                path: stele.clone(),
+                scratch_dir: None,
+            },
             false,
             &Observer::silent(),
         )
@@ -511,4 +514,95 @@ fn a_json_report_stdout_will_not_take_exits_one() {
         "{}",
         stderr_words(&output)
     );
+}
+
+#[test]
+fn a_directory_publish_spools_under_the_scratch_directory_it_is_given() {
+    let fixture = Fixture::published();
+    let spool = fixture.node.path().join("named-spool");
+    let output = fixture.node.path().join("again");
+    assert!(!spool.exists());
+
+    let run = fixture.run(&[
+        "publish",
+        "--output-dir",
+        output.to_str().unwrap(),
+        "--scratch-dir",
+        spool.to_str().unwrap(),
+        "--state-epochs-file",
+        fixture.epochs.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&run), 0, "{}", stderr_words(&run));
+    assert!(spool.is_dir());
+}
+
+/// Naming a spool keeps the publish away from the default under the stores.
+#[test]
+fn a_directory_publish_needs_no_room_on_the_store_volume_once_it_names_a_spool() {
+    let fixture = Fixture::published();
+    let scratch = fixture.node.config.storage.path.join("scratch");
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::write(&scratch, b"not a directory").unwrap();
+    let spool = fixture.node.path().join("named-spool");
+    let output = fixture.node.path().join("again");
+
+    let run = fixture.run(&[
+        "publish",
+        "--output-dir",
+        output.to_str().unwrap(),
+        "--scratch-dir",
+        spool.to_str().unwrap(),
+        "--state-epochs-file",
+        fixture.epochs.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&run), 0, "{}", stderr_words(&run));
+}
+
+#[test]
+fn a_digest_spools_under_the_scratch_dir_it_is_given() {
+    let fixture = Fixture::published();
+    let spool = fixture.node.path().join("named-spool");
+    assert!(!spool.exists());
+
+    let output = fixture.run(&[
+        "digest",
+        "--state-epochs-file",
+        fixture.epochs.to_str().unwrap(),
+        "--format",
+        "json",
+        "--scratch-dir",
+        spool.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code(&output),
+        0,
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(spool.is_dir());
+}
+
+#[test]
+fn a_reproduction_spools_under_the_scratch_dir_it_is_given() {
+    let fixture = Fixture::published();
+    let spool = fixture.node.path().join("named-spool");
+    assert!(!spool.exists());
+
+    let output = fixture.run(&[
+        "verify",
+        "--repo",
+        &fixture.repo(),
+        "--reproduce",
+        "--state-epochs-file",
+        fixture.epochs.to_str().unwrap(),
+        "--scratch-dir",
+        spool.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code(&output),
+        0,
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(spool.is_dir());
 }
