@@ -804,8 +804,8 @@ pub fn reports_full_volume(error: &(dyn std::error::Error + 'static)) -> bool {
     })
 }
 
-/// Whether a store refused work because a background worker failed. fjall says
-/// no more than that, whatever the worker hit.
+/// Whether a store refused work because a write or a background worker failed.
+/// fjall says no more than that, whatever it hit.
 pub fn reports_poisoned(error: &(dyn std::error::Error + 'static)) -> bool {
     in_chain(error, &|error| {
         error.to_string().contains("FjallError: Poisoned")
@@ -1217,6 +1217,42 @@ mod tests {
 
         let lock = io::Error::other("poisoned lock: another task failed inside");
         assert!(!reports_poisoned(&lock));
+    }
+
+    /// Built from each store's own types, so a pin moving their words fails
+    /// here rather than leaving the needle matching nothing.
+    #[test]
+    fn a_failed_worker_reads_the_same_from_every_store() {
+        let poisoned = || dolos_fjall::Error::Fjall(fjall::Error::Poisoned);
+        let state = dolos_core::StateError::from(poisoned());
+        let archive = dolos_core::ArchiveError::from(poisoned());
+        assert!(reports_poisoned(&state), "{state}");
+        assert!(reports_poisoned(&archive), "{archive}");
+        assert!(!reports_full_volume(&state), "{state}");
+        assert!(!reports_full_volume(&archive), "{archive}");
+
+        let full =
+            || dolos_fjall::Error::Fjall(fjall::Error::Io(io::ErrorKind::StorageFull.into()));
+        let state = dolos_core::StateError::from(full());
+        let archive = dolos_core::ArchiveError::from(full());
+        assert!(!reports_poisoned(&state), "{state}");
+        assert!(!reports_poisoned(&archive), "{archive}");
+    }
+
+    /// Over standing stores a restore changes nothing, so each recovery clears
+    /// them first.
+    #[test]
+    fn every_recovery_clears_the_stores_before_it_restores_them() {
+        for recovery in [START_OVER, REPLAY] {
+            let text = recovery.to_lowercase();
+            let clear = text
+                .find("clear the storage path and any store configured outside it")
+                .unwrap_or_else(|| panic!("{recovery}"));
+            let restore = text
+                .find("restore the stores from the repository's latest stele")
+                .unwrap_or_else(|| panic!("{recovery}"));
+            assert!(clear < restore, "{recovery}");
+        }
     }
 
     #[test]

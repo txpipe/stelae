@@ -294,6 +294,17 @@ mod tests {
         assert_eq!(available(Path::new("relative-with-no-ancestor")), None);
     }
 
+    /// A proportion, for the reason above. It can't tell a nearly empty
+    /// volume's size from its free space, and it needn't: there the two
+    /// don't mislead.
+    #[test]
+    fn free_space_is_what_is_free_rather_than_the_volumes_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let free = fs4::available_space(temp.path()).unwrap();
+        let read = available(temp.path()).unwrap();
+        assert!(read.abs_diff(free) <= free / 2, "read {read}, free {free}");
+    }
+
     /// The whole of the free-space policy, over needs that share one volume.
     ///
     /// Both halves in one test because they are one rule: what was measured

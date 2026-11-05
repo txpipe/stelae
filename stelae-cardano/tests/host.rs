@@ -355,6 +355,22 @@ fn a_rolling_history_is_refused_before_backfill_creates_anything() {
     assert!(!config.storage.path.exists());
 }
 
+/// The check asks what opening a workspace would refuse before it opens a store
+/// itself, which would create it.
+#[test]
+fn a_configuration_the_engine_refuses_creates_no_store_in_the_check() {
+    let node = Node::new();
+    let mut config = node.config.clone();
+    config.storage.path = node.path().join("refused");
+    config.chain.network = "custom".to_owned();
+
+    let error =
+        backfill::refuse_archive_behind(&config, dolos_cardano::include::preview::load().into())
+            .unwrap_err();
+    assert!(matches!(error, backfill::Error::Caller(_)), "{error}");
+    assert!(!config.storage.path.exists());
+}
+
 /// The host's own run looks at the stores before it replays or publishes.
 #[test]
 fn a_backfill_refuses_stores_whose_state_passed_the_archive() {
