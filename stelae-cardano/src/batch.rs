@@ -42,7 +42,9 @@ pub fn dir_in(storage_path: &Path) -> PathBuf {
 /// What a batch over an empty repository leaves beside the stores, outside the
 /// batch: the first sequence they may pass unpublished. No stele can restore
 /// those stores, so without this a lost batch reads as a deliberate first stele
-/// further on. Clearing the storage path takes it too.
+/// further on. Clearing the storage path takes it too, and a store configured
+/// outside that path has to go with it: left standing, nothing refuses a first
+/// stele past what the batch held.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Began {
@@ -268,13 +270,16 @@ pub enum Error {
     Preparing(#[source] Box<dolos_snapshot::Error>),
 }
 
-/// The recovery from losing what only a batch holds.
-const REPLAY: &str = "Nothing else holds those boundaries: restore the stores from the \
-                      repository's latest stele and delete the batch to replay them. A repository \
-                      with no stele has nothing to restore, so clear the storage path and run \
-                      with --allow-genesis";
+/// The recovery from losing what only a batch holds. Over stores still there a
+/// restore changes nothing, and a store configured outside the storage path
+/// survives clearing it, so both are named.
+const REPLAY: &str = "Nothing else holds those boundaries: clear the storage path and any store \
+                      configured outside it to delete the batch, then restore the stores from the \
+                      repository's latest stele to replay them. A repository with no stele has \
+                      nothing to restore, so clear them the same way and run with --allow-genesis";
 
-const REPLAY_FROM_GENESIS: &str = "clear the storage path and run with --allow-genesis";
+const REPLAY_FROM_GENESIS: &str =
+    "clear the storage path and any store configured outside it, and run with --allow-genesis";
 
 /// The recovery for stores nothing can repair.
 pub const START_OVER: &str =

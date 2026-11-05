@@ -1643,6 +1643,121 @@ fn restored_stores_with_their_files_replay_the_batch() {
     assert_eq!(rig.sequences(), [2, 3, 4]);
 }
 
+fn initialize_from(
+    rig: &Rig<'_>,
+    source: &Path,
+    allow_genesis: bool,
+) -> Result<stelae_cardano::initialize::Outcome, String> {
+    stelae_cardano::initialize::run(
+        &rig.node.config,
+        &rig.chain.genesis,
+        &stelae_cardano::initialize::Options {
+            source: dolos_snapshot::restore::Source::Dir(source.to_owned()),
+            point: dolos_snapshot::facade::Point::Latest,
+            auth: stelae_cardano::Auth::Anonymous,
+            insecure: false,
+            scratch_dir: None,
+            skip_space_check: true,
+            resume: false,
+            allow_genesis,
+        },
+        &Observer::silent(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// The refusal's own steps, in its order, over a repository holding a stele.
+#[test]
+fn the_recovery_over_a_held_repository_works_as_written() {
+    use stelae_cardano::initialize::Outcome as Init;
+
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    assert_eq!(
+        rig.run(Limits::ONE, Some(1)).unwrap(),
+        Outcome::UntilEpoch { sequence: 1 }
+    );
+    repository_at(&rig, 1);
+    let stele = rig.node.path().join("stele");
+    stelae_cardano::publisher::publish_once(
+        &rig.node.config,
+        &chain.genesis,
+        &retained(),
+        stelae_cardano::Selection::default(),
+        stelae_cardano::publisher::Destination::Directory {
+            path: stele.clone(),
+            scratch_dir: None,
+        },
+        false,
+        &Observer::silent(),
+    )
+    .unwrap();
+    let (_, frontiers) = ready(rig.run(limits(3), None));
+    assert_eq!(frontiers.prepared, Some(4));
+
+    std::fs::remove_file(batch_dir(&rig).join("prepared/bundles/3.json")).unwrap();
+    let message = rig.run(limits(3), None).unwrap_err().to_string();
+    assert!(
+        message.contains("clear the storage path and any store configured outside it"),
+        "{message}"
+    );
+
+    // Out of order, the restore finds the stores there and changes nothing.
+    assert_eq!(initialize_from(&rig, &stele, false), Ok(Init::Existing));
+
+    dolos::storage::clear_storage(&rig.node.config.storage.path).unwrap();
+    assert_eq!(
+        initialize_from(&rig, &stele, false),
+        Ok(Init::Restored { sequence: 1 })
+    );
+    rig.restart_with_the_whole_source();
+    ready(rig.run(limits(3), None));
+    assert_eq!(rig.sequences(), [2, 3, 4]);
+}
+
+/// A store outside the storage path survives clearing it, and reads as existing
+/// stores: the recovery names it, and with it gone a history starts over.
+#[test]
+fn the_recovery_clears_stores_configured_outside_the_storage_path() {
+    use stelae_cardano::initialize::Outcome as Init;
+
+    let chain = Chain::spanning(12);
+    let mut rig = Rig::new(&chain);
+    let outside = rig.node.path().join("elsewhere");
+    rig.node.config.storage.state.path = Some(outside.join("state"));
+    rig.node.config.storage.archive.path = Some(outside.join("archive"));
+    let no_stele = rig.node.path().join("no-stele");
+
+    assert_eq!(initialize_from(&rig, &no_stele, true), Ok(Init::Genesis));
+    ready(rig.run(limits(4), None));
+    std::fs::remove_file(batch_dir(&rig).join("prepared/bundles/2.json")).unwrap();
+    let message = rig.run(limits(4), None).unwrap_err().to_string();
+    assert!(message.contains("configured outside"), "{message}");
+
+    let storage = &rig.node.config.storage.path;
+    dolos::storage::clear_storage(storage).unwrap();
+    assert_eq!(initialize_from(&rig, &no_stele, true), Ok(Init::Existing));
+
+    std::fs::remove_dir_all(&outside).unwrap();
+    assert_eq!(initialize_from(&rig, &no_stele, true), Ok(Init::Genesis));
+    rig.restart_with_the_whole_source();
+    ready(rig.run(limits(4), None));
+    assert_eq!(rig.sequences(), [1, 2, 3, 4]);
+}
+
+/// The history's own refusal names the same clearing.
+#[test]
+fn a_lost_history_names_stores_outside_the_storage_path() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(3), None));
+    std::fs::remove_dir_all(batch_dir(&rig)).unwrap();
+
+    let message = rig.run(limits(3), None).unwrap_err().to_string();
+    assert!(message.contains("past the sequence"), "{message}");
+    assert!(message.contains("configured outside"), "{message}");
+}
+
 /// Every route the refusal names for a batch nothing holds, and what
 /// `initialize` does for each.
 #[test]

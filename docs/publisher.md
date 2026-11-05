@@ -359,18 +359,24 @@ revision than the batch was prepared from. A batch of one and a repository
 right now, through permissions or a failing disk, may be intact: that refusal says
 so, and a rerun goes on once it is readable.
 
-The recovery depends on what the repository holds:
+The recovery starts the stores over from what the repository holds. A restore
+changes nothing over stores that are still there, and deleting the batch alone
+leaves stores past the repository, which refuse, so clear them first:
 
-- **It holds a stele.** Restore the stores from its latest stele and delete
-  `<storage.path>/.stelae-batch` to replay those sequences.
-- **It is empty.** There is nothing to restore, and deleting the batch alone
-  refuses: clear the storage path and run with `--allow-genesis`. Clearing it takes
-  the batch with it.
+- **It holds a stele.** Clear the storage path and any store configured outside it,
+  which deletes the batch with them. Then restore the stores from its latest stele
+  with `initialize`, or `run`, which starts with it, to replay those sequences.
+- **It is empty.** There is nothing to restore: clear them the same way and run with
+  `--allow-genesis`.
+
+A store configured outside the storage path survives clearing that path and reads as
+existing stores afterwards. `--allow-genesis` then keeps it, and a first stele starts
+past what the batch held with nothing to refuse it.
 
 A download window left from the lost replay can't continue a restored one. With
-`--download-dir` outside the storage path, or a restore that leaves `mithril/`, the
-run refuses and names the immutable directory: empty it and rerun, and what the
-replay needs downloads again.
+`--download-dir` outside the storage path it survives the clearing, so the run
+refuses and names the immutable directory: empty it and rerun, and what the replay
+needs downloads again.
 
 A batch over an empty repository records where it began in
 `<storage.path>/.stelae-batch-began.json`, outside the batch. A history can't start
