@@ -7,7 +7,7 @@ use stelae::{inscription::Inscription, progress::Observer};
 use stelae_cardano::{
     config,
     publisher::{publish_once, Destination},
-    testing::Node,
+    testing::{empty_registry, Node},
     Selection,
 };
 
@@ -605,4 +605,30 @@ fn a_reproduction_spools_under_the_scratch_dir_it_is_given() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(spool.is_dir());
+}
+
+/// The flag reaches both a repository publish's spool and its staging: nothing
+/// lands on the store volume.
+#[test]
+fn a_repository_publish_spools_under_the_scratch_directory_it_is_given() {
+    let fixture = Fixture::published();
+    let default = fixture.node.config.storage.path.join("scratch");
+    std::fs::remove_dir_all(&default).unwrap();
+    let spool = fixture.node.path().join("named-spool");
+    let repo = empty_registry();
+
+    let run = fixture.run(&[
+        "publish",
+        "--repo",
+        &repo,
+        "--insecure",
+        "--scratch-dir",
+        spool.to_str().unwrap(),
+        "--state-epochs-file",
+        fixture.epochs.to_str().unwrap(),
+    ]);
+
+    assert_eq!(code(&run), 1, "{}", stderr_words(&run));
+    assert!(spool.is_dir(), "{}", stderr_words(&run));
+    assert!(!default.exists(), "{}", stderr_words(&run));
 }

@@ -13,6 +13,25 @@ use dolos_core::{
 };
 use dolos_testing::blocks::make_conway_block_with_prev;
 
+/// A registry holding nothing: it answers every request with a 404, so a
+/// publish reads it as empty, spools, stages and fails at its first upload.
+pub fn empty_registry() -> String {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    format!("oci://127.0.0.1:{port}/cardano/test")
+}
+
 /// A preview node whose stores live in a temporary directory.
 pub struct Node {
     pub root: tempfile::TempDir,

@@ -8,7 +8,7 @@ use stelae_cardano::{
     backfill::{self, Batching, Driver},
     batch, initialize,
     publisher::{publish_once, Destination, PublishOutcome},
-    testing::Node,
+    testing::{empty_registry, Node},
     Auth, MithrilSource, Point, RestoreSource, RetainedEpochs, Selection,
 };
 
@@ -402,6 +402,49 @@ fn a_backfill_refuses_stores_whose_state_passed_the_archive() {
         matches!(error, backfill::Error::ArchiveBehind { .. }),
         "{error}"
     );
+}
+
+/// The option reaches both a backfill's spool and its staging: nothing lands on
+/// the store volume. Takes the retries' whole backoff.
+#[test]
+fn a_backfill_spools_under_the_scratch_directory_it_is_given() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let node = Node::new();
+    let (genesis, _) = node.replay_to_the_first_boundary();
+    let default = node.config.storage.path.join("scratch");
+    assert!(!default.exists());
+    let spool = node.path().join("named-spool");
+
+    let options = backfill::Options {
+        direct_s3: None,
+        repository: empty_registry().parse().unwrap(),
+        auth: Auth::Anonymous,
+        insecure: true,
+        scratch_dir: Some(spool.clone()),
+        concurrency: None,
+        verify_carried: false,
+        download_dir: Some(node.path().join("unused")),
+        window: 1,
+        until_epoch: Some(1),
+        skip_validation: true,
+        mithril: MithrilSource {
+            aggregator: "http://unused.invalid".to_owned(),
+            genesis_vkey: String::new(),
+        },
+        retained: dolos_snapshot::planning::retained_epochs(&[1]).unwrap(),
+        limits: batch::Limits::ONE,
+    };
+    let error = backfill::run(
+        &node.config,
+        &genesis,
+        &options,
+        tokio_util::sync::CancellationToken::new(),
+        &Observer::silent(),
+    )
+    .unwrap_err();
+
+    assert!(spool.is_dir(), "{error}");
+    assert!(!default.exists(), "{error}");
 }
 
 /// A prepared batch has nowhere to go until ordered publication arrives, so no

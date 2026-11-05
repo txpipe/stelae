@@ -1172,6 +1172,16 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_beginning_is_refused_rather_than_read_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(BEGAN_FILE)).unwrap();
+        assert!(matches!(
+            refuse_lost_history(dir.path(), 1),
+            Err(Error::Io { .. })
+        ));
+    }
+
+    #[test]
     fn a_full_volume_is_read_through_the_chain_and_the_words() {
         #[derive(Debug, thiserror::Error)]
         #[error("wrapped")]

@@ -1217,6 +1217,11 @@ mod tests {
                 given("--scratch-dir").then(|| scratch.clone()),
                 "{restore:?}"
             );
+            assert_eq!(
+                backfill.scratch_dir,
+                given("--scratch-dir").then(|| scratch.clone()),
+                "{restore:?}"
+            );
             assert_eq!(initialize.insecure, given("--insecure"), "{restore:?}");
             assert_eq!(
                 initialize.skip_space_check,

@@ -29,7 +29,7 @@ use stelae::{inscription::Inscription, progress::Observer};
 use stelae_cardano::{
     backfill::{self, Batching, Driver, Outcome, Session, Workspace},
     batch::{self, Batch, Committed, Flush, Frontiers, Limits},
-    testing::Node,
+    testing::{empty_registry, Node},
     MithrilSource, RetainedEpochs,
 };
 use tokio_util::sync::CancellationToken;
@@ -1379,24 +1379,6 @@ fn stage_under(rig: &Rig<'_>, limits: Limits) -> Result<u64, batch::Error> {
     staged
 }
 
-/// A registry holding nothing: it answers every request with a 404.
-fn empty_registry() -> String {
-    use std::io::{Read as _, Write as _};
-
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            let mut request = [0; 4096];
-            let _ = stream.read(&mut request);
-            let _ = stream.write_all(
-                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
-        }
-    });
-    format!("oci://127.0.0.1:{port}/cardano/test")
-}
-
 fn tree_bytes(path: &Path) -> u64 {
     let mut total = 0;
     for entry in std::fs::read_dir(path).unwrap().flatten() {
@@ -1982,6 +1964,26 @@ fn a_session_close_filling_the_volume_stops_recoverably() {
     let (_, frontiers) = ready(rig.run(limits(4), None));
     assert_eq!(frontiers.prepared, Some(4));
     assert_eq!(*rig.calls.traversed.borrow(), [3]);
+}
+
+/// A damaged chunk isn't another replay's window, and doesn't say so.
+#[test]
+fn a_damaged_chunk_is_not_read_as_a_stale_window() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    let kept = batch_over_a_held_repository(&rig);
+    restore_stores(&rig, &kept);
+
+    let chunks = std::fs::read_dir(rig.download.join("immutable"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "chunk"));
+    for chunk in chunks {
+        std::fs::write(chunk.path(), [0x01]).unwrap();
+    }
+
+    let error = rig.run(limits(3), None).unwrap_err();
+    assert!(matches!(error, backfill::Error::ImmutableDb(_)), "{error}");
 }
 
 /// A batch of one has no batch to close and no reserve to raise, and the same

@@ -267,6 +267,21 @@ pub enum PublishOutcome {
     },
 }
 
+/// A publish starting a history refuses to where a batch already passed. A dry
+/// run publishes nothing, and a repository holding anything refuses a gap
+/// itself.
+fn refuse_lost_history(
+    next: &Next,
+    dry_run: bool,
+    storage_path: &Path,
+    sequence: u64,
+) -> Result<(), batch::Error> {
+    match (next, dry_run) {
+        (Next::First, false) => batch::refuse_lost_history(storage_path, sequence),
+        _ => Ok(()),
+    }
+}
+
 pub fn publish_once(
     config: &RootConfig,
     genesis: &dolos_core::Genesis,
@@ -335,9 +350,7 @@ pub fn publish_once(
                 match Next::read(standing, plan.sequence, require_new)? {
                     Next::Nothing(message) => PublishOutcome::Nothing(message),
                     next @ (Next::First | Next::After { .. }) => {
-                        if next == Next::First && !dry_run {
-                            batch::refuse_lost_history(&config.storage.path, plan.sequence)?;
-                        }
+                        refuse_lost_history(&next, dry_run, &config.storage.path, plan.sequence)?;
                         publisher.preflight()?;
                         if dry_run {
                             let _preview = publisher.preview(&plan, &snapshot)?;
@@ -410,6 +423,35 @@ mod tests {
             Path::new("/spool")
         );
         assert_eq!(directory(None).spool(storage), default);
+    }
+
+    /// A node whose first batch began over an empty repository keeps the
+    /// record, and later publishes to the repository it then filled must
+    /// not read it.
+    #[test]
+    fn only_a_publish_starting_a_history_reads_the_record_of_a_batch() {
+        let storage = tempfile::tempdir().unwrap();
+        let source = batch::Source {
+            repository: "oci://registry.invalid/cardano/preview".to_owned(),
+            network_magic: 2,
+            store_contract: "contract".to_owned(),
+            mutable_slots: 129_600,
+            retained: vec![1],
+            dolos_revision: "revision".to_owned(),
+        };
+        let dir = batch::dir_in(storage.path());
+        batch::Batch::open(dir, batch::Limits::ONE, source)
+            .unwrap()
+            .begin(storage.path(), 1, None)
+            .unwrap();
+
+        let reading = |next, dry_run| refuse_lost_history(next, dry_run, storage.path(), 4);
+        assert!(matches!(
+            reading(&Next::First, false),
+            Err(batch::Error::HistoryLost { .. })
+        ));
+        assert!(reading(&Next::First, true).is_ok());
+        assert!(reading(&Next::After { latest: 3 }, false).is_ok());
     }
 
     #[test]
