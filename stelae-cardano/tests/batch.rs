@@ -184,6 +184,8 @@ struct Calls {
     break_finish_at: Cell<Option<u64>>,
     /// Fail the next close of a workspace as a store whose worker failed.
     poison_workspace_close: Cell<bool>,
+    /// Fail the next check of the stores as a full volume.
+    check_full: Cell<bool>,
     /// Fail the next workspace to open as a full volume.
     open_full: Cell<bool>,
     /// Fail the next session to start as a full volume.
@@ -578,6 +580,9 @@ impl<'a> Rig<'a> {
             replay: &replay,
             open_workspace: &open_workspace,
             check_stores: &|| {
+                if calls.check_full.replace(false) {
+                    return Err(full_volume());
+                }
                 backfill::refuse_archive_behind(&self.node.config, self.chain.genesis.clone())
             },
             publish: &self.repository,
@@ -2092,7 +2097,8 @@ fn a_store_failing_anywhere_in_a_run_is_the_same_stop() {
     let chain = Chain::spanning(12);
 
     type Fault = (&'static str, fn(&Calls));
-    let filling: [Fault; 3] = [
+    let filling: [Fault; 4] = [
+        ("checking", |calls| calls.check_full.set(true)),
         ("opening", |calls| calls.open_full.set(true)),
         ("starting", |calls| calls.start_full.set(true)),
         ("pruning", |calls| calls.prune_full.set(true)),

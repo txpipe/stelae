@@ -262,7 +262,8 @@ so clear them the same way and run with `--allow-genesis`.
 
 This can't vouch for stores that crossed a gap on an earlier build. Once later
 imports bring the tip level with the cursor, the hole sits inside the archive and
-the two compare equal. The chart reruns a failed publisher by itself
+the two compare equal. It also compares slots, so a Byron main block lost beside
+its boundary block at one slot passes. The chart reruns a failed publisher by itself
 (`restartPolicy: OnFailure`, `backoffLimit`), so on a persistent claim nobody read
 the stop before that rerun: steles from a publisher restarted on a kept claim
 before this check are unchecked by it.

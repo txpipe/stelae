@@ -117,7 +117,7 @@ pub enum Error {
          and rerun"
     )]
     NoRoom { needed: u64, used: u64 },
-    #[error("replay filled the volume: {0}. Make room and rerun. {IF_THE_STATE_PASSED}")]
+    #[error("the stores ran out of room: {0}. Make room and rerun. {IF_THE_STATE_PASSED}")]
     ReplayFilledVolume(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error(
         "a store stopped taking writes: {0}. A background worker failed, which a full volume or a \
@@ -175,22 +175,18 @@ impl Error {
 pub fn refuse_archive_behind(config: &RootConfig, genesis: Arc<Genesis>) -> Result<(), Error> {
     use dolos_core::{ArchiveStore as _, StateStore as _};
 
-    fn failed(error: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>) -> Error {
-        Error::caller(error).in_replay()
-    }
-
     // What the engine refuses comes first, and this creates what it would.
     ReplayWorkspace::open(config, genesis)
-        .map_err(failed)?
+        .map_err(Error::caller)?
         .finish()
-        .map_err(failed)?;
+        .map_err(Error::caller)?;
     if !config.keeps_archive() {
         return Ok(());
     }
 
-    let state = dolos::storage::open_state_store(config).map_err(failed)?;
-    let cursor = state.read_cursor().map_err(failed);
-    let closed = state.shutdown().map_err(failed);
+    let state = dolos::storage::open_state_store(config).map_err(Error::caller)?;
+    let cursor = state.read_cursor().map_err(Error::caller);
+    let closed = state.shutdown().map_err(Error::caller);
     drop(state);
     closed?;
     // An unanchored cursor has its own refusal, and Origin has no block.
@@ -198,9 +194,9 @@ pub fn refuse_archive_behind(config: &RootConfig, genesis: Arc<Genesis>) -> Resu
         return Ok(());
     };
 
-    let archive = dolos::storage::open_archive_store(config).map_err(failed)?;
-    let tip = archive.get_tip().map_err(failed);
-    let closed = archive.shutdown().map_err(failed);
+    let archive = dolos::storage::open_archive_store(config).map_err(Error::caller)?;
+    let tip = archive.get_tip().map_err(Error::caller);
+    let closed = archive.shutdown().map_err(Error::caller);
     drop(archive);
     closed?;
     match tip?.map(|(slot, _)| slot) {
@@ -654,7 +650,7 @@ impl<W: Workspace> Driver<'_, W> {
         if self.window == 0 {
             return Err(Error::EmptyWindow);
         }
-        (self.check_stores)()?;
+        (self.check_stores)().map_err(Error::in_replay)?;
         let width = slots_per_immutable_file(self.genesis);
         let immutable_dir = self.immutable_dir();
         info!(
@@ -1343,7 +1339,7 @@ mod tests {
             message.contains("a full volume or a failing disk"),
             "{message}"
         );
-        assert!(!message.contains("filled the volume"), "{message}");
+        assert!(!message.contains("ran out of room"), "{message}");
     }
 
     #[test]
