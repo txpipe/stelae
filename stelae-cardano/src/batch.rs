@@ -275,6 +275,12 @@ const REPLAY: &str = "Nothing else holds those boundaries: restore the stores fr
 
 const REPLAY_FROM_GENESIS: &str = "clear the storage path and run with --allow-genesis";
 
+/// The recovery for stores nothing can repair.
+pub const START_OVER: &str =
+    "Clear the storage path and any store configured outside it, then restore the stores from the \
+     repository's latest stele. A repository with no stele has nothing to restore, so clear them \
+     the same way and run with --allow-genesis";
+
 fn io_at(path: &Path) -> impl FnOnce(io::Error) -> Error + '_ {
     move |source| Error::Io {
         path: path.to_owned(),

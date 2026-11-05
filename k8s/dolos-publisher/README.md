@@ -93,7 +93,11 @@ Pending. Start over whenever the kept stores no longer fit the release:
   until `backoffLimit`, but does not check the image itself;
 - a rollback away from a suspect image. The rolled-back image continues
   from the state the suspect image left, and every boundary it publishes
-  afterwards is built on that state.
+  afterwards is built on that state;
+- stores whose state passed the archive, which a kill or a full volume can
+  leave. Every restart refuses them until `backoffLimit`. The check can't
+  vouch for stores that crossed a gap on an image without it (see
+  [publisher.md](../../docs/publisher.md#stores-whose-state-passed-the-archive)).
 
 Once the claim exists its class is fixed. Naming a class other than the
 one the claim has fails, and so does clearing a named class back to empty,

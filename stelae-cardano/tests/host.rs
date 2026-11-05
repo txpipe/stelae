@@ -231,6 +231,7 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
             beacon: &|| unreachable!("the publish decides this run"),
             replay: &(),
             open_workspace: &open_workspace,
+            check_stores: &|| backfill::refuse_archive_behind(&node.config, genesis.clone()),
             publish: &publish,
             batching: Batching {
                 limits: batch::Limits::ONE,
@@ -352,6 +353,55 @@ fn a_rolling_history_is_refused_before_backfill_creates_anything() {
     .to_string();
     assert!(error.contains("history.mode = \"full\""), "{error}");
     assert!(!config.storage.path.exists());
+}
+
+/// The host's own run looks at the stores before it replays or publishes.
+#[test]
+fn a_backfill_refuses_stores_whose_state_passed_the_archive() {
+    use dolos_core::{StateStore as _, StateWriter as _};
+
+    let node = Node::new();
+    let (genesis, boundary) = node.replay_to_the_first_boundary();
+
+    let state = dolos::storage::open_state_store(&node.config).unwrap();
+    let writer = state.start_writer().unwrap();
+    let past = ChainPoint::Specific(boundary.slot() + 1, boundary.hash().unwrap());
+    writer.set_cursor(past).unwrap();
+    writer.commit().unwrap();
+    state.shutdown().unwrap();
+    drop(state);
+
+    let options = backfill::Options {
+        direct_s3: None,
+        repository: "oci://registry.invalid/cardano/preview".parse().unwrap(),
+        auth: Auth::Anonymous,
+        insecure: false,
+        scratch_dir: None,
+        concurrency: None,
+        verify_carried: false,
+        download_dir: Some(node.path().join("unused")),
+        window: 1,
+        until_epoch: Some(1),
+        skip_validation: true,
+        mithril: MithrilSource {
+            aggregator: "http://unused.invalid".to_owned(),
+            genesis_vkey: String::new(),
+        },
+        retained: RetainedEpochs::default(),
+        limits: batch::Limits::ONE,
+    };
+    let error = backfill::run(
+        &node.config,
+        &genesis,
+        &options,
+        tokio_util::sync::CancellationToken::new(),
+        &Observer::silent(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, backfill::Error::ArchiveBehind { .. }),
+        "{error}"
+    );
 }
 
 /// A prepared batch has nowhere to go until ordered publication arrives, so no

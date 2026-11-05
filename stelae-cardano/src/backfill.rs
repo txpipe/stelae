@@ -41,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::{
-    batch::{self, Admission, Batch, Committed, Flush, Frontiers, Limits, Position},
+    batch::{self, Admission, Batch, Committed, Flush, Frontiers, Limits, Position, START_OVER},
     publisher::{BackfillPublisher, PolicyError, RepositoryPublish},
 };
 
@@ -121,6 +121,15 @@ pub enum Error {
     )]
     ReplayFilledVolume(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error(
+        "the state store stands at slot {cursor} and the archive's last block is at {tip:?}: the \
+         state passed blocks the archive never got, and replaying on would leave them out of \
+         every stele. {START_OVER}"
+    )]
+    ArchiveBehind {
+        cursor: BlockSlot,
+        tip: Option<BlockSlot>,
+    },
+    #[error(
         "--batch-epochs above 1 is not active yet: publishing a prepared batch arrives with \
          ordered publication and recovery"
     )]
@@ -140,6 +149,50 @@ impl Error {
             }
             other => other,
         }
+    }
+}
+
+/// Refuse stores whose state has passed the archive. Dolos commits a block's
+/// state first and an import keeps no WAL to catch the archive up from, so
+/// replaying on would close the difference and leave those blocks out of every
+/// stele. Only a block's commit moves a hashed cursor, and an archive ahead of
+/// it heals as the same blocks import again.
+///
+/// This can't see a gap later imports already closed.
+pub fn refuse_archive_behind(config: &RootConfig, genesis: Arc<Genesis>) -> Result<(), Error> {
+    use dolos_core::{ArchiveStore as _, StateStore as _};
+
+    fn failed(error: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>) -> Error {
+        Error::caller(error).in_replay()
+    }
+
+    // What the engine refuses comes first, and this creates what it would.
+    ReplayWorkspace::open(config, genesis)
+        .map_err(failed)?
+        .finish()
+        .map_err(failed)?;
+    if !config.keeps_archive() {
+        return Ok(());
+    }
+
+    let state = dolos::storage::open_state_store(config).map_err(failed)?;
+    let cursor = state.read_cursor().map_err(failed);
+    let closed = state.shutdown().map_err(failed);
+    drop(state);
+    closed?;
+    // An unanchored cursor has its own refusal, and Origin has no block.
+    let Some(ChainPoint::Specific(cursor, _)) = cursor? else {
+        return Ok(());
+    };
+
+    let archive = dolos::storage::open_archive_store(config).map_err(failed)?;
+    let tip = archive.get_tip().map_err(failed);
+    let closed = archive.shutdown().map_err(failed);
+    drop(archive);
+    closed?;
+    match tip?.map(|(slot, _)| slot) {
+        Some(tip) if tip >= cursor => Ok(()),
+        tip => Err(Error::ArchiveBehind { cursor, tip }),
     }
 }
 
@@ -374,6 +427,9 @@ pub struct Driver<'a, W: Workspace> {
     pub beacon: &'a dyn Fn() -> Result<Option<u64>, Error>,
     pub replay: &'a dyn Replay,
     pub open_workspace: &'a dyn Fn() -> Result<W, Error>,
+    /// Refuse stores no run may continue. It opens them itself, so it runs with
+    /// no workspace holding their locks.
+    pub check_stores: &'a dyn Fn() -> Result<(), Error>,
     pub publish: &'a dyn Publish,
     pub batching: Batching<'a>,
 }
@@ -502,6 +558,7 @@ pub fn run(
         beacon: &beacon,
         replay: &(),
         open_workspace: &|| ReplayWorkspace::open(config, genesis.clone()).map_err(Error::caller),
+        check_stores: &|| refuse_archive_behind(config, genesis.clone()),
         publish: &publisher,
         batching: Batching {
             limits: options.limits,
@@ -554,6 +611,7 @@ impl<W: Workspace> Driver<'_, W> {
         if self.window == 0 {
             return Err(Error::EmptyWindow);
         }
+        (self.check_stores)()?;
         let width = slots_per_immutable_file(self.genesis);
         let immutable_dir = self.immutable_dir();
         info!(

@@ -244,6 +244,29 @@ The backfill state machine preserves these rules from the accepted Dolos host:
 - retain the `--state-epochs-file` epochs, and the plan, schema, media-type,
   compression and journal identities of the pinned profile.
 
+### Stores whose state passed the archive
+
+Dolos commits a replayed block's state before its archive entry, and an import
+keeps no WAL, so a kill or a full volume between the two leaves the state cursor
+past blocks the archive never got. Replaying on closes the difference with those
+blocks missing: the stele cut from there restores without complaint, and every
+later stele inherits the hole. So `run` and `backfill` compare the cursor with the
+archive's tip before anything else, on a batch of one and a larger batch alike, and
+refuse while the tip is behind. An archive ahead of the cursor passes, because
+replay writes the same blocks again.
+
+The refusal repeats until the stores are replaced, and nothing repairs them: clear
+the storage path and any store configured outside it, then restore the stores from
+the repository's latest stele. A repository with no stele has nothing to restore,
+so clear them the same way and run with `--allow-genesis`.
+
+This can't vouch for stores that crossed a gap on an earlier build. Once later
+imports bring the tip level with the cursor, the hole sits inside the archive and
+the two compare equal. The chart reruns a failed publisher by itself
+(`restartPolicy: OnFailure`, `backoffLimit`), so on a persistent claim nobody read
+the stop before that rerun: steles from a publisher restarted on a kept claim
+before this check are unchecked by it.
+
 ## Prepared batches
 
 **Not active yet.** `--batch-epochs` above 1 is refused, because a prepared batch

@@ -522,6 +522,9 @@ impl<'a> Rig<'a> {
             },
             replay: &replay,
             open_workspace: &open_workspace,
+            check_stores: &|| {
+                backfill::refuse_archive_behind(&self.node.config, self.chain.genesis.clone())
+            },
             publish: &self.repository,
             batching: Batching {
                 limits,
@@ -1802,6 +1805,157 @@ fn a_session_close_filling_the_volume_stops_recoverably() {
     let (_, frontiers) = ready(rig.run(limits(4), None));
     assert_eq!(frontiers.prepared, Some(4));
     assert_eq!(*rig.calls.traversed.borrow(), [3]);
+}
+
+/// Where `index`'s block stands, as a commit of it would leave the cursor.
+fn block_point(chain: &Chain, index: usize) -> ChainPoint {
+    let block = MultiEraBlock::decode(&chain.blocks[index]).unwrap();
+    ChainPoint::Specific(block.slot(), block.hash())
+}
+
+/// Write the state cursor alone, as the state's commit does when the archive's
+/// after it never lands.
+fn state_cursor_at(rig: &Rig<'_>, cursor: ChainPoint) {
+    use dolos_core::{StateStore as _, StateWriter as _};
+
+    let state = dolos::storage::open_state_store(&rig.node.config).unwrap();
+    let writer = state.start_writer().unwrap();
+    writer.set_cursor(cursor).unwrap();
+    writer.commit().unwrap();
+    state.shutdown().unwrap();
+}
+
+fn refuses_archive_behind(rig: &Rig<'_>) -> Result<(), backfill::Error> {
+    backfill::refuse_archive_behind(&rig.node.config, rig.chain.genesis.clone())
+}
+
+/// A kill or a full volume between the state's commit and the archive's leaves
+/// the cursor past blocks nothing can restore. Replaying on would hide the gap,
+/// so every rerun refuses before it imports or publishes, whatever it batches.
+#[test]
+fn stores_whose_state_passed_the_archive_are_refused() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    assert_eq!(
+        rig.run(Limits::ONE, Some(1)).unwrap(),
+        Outcome::UntilEpoch { sequence: 1 }
+    );
+    let at = block_point(&chain, 2).slot();
+    let past = block_point(&chain, 4);
+    state_cursor_at(&rig, past.clone());
+    let sessions = rig.calls.sessions.get();
+    let published = rig.calls.published.get();
+
+    for batching in [Limits::ONE, limits(3), Limits::ONE] {
+        let error = rig.run(batching, None).unwrap_err();
+        let backfill::Error::ArchiveBehind { cursor, tip } = error else {
+            panic!("{error}");
+        };
+        assert_eq!(cursor, past.slot());
+        assert_eq!(tip, Some(at));
+        assert_eq!(rig.cursor(), past, "the refusal moved nothing");
+        assert_eq!(rig.calls.sessions.get(), sessions, "no import ran");
+        assert_eq!(rig.calls.published.get(), published, "nothing published");
+        assert!(rig.calls.prepared.borrow().is_empty(), "nothing captured");
+    }
+
+    let message = rig.run(Limits::ONE, None).unwrap_err().to_string();
+    assert!(message.contains("latest stele"), "{message}");
+    assert!(message.contains("--allow-genesis"), "{message}");
+}
+
+/// A batch resuming is no exception: what it holds doesn't vouch for the blocks
+/// it would replay past.
+#[test]
+fn a_batch_doesnt_resume_past_a_gap_in_the_archive() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.cancel_after.set(Some(1));
+    assert!(matches!(
+        rig.run(limits(4), None),
+        Err(backfill::Error::Interrupted)
+    ));
+    assert_eq!(rig.sequences(), [1]);
+    rig.calls.cancel.restart();
+    state_cursor_at(&rig, block_point(&chain, 4));
+
+    let error = rig.run(limits(4), None).unwrap_err();
+    assert!(
+        matches!(error, backfill::Error::ArchiveBehind { .. }),
+        "{error}"
+    );
+    assert_eq!(rig.sequences(), [1]);
+}
+
+/// Stores with a cursor and no archive at all have lost every block they
+/// passed.
+#[test]
+fn an_empty_archive_under_a_hashed_cursor_is_refused() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    state_cursor_at(&rig, block_point(&chain, 1));
+    assert!(matches!(
+        refuses_archive_behind(&rig),
+        Err(backfill::Error::ArchiveBehind { tip: None, .. })
+    ));
+}
+
+/// Only a block's commit moves a hashed cursor, so these have no block to miss.
+#[test]
+fn stores_with_no_hashed_cursor_pass() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    refuses_archive_behind(&rig).unwrap();
+    state_cursor_at(&rig, ChainPoint::Origin);
+    refuses_archive_behind(&rig).unwrap();
+    state_cursor_at(&rig, ChainPoint::Slot(block_point(&chain, 4).slot()));
+    refuses_archive_behind(&rig).unwrap();
+}
+
+/// With no archive kept there is nothing to fall behind.
+#[test]
+fn stores_keeping_no_archive_pass() {
+    let chain = Chain::spanning(12);
+    let mut rig = Rig::new(&chain);
+    rig.node.config.history = dolos_core::config::HistoryConfig::none();
+    state_cursor_at(&rig, block_point(&chain, 1));
+    refuses_archive_behind(&rig).unwrap();
+}
+
+/// What an archive-first commit order would leave. It heals as the same block
+/// imports again, so "behind" is the test rather than "differs".
+#[test]
+fn an_archive_ahead_of_the_state_heals_on_replay() {
+    use dolos_core::{ArchiveStore as _, ArchiveWriter as _};
+
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.source_ends_after(2);
+    assert_eq!(rig.run(Limits::ONE, Some(1)).unwrap(), Outcome::UpToDate);
+    assert_eq!(rig.cursor(), block_point(&chain, 1));
+
+    let archive = dolos::storage::open_archive_store(&rig.node.config).unwrap();
+    let writer = archive.start_writer().unwrap();
+    writer
+        .apply(&block_point(&chain, 2), &chain.blocks[2])
+        .unwrap();
+    writer.commit().unwrap();
+    archive.shutdown().unwrap();
+    drop(archive);
+
+    rig.restart_with_the_whole_source();
+    assert_eq!(
+        rig.run(Limits::ONE, Some(1)).unwrap(),
+        Outcome::UntilEpoch { sequence: 1 }
+    );
+
+    let workspace = ReplayWorkspace::open(&rig.node.config, chain.genesis.clone()).unwrap();
+    let snapshot = workspace.snapshot();
+    let plan = snapshot.plan(MAGIC.into(), retained()).unwrap();
+    let healed = snapshot.digest_document(&plan, &First).unwrap();
+    drop(snapshot);
+    workspace.finish().unwrap();
+    assert_eq!(healed.canonical, chain.frozen(1, None).canonical);
 }
 
 /// Another failure while replaying stays what it was.
