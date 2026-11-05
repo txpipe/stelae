@@ -1136,6 +1136,13 @@ mod tests {
             refuse_lost_history(dir.path(), 1),
             Err(Error::Corrupt { .. })
         ));
+
+        let another_format = format!("{{\"format\":{},\"first\":1}}", JOURNAL_FORMAT + 1);
+        fs::write(dir.path().join(BEGAN_FILE), another_format).unwrap();
+        assert!(matches!(
+            refuse_lost_history(dir.path(), 1),
+            Err(Error::Corrupt { .. })
+        ));
     }
 
     #[test]
