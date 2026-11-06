@@ -189,6 +189,8 @@ struct Calls {
     poison_workspace_close: Cell<bool>,
     /// Fail the next check of the stores as a full volume.
     check_full: Cell<bool>,
+    /// Fail the next read of the stores' epoch, as a store that can't be read.
+    epoch_fails: Cell<bool>,
     /// Fail the next workspace to open as a full volume.
     open_full: Cell<bool>,
     /// Fail the workspace to open after this many more, as a full volume.
@@ -242,6 +244,10 @@ impl<S: SnapshotSource> SnapshotSource for Counted<'_, S> {
         self.inner.committed_position()
     }
     fn epoch(&self) -> Result<Option<u64>, dolos_snapshot::Error> {
+        if self.calls.epoch_fails.replace(false) {
+            let unread = dolos_core::StateError::InternalStoreError("read failed".to_owned());
+            return Err(dolos_snapshot::Error::Chain(unread.into()));
+        }
         self.inner.epoch()
     }
     fn plan(&self, magic: u64, retained: RetainedEpochs) -> Result<Plan, dolos_snapshot::Error> {
@@ -2344,6 +2350,26 @@ fn a_cursor_estart_left_names_how_to_recover() {
         let message = rig.run(batching, None).unwrap_err().to_string();
         assert!(message.contains("latest stele"), "{message}");
         assert!(message.contains("--allow-genesis"), "{message}");
+    }
+}
+
+/// A failed read says nothing of the cursor, so it keeps its cause and sends no
+/// one to clear stores that may be sound.
+#[test]
+fn a_failed_read_of_the_epoch_doesnt_ask_to_clear_the_stores() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.source_ends_after(2);
+    assert_eq!(rig.run(Limits::ONE, Some(1)).unwrap(), Outcome::UpToDate);
+
+    for batching in [Limits::ONE, limits(3)] {
+        rig.calls.epoch_fails.set(true);
+        let error = rig.run(batching, None).unwrap_err();
+        let backfill::Error::Planning(cause) = &error else {
+            panic!("{error}");
+        };
+        assert!(cause.to_string().contains("read failed"), "{error}");
+        assert!(!error.to_string().contains("latest stele"), "{error}");
     }
 }
 

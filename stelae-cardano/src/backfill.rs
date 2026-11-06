@@ -1404,6 +1404,19 @@ mod tests {
         );
     }
 
+    /// With no figure to show, the words can't rule a full volume out, and the
+    /// client's own error still leads.
+    #[test]
+    fn a_failed_fetch_says_when_it_cant_read_the_free_space() {
+        let dir = Path::new("relative-with-no-ancestor");
+        let reason = fetch_failure(&"All locations failed", dir);
+        assert!(reason.starts_with("All locations failed. "), "{reason}");
+        assert!(
+            reason.ends_with("so a full volume can't be ruled out"),
+            "{reason}"
+        );
+    }
+
     #[test]
     fn a_run_spools_under_the_scratch_directory_it_is_given() {
         let storage = StorageConfig {

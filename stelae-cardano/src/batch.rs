@@ -1239,6 +1239,20 @@ mod tests {
         assert!(!reports_poisoned(&archive), "{archive}");
     }
 
+    /// Built from each store's own types and a real OS error, so a pin moving
+    /// their words fails here too. That text has no "(os error 28)".
+    #[cfg(unix)]
+    #[test]
+    fn a_full_volume_reads_the_same_from_every_store() {
+        let full = || dolos_fjall::Error::Fjall(fjall::Error::Io(io::Error::from_raw_os_error(28)));
+        let state = dolos_core::StateError::from(full());
+        let archive = dolos_core::ArchiveError::from(full());
+        assert!(reports_full_volume(&state), "{state}");
+        assert!(reports_full_volume(&archive), "{archive}");
+        assert!(!reports_poisoned(&state), "{state}");
+        assert!(!reports_poisoned(&archive), "{archive}");
+    }
+
     /// Over standing stores a restore changes nothing, so each recovery clears
     /// them first.
     #[test]
