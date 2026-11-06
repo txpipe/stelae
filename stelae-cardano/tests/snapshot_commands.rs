@@ -34,7 +34,10 @@ impl Fixture {
             &genesis,
             &retained(),
             Selection::default(),
-            Destination::Directory(stele.clone()),
+            Destination::Directory {
+                path: stele.clone(),
+                scratch_dir: None,
+            },
             false,
             &Observer::silent(),
         )
@@ -73,9 +76,35 @@ impl Fixture {
             &self.genesis,
             retained,
             Selection::default(),
+            None,
             &|_, _| {},
             then,
         )
+    }
+}
+
+/// A reproduction spools where it is told to, by default under the stores.
+#[test]
+fn a_digest_spools_under_the_scratch_directory_it_names() {
+    let node = Node::new();
+    let (genesis, _) = node.replay_to_the_first_boundary();
+    let named = node.path().join("spool");
+    for (scratch, expected) in [
+        (None, node.config.storage.path.join("scratch")),
+        (Some(named.as_path()), named.clone()),
+    ] {
+        assert!(!expected.exists());
+        snapshot::with_plan(
+            &node.config,
+            &genesis,
+            retained(),
+            Selection::default(),
+            scratch,
+            &|_, _| {},
+            |source, plan| snapshot::digest(source, plan, None),
+        )
+        .unwrap();
+        assert!(expected.is_dir(), "{}", expected.display());
     }
 }
 

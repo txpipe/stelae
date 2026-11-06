@@ -5,10 +5,10 @@ use dolos_core::ChainPoint;
 use dolos_snapshot::{export::Plan, source::SnapshotSource};
 use stelae::progress::Observer;
 use stelae_cardano::{
-    backfill::{self, Driver},
-    initialize,
+    backfill::{self, Batching, Driver},
+    batch, initialize,
     publisher::{publish_once, Destination, PublishOutcome},
-    testing::Node,
+    testing::{empty_registry, Node},
     Auth, MithrilSource, Point, RestoreSource, RetainedEpochs, Selection,
 };
 
@@ -23,7 +23,10 @@ fn a_bounded_fixture_publishes_to_a_directory_through_the_new_host() {
         &genesis,
         &RetainedEpochs::default(),
         Selection::default(),
-        Destination::Directory(destination.clone()),
+        Destination::Directory {
+            path: destination.clone(),
+            scratch_dir: None,
+        },
         false,
         &Observer::silent(),
     )
@@ -34,6 +37,10 @@ fn a_bounded_fixture_publishes_to_a_directory_through_the_new_host() {
     };
     assert!(layers > 0);
     assert!(destination.join("inscription.json").is_file());
+    assert!(
+        node.config.storage.path.join("scratch").is_dir(),
+        "the index runs spool under the storage path, not the system's"
+    );
 
     let restored = Node::new();
     let outcome = initialize::run(
@@ -67,7 +74,10 @@ fn a_restored_stele_publishes_the_same_inscription() {
             genesis,
             &retained,
             Selection::default(),
-            Destination::Directory(destination),
+            Destination::Directory {
+                path: destination,
+                scratch_dir: None,
+            },
             false,
             &Observer::silent(),
         )
@@ -118,7 +128,10 @@ fn retained_state_epochs_reach_the_signed_inscription() {
         &genesis,
         &retained,
         Selection::default(),
-        Destination::Directory(destination.clone()),
+        Destination::Directory {
+            path: destination.clone(),
+            scratch_dir: None,
+        },
         false,
         &Observer::silent(),
     )
@@ -145,6 +158,7 @@ fn retained_state_epochs_reach_the_signed_inscription() {
 fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
     struct Publisher {
         expected: ChainPoint,
+        scratch: PathBuf,
         fail: bool,
         called: Cell<bool>,
         cancel: tokio_util::sync::CancellationToken,
@@ -154,6 +168,7 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
         fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {
             assert_eq!(plan.sequence, 1);
             assert_eq!(plan.retained.as_slice(), &[1]);
+            assert_eq!(plan.scratch.as_ref(), Some(&self.scratch));
             assert_eq!(
                 source.committed_position().unwrap(),
                 Some(self.expected.clone())
@@ -167,6 +182,10 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
             } else {
                 Ok(())
             }
+        }
+
+        fn latest(&self, _: &Plan) -> Result<Option<batch::Committed>, backfill::Error> {
+            unreachable!("a batch of one never asks")
         }
     }
 
@@ -183,10 +202,13 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
         .build()
         .unwrap();
 
+    let observer = Observer::silent();
+
     for fail in [true, false] {
         let cancel = tokio_util::sync::CancellationToken::new();
         let publish = Publisher {
             expected: boundary.clone(),
+            scratch: node.path().join("spool"),
             fail,
             called: Cell::new(false),
             cancel: cancel.clone(),
@@ -199,15 +221,25 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
             retained: &retained,
             mithril: &mithril,
             download_dir: node.path().join("unused"),
+            scratch: node.path().join("spool"),
             window: 1,
             until_epoch: Some(1),
             skip_validation: false,
             runtime: runtime.handle().clone(),
             cancel,
             mithril_feedback: &|| None,
+            beacon: &|| unreachable!("the publish decides this run"),
             replay: &(),
             open_workspace: &open_workspace,
+            check_stores: &|| backfill::refuse_archive_behind(&node.config, genesis.clone()),
             publish: &publish,
+            batching: Batching {
+                limits: batch::Limits::ONE,
+                storage_path: node.config.storage.path.clone(),
+                repository: "oci://registry.invalid/cardano/preview".to_owned(),
+                room: &|_, _| true,
+                observer: &observer,
+            },
         };
         assert_eq!(driver.run().is_err(), fail);
         assert!(publish.called.get());
@@ -307,6 +339,7 @@ fn a_rolling_history_is_refused_before_backfill_creates_anything() {
             genesis_vkey: String::new(),
         },
         retained: RetainedEpochs::default(),
+        limits: batch::Limits::ONE,
     };
 
     let error = backfill::run(
@@ -319,5 +352,157 @@ fn a_rolling_history_is_refused_before_backfill_creates_anything() {
     .unwrap_err()
     .to_string();
     assert!(error.contains("history.mode = \"full\""), "{error}");
+    assert!(!config.storage.path.exists());
+}
+
+/// The check asks what opening a workspace would refuse before it opens a store
+/// itself, which would create it.
+#[test]
+fn a_configuration_the_engine_refuses_creates_no_store_in_the_check() {
+    let node = Node::new();
+    let mut config = node.config.clone();
+    config.storage.path = node.path().join("refused");
+    config.chain.network = "custom".to_owned();
+
+    let error =
+        backfill::refuse_archive_behind(&config, dolos_cardano::include::preview::load().into())
+            .unwrap_err();
+    assert!(matches!(error, backfill::Error::Caller(_)), "{error}");
+    assert!(!config.storage.path.exists());
+}
+
+/// The host's own run looks at the stores before it replays or publishes.
+#[test]
+fn a_backfill_refuses_stores_whose_state_passed_the_archive() {
+    use dolos_core::{StateStore as _, StateWriter as _};
+
+    let node = Node::new();
+    let (genesis, boundary) = node.replay_to_the_first_boundary();
+
+    let state = dolos::storage::open_state_store(&node.config).unwrap();
+    let writer = state.start_writer().unwrap();
+    let past = ChainPoint::Specific(boundary.slot() + 1, boundary.hash().unwrap());
+    writer.set_cursor(past).unwrap();
+    writer.commit().unwrap();
+    state.shutdown().unwrap();
+    drop(state);
+
+    let options = backfill::Options {
+        direct_s3: None,
+        repository: "oci://registry.invalid/cardano/preview".parse().unwrap(),
+        auth: Auth::Anonymous,
+        insecure: false,
+        scratch_dir: None,
+        concurrency: None,
+        verify_carried: false,
+        download_dir: Some(node.path().join("unused")),
+        window: 1,
+        until_epoch: Some(1),
+        skip_validation: true,
+        mithril: MithrilSource {
+            aggregator: "http://unused.invalid".to_owned(),
+            genesis_vkey: String::new(),
+        },
+        retained: RetainedEpochs::default(),
+        limits: batch::Limits::ONE,
+    };
+    let error = backfill::run(
+        &node.config,
+        &genesis,
+        &options,
+        tokio_util::sync::CancellationToken::new(),
+        &Observer::silent(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, backfill::Error::ArchiveBehind { .. }),
+        "{error}"
+    );
+}
+
+/// The option reaches both a backfill's spool and its staging: nothing lands on
+/// the store volume. Takes the retries' whole backoff.
+#[test]
+fn a_backfill_spools_under_the_scratch_directory_it_is_given() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let node = Node::new();
+    let (genesis, _) = node.replay_to_the_first_boundary();
+    let default = node.config.storage.path.join("scratch");
+    assert!(!default.exists());
+    let spool = node.path().join("named-spool");
+
+    let options = backfill::Options {
+        direct_s3: None,
+        repository: empty_registry().parse().unwrap(),
+        auth: Auth::Anonymous,
+        insecure: true,
+        scratch_dir: Some(spool.clone()),
+        concurrency: None,
+        verify_carried: false,
+        download_dir: Some(node.path().join("unused")),
+        window: 1,
+        until_epoch: Some(1),
+        skip_validation: true,
+        mithril: MithrilSource {
+            aggregator: "http://unused.invalid".to_owned(),
+            genesis_vkey: String::new(),
+        },
+        retained: dolos_snapshot::planning::retained_epochs(&[1]).unwrap(),
+        limits: batch::Limits::ONE,
+    };
+    let error = backfill::run(
+        &node.config,
+        &genesis,
+        &options,
+        tokio_util::sync::CancellationToken::new(),
+        &Observer::silent(),
+    )
+    .unwrap_err();
+
+    assert!(spool.is_dir(), "{error}");
+    assert!(!default.exists(), "{error}");
+}
+
+/// A prepared batch has nowhere to go until ordered publication arrives, so no
+/// host entry point starts one.
+#[test]
+fn a_batch_above_one_is_gated_before_anything_opens() {
+    let node = Node::new();
+    let genesis = dolos_cardano::include::preview::load();
+    let mut config = node.config.clone();
+    config.storage.path = node.path().join("gated");
+    let options = backfill::Options {
+        direct_s3: None,
+        repository: "oci://registry.invalid/cardano/preview".parse().unwrap(),
+        auth: Auth::Anonymous,
+        insecure: false,
+        scratch_dir: None,
+        concurrency: None,
+        verify_carried: false,
+        download_dir: None,
+        window: 1,
+        until_epoch: None,
+        skip_validation: false,
+        mithril: MithrilSource {
+            aggregator: "http://unused.invalid".to_owned(),
+            genesis_vkey: String::new(),
+        },
+        retained: RetainedEpochs::default(),
+        limits: batch::Limits {
+            max_epochs: std::num::NonZeroU64::new(2).unwrap(),
+            scratch: u64::MAX,
+            reserve_per_epoch: 0,
+        },
+    };
+
+    let error = backfill::run(
+        &config,
+        &genesis,
+        &options,
+        tokio_util::sync::CancellationToken::new(),
+        &Observer::silent(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, backfill::Error::BatchingGated), "{error}");
     assert!(!config.storage.path.exists());
 }

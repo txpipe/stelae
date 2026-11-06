@@ -6,6 +6,7 @@
 //! `stelae` and `stelae-driver`, which have no Cardano dependency.
 
 pub mod backfill;
+pub mod batch;
 pub mod config;
 pub mod initialize;
 pub mod publisher;
@@ -25,9 +26,9 @@ pub use dolos_snapshot::{
 };
 
 /// The Dolos revision this publisher reads its configuration and stores with:
-/// the Stelae snapshot envelope adoption (txpipe/dolos PR #1553). The v2
-/// profile was frozen earlier, at e39a38a3 (PR #1548).
-pub const DOLOS_REVISION: &str = "1db3e41fd04bca64bf245f50b54ca656719764ca";
+/// the boundary preparation facade (txpipe/dolos PR #1564). The v2 profile was
+/// frozen earlier, at e39a38a3 (PR #1548).
+pub const DOLOS_REVISION: &str = "bf66dcc66cd65228539c8401e291807e947c61ec";
 
 #[cfg(test)]
 mod dependency_identity {

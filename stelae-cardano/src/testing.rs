@@ -8,10 +8,29 @@ use std::{
 
 use dolos::engine::BulkReplaySession;
 use dolos_core::{
-    config::{ChainConfig, RootConfig},
+    config::{CardanoConfig, ChainConfig, CustomUtxo, GenesisConfig, RootConfig, UpstreamConfig},
     ChainPoint, Genesis,
 };
 use dolos_testing::blocks::make_conway_block_with_prev;
+
+/// A registry holding nothing: it answers every request with a 404, so a
+/// publish reads it as empty, spools, stages and fails at its first upload.
+pub fn empty_registry() -> String {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    format!("oci://127.0.0.1:{port}/cardano/test")
+}
 
 /// A preview node whose stores live in a temporary directory.
 pub struct Node {
@@ -44,6 +63,19 @@ impl Node {
 
     pub fn path(&self) -> &Path {
         self.root.path()
+    }
+
+    /// Put the node on a chain seeding `utxos` over the preview genesis, which
+    /// a replay of synthetic blocks spends from.
+    pub fn on_custom_chain(&mut self, magic: u32, utxos: Vec<CustomUtxo>) {
+        dolos_cardano::include::preview::save(self.path()).unwrap();
+        self.config.chain = ChainConfig::custom(CardanoConfig {
+            magic,
+            is_testnet: true,
+            genesis: GenesisConfig::in_dir(self.path()),
+            custom_utxos: utxos,
+        });
+        self.config.upstream = Some(UpstreamConfig::peer("unused.invalid:3001"));
     }
 
     pub fn config_path(&self) -> PathBuf {

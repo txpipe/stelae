@@ -197,13 +197,15 @@ fn reproduction_differs(error: &dolos_snapshot::Error) -> bool {
 /// cut, then run `then` over the plan before closing them.
 ///
 /// One sequence for `digest` and `verify --reproduce`, because a node that
-/// gave them different plans would be verifying a different document.
+/// gave them different plans would be verifying a different document. Both
+/// spool index runs under `scratch_dir`, or the storage path's default.
 /// `announce` hears the plan before anything slow runs.
 pub fn with_plan<T>(
     config: &RootConfig,
     genesis: &Genesis,
     retained: RetainedEpochs,
     selection: Selection,
+    scratch_dir: Option<&Path>,
     announce: &dyn Fn(&PlanReport, &Boundary),
     then: impl FnOnce(&dyn SnapshotSource, &Plan) -> Result<T, Error>,
 ) -> Result<T, Error> {
@@ -214,7 +216,8 @@ pub fn with_plan<T>(
         let what = "planning the reproduction";
         let plan = snapshot
             .selected_plan(u64::from(genesis.network_magic()), retained, selection)
-            .map_err(Error::profile(what))?;
+            .map_err(Error::profile(what))?
+            .with_scratch(node::scratch_dir(&config.storage, scratch_dir));
         let boundary = snapshot.boundary(&plan).map_err(Error::profile(what))?;
         announce(
             &PlanReport::read(&plan).map_err(Error::profile(what))?,

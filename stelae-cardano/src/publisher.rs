@@ -2,21 +2,24 @@
 
 use std::path::{Path, PathBuf};
 
-use dolos_core::config::RootConfig;
+use dolos_core::config::{RootConfig, StorageConfig};
 use dolos_snapshot::{
     export::Plan,
     facade::SnapshotSource,
     node,
     planning::PlanReport,
     registry::{
-        self, Auth, Preview, Published, Publishing, Repository, SnapshotRepository, Tuning,
+        self, Auth, Point, Preview, Published, Publishing, Repository, SnapshotRepository, Tuning,
     },
     RetainedEpochs,
 };
 use stelae::progress::Observer;
 use stelae_driver::Standing;
 
-use crate::backfill;
+use crate::{
+    backfill,
+    batch::{self, Committed},
+};
 
 /// Resolved repository publication settings.
 pub struct RepositoryPublish<'a> {
@@ -125,6 +128,19 @@ impl Publisher {
         self.repository.standing(plan)
     }
 
+    /// What the repository really holds, as a stele that follows it would name
+    /// it.
+    pub fn latest(&self, plan: &Plan) -> Result<Option<Committed>, dolos_snapshot::Error> {
+        if self.standing(plan)? == Standing::Empty {
+            return Ok(None);
+        }
+        let latest = self.repository.inspect(Point::Latest)?;
+        Ok(Some(Committed {
+            sequence: latest.inscription.sequence,
+            identity: latest.identity.to_string(),
+        }))
+    }
+
     pub fn preflight(&self) -> Result<(), dolos_snapshot::Error> {
         self.repository.preflight()
     }
@@ -172,6 +188,12 @@ impl backfill::Publish for BackfillPublisher<'_> {
         Ok(())
     }
 
+    fn latest(&self, plan: &Plan) -> Result<Option<Committed>, backfill::Error> {
+        Publisher::open(self.config, &self.settings)
+            .and_then(|publisher| publisher.latest(plan))
+            .map_err(backfill::Error::caller)
+    }
+
     fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {
         let publisher =
             Publisher::open(self.config, &self.settings).map_err(backfill::Error::caller)?;
@@ -200,7 +222,10 @@ impl backfill::Publish for BackfillPublisher<'_> {
 
 #[derive(Debug, Clone)]
 pub enum Destination {
-    Directory(PathBuf),
+    Directory {
+        path: PathBuf,
+        scratch_dir: Option<PathBuf>,
+    },
     Repository {
         direct_s3: Option<Box<stelae::oci::s3_upload::Config>>,
         repository: Repository,
@@ -212,6 +237,14 @@ pub enum Destination {
         verify_carried: bool,
         require_new: bool,
     },
+}
+
+impl Destination {
+    /// Where this publish spools its index runs.
+    fn spool(&self, storage: &StorageConfig) -> PathBuf {
+        let (Self::Directory { scratch_dir, .. } | Self::Repository { scratch_dir, .. }) = self;
+        node::scratch_dir(storage, scratch_dir.as_deref())
+    }
 }
 
 #[derive(Debug)]
@@ -234,6 +267,21 @@ pub enum PublishOutcome {
     },
 }
 
+/// A publish starting a history refuses to where a batch already passed. A dry
+/// run publishes nothing, and a repository holding anything refuses a gap
+/// itself.
+fn refuse_lost_history(
+    next: &Next,
+    dry_run: bool,
+    storage_path: &Path,
+    sequence: u64,
+) -> Result<(), batch::Error> {
+    match (next, dry_run) {
+        (Next::First, false) => batch::refuse_lost_history(storage_path, sequence),
+        _ => Ok(()),
+    }
+}
+
 pub fn publish_once(
     config: &RootConfig,
     genesis: &dolos_core::Genesis,
@@ -243,18 +291,24 @@ pub fn publish_once(
     dry_run: bool,
     observer: &Observer,
 ) -> Result<(PlanReport, PublishOutcome), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    if matches!(destination, Destination::Repository { .. }) && !dry_run {
+        batch::refuse_pending(&config.storage.path)?;
+    }
     let workspace =
         dolos::engine::ReplayWorkspace::open(config, std::sync::Arc::new(genesis.clone()))?;
     let result = (|| {
         let snapshot = workspace.snapshot();
-        let plan = snapshot.selected_plan(
-            u64::from(genesis.network_magic()),
-            retained.clone(),
-            selection,
-        )?;
+        let spool = destination.spool(&config.storage);
+        let plan = snapshot
+            .selected_plan(
+                u64::from(genesis.network_magic()),
+                retained.clone(),
+                selection,
+            )?
+            .with_scratch(spool);
         let report = PlanReport::read(&plan)?;
         let outcome = match destination {
-            Destination::Directory(path) => {
+            Destination::Directory { path, .. } => {
                 if dry_run {
                     PublishOutcome::DryRun {
                         sequence: plan.sequence,
@@ -295,7 +349,8 @@ pub fn publish_once(
                 let standing = publisher.standing(&plan)?;
                 match Next::read(standing, plan.sequence, require_new)? {
                     Next::Nothing(message) => PublishOutcome::Nothing(message),
-                    Next::First | Next::After { .. } => {
+                    next @ (Next::First | Next::After { .. }) => {
+                        refuse_lost_history(&next, dry_run, &config.storage.path, plan.sequence)?;
                         publisher.preflight()?;
                         if dry_run {
                             let _preview = publisher.preview(&plan, &snapshot)?;
@@ -334,6 +389,70 @@ pub fn publish_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_publish_spools_under_the_scratch_directory_it_is_given() {
+        let storage = StorageConfig {
+            path: PathBuf::from("/data"),
+            ..Default::default()
+        };
+        let storage = &storage;
+        let repository = |scratch_dir: Option<&str>| Destination::Repository {
+            direct_s3: None,
+            repository: "oci://registry.invalid/cardano/preview".parse().unwrap(),
+            auth: Auth::Anonymous,
+            insecure: false,
+            scratch_dir: scratch_dir.map(PathBuf::from),
+            rebuild: false,
+            concurrency: None,
+            verify_carried: false,
+            require_new: false,
+        };
+        let directory = |scratch_dir: Option<&str>| Destination::Directory {
+            path: PathBuf::from("/stele"),
+            scratch_dir: scratch_dir.map(PathBuf::from),
+        };
+        let default = storage.path.join("scratch");
+        assert_eq!(
+            repository(Some("/spool")).spool(storage),
+            Path::new("/spool")
+        );
+        assert_eq!(repository(None).spool(storage), default);
+        assert_eq!(
+            directory(Some("/spool")).spool(storage),
+            Path::new("/spool")
+        );
+        assert_eq!(directory(None).spool(storage), default);
+    }
+
+    /// A node whose first batch began over an empty repository keeps the
+    /// record, and later publishes to the repository it then filled must
+    /// not read it.
+    #[test]
+    fn only_a_publish_starting_a_history_reads_the_record_of_a_batch() {
+        let storage = tempfile::tempdir().unwrap();
+        let source = batch::Source {
+            repository: "oci://registry.invalid/cardano/preview".to_owned(),
+            network_magic: 2,
+            store_contract: "contract".to_owned(),
+            mutable_slots: 129_600,
+            retained: vec![1],
+            dolos_revision: "revision".to_owned(),
+        };
+        let dir = batch::dir_in(storage.path());
+        batch::Batch::open(dir, batch::Limits::ONE, source)
+            .unwrap()
+            .begin(storage.path(), 1, None)
+            .unwrap();
+
+        let reading = |next, dry_run| refuse_lost_history(next, dry_run, storage.path(), 4);
+        assert!(matches!(
+            reading(&Next::First, false),
+            Err(batch::Error::HistoryLost { .. })
+        ));
+        assert!(reading(&Next::First, true).is_ok());
+        assert!(reading(&Next::After { latest: 3 }, false).is_ok());
+    }
 
     #[test]
     fn repository_standing_maps_to_first_next_noop_and_refusal() {

@@ -1,6 +1,6 @@
 use std::{
     io::Write as _,
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
@@ -10,7 +10,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use miette::{Context as _, IntoDiagnostic as _};
 use stelae::progress::{Event, Observer, Progress};
 use stelae_cardano::{
-    backfill, config, initialize,
+    backfill,
+    batch::Limits,
+    config, initialize,
     publisher::{self, Destination, PublishOutcome},
     snapshot::{self, Boundary, PlanReport, Published, Verified},
     Auth, EpochRange, Genesis, Point, RegistryAuth, Repository, RestoreSource, RetainedEpochs,
@@ -248,9 +250,40 @@ struct BackfillArgs {
     until_epoch: Option<u64>,
     #[arg(long, action)]
     skip_validation: bool,
+    /// Boundaries prepared before they are published in order. Above 1 is
+    /// refused until ordered publication and recovery are integrated.
+    #[arg(long, default_value = "1", value_name = "EPOCHS")]
+    batch_epochs: NonZeroU64,
+    /// MiB a batch may hold on disk; required above one epoch.
+    #[arg(long, value_name = "MIB")]
+    batch_scratch_mib: Option<u64>,
+    /// MiB kept free per prepared boundary; required above one epoch.
+    #[arg(long, value_name = "MIB")]
+    batch_reserve_mib: Option<u64>,
 }
 
 impl BackfillArgs {
+    fn limits(&self) -> miette::Result<Limits> {
+        const MIB: u64 = 1024 * 1024;
+
+        let limits = match (self.batch_scratch_mib, self.batch_reserve_mib) {
+            (None, None) if self.batch_epochs.get() == 1 => Limits::ONE,
+            (Some(scratch), Some(reserve)) if self.batch_epochs.get() > 1 => Limits {
+                max_epochs: self.batch_epochs,
+                scratch: scratch.saturating_mul(MIB),
+                reserve_per_epoch: reserve.saturating_mul(MIB),
+            },
+            _ => {
+                return Err(miette::miette!(
+                    "--batch-scratch-mib and --batch-reserve-mib go together, with a \
+                     --batch-epochs above 1"
+                ))
+            }
+        };
+        backfill::gate(&limits).into_diagnostic()?;
+        Ok(limits)
+    }
+
     /// Every backfill input, resolved before a store opens.
     fn options(&self, config: &RootConfig, auth: ResolveAuth) -> miette::Result<backfill::Options> {
         if self.window == 0 {
@@ -285,6 +318,7 @@ impl BackfillArgs {
             skip_validation: self.skip_validation,
             mithril,
             retained: self.state_epochs.read()?,
+            limits: self.limits()?,
         })
     }
 }
@@ -361,14 +395,12 @@ struct PublishArgs {
     #[arg(long)]
     epochs: Option<EpochRange>,
     #[arg(long)]
-    index_band: Option<NonZeroUsize>,
-    #[arg(long)]
     producers: Option<NonZeroUsize>,
     #[arg(long, action, conflicts_with = "output_dir")]
     rebuild: bool,
     #[arg(long, action, conflicts_with = "output_dir")]
     insecure: bool,
-    #[arg(long, conflicts_with = "output_dir")]
+    #[arg(long)]
     scratch_dir: Option<PathBuf>,
     #[arg(long, conflicts_with = "output_dir")]
     concurrency: Option<NonZeroUsize>,
@@ -387,13 +419,13 @@ struct DigestArgs {
     /// match what the stele being reproduced was published with.
     #[arg(long, value_name = "RANGE")]
     epochs: Option<EpochRange>,
-    /// Epochs whose index layers one archive traversal fills; changes nothing
-    /// about the digest.
-    #[arg(long, value_name = "EPOCHS")]
-    index_band: Option<NonZeroUsize>,
     /// Layer producers run at once; changes nothing about the digest.
     #[arg(long, value_name = "N")]
     producers: Option<NonZeroUsize>,
+    /// Where the index runs spool while the digest is computed; defaults to
+    /// the storage path's `scratch` directory.
+    #[arg(long, value_name = "PATH")]
+    scratch_dir: Option<PathBuf>,
     /// Canonical inscription of the stele this one follows, as `inspect
     /// --format json` or a published `inscription.json` holds it; without it
     /// the reproduction carries no history, which is a different digest.
@@ -424,10 +456,12 @@ struct VerifyArgs {
     /// inscription. Costs what a publish costs.
     #[arg(long, action)]
     reproduce: bool,
-    #[arg(long, value_name = "EPOCHS", requires = "reproduce")]
-    index_band: Option<NonZeroUsize>,
     #[arg(long, value_name = "N", requires = "reproduce")]
     producers: Option<NonZeroUsize>,
+    /// Where the index runs spool while the stele is reproduced; defaults to
+    /// the storage path's `scratch` directory.
+    #[arg(long, value_name = "PATH", requires = "reproduce")]
+    scratch_dir: Option<PathBuf>,
     /// Epochs the reproduction builds layers for; must match what the stele
     /// was published with.
     #[arg(long, value_name = "RANGE", requires = "reproduce")]
@@ -550,6 +584,11 @@ fn run_backfill(
     {
         backfill::Outcome::UntilEpoch { sequence } => println!("sequence {sequence} published"),
         backfill::Outcome::UpToDate => println!("repository is up to date with Mithril"),
+        backfill::Outcome::BatchReady { flush, frontiers } => println!(
+            "batch closed ({flush:?}): prepared through {:?}, staged at {:?}, published through \
+             {:?}",
+            frontiers.prepared, frontiers.staged, frontiers.published,
+        ),
     }
     Ok(())
 }
@@ -567,11 +606,13 @@ fn run_publish(
     let retained = args.state_epochs.read()?;
     let selection = Selection {
         epochs: args.epochs,
-        index_band: args.index_band,
         producers: args.producers,
     };
     let destination = match (&args.output_dir, &args.repo) {
-        (Some(path), None) => Destination::Directory(path.clone()),
+        (Some(path), None) => Destination::Directory {
+            path: path.clone(),
+            scratch_dir: args.scratch_dir.clone(),
+        },
         (None, Some(repository)) => Destination::Repository {
             direct_s3: read_direct_s3(args.direct_s3_config.as_deref())?,
             repository: repository.clone(),
@@ -696,10 +737,6 @@ fn report_plan(report: &PlanReport, boundary: &Boundary) {
         "boundary: first block of epoch {}, after {}",
         boundary.epoch, boundary.parent,
     );
-    eprintln!(
-        "band:     {} epochs per index traversal ({} MiB budgeted)",
-        report.band_epochs, report.band_budget_mib,
-    );
     match report.epochs {
         Some(span) => eprintln!(
             "epochs:   {}..={} ({} of them, slots {}..={})",
@@ -716,7 +753,6 @@ fn report_plan(report: &PlanReport, boundary: &Boundary) {
 fn run_digest(config: &RootConfig, genesis: &Genesis, args: &DigestArgs) -> miette::Result<()> {
     let selection = Selection {
         epochs: args.epochs,
-        index_band: args.index_band,
         producers: args.producers,
     };
     let digested = snapshot::with_plan(
@@ -724,6 +760,7 @@ fn run_digest(config: &RootConfig, genesis: &Genesis, args: &DigestArgs) -> miet
         genesis,
         args.state_epochs.read()?,
         selection,
+        args.scratch_dir.as_deref(),
         &report_plan,
         |source, plan| snapshot::digest(source, plan, args.chain_from.as_deref()),
     )
@@ -797,7 +834,6 @@ fn run_verify(
         Some(path) if args.reproduce => {
             let selection = Selection {
                 epochs: args.epochs,
-                index_band: args.index_band,
                 producers: args.producers,
             };
             // Planned before the transport check, so a selection these stores
@@ -807,6 +843,7 @@ fn run_verify(
                 genesis,
                 read_state_epochs(path)?,
                 selection,
+                args.scratch_dir.as_deref(),
                 &report_plan,
                 |source, plan| {
                     let verified = transport()?;
@@ -1010,6 +1047,97 @@ mod tests {
         (name == PASSWORD_ENV).then(|| "secret".to_owned())
     }
 
+    /// The batching flags as `backfill` reads them, on an otherwise valid
+    /// command line.
+    fn limits(flags: &[&str]) -> miette::Result<Limits> {
+        let mut args = vec![
+            "backfill",
+            "--repo",
+            "oci://registry.invalid/cardano/preview",
+            "--state-epochs-file",
+            "unused",
+        ];
+        args.extend_from_slice(flags);
+        match parse(&args).unwrap().command {
+            Command::Backfill(args) => args.limits(),
+            _ => unreachable!("parsed a backfill"),
+        }
+    }
+
+    #[test]
+    fn a_batch_of_one_is_the_default_and_takes_no_budget() {
+        assert_eq!(limits(&[]).unwrap(), Limits::ONE);
+        assert_eq!(limits(&["--batch-epochs", "1"]).unwrap(), Limits::ONE);
+        for flags in [
+            ["--batch-scratch-mib", "10"].as_slice(),
+            ["--batch-reserve-mib", "10"].as_slice(),
+            ["--batch-epochs", "1", "--batch-scratch-mib", "10"].as_slice(),
+        ] {
+            let error = limits(flags).unwrap_err().to_string();
+            assert!(error.contains("go together"), "{flags:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_larger_batch_needs_its_budget_and_is_gated() {
+        for flags in [
+            ["--batch-epochs", "4"].as_slice(),
+            ["--batch-epochs", "4", "--batch-scratch-mib", "10"].as_slice(),
+        ] {
+            let error = limits(flags).unwrap_err().to_string();
+            assert!(error.contains("go together"), "{flags:?}: {error}");
+        }
+        let error = limits(&[
+            "--batch-epochs",
+            "4",
+            "--batch-scratch-mib",
+            "10",
+            "--batch-reserve-mib",
+            "1",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not active yet"), "{error}");
+    }
+
+    #[test]
+    fn the_band_flag_is_gone() {
+        for command in ["publish", "digest", "verify"] {
+            let error = parse(&[command, "--index-band", "4"]).err().unwrap();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn digest_and_reproduction_take_a_scratch_directory() {
+        let cli = parse(&[
+            "digest",
+            "--state-epochs-file",
+            "unused",
+            "--scratch-dir",
+            "/spool",
+        ])
+        .unwrap();
+        let Command::Digest(digest) = cli.command else {
+            unreachable!("parsed a digest")
+        };
+        assert_eq!(digest.scratch_dir, Some(PathBuf::from("/spool")));
+
+        // Only a reproduction spools.
+        let plain = parse(&[
+            "verify",
+            "--repo",
+            "file:///stele",
+            "--scratch-dir",
+            "/spool",
+        ]);
+        assert!(plain.is_err());
+    }
+
     #[test]
     fn backfill_options_carry_the_state_epochs_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -1086,6 +1214,11 @@ mod tests {
             assert_eq!(initialize.point, point, "{restore:?}");
             assert_eq!(
                 initialize.scratch_dir,
+                given("--scratch-dir").then(|| scratch.clone()),
+                "{restore:?}"
+            );
+            assert_eq!(
+                backfill.scratch_dir,
                 given("--scratch-dir").then(|| scratch.clone()),
                 "{restore:?}"
             );
