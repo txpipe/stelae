@@ -280,8 +280,11 @@ pub enum Error {
     #[error(
         "the repository's latest stele still follows the batch at {path}, and the immutable tag \
          of sequence {sequence} holds {found} where this batch would publish {expected}: another \
-         writer stopped before moving the latest tag. Nothing was overwritten and nothing needs \
-         clearing: check that tag, stop that writer, delete the tag and rerun"
+         writer stopped before moving the latest tag, or this publisher did and these stores \
+         aren't what the batch was prepared from. Nothing was overwritten. If you know that tag \
+         is another writer's, stop that writer, delete the tag and rerun. Otherwise leave the tag \
+         and treat the stores as wrong, because deleting it publishes from them unchecked. \
+         {REPLAY}"
     )]
     TagTaken {
         sequence: u64,

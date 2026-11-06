@@ -78,6 +78,16 @@ pub enum Error {
         replay: Box<Error>,
         shutdown: Box<Error>,
     },
+    /// A source failure closed the batch and publishing it failed too. A
+    /// download that filled the volume does both, and each needs its own fix.
+    #[error(
+        "the source stopped answering ({failure}), and publishing what the batch prepared then \
+         failed ({flush}). Deal with both before the rerun"
+    )]
+    SourceAndFlush {
+        failure: Box<Error>,
+        flush: Box<Error>,
+    },
     #[error("iterating the local immutable db: {0}")]
     ImmutableDb(String),
     #[error(
@@ -195,8 +205,8 @@ impl Error {
         matches!(self, Self::Batch(_) | Self::FlushNoRoom(_))
     }
 
-    /// The source stopped answering, past its retries. A rerun may find it
-    /// back.
+    /// The source stopped answering past its retries, or a fetch brought
+    /// nothing new. A rerun may find it back.
     fn is_source_failure(&self) -> bool {
         matches!(self, Self::Mithril { .. } | Self::StalledWindow { .. })
     }
@@ -722,7 +732,11 @@ fn finalizing_failure(batch: &Batch, sequence: u64, error: Error) -> Error {
         return error;
     };
     match &*source {
-        E::Stelae(stelae::Error::PredecessorMoved { found, .. }) => {
+        // At this very sequence it can be this batch's own seal, applied after
+        // its answer was lost, so the next try's first read compares it.
+        E::Stelae(stelae::Error::PredecessorMoved { found, .. })
+            if found.as_ref().is_none_or(|(held, _)| *held != sequence) =>
+        {
             let found = found
                 .clone()
                 .map(|(sequence, identity)| Committed { sequence, identity });
@@ -784,9 +798,14 @@ impl<W: Workspace> Driver<'_, W> {
                 Ok(Outcome::BatchReady { .. }) => self.flush()?,
                 Ok(outcome) => return Ok(outcome),
                 Err(failure) if failure.is_source_failure() && !self.aborted() => {
-                    warn!(error = %failure, "the source stopped answering: publishing what the batch prepared");
-                    self.flush_open_batch()?;
-                    return Err(failure);
+                    warn!(error = %failure, "the source stopped answering");
+                    return Err(match self.flush_open_batch() {
+                        Ok(()) => failure,
+                        Err(flush) => Error::SourceAndFlush {
+                            failure: Box::new(failure),
+                            flush: Box::new(flush),
+                        },
+                    });
                 }
                 Err(error) => return Err(error),
             }
@@ -800,6 +819,7 @@ impl<W: Workspace> Driver<'_, W> {
         if batch.is_empty() {
             return Ok(());
         }
+        warn!("publishing what the batch prepared before the run ends");
         let workspace = self.open()?;
         let cursor = workspace
             .snapshot()

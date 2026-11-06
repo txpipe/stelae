@@ -308,7 +308,10 @@ Three cases read differently:
   tried, so the failed fetch adds the free bytes of the download directory: read a
   low figure as a full volume. A stopped download can also leave partial or absent
   files below the highest one, which a rerun doesn't fetch again, so make room, empty
-  the immutable directory and rerun. That can't help once a rerun has imported across
+  the immutable directory and rerun. A batched run closes and publishes what it
+  prepared first, so this failure can arrive beside a room error from that
+  publication. The exit names both, and emptying the immutable directory still
+  applies. That can't help once a rerun has imported across
   an absent file next to an epoch's start, which the chart's own restart can do: every
   run then refuses before any fetch, saying the archive has a gap there, unless the
   repository already holds that boundary. A held boundary isn't checked, so a run over
@@ -376,8 +379,9 @@ gets the last one published.
 A closed batch stays closed across restarts, whatever the controls say then. A
 periodic run reaches `end-of-source` and publishes what it prepared, however few
 boundaries that is: nothing waits at the tip for a full batch. A source that stays
-down past its retries closes the batch the same way, and the run publishes what it
-prepared before it exits on that failure. So an outage during a backfill costs one
+down past its retries, or a fetch that brings nothing new, closes the batch the same
+way, and the run publishes what it prepared before it exits on that failure. If that
+publication fails too, the exit names both. So an outage during a backfill costs one
 smaller batch, and one more index traversal for the next.
 
 ### Progress
@@ -415,16 +419,23 @@ from the sequence the journal names:
 | this sequence under its immutable tag only: a seal that stopped half way | reproduces it, compares identities and seals again |
 | this sequence as `latest`: an upload whose answer was lost | reproduces it, compares identities, journals it and doesn't upload it again |
 | this sequence as `latest` with another identity | refuses, and overwrites nothing: another writer published it, or these stores aren't what the batch was prepared from. The recovery below applies |
-| this sequence with another identity under its immutable tag only | refuses, and overwrites nothing: another writer stopped before moving `latest`. Nothing needs clearing: check that tag, stop that writer, delete the tag and rerun |
+| this sequence with another identity under its immutable tag only | refuses, and overwrites nothing: another writer stopped before moving `latest`, or this publisher did and these stores aren't what the batch was prepared from. If you know that tag is another writer's, stop that writer, delete the tag and rerun. Otherwise leave the tag and treat the stores as wrong, because deleting it publishes from them unchecked: the recovery below applies |
 | anything else: past this sequence, behind the journal, or a predecessor under another identity | refuses: the repository moved |
 
 A batch of one has no such check on the immutable tag and overwrites it, as it
 always has.
 
 The read a publication chains from is held to the journal too, so `latest` moving
-after these checks refuses before anything is uploaded. The registry has no
-compare-and-set, so a writer moving it during the upload is only found at the next
-sequence.
+after these checks refuses before anything is uploaded. The exception is `latest`
+moving to this very sequence, which can be this batch's own seal applied after its
+answer was lost: the next try compares it as the table says.
+
+The registry has no compare-and-set, so nothing guards the upload that follows that
+read. Another writer's seal landing during the upload is overwritten by this batch's
+at both tags and never found, on a batch's last sequence as on any other. While a
+later sequence is left to publish, a `latest` landing after this batch's own refuses
+at that sequence's read, and a tag that writer left at that sequence refuses as the
+table says. So keep to one publisher per repository.
 
 Reproducing a sequence costs what assembling its layers costs, without the upload.
 Staged runs are disposable. Missing, damaged or staged for something else, they are

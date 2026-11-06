@@ -219,6 +219,9 @@ type SourceFailure = fn(&Calls) -> backfill::Error;
 /// What a store says once a background worker has failed.
 const POISONED: &str = "state error: internal store error: fjall error: FjallError: Poisoned";
 
+/// What a registry's 5xx on an immutable tag reads as.
+const UNREADABLE_TAG: &str = "the registry answered 503 for that tag";
+
 /// What a real close said when the WAL's checkpoint, its one foreground write,
 /// met the full volume.
 const CLOSE_ON_FULL_VOLUME: &str = "finishing replay: persisting replay checkpoint: IO error: I/O \
@@ -550,6 +553,8 @@ struct Repository {
     fault: Cell<Option<(u64, Fault)>>,
     /// Keep what a batch of one publishes, for a batch to follow it.
     keep_singles: Cell<bool>,
+    /// The sequence whose immutable tag can't be read.
+    unreadable_tag: Cell<Option<u64>>,
     /// The payloads the batch held as each sequence was published.
     payloads: RefCell<Vec<(u64, usize)>>,
     batch_dir: PathBuf,
@@ -609,6 +614,11 @@ impl backfill::Publish for Repository {
     }
 
     fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+        if self.unreadable_tag.get() == Some(sequence) {
+            // Spares the retries' backoff: this failure is all a test asks of them.
+            self.calls.cancel.get().cancel();
+            return Err(backfill::Error::caller(io::Error::other(UNREADABLE_TAG)));
+        }
         let steles = self.steles.borrow();
         Ok(steles.get(&sequence).map(|document| Held {
             committed: Self::committed(sequence, document),
@@ -769,6 +779,7 @@ impl<'a> Rig<'a> {
                 uploaded: RefCell::default(),
                 fault: Cell::new(None),
                 keep_singles: Cell::new(false),
+                unreadable_tag: Cell::new(None),
                 payloads: RefCell::default(),
                 batch_dir,
             },
@@ -3250,10 +3261,11 @@ fn a_shutdown_while_the_source_fails_publishes_nothing() {
     assert_eq!(rig.batch().ready(), None);
 }
 
-/// What stopped the publication is what an operator has to act on. The batch
-/// stays closed for the rerun.
+/// The operator has two things to act on, so the exit names both. The batch
+/// stays closed for the rerun, at where the stores reached, and the rerun goes
+/// on.
 #[test]
-fn a_flush_failing_after_the_source_did_reports_the_flush() {
+fn a_flush_failing_after_the_source_did_reports_both() {
     let chain = Chain::spanning(12);
     let rig = Rig::new(&chain);
     rig.source_ends_after(6);
@@ -3261,9 +3273,88 @@ fn a_flush_failing_after_the_source_did_reports_the_flush() {
     rig.repository.fault.set(Some((2, Fault::FullVolume)));
 
     let error = rig.drain(limits(16), None).unwrap_err();
-    assert!(matches!(error, backfill::Error::FlushNoRoom(_)), "{error}");
+    assert!(
+        matches!(
+            &error,
+            backfill::Error::SourceAndFlush { flush, failure }
+                if matches!(**flush, backfill::Error::FlushNoRoom(_))
+                    && matches!(**failure, backfill::Error::Mithril { .. })
+        ),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("ran out of room"), "{message}");
+    assert!(
+        message.contains(&source_down(&rig.calls).to_string()),
+        "{message}"
+    );
     assert_eq!(*rig.repository.uploaded.borrow(), [1]);
+    let batch = rig.batch();
+    assert_eq!(batch.ready(), Some(Flush::EndOfSource));
+    let replay = batch.frontiers().replay.unwrap();
+    assert_eq!(replay.slot, rig.cursor().slot());
+    assert!(replay.slot > batch.prepared().last().unwrap().point.slot);
+
+    rig.calls.source_fails.set(None);
+    rig.restart_with_the_whole_source();
+    assert_eq!(rig.drain(limits(16), None).unwrap(), Outcome::UpToDate);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// A real fetch failing with a batch prepared, then a publication that runs out
+/// of room as it would on the volume the download filled: the exit keeps the
+/// free space the fetch read. Takes the retries' whole backoff.
+#[test]
+fn a_failed_download_is_still_named_when_the_flush_runs_out_of_room() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.source_ends_after(6);
+    rig.calls.beacon.set(100);
+    rig.repository.fault.set(Some((1, Fault::FullVolume)));
+
+    let error = rig.drain(limits(16), None).unwrap_err();
+    assert!(
+        matches!(&error, backfill::Error::SourceAndFlush { .. }),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("ran out of room"), "{message}");
+    assert!(
+        message.contains("fetching a mithril immutable window"),
+        "{message}"
+    );
+    assert!(message.contains("bytes free"), "{message}");
+    assert!(rig.repository.uploaded.borrow().is_empty());
     assert_eq!(rig.batch().ready(), Some(Flush::EndOfSource));
+}
+
+/// A shutdown during that flush stops it, and the source's failure is still
+/// told.
+#[test]
+fn a_shutdown_during_the_flush_keeps_the_sources_failure() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.source_ends_after(6);
+    rig.calls.source_fails.set(Some(source_down));
+    rig.repository.fault.set(Some((1, Fault::AfterAnswer)));
+
+    let error = rig.drain(limits(16), None).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            backfill::Error::SourceAndFlush { flush, .. }
+                if matches!(**flush, backfill::Error::Interrupted)
+        ),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&source_down(&rig.calls).to_string()),
+        "{error}"
+    );
+    assert_eq!(*rig.repository.uploaded.borrow(), [1]);
 }
 
 /// A batch following a history a batch of one began, whose publish record is
@@ -3727,8 +3818,8 @@ fn another_writers_stele_at_the_next_sequence_refuses() {
 }
 
 /// A writer that left only its immutable tag is caught before a seal could
-/// write over that tag, and the refusal says what gets past it: `latest` still
-/// follows the batch, so nothing needs clearing.
+/// write over that tag. A half seal of this publisher's over stores since
+/// replaced looks the same, so the refusal names both and a recovery for each.
 #[test]
 fn another_writers_immutable_tag_refuses_before_it_is_overwritten() {
     let chain = Chain::spanning(12);
@@ -3743,15 +3834,39 @@ fn another_writers_immutable_tag_refuses_before_it_is_overwritten() {
     let error = rig.drain(limits(4), None).unwrap_err();
     assert!(
         matches!(
-            error,
-            backfill::Error::Batch(batch::Error::TagTaken { sequence: 2, .. })
+            &error,
+            backfill::Error::Batch(batch::Error::TagTaken { sequence: 2, found, expected, .. })
+                if *found == theirs.identity.to_string() && expected != found
         ),
         "{error}"
     );
     let message = error.to_string();
-    assert!(message.contains("nothing needs clearing"), "{message}");
+    assert!(message.contains("another writer stopped"), "{message}");
+    assert!(message.contains("these stores aren't"), "{message}");
     assert!(message.contains("delete the tag and rerun"), "{message}");
-    assert!(!message.contains("clear the storage path"), "{message}");
+    assert!(message.contains("leave the tag"), "{message}");
+    assert!(message.contains("clear the storage path"), "{message}");
+    assert!(!message.contains("nothing needs clearing"), "{message}");
+    assert_nothing_moved(&rig, &journal, &[1]);
+    assert_eq!(rig.repository.steles.borrow()[&2].identity, theirs.identity);
+}
+
+/// A failed read of the tag isn't an absent tag: the seal would push over
+/// whatever that tag holds.
+#[test]
+fn an_immutable_tag_that_cant_be_read_isnt_sealed_over() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    stopped_after_the_first_commit(&rig);
+    let journal = journal_bytes(&rig);
+
+    let mut theirs = rig.repository.steles.borrow()[&1].clone();
+    theirs.identity = stelae::Digest::compute(b"another writer");
+    rig.repository.steles.borrow_mut().insert(2, theirs.clone());
+    rig.repository.unreadable_tag.set(Some(2));
+
+    let error = rig.drain(limits(4), None).unwrap_err();
+    assert!(error.to_string().contains(UNREADABLE_TAG), "{error}");
     assert_nothing_moved(&rig, &journal, &[1]);
     assert_eq!(rig.repository.steles.borrow()[&2].identity, theirs.identity);
 }
@@ -3861,28 +3976,109 @@ fn a_tag_deleted_before_the_chain_read_refuses() {
 #[test]
 fn a_moved_chain_read_is_refused_at_once() {
     let chain = Chain::spanning(12);
+    let at = |sequence| Committed {
+        sequence,
+        identity: "sha256:another-writer".to_owned(),
+    };
+    for moved in [None, Some(at(1)), Some(at(3))] {
+        let rig = Rig::new(&chain);
+        let attempts = Cell::new(0);
+        let publisher = Around {
+            inner: &rig.repository,
+            finalize: &|finalizing, predecessor, source| {
+                let publish = |finalizing: &Finalizing<'_>, source: &dyn SnapshotSource| {
+                    backfill::Publish::finalize(&rig.repository, finalizing, predecessor, source)
+                };
+                if finalizing.bundle.sequence() != 2 {
+                    return publish(finalizing, source);
+                }
+                attempts.set(attempts.get() + 1);
+                let held = rig.repository.latest.replace(moved.clone());
+                let answer = publish(finalizing, source);
+                *rig.repository.latest.borrow_mut() = held;
+                answer
+            },
+        };
+
+        let error = rig.drive(limits(4), None, true, &publisher).unwrap_err();
+        assert_eq!(moved_to(error), moved);
+        assert_eq!(attempts.get(), 1);
+    }
+}
+
+/// A seal's `latest` answers with an error and the registry applies it late,
+/// during the retry's reproduction. The chain read then finds this batch's own
+/// stele at the sequence being published, which the next try reconciles. Takes
+/// two backoffs.
+#[test]
+fn our_own_late_latest_before_the_chain_read_reconciles() {
+    let chain = Chain::spanning(12);
     let rig = Rig::new(&chain);
     let attempts = Cell::new(0);
+    let late = RefCell::new(None);
     let publisher = Around {
         inner: &rig.repository,
         finalize: &|finalizing, predecessor, source| {
-            let publish = |finalizing: &Finalizing<'_>, source: &dyn SnapshotSource| {
-                backfill::Publish::finalize(&rig.repository, finalizing, predecessor, source)
-            };
+            let publish =
+                || backfill::Publish::finalize(&rig.repository, finalizing, predecessor, source);
             if finalizing.bundle.sequence() != 2 {
-                return publish(finalizing, source);
+                return publish();
             }
             attempts.set(attempts.get() + 1);
-            let held = rig.repository.latest.borrow_mut().take();
-            let answer = publish(finalizing, source);
-            *rig.repository.latest.borrow_mut() = held;
-            answer
+            match attempts.get() {
+                1 => {
+                    let ours = publish()?;
+                    *rig.repository.latest.borrow_mut() = predecessor.cloned();
+                    *late.borrow_mut() = Some(ours);
+                    let refused = stelae::Error::Registry(
+                        oci_client::errors::OciDistributionError::ServerError {
+                            code: 504,
+                            url: "https://registry.invalid/v2/x/manifests/latest".to_owned(),
+                            message: "gateway timeout".to_owned(),
+                        },
+                    );
+                    Err(backfill::Error::Finalizing(Box::new(refused.into())))
+                }
+                2 => {
+                    *rig.repository.latest.borrow_mut() = late.borrow_mut().take();
+                    publish()
+                }
+                attempt => panic!("attempt {attempt}: the third read should have reconciled"),
+            }
         },
     };
 
-    let error = rig.drive(limits(4), None, true, &publisher).unwrap_err();
-    assert_eq!(moved_to(error), None);
-    assert_eq!(attempts.get(), 1);
+    let outcome = rig.drive(limits(4), None, true, &publisher);
+    assert_eq!(outcome.unwrap(), Outcome::UpToDate);
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// Another writer's stele landing at the same place isn't this batch's, and the
+/// next try's compare is what says so. Takes one backoff.
+#[test]
+fn another_writers_stele_at_the_chain_read_ends_as_diverged() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    let theirs = Committed {
+        sequence: 2,
+        identity: "sha256:another-writer".to_owned(),
+    };
+    let error = drain_moving_before_chaining(&rig, limits(4), 2, &|repository| {
+        *repository.latest.borrow_mut() = Some(theirs.clone());
+    })
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            backfill::Error::Batch(batch::Error::Diverged { sequence: 2, found, .. })
+                if *found == theirs.identity
+        ),
+        "{error}"
+    );
+    assert!(rig.repository.inscription(2).is_none());
+    assert_eq!(*rig.repository.uploaded.borrow(), [1]);
 }
 
 /// Each sequence reads the repository before it does anything else, so a writer
@@ -4538,8 +4734,9 @@ mod over_a_registry {
 
     /// The chain read itself, on the real transport: `latest` moves past every
     /// check the flush makes, and nothing is sealed on it. Sequence 1 reads
-    /// another writer's where the batch began over an empty repository, and
-    /// sequence 2 reads another stele under the number it follows.
+    /// another writer's stele at the sequence it publishes, which the next
+    /// try's compare refuses, and sequence 2 reads another stele under the
+    /// number it follows, which refuses at once.
     #[test]
     #[ignore = "spawns a registry"]
     fn a_latest_moved_before_the_chain_read_refuses_and_seals_nothing() {
@@ -4573,15 +4770,22 @@ mod over_a_registry {
             };
 
             let error = rig.drive(limits(4), Some(4), true, &publisher).unwrap_err();
-            let backfill::Error::Batch(batch::Error::PredecessorMoved { found, .. }) = &error
-            else {
-                panic!("at {at}: {error}");
-            };
             let expected = Committed {
                 sequence: 1,
                 identity: their_identity.to_string(),
             };
-            assert_eq!(found.as_ref(), Some(&expected), "at {at}");
+            match (at, &error) {
+                (
+                    1,
+                    backfill::Error::Batch(batch::Error::Diverged {
+                        sequence: 1, found, ..
+                    }),
+                ) => assert_eq!(*found, expected.identity),
+                (2, backfill::Error::Batch(batch::Error::PredecessorMoved { found, .. })) => {
+                    assert_eq!(found.as_ref(), Some(&expected))
+                }
+                _ => panic!("at {at}: {error}"),
+            }
             assert_eq!(inspect(&repo, Point::Latest).identity, their_identity);
             assert_eq!(rig.sequences().first(), Some(&at), "the journal stands");
             assert!(
@@ -4589,6 +4793,47 @@ mod over_a_registry {
                 "at {at}: another stele was sealed on what it read"
             );
         }
+    }
+
+    /// A seal of this batch's own applied late, on the real transport: the
+    /// chain read finds it at the sequence being published, and the next
+    /// try reconciles it without another upload. Another publisher over the
+    /// same chain stands in for the late write, since it seals the same
+    /// stele. Takes one backoff.
+    #[test]
+    #[ignore = "spawns a registry"]
+    fn our_own_late_seal_found_by_the_chain_read_reconciles() {
+        let chain = Chain::spanning(12);
+        let registry = LocalRegistry::spawn();
+        let (single, batched) = (registry.repository("one"), registry.repository("batch"));
+        one_at_a_time(&chain, &single, 2);
+
+        let rig = Rig::new(&chain);
+        let late = Rig::new(&chain);
+        let observer = Observer::silent();
+        let inner = BackfillPublisher {
+            config: &rig.node.config,
+            settings: settings(&batched),
+            observer: &observer,
+        };
+        let attempts = Cell::new(0);
+        let publisher = Around {
+            inner: &inner,
+            finalize: &|finalizing, predecessor, source| {
+                if finalizing.bundle.sequence() == 1 {
+                    attempts.set(attempts.get() + 1);
+                    one_at_a_time_on(&late, &batched, 1);
+                }
+                backfill::Publish::finalize(&inner, finalizing, predecessor, source)
+            },
+        };
+
+        assert_eq!(
+            rig.drive(limits(2), Some(2), true, &publisher).unwrap(),
+            Outcome::UntilEpoch { sequence: 2 }
+        );
+        assert_eq!(attempts.get(), 1, "reconciled, not published again");
+        assert_same_steles(&batched, &single, 2);
     }
 
     /// What the immutable tag holds, reading no further than a publish does.
