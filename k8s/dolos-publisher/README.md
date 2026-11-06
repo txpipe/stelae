@@ -102,8 +102,9 @@ Pending. Start over whenever the kept stores no longer fit the release:
   on an image without it (see
   [publisher.md](../../docs/publisher.md#stores-whose-state-passed-the-archive));
 - stores a rerun imported across an absent file next to an epoch's start.
-  Every restart refuses them before any fetch, saying the archive has a gap
-  there (see [publisher.md](../../docs/publisher.md#a-volume-that-fills)).
+  Unless the repository already holds that boundary, every restart refuses
+  them before any fetch, saying the archive has a gap there (see
+  [publisher.md](../../docs/publisher.md#a-volume-that-fills)).
 
 Once the claim exists its class is fixed. Naming a class other than the
 one the claim has fails, and so does clearing a named class back to empty,
