@@ -91,3 +91,4 @@ jobs:
       # containers. Keeping the ignored selector here makes Docker a visible
       # CI requirement instead of silently treating the registry gate as run.
       - run: cargo test --locked -p stelae --all-features --test oci -- --ignored --nocapture
+      - run: cargo test --locked -p stelae-cardano --all-features --test batch -- --ignored --nocapture

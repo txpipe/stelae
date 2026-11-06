@@ -4,6 +4,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::{BTreeMap, BTreeSet},
     io,
     num::NonZeroU64,
     path::{Path, PathBuf},
@@ -18,7 +19,7 @@ use dolos_snapshot::{
     prepare::{self, Bundle, Finalizing},
     registry::{Preview, Published, Publishing},
     source::SnapshotSource,
-    staging::{Budget, Staged},
+    staging::{Budget, Report, Staged},
 };
 use dolos_testing::{
     blocks::write_immutable_chunks,
@@ -28,7 +29,7 @@ use pallas::ledger::traverse::MultiEraBlock;
 use stelae::{inscription::Inscription, progress::Observer};
 use stelae_cardano::{
     backfill::{self, Batching, Driver, Outcome, Session, Workspace},
-    batch::{self, Batch, Committed, Flush, Frontiers, Limits},
+    batch::{self, Batch, Committed, Flush, Frontiers, Held, Limits},
     testing::{empty_registry, Node},
     MithrilSource, RetainedEpochs,
 };
@@ -201,6 +202,12 @@ struct Calls {
     prune_full: Cell<bool>,
     /// The highest immutable file the source offers.
     beacon: Cell<u64>,
+    /// What each staging cost, including those that reused every run.
+    stagings: RefCell<Vec<Report>>,
+    /// Die as the next staging finishes, its markers on disk.
+    die_after_staging: Cell<bool>,
+    /// Refuse the next staging this way.
+    stage_refusal: Cell<Option<fn() -> dolos_snapshot::Error>>,
 }
 
 /// What a store says once a background worker has failed.
@@ -332,8 +339,20 @@ impl<S: SnapshotSource> SnapshotSource for Counted<'_, S> {
         budget: Budget,
         observer: &Observer,
     ) -> Result<Staged, dolos_snapshot::Error> {
-        self.inner
-            .stage_batch(root, bundles, previous, budget, observer)
+        if let Some(refusal) = self.calls.stage_refusal.take() {
+            return Err(refusal());
+        }
+        let staged = self
+            .inner
+            .stage_batch(root, bundles, previous, budget, observer)?;
+        self.calls.stagings.borrow_mut().push(staged.report());
+        if self.calls.die_after_staging.replace(false) {
+            self.calls.cancel.get().cancel();
+            return Err(dolos_snapshot::Error::Staging(
+                dolos_snapshot::staging::Refusal::Io(io::Error::other("the process died")),
+            ));
+        }
+        Ok(staged)
     }
     fn finalize_document(
         &self,
@@ -490,21 +509,163 @@ impl Session for CountedSession<'_> {
     }
 }
 
-/// A repository holding what the test says it holds, which only moves if the
-/// test moves it.
+/// Where a publication stops short, as a process dying or a volume filling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    /// Die before anything reaches the repository.
+    Upload,
+    /// Die with the immutable tag written and the latest tag not moved.
+    SealHalfWay,
+    /// Die with the stele published, before its answer is read.
+    Acknowledgement,
+    /// The answer is lost, and the process lives to try again.
+    AcknowledgementLostAlive,
+    /// Die just after the answer, so the journal commits and nothing follows.
+    AfterAnswer,
+    /// The volume fills, with nothing written.
+    FullVolume,
+    /// Make the journal unwritable as the answer comes back.
+    UnwritableJournal,
+}
+
+/// A repository holding what the test says it holds, which otherwise moves only
+/// by what is published into it. Identities are real: each stele is the
+/// document a chained publish produces from the same bundle, runs and
+/// predecessor.
 struct Repository {
     latest: RefCell<Option<Committed>>,
     calls: Rc<Calls>,
+    /// The immutable tags.
+    steles: RefCell<BTreeMap<u64, Document>>,
+    /// Sequences that reached the repository, each time one did.
+    uploaded: RefCell<Vec<u64>>,
+    fault: Cell<Option<(u64, Fault)>>,
+    /// Keep what a batch of one publishes, for a batch to follow it.
+    keep_singles: Cell<bool>,
+    /// The payloads the batch held as each sequence was published.
+    payloads: RefCell<Vec<(u64, usize)>>,
+    batch_dir: PathBuf,
+}
+
+impl Repository {
+    fn committed(sequence: u64, document: &Document) -> Committed {
+        Committed {
+            sequence,
+            identity: document.identity.to_string(),
+        }
+    }
+
+    fn inscription(&self, sequence: u64) -> Option<Inscription> {
+        let steles = self.steles.borrow();
+        let document = steles.get(&sequence)?;
+        Some(Inscription::parse(&document.canonical).unwrap())
+    }
+
+    /// What the repository's latest stele chains the next one to.
+    fn followed(&self) -> Option<Inscription> {
+        let latest = self.latest.borrow();
+        latest.as_ref().and_then(|l| self.inscription(l.sequence))
+    }
+
+    fn die(&self) -> backfill::Error {
+        self.calls.cancel.get().cancel();
+        backfill::Error::caller(io::Error::other("the process died"))
+    }
+
+    fn tags(&self) -> BTreeMap<u64, Vec<u8>> {
+        let steles = self.steles.borrow();
+        steles
+            .iter()
+            .map(|(sequence, document)| (*sequence, document.canonical.clone()))
+            .collect()
+    }
 }
 
 impl backfill::Publish for Repository {
-    fn publish(&self, _: &Plan, _: &dyn SnapshotSource) -> Result<(), backfill::Error> {
+    fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {
         self.calls.published.set(self.calls.published.get() + 1);
+        if self.keep_singles.get() {
+            let previous = self.followed();
+            let following = backfill::following(previous.as_ref(), plan.sequence)?;
+            let document = source
+                .digest_document(plan, &*following)
+                .map_err(backfill::Error::caller)?;
+            *self.latest.borrow_mut() = Some(Self::committed(plan.sequence, &document));
+            self.steles.borrow_mut().insert(plan.sequence, document);
+        }
         Ok(())
     }
 
     fn latest(&self, _: &Plan) -> Result<Option<Committed>, backfill::Error> {
         Ok(self.latest.borrow().clone())
+    }
+
+    fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+        let steles = self.steles.borrow();
+        Ok(steles.get(&sequence).map(|document| Held {
+            committed: Self::committed(sequence, document),
+            inscription: Inscription::parse(&document.canonical).unwrap(),
+        }))
+    }
+
+    fn finalize(
+        &self,
+        finalizing: &Finalizing<'_>,
+        source: &dyn SnapshotSource,
+    ) -> Result<Committed, backfill::Error> {
+        let sequence = finalizing.bundle.sequence();
+        let payloads = std::fs::read_dir(self.batch_dir.join("prepared/blobs/sha256"))
+            .unwrap()
+            .count();
+        self.payloads.borrow_mut().push((sequence, payloads));
+
+        let fault = self
+            .fault
+            .get()
+            .filter(|(at, _)| *at == sequence)
+            .map(|(_, fault)| fault);
+        if fault.is_some() {
+            self.fault.set(None);
+        }
+        match fault {
+            Some(Fault::Upload) => return Err(self.die()),
+            Some(Fault::FullVolume) => {
+                let full = prepare::Refusal::Io(io::ErrorKind::StorageFull.into());
+                return Err(backfill::Error::Finalizing(Box::new(full.into())));
+            }
+            _ => {}
+        }
+
+        let previous = self.followed();
+        let following = backfill::following(previous.as_ref(), sequence)?;
+        let document = source
+            .finalize_document(finalizing, &*following)
+            .map_err(|error| backfill::Error::Finalizing(Box::new(error)))?;
+        let committed = Self::committed(sequence, &document);
+        self.steles.borrow_mut().insert(sequence, document);
+        if fault == Some(Fault::SealHalfWay) {
+            return Err(self.die());
+        }
+        *self.latest.borrow_mut() = Some(committed.clone());
+        self.uploaded.borrow_mut().push(sequence);
+        match fault {
+            Some(Fault::Acknowledgement) => Err(self.die()),
+            Some(Fault::AcknowledgementLostAlive) => Err(backfill::Error::caller(
+                io::Error::other("the registry stopped answering"),
+            )),
+            Some(Fault::AfterAnswer) => {
+                self.calls.cancel.get().cancel();
+                Ok(committed)
+            }
+            #[cfg(unix)]
+            Some(Fault::UnwritableJournal) => {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&self.batch_dir, std::fs::Permissions::from_mode(0o555))
+                    .unwrap();
+                Ok(committed)
+            }
+            _ => Ok(committed),
+        }
     }
 }
 
@@ -527,6 +688,11 @@ struct Rig<'a> {
     repository: Repository,
     runtime: tokio::runtime::Runtime,
     room: Box<Room>,
+    /// The repository the batch is told it publishes to.
+    named: RefCell<String>,
+    /// The genesis the driver reads, which the stores' own replay doesn't.
+    driver_genesis: RefCell<Arc<Genesis>>,
+    retained: RefCell<RetainedEpochs>,
 }
 
 impl<'a> Rig<'a> {
@@ -534,6 +700,7 @@ impl<'a> Rig<'a> {
         let node = chain.node();
         let download = chain.write_immutable(&node);
         let calls = Rc::<Calls>::default();
+        let batch_dir = batch::dir_in(&node.config.storage.path);
         Self {
             chain,
             node,
@@ -541,6 +708,12 @@ impl<'a> Rig<'a> {
             repository: Repository {
                 latest: RefCell::new(None),
                 calls: calls.clone(),
+                steles: RefCell::default(),
+                uploaded: RefCell::default(),
+                fault: Cell::new(None),
+                keep_singles: Cell::new(false),
+                payloads: RefCell::default(),
+                batch_dir,
             },
             calls,
             runtime: tokio::runtime::Builder::new_current_thread()
@@ -548,12 +721,37 @@ impl<'a> Rig<'a> {
                 .build()
                 .unwrap(),
             room: Box::new(|_, _| true),
+            named: RefCell::new(REPOSITORY.to_owned()),
+            driver_genesis: RefCell::new(chain.genesis.clone()),
+            retained: RefCell::new(retained()),
         }
     }
 
+    /// Prepare until the batch closes. A batch of one has only its own path.
     fn run(&self, limits: Limits, until_epoch: Option<u64>) -> Result<Outcome, backfill::Error> {
+        self.drive(limits, until_epoch, false, &self.repository)
+    }
+
+    /// Run as a process would: replay and publish until there is nothing left.
+    fn drain(&self, limits: Limits, until_epoch: Option<u64>) -> Result<Outcome, backfill::Error> {
+        self.drive(limits, until_epoch, true, &self.repository)
+    }
+
+    /// As a new process would, after one that stopped short.
+    fn restart_and_drain(&self, limits: Limits) -> Result<Outcome, backfill::Error> {
+        self.calls.cancel.restart();
+        self.drain(limits, None)
+    }
+
+    fn drive(
+        &self,
+        limits: Limits,
+        until_epoch: Option<u64>,
+        drain: bool,
+        publish: &dyn backfill::Publish,
+    ) -> Result<Outcome, backfill::Error> {
         let calls = &*self.calls;
-        let retained = retained();
+        let retained = self.retained.borrow().clone();
         let mithril = MithrilSource {
             aggregator: "http://unused.invalid".to_owned(),
             genesis_vkey: String::new(),
@@ -587,8 +785,9 @@ impl<'a> Rig<'a> {
         let replay = Frontier(calls);
         let observer = Observer::silent();
         let room = |path: &Path, bytes: u64| (self.room)(path, bytes);
-        Driver {
-            genesis: &self.chain.genesis,
+        let driver_genesis = self.driver_genesis.borrow().clone();
+        let driver = Driver {
+            genesis: &driver_genesis,
             retained: &retained,
             mithril: &mithril,
             download_dir: self.download.clone(),
@@ -616,16 +815,19 @@ impl<'a> Rig<'a> {
                 }
                 backfill::refuse_archive_behind(&self.node.config, self.chain.genesis.clone())
             },
-            publish: &self.repository,
+            publish,
             batching: Batching {
                 limits,
                 storage_path: self.node.config.storage.path.clone(),
-                repository: REPOSITORY.to_owned(),
+                repository: self.named.borrow().clone(),
                 room: &room,
                 observer: &observer,
             },
+        };
+        match drain || limits.is_one() {
+            true => driver.run(),
+            false => driver.prepare(),
         }
-        .run()
     }
 
     /// Leave the immutable db holding only the first `count` blocks.
@@ -648,7 +850,7 @@ impl<'a> Rig<'a> {
             repository: REPOSITORY.to_owned(),
             network_magic: MAGIC.into(),
             store_contract: dolos_core::compat::SUPPORTED_CONTRACTS[0].to_owned(),
-            mutable_slots: dolos_cardano::mutable_slots(&self.chain.genesis),
+            mutable_slots: dolos_cardano::mutable_slots(&self.driver_genesis.borrow()),
             retained: RETAINED.to_vec(),
             dolos_revision: stelae_cardano::DOLOS_REVISION.to_owned(),
         };
@@ -1168,7 +1370,7 @@ fn staging_is_bounded_by_what_the_budget_has_left() {
     assert!(
         matches!(
             &error,
-            batch::Error::Preparing(source)
+            batch::Error::Staging { source, .. }
                 if matches!(
                     **source,
                     dolos_snapshot::Error::Staging(
@@ -1238,8 +1440,9 @@ fn a_repository_that_moved_during_the_batch_is_refused() {
     let rig = Rig::new(&chain);
     ready(rig.run(limits(2), None));
 
+    // Past the next sequence, which no lost answer can explain.
     *rig.repository.latest.borrow_mut() = Some(Committed {
-        sequence: 1,
+        sequence: 2,
         identity: "sha256:another-writer".to_owned(),
     });
     let error = rig.run(limits(2), None).unwrap_err();
@@ -2690,4 +2893,1235 @@ fn a_scan_failure_does_not_blame_the_journal() {
 
     let message = outcome.err().map(|error| error.to_string()).unwrap();
     assert!(!message.contains("journal"), "{message}");
+}
+
+/// Publishes the whole chain with nothing going wrong, as what every
+/// interrupted run below has to converge on.
+fn uninterrupted(chain: &Chain) -> BTreeMap<u64, Vec<u8>> {
+    let rig = Rig::new(chain);
+    assert_eq!(rig.drain(limits(4), None).unwrap(), Outcome::UpToDate);
+    rig.repository.tags()
+}
+
+fn latest_sequence(rig: &Rig<'_>) -> Option<u64> {
+    rig.repository.latest.borrow().as_ref().map(|l| l.sequence)
+}
+
+fn journal_bytes(rig: &Rig<'_>) -> Vec<u8> {
+    std::fs::read(batch_dir(rig).join("journal.json")).unwrap()
+}
+
+fn assert_batch_is_gone(rig: &Rig<'_>) {
+    let dir = batch_dir(rig);
+    assert!(!dir.join("journal.json").exists());
+    assert!(!dir.join("staging").exists());
+    for held in ["prepared/bundles", "prepared/blobs/sha256"] {
+        let held = std::fs::read_dir(dir.join(held)).map_or(0, |entries| entries.count());
+        assert_eq!(held, 0);
+    }
+}
+
+/// Every sequence in order, one staging for the batch, each stele what stores
+/// frozen at its boundary publish, chained to the real digest before it.
+#[test]
+fn a_batch_publishes_in_order_as_frozen_stores_do_from_one_staging() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+
+    assert_eq!(
+        rig.drain(limits(4), Some(4)).unwrap(),
+        Outcome::UntilEpoch { sequence: 4 }
+    );
+
+    assert_eq!(*rig.repository.uploaded.borrow(), [1, 2, 3, 4]);
+    assert_eq!(*rig.calls.prepared.borrow(), [1, 2, 3, 4]);
+    assert!(rig.calls.traversed.borrow().is_empty(), "no hidden scan");
+    assert_eq!(rig.calls.published.get(), 0, "no publish from the stores");
+
+    let stagings = rig.calls.stagings.borrow();
+    assert_eq!(stagings.len(), 1, "one staging: {stagings:?}");
+    assert_eq!(stagings[0].tag_traversals, 1);
+    assert_eq!(stagings[0].exact_traversals, 1);
+    assert!(stagings[0].entity_traversals <= 1);
+
+    let mut previous: Option<Document> = None;
+    for sequence in 1..=4 {
+        let frozen = chain.frozen(sequence, previous.as_ref());
+        let tags = rig.repository.tags();
+        assert_eq!(tags[&sequence], frozen.canonical, "at sequence {sequence}");
+
+        let inscription = rig.repository.inscription(sequence).unwrap();
+        let chained = inscription
+            .history
+            .last()
+            .map(|entry| entry.inscription_digest);
+        assert_eq!(
+            chained,
+            previous.as_ref().map(|previous| previous.identity),
+            "at sequence {sequence}"
+        );
+        previous = Some(frozen);
+    }
+
+    let committed = Repository::committed(4, previous.as_ref().unwrap());
+    assert_eq!(*rig.repository.latest.borrow(), Some(committed));
+    assert_batch_is_gone(&rig);
+}
+
+/// A payload stays until the last bundle naming it has committed, and goes
+/// then.
+#[test]
+fn shared_payloads_stay_until_their_last_consumer_commits() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    // A mutable window past an epoch, as Byron's is, so boundaries capture the
+    // logs of a window still unsealed alike. Preview's own can't be that long.
+    let mut longer = (*chain.genesis).clone();
+    longer.byron.protocol_consts.k *= 8;
+    *rig.driver_genesis.borrow_mut() = Arc::new(longer);
+    ready(rig.run(limits(4), None));
+
+    let bundles = rig.batch().bundles().unwrap();
+    let held = |from: usize| -> BTreeSet<_> {
+        bundles[from..]
+            .iter()
+            .flat_map(|bundle| bundle.references())
+            .collect()
+    };
+    let named: usize = bundles.iter().map(|b| b.references().len()).sum();
+    assert!(
+        held(0).len() < named,
+        "no payload is shared in this fixture"
+    );
+
+    rig.drain(limits(4), Some(4)).unwrap();
+
+    let expected: Vec<_> = (0..4)
+        .map(|index| (bundles[index].sequence(), held(index).len()))
+        .collect();
+    assert_eq!(*rig.repository.payloads.borrow(), expected);
+}
+
+/// Replay stands still from the batch's close to its last commit, and
+/// housekeeping waits for that commit.
+#[test]
+fn nothing_prunes_until_the_batch_has_drained() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(4), None));
+    let at_close = rig.cursor();
+
+    rig.repository.fault.set(Some((3, Fault::Upload)));
+    rig.drain(limits(4), None).unwrap_err();
+    assert_eq!(rig.calls.pruned.get(), 0);
+    assert_eq!(rig.cursor(), at_close);
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+    // Once for each batch that drained: this one, and the last boundary's.
+    assert_eq!(rig.calls.pruned.get(), 2);
+}
+
+#[test]
+fn each_commit_moves_the_published_frontier() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.drain(limits(4), Some(4)).unwrap();
+
+    let reported: Vec<_> = rig
+        .calls
+        .frontiers
+        .borrow()
+        .iter()
+        .map(|frontiers| frontiers.published)
+        .collect();
+    let first = reported.iter().position(|p| p.is_some()).unwrap();
+    assert_eq!(reported[first..], [Some(1), Some(2), Some(3), Some(4)]);
+}
+
+/// A periodic run publishes what it prepared, and what the source offers next
+/// starts another batch: nothing waits at the tip for a full one.
+#[test]
+fn a_run_at_the_tip_publishes_a_partial_batch_and_the_next_run_goes_on() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.source_ends_after(5);
+
+    assert_eq!(rig.drain(limits(16), None).unwrap(), Outcome::UpToDate);
+    assert_eq!(*rig.repository.uploaded.borrow(), [1, 2]);
+    assert_batch_is_gone(&rig);
+
+    rig.restart_with_the_whole_source();
+    assert_eq!(rig.drain(limits(16), None).unwrap(), Outcome::UpToDate);
+    assert_eq!(*rig.repository.uploaded.borrow(), [1, 2, 3, 4, 5]);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// An epoch in progress has no boundary: it stays out, however the batch
+/// closed.
+#[test]
+fn a_run_ending_in_mid_epoch_publishes_only_captured_boundaries() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.source_ends_after(6);
+
+    assert_eq!(rig.drain(limits(16), None).unwrap(), Outcome::UpToDate);
+    assert_eq!(latest_sequence(&rig), Some(2));
+    assert_eq!(rig.calls.stagings.borrow().len(), 1);
+    assert_batch_is_gone(&rig);
+}
+
+/// A capture that filled the volume closes the batch behind the stores.
+/// Publishing frees its room, and the uncaptured boundary begins the next
+/// batch.
+#[test]
+fn a_batch_closed_by_a_full_volume_publishes_and_goes_on() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.full_at.set(Some(3));
+
+    assert_eq!(rig.drain(limits(9), None).unwrap(), Outcome::UpToDate);
+    assert_eq!(*rig.repository.uploaded.borrow(), [1, 2, 3, 4, 5]);
+    assert_eq!(*rig.calls.traversed.borrow(), [3], "the delta died with it");
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// The first batch, its successor and every sequence past `until_epoch` left
+/// alone.
+#[test]
+fn successive_batches_drain_in_turn_up_to_the_epoch_asked_for() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    assert_eq!(
+        rig.drain(limits(2), Some(3)).unwrap(),
+        Outcome::UntilEpoch { sequence: 3 }
+    );
+    assert_eq!(*rig.repository.uploaded.borrow(), [1, 2, 3]);
+    assert_eq!(rig.calls.stagings.borrow().len(), 2, "one per batch");
+}
+
+/// A batch following a history a batch of one began, whose publish record is
+/// the old way a publish resumed, keeps that history.
+#[test]
+fn a_batch_continues_a_history_a_batch_of_one_began() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.repository.keep_singles.set(true);
+    assert_eq!(
+        rig.run(Limits::ONE, Some(1)).unwrap(),
+        Outcome::UntilEpoch { sequence: 1 }
+    );
+
+    assert_eq!(rig.drain(limits(3), None).unwrap(), Outcome::UpToDate);
+    assert_eq!(*rig.repository.uploaded.borrow(), [2, 3, 4, 5]);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+#[test]
+fn a_kill_between_capture_and_journal_converges() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+
+    // 2 is captured and its stores don't close, so nothing journals it.
+    rig.calls.fail_finish_after.set(Some(2));
+    rig.drain(limits(4), None).unwrap_err();
+    assert_eq!(rig.sequences(), [1]);
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// The markers survive the process, so the rerun walks nothing again.
+#[test]
+fn a_kill_after_the_staging_markers_reuses_them() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.die_after_staging.set(true);
+    rig.drain(limits(4), None).unwrap_err();
+    assert_eq!(latest_sequence(&rig), None);
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+
+    let stagings = rig.calls.stagings.borrow();
+    assert!(stagings[0].tag_traversals > 0, "{stagings:?}");
+    assert_eq!(stagings[1].tag_traversals, 0, "{stagings:?}");
+    assert_eq!(stagings[1].exact_traversals, 0, "{stagings:?}");
+    assert_eq!(stagings[1].entity_traversals, 0, "{stagings:?}");
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// A family whose marker never landed is walked again, and only that family.
+#[test]
+fn a_kill_before_a_staging_marker_walks_that_family_again() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.die_after_staging.set(true);
+    rig.drain(limits(4), None).unwrap_err();
+    std::fs::remove_file(batch_dir(&rig).join("staging/indexes.json")).unwrap();
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+
+    let stagings = rig.calls.stagings.borrow();
+    assert_eq!(stagings[1].tag_traversals, 1, "{stagings:?}");
+    assert_eq!(stagings[1].entity_traversals, 0, "{stagings:?}");
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// Runs are disposable, so damage to a marker costs a rebuild from the stores.
+#[test]
+fn a_damaged_staging_marker_is_rebuilt_from_the_stores() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.die_after_staging.set(true);
+    rig.drain(limits(4), None).unwrap_err();
+    std::fs::write(batch_dir(&rig).join("staging/indexes.json"), b"{").unwrap();
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// Runs of another frontier were staged for something else. Staged again, they
+/// still have to stand on the chain the bundles were captured from.
+#[test]
+fn runs_of_another_batch_are_rebuilt_from_the_stores() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.die_after_staging.set(true);
+    rig.drain(limits(4), None).unwrap_err();
+
+    let marker = batch_dir(&rig).join("staging/indexes.json");
+    let mut held: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    held["identity"]["frontier"][0] = 1.into();
+    std::fs::write(&marker, serde_json::to_vec(&held).unwrap()).unwrap();
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+fn flip_a_byte(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// A run the marker can't see is damaged only shows when it is read. It
+/// produces no layer, and the flush stages again rather than stopping for good.
+#[test]
+fn a_damaged_run_is_found_at_finalization_and_staged_again() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.calls.die_after_staging.set(true);
+    rig.drain(limits(4), None).unwrap_err();
+
+    let runs = batch_dir(&rig).join("staging/indexes");
+    let run = std::fs::read_dir(&runs)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .max_by_key(|path| std::fs::metadata(path).unwrap().len())
+        .unwrap();
+    flip_a_byte(&run);
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+    // The killed run, its rerun reusing the runs, and the rebuild.
+    let stagings = rig.calls.stagings.borrow();
+    assert_eq!(stagings[1].tag_traversals, 0, "{stagings:?}");
+    assert_eq!(stagings[2].tag_traversals, 1, "{stagings:?}");
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+#[test]
+fn a_kill_during_an_upload_converges() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.repository.fault.set(Some((2, Fault::Upload)));
+
+    rig.drain(limits(4), None).unwrap_err();
+    assert_eq!(latest_sequence(&rig), Some(1));
+    assert_eq!(rig.sequences(), [2, 3, 4]);
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+    assert_eq!(*rig.repository.uploaded.borrow(), [1, 2, 3, 4, 5]);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// The stele landed and nothing said so: the rerun finds it, proves it is this
+/// batch's by its identity, and doesn't upload it again.
+#[test]
+fn a_lost_acknowledgement_reconciles_without_another_upload() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.repository.fault.set(Some((2, Fault::Acknowledgement)));
+
+    rig.drain(limits(4), None).unwrap_err();
+    assert_eq!(latest_sequence(&rig), Some(2));
+    assert_eq!(rig.sequences(), [2, 3, 4], "the journal hasn't heard");
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+    assert_eq!(*rig.repository.uploaded.borrow(), [1, 2, 3, 4, 5]);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// The same within one process, whose next attempt finds what the last one did.
+#[test]
+fn an_attempt_after_a_lost_acknowledgement_reconciles_in_place() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.repository
+        .fault
+        .set(Some((2, Fault::AcknowledgementLostAlive)));
+
+    assert_eq!(rig.drain(limits(4), None).unwrap(), Outcome::UpToDate);
+    assert_eq!(*rig.repository.uploaded.borrow(), [1, 2, 3, 4, 5]);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// The first sequence has no predecessor to read, which reconciling also
+/// covers.
+#[test]
+fn a_lost_acknowledgement_of_a_first_stele_reconciles() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.repository.fault.set(Some((1, Fault::Acknowledgement)));
+    rig.drain(limits(4), None).unwrap_err();
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+    assert_eq!(*rig.repository.uploaded.borrow(), [1, 2, 3, 4, 5]);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// A seal writes the immutable tag first. One left behind is checked to be this
+/// batch's, and sealing again finishes it with the same bytes.
+#[test]
+fn a_seal_that_stopped_half_way_is_finished() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.repository.fault.set(Some((2, Fault::SealHalfWay)));
+
+    rig.drain(limits(4), None).unwrap_err();
+    assert_eq!(latest_sequence(&rig), Some(1));
+    assert!(rig.repository.tags().contains_key(&2));
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// The stele landed and its journal write failed, so the journal still names
+/// it: the rerun reconciles rather than uploading it again.
+#[cfg(unix)]
+#[test]
+fn a_journal_commit_that_failed_reconciles() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.repository
+        .fault
+        .set(Some((2, Fault::UnwritableJournal)));
+
+    let error = rig.drain(limits(4), None).unwrap_err();
+    std::fs::set_permissions(batch_dir(&rig), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        matches!(error, backfill::Error::Batch(batch::Error::Io { .. })),
+        "{error}"
+    );
+    assert_eq!(latest_sequence(&rig), Some(2));
+    assert_eq!(rig.sequences(), [2, 3, 4]);
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+    assert_eq!(*rig.repository.uploaded.borrow(), [1, 2, 3, 4, 5]);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// The journal moved and its bundle didn't go: nothing names it, so it does.
+#[test]
+fn a_kill_between_the_journal_and_the_release_sweeps_the_bundle() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(4), None));
+    let prepared = batch_dir(&rig).join("prepared");
+    let kept = rig.node.path().join("kept-prepared");
+    copy_tree(&prepared, &kept);
+
+    rig.repository.fault.set(Some((2, Fault::AfterAnswer)));
+    let error = rig.drain(limits(4), None).unwrap_err();
+    assert!(matches!(error, backfill::Error::Interrupted), "{error}");
+    assert_eq!(rig.sequences(), [3, 4]);
+
+    std::fs::remove_dir_all(&prepared).unwrap();
+    copy_tree(&kept, &prepared);
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+    assert_eq!(*rig.repository.uploaded.borrow(), [1, 2, 3, 4, 5]);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+    assert_batch_is_gone(&rig);
+}
+
+/// Cancelling between sequences keeps what committed and what is left.
+#[test]
+fn a_cancelled_flush_goes_on_from_the_next_sequence() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.repository.fault.set(Some((2, Fault::AfterAnswer)));
+
+    let error = rig.drain(limits(4), None).unwrap_err();
+    assert!(matches!(error, backfill::Error::Interrupted), "{error}");
+    assert_eq!(latest_sequence(&rig), Some(2));
+    let batch = rig.batch();
+    assert_eq!(batch.frontiers().published, Some(2));
+    assert_eq!(batch.bundles().unwrap().len(), 2, "what is left stands");
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+    assert_eq!(*rig.repository.uploaded.borrow(), [1, 2, 3, 4, 5]);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// Cleanup that stopped part way is only ever repeated. It holds nothing a
+/// later sequence needs, so even a bundle it can't read doesn't stop it.
+#[test]
+fn a_cleanup_that_stopped_part_way_finishes() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(4), None));
+    let mut journal: serde_json::Value = serde_json::from_slice(&journal_bytes(&rig)).unwrap();
+    rig.drain(limits(4), Some(4)).unwrap();
+
+    let dir = batch_dir(&rig);
+    let leave = |journal: &mut serde_json::Value| {
+        journal["prepared"] = serde_json::json!([]);
+        journal["source"]["dolos_revision"] = "another build".into();
+        std::fs::write(
+            dir.join("journal.json"),
+            serde_json::to_vec(journal).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("staging/indexes")).unwrap();
+        std::fs::write(dir.join("staging/indexes/1.run"), b"left").unwrap();
+        std::fs::write(dir.join("prepared/bundles/9.json"), b"{").unwrap();
+    };
+
+    leave(&mut journal);
+    assert_eq!(rig.drain(limits(4), None).unwrap(), Outcome::UpToDate);
+    assert_batch_is_gone(&rig);
+    assert_eq!(latest_sequence(&rig), Some(5));
+
+    // A batch of one finishes it too, rather than leaving the runs on the volume.
+    leave(&mut journal);
+    rig.run(Limits::ONE, None).unwrap();
+    assert_batch_is_gone(&rig);
+}
+
+/// Cleaning up only ever follows the last commit.
+#[test]
+fn clearing_a_batch_with_a_sequence_left_keeps_it() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(2), None));
+
+    let mut batch = rig.batch();
+    batch.clear().unwrap();
+    batch::clear_if_drained(&rig.node.config.storage.path).unwrap();
+    assert_eq!(rig.batch().bundles().unwrap().len(), 2);
+}
+
+/// Half way through, what is already published and what is left both stand.
+fn stopped_after_the_first_commit(rig: &Rig<'_>) {
+    rig.repository.fault.set(Some((1, Fault::AfterAnswer)));
+    rig.drain(limits(4), None).unwrap_err();
+    assert_eq!(latest_sequence(rig), Some(1));
+    rig.calls.cancel.restart();
+}
+
+fn assert_nothing_moved(rig: &Rig<'_>, journal: &[u8], uploaded: &[u64]) {
+    assert_eq!(journal_bytes(rig), journal);
+    assert_eq!(*rig.repository.uploaded.borrow(), uploaded);
+}
+
+#[test]
+fn another_source_refuses_a_batch_part_way_through() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    stopped_after_the_first_commit(&rig);
+    let journal = journal_bytes(&rig);
+
+    *rig.named.borrow_mut() = "oci://registry.invalid/cardano/other".to_owned();
+    let error = rig.drain(limits(4), None).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            backfill::Error::Batch(batch::Error::SourceChanged {
+                what: "repository",
+                ..
+            })
+        ),
+        "{error}"
+    );
+    assert_nothing_moved(&rig, &journal, &[1]);
+
+    *rig.named.borrow_mut() = REPOSITORY.to_owned();
+    assert_eq!(rig.drain(limits(4), None).unwrap(), Outcome::UpToDate);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// Another writer's stele at the next sequence differs in its identity, and
+/// nothing overwrites it or moves past it.
+#[test]
+fn another_writers_stele_at_the_next_sequence_refuses() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    stopped_after_the_first_commit(&rig);
+    let journal = journal_bytes(&rig);
+
+    let theirs = Committed {
+        sequence: 2,
+        identity: "sha256:another-writer".to_owned(),
+    };
+    *rig.repository.latest.borrow_mut() = Some(theirs.clone());
+    let error = rig.drain(limits(4), None).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            backfill::Error::Batch(batch::Error::Diverged { sequence: 2, found, .. })
+                if *found == theirs.identity
+        ),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("Nothing was overwritten"), "{message}");
+    assert!(message.contains("clear the storage path"), "{message}");
+    assert_nothing_moved(&rig, &journal, &[1]);
+    assert_eq!(*rig.repository.latest.borrow(), Some(theirs));
+}
+
+/// A writer that left only its immutable tag is caught before a seal could
+/// write over that tag.
+#[test]
+fn another_writers_immutable_tag_refuses_before_it_is_overwritten() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    stopped_after_the_first_commit(&rig);
+    let journal = journal_bytes(&rig);
+
+    let mut theirs = rig.repository.steles.borrow()[&1].clone();
+    theirs.identity = stelae::Digest::compute(b"another writer");
+    rig.repository.steles.borrow_mut().insert(2, theirs.clone());
+
+    let error = rig.drain(limits(4), None).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            backfill::Error::Batch(batch::Error::Diverged { sequence: 2, .. })
+        ),
+        "{error}"
+    );
+    assert_nothing_moved(&rig, &journal, &[1]);
+    assert_eq!(rig.repository.steles.borrow()[&2].identity, theirs.identity);
+}
+
+#[test]
+fn a_repository_past_the_next_sequence_or_behind_the_journal_refuses() {
+    for found in [
+        Some(Committed {
+            sequence: 3,
+            identity: "sha256:another-writer".to_owned(),
+        }),
+        None,
+    ] {
+        let chain = Chain::spanning(12);
+        let rig = Rig::new(&chain);
+        stopped_after_the_first_commit(&rig);
+        let journal = journal_bytes(&rig);
+
+        *rig.repository.latest.borrow_mut() = found.clone();
+        let error = rig.drain(limits(4), None).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                backfill::Error::Batch(batch::Error::PredecessorMoved { .. })
+            ),
+            "{found:?}: {error}"
+        );
+        assert_nothing_moved(&rig, &journal, &[1]);
+    }
+}
+
+/// The predecessor is held to the digest the journal recorded, not to its
+/// number.
+#[test]
+fn a_predecessor_rewritten_under_its_tag_refuses() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    stopped_after_the_first_commit(&rig);
+    let journal = journal_bytes(&rig);
+
+    let rewritten = stelae::Digest::compute(b"another writer");
+    rig.repository
+        .steles
+        .borrow_mut()
+        .get_mut(&1)
+        .unwrap()
+        .identity = rewritten;
+    let error = rig.drain(limits(4), None).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            backfill::Error::Batch(batch::Error::PredecessorMoved { .. })
+        ),
+        "{error}"
+    );
+    assert_nothing_moved(&rig, &journal, &[1]);
+}
+
+/// A lost bundle is a precise stop, and the frontier stays what the repository
+/// really holds. The recovery restores from there, not from where the batch
+/// began.
+#[test]
+fn a_bundle_lost_part_way_through_stops_with_its_recovery() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    stopped_after_the_first_commit(&rig);
+    let journal = journal_bytes(&rig);
+
+    std::fs::remove_file(batch_dir(&rig).join("prepared/bundles/3.json")).unwrap();
+    let error = rig.drain(limits(4), None).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            backfill::Error::Batch(batch::Error::BundleLost { sequence: 3, .. })
+        ),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("clear the storage path"), "{message}");
+    assert!(message.contains("latest stele"), "{message}");
+    assert_nothing_moved(&rig, &journal, &[1]);
+}
+
+/// Damage a bundle's load can't see surfaces as its payload is read, with no
+/// stele and no silent use of what the stores hold now.
+#[test]
+fn a_damaged_payload_stops_at_its_sequence_with_its_recovery() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(4), None));
+
+    let bundles = rig.batch().bundles().unwrap();
+    let earlier: BTreeSet<_> = bundles[..2].iter().flat_map(|b| b.references()).collect();
+    let only_third: Vec<_> = bundles[2]
+        .references()
+        .into_iter()
+        .filter(|digest| !earlier.contains(digest))
+        .collect();
+    let blobs = batch_dir(&rig).join("prepared/blobs/sha256");
+    let path = only_third
+        .iter()
+        .map(|digest| blobs.join(digest.to_hex()))
+        .max_by_key(|path| std::fs::metadata(path).unwrap().len())
+        .unwrap();
+    flip_a_byte(&path);
+
+    let error = rig.drain(limits(4), None).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            backfill::Error::Batch(batch::Error::BundleLost { sequence: 3, .. })
+        ),
+        "{error}"
+    );
+    assert_eq!(*rig.repository.uploaded.borrow(), [1, 2]);
+    assert_eq!(latest_sequence(&rig), Some(2));
+    assert_eq!(rig.sequences(), [3, 4]);
+}
+
+/// Stores that can't serve the bundles are no fault of the runs. Staging again
+/// wouldn't mend them, so it stops with what recovers.
+#[test]
+fn stores_that_cant_serve_the_batch_stop_with_its_recovery() {
+    let refusals: [fn() -> dolos_snapshot::Error; 2] = [
+        || {
+            prepare::Refusal::HorizonLost {
+                sequence: 2,
+                horizon: 1,
+                first: 9,
+            }
+            .into()
+        },
+        || {
+            dolos_snapshot::staging::Refusal::NotAtFrontier {
+                frontier: "here".to_owned(),
+            }
+            .into()
+        },
+    ];
+    for refusal in refusals {
+        let chain = Chain::spanning(6);
+        let rig = Rig::new(&chain);
+        ready(rig.run(limits(2), None));
+        let journal = journal_bytes(&rig);
+
+        rig.calls.stage_refusal.set(Some(refusal));
+        let error = rig.drain(limits(2), None).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                backfill::Error::Batch(batch::Error::BundleLost { sequence: 1, .. })
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("clear the storage path"),
+            "{error}"
+        );
+        assert_nothing_moved(&rig, &journal, &[]);
+    }
+}
+
+/// A full volume at a commit moves nothing, and a rerun with room goes on.
+#[test]
+fn a_volume_filling_during_a_publish_stops_recoverably() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.repository.fault.set(Some((2, Fault::FullVolume)));
+
+    let error = rig.drain(limits(4), None).unwrap_err();
+    assert!(matches!(error, backfill::Error::FlushNoRoom(_)), "{error}");
+    assert!(error.to_string().contains("make room"), "{error}");
+    assert_eq!(latest_sequence(&rig), Some(1));
+    assert_eq!(rig.sequences(), [2, 3, 4]);
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// A staging past the budget stops with what to raise, and leaves no partial
+/// runs to charge the rerun with. The closed batch stays closed under any
+/// controls.
+#[test]
+fn a_staging_past_the_budget_stops_until_it_is_raised() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(4), None));
+    let journal = journal_bytes(&rig);
+
+    let tight = Limits {
+        scratch: 1,
+        ..limits(4)
+    };
+    let error = rig.drain(tight, None).unwrap_err();
+    assert!(matches!(error, backfill::Error::FlushNoRoom(_)), "{error}");
+    assert!(error.to_string().contains("--batch-scratch-mib"), "{error}");
+    assert!(!batch_dir(&rig).join("staging").exists());
+    assert_nothing_moved(&rig, &journal, &[]);
+
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// A capture's overshoot closes the batch past its budget, and the reserve kept
+/// for finishing it is what staging then has.
+#[test]
+fn a_batch_a_capture_overshot_stages_within_its_reserve() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(4), None));
+
+    let overshot = Limits {
+        scratch: 1,
+        reserve_per_epoch: 64 * 1024 * 1024,
+        ..limits(4)
+    };
+    assert_eq!(
+        rig.drain(overshot, Some(4)).unwrap(),
+        Outcome::UntilEpoch { sequence: 4 }
+    );
+    assert_eq!(*rig.repository.uploaded.borrow(), [1, 2, 3, 4]);
+}
+
+/// What a restarted staging reuses counts against its budget, so a family it
+/// walks again can't take the batch past the limit.
+#[test]
+fn a_restarted_staging_is_charged_for_the_runs_it_holds() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(4), None));
+    let bytes = stage_under(&rig, limits(4)).unwrap();
+    assert!(bytes > 0);
+
+    std::fs::remove_file(batch_dir(&rig).join("staging/indexes.json")).unwrap();
+    let used = tree_bytes(&batch_dir(&rig));
+    let one_short = Limits {
+        scratch: used,
+        ..limits(4)
+    };
+    let error = stage_under(&rig, one_short).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            batch::Error::Staging { source, .. }
+                if matches!(
+                    **source,
+                    dolos_snapshot::Error::Staging(
+                        dolos_snapshot::staging::Refusal::ScratchExceeded { .. }
+                    )
+                )
+        ),
+        "{error}"
+    );
+}
+
+/// A batch's pending refusal names flags that really continue it, and they do.
+#[test]
+fn the_pending_refusal_names_how_to_continue() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(4), None));
+
+    let error = rig.run(Limits::ONE, None).unwrap_err();
+    assert!(
+        error.to_string().contains("--batch-epochs above 1"),
+        "{error}"
+    );
+    assert_eq!(rig.drain(limits(2), None).unwrap(), Outcome::UpToDate);
+}
+
+/// The real transport: `cargo test -p stelae-cardano --all-features --test
+/// batch -- --ignored --test-threads=1`. `STELAE_TEST_REGISTRY_IMAGE` picks the
+/// server.
+mod over_a_registry {
+    use dolos_snapshot::registry::{
+        Auth, Inspected, Point, Repository, SnapshotRepository, Tuning,
+    };
+    use stelae::transport::WrittenLayer;
+    use stelae_cardano::publisher::{BackfillPublisher, RepositoryPublish};
+    use stelae_driver::publish::{Origin, PublishRecord};
+
+    use super::*;
+
+    struct LocalRegistry {
+        container: String,
+        port: u16,
+    }
+
+    impl LocalRegistry {
+        fn spawn() -> Self {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let image = std::env::var("STELAE_TEST_REGISTRY_IMAGE")
+                .unwrap_or_else(|_| "registry:2".to_owned());
+            let run = std::process::Command::new("docker")
+                .args(["run", "--detach", "--rm", "--publish", "127.0.0.1::5000"])
+                .arg(&image)
+                .output()
+                .expect("docker is required for the registry lane");
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            assert!(run.status.success(), "docker run {image}: {stderr}");
+            let container = String::from_utf8(run.stdout).unwrap().trim().to_owned();
+            let ports = std::process::Command::new("docker")
+                .args(["port", &container, "5000/tcp"])
+                .output()
+                .unwrap();
+            let port = String::from_utf8(ports.stdout)
+                .unwrap()
+                .lines()
+                .find_map(|line| line.rsplit(':').next()?.trim().parse().ok())
+                .expect("docker port");
+            let registry = Self { container, port };
+            registry.wait();
+            registry
+        }
+
+        /// Until `/v2/` answers: a mapped port takes connections before the
+        /// server behind it listens.
+        fn wait(&self) {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..100 {
+                let answer = std::net::TcpStream::connect(("127.0.0.1", self.port)).and_then(
+                    |mut stream| {
+                        let request = "GET /v2/ HTTP/1.0\r\nHost: localhost\r\n\r\n";
+                        stream.write_all(request.as_bytes())?;
+                        let mut answer = String::new();
+                        stream.read_to_string(&mut answer)?;
+                        Ok(answer)
+                    },
+                );
+                if answer.is_ok_and(|answer| answer.starts_with("HTTP/1.0 200")) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            panic!("the registry never answered");
+        }
+
+        fn repository(&self, name: &str) -> Repository {
+            format!("oci://127.0.0.1:{}/cardano/{name}", self.port)
+                .parse()
+                .unwrap()
+        }
+    }
+
+    impl Drop for LocalRegistry {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &self.container])
+                .output();
+        }
+    }
+
+    fn settings(repo: &Repository) -> RepositoryPublish<'_> {
+        RepositoryPublish {
+            repo,
+            auth: Auth::Anonymous,
+            insecure: true,
+            scratch_dir: None,
+            rebuild: false,
+            tuning: Tuning::default(),
+        }
+    }
+
+    fn publish_through(
+        rig: &Rig<'_>,
+        repo: &Repository,
+        limits: Limits,
+        until: u64,
+    ) -> Result<Outcome, backfill::Error> {
+        let observer = Observer::silent();
+        let publisher = BackfillPublisher {
+            config: &rig.node.config,
+            settings: settings(repo),
+            observer: &observer,
+        };
+        rig.drive(limits, Some(until), true, &publisher)
+    }
+
+    fn inspect(repo: &Repository, point: Point) -> Inspected {
+        let scratch = tempfile::tempdir().unwrap();
+        SnapshotRepository::open(
+            repo,
+            true,
+            Auth::Anonymous,
+            scratch.path().to_owned(),
+            Tuning::default(),
+        )
+        .unwrap()
+        .inspect(point)
+        .unwrap()
+    }
+
+    /// The whole chain one boundary at a time, to hold a batch against.
+    fn one_at_a_time(chain: &Chain, repo: &Repository, until: u64) {
+        one_at_a_time_on(&Rig::new(chain), repo, until);
+    }
+
+    fn one_at_a_time_on(rig: &Rig<'_>, repo: &Repository, until: u64) {
+        assert_eq!(
+            publish_through(rig, repo, Limits::ONE, until).unwrap(),
+            Outcome::UntilEpoch { sequence: until }
+        );
+    }
+
+    fn assert_same_steles(found: &Repository, expected: &Repository, through: u64) {
+        for sequence in 1..=through {
+            let (found, expected) = (
+                inspect(found, Point::Epoch(sequence)),
+                inspect(expected, Point::Epoch(sequence)),
+            );
+            assert_eq!(found.identity, expected.identity, "at sequence {sequence}");
+            assert_eq!(
+                found.inscription, expected.inscription,
+                "at sequence {sequence}"
+            );
+            assert_eq!(
+                found.total_compressed, expected.total_compressed,
+                "at sequence {sequence}"
+            );
+        }
+        let latest = inspect(found, Point::Latest);
+        assert_eq!(latest.inscription.sequence, through);
+    }
+
+    /// A repository a batch filled holds what one filled a boundary at a time
+    /// holds: the same steles, the same blobs and a `latest` standing on the
+    /// last.
+    #[test]
+    #[ignore = "spawns a registry"]
+    fn a_batch_publishes_what_one_boundary_at_a_time_publishes() {
+        let chain = Chain::spanning(12);
+        let registry = LocalRegistry::spawn();
+        let (single, batched) = (registry.repository("one"), registry.repository("batch"));
+        one_at_a_time(&chain, &single, 4);
+
+        let rig = Rig::new(&chain);
+        assert_eq!(
+            publish_through(&rig, &batched, limits(2), 4).unwrap(),
+            Outcome::UntilEpoch { sequence: 4 }
+        );
+        assert_batch_is_gone(&rig);
+        assert_same_steles(&batched, &single, 4);
+
+        let scratch = tempfile::tempdir().unwrap();
+        SnapshotRepository::open(
+            &batched,
+            true,
+            Auth::Anonymous,
+            scratch.path().to_owned(),
+            Tuning::default(),
+        )
+        .unwrap()
+        .verify(Point::Latest)
+        .unwrap();
+    }
+
+    /// Publishes through a real repository, and loses the answer once.
+    struct LosesAnAnswer<'a> {
+        inner: BackfillPublisher<'a>,
+        at: u64,
+        cancel: CancellationToken,
+        uploads: RefCell<Vec<u64>>,
+    }
+
+    impl backfill::Publish for LosesAnAnswer<'_> {
+        fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {
+            self.inner.publish(plan, source)
+        }
+
+        fn latest(&self, plan: &Plan) -> Result<Option<Committed>, backfill::Error> {
+            self.inner.latest(plan)
+        }
+
+        fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+            self.inner.stele(sequence)
+        }
+
+        fn finalize(
+            &self,
+            finalizing: &Finalizing<'_>,
+            source: &dyn SnapshotSource,
+        ) -> Result<Committed, backfill::Error> {
+            let committed = self.inner.finalize(finalizing, source)?;
+            self.uploads.borrow_mut().push(committed.sequence);
+            if committed.sequence == self.at && !self.cancel.is_cancelled() {
+                self.cancel.cancel();
+                return Err(backfill::Error::caller(io::Error::other(
+                    "the process died",
+                )));
+            }
+            Ok(committed)
+        }
+    }
+
+    #[test]
+    #[ignore = "spawns a registry"]
+    fn a_lost_answer_reconciles_against_the_repository() {
+        let chain = Chain::spanning(12);
+        let registry = LocalRegistry::spawn();
+        let (single, batched) = (registry.repository("one"), registry.repository("batch"));
+        one_at_a_time(&chain, &single, 4);
+
+        let rig = Rig::new(&chain);
+        let observer = Observer::silent();
+        let publisher = LosesAnAnswer {
+            inner: BackfillPublisher {
+                config: &rig.node.config,
+                settings: settings(&batched),
+                observer: &observer,
+            },
+            at: 2,
+            cancel: rig.calls.cancel.get(),
+            uploads: RefCell::default(),
+        };
+        rig.drive(limits(4), Some(4), true, &publisher).unwrap_err();
+        assert_eq!(rig.sequences(), [2, 3, 4], "the journal hasn't heard");
+        assert_eq!(inspect(&batched, Point::Latest).inscription.sequence, 2);
+
+        rig.calls.cancel.restart();
+        assert_eq!(
+            rig.drive(limits(4), Some(4), true, &publisher).unwrap(),
+            Outcome::UntilEpoch { sequence: 4 }
+        );
+        assert_eq!(*publisher.uploads.borrow(), [1, 2, 3, 4]);
+        assert_same_steles(&batched, &single, 4);
+    }
+
+    /// Another writer's stele is told by its identity, and it stays.
+    #[test]
+    #[ignore = "spawns a registry"]
+    fn another_writers_stele_refuses_and_stays() {
+        let chain = Chain::spanning(12);
+        let registry = LocalRegistry::spawn();
+        let repo = registry.repository("shared");
+
+        let rig = Rig::new(&chain);
+        ready(rig.run(limits(2), None));
+
+        // The same chain under another retained list, which its identity states.
+        let theirs = Rig::new(&chain);
+        *theirs.retained.borrow_mut() = dolos_snapshot::planning::retained_epochs(&[3]).unwrap();
+        one_at_a_time_on(&theirs, &repo, 1);
+        let before = inspect(&repo, Point::Epoch(1)).identity;
+
+        let error = publish_through(&rig, &repo, limits(2), 2).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                backfill::Error::Batch(batch::Error::Diverged { sequence: 1, .. })
+            ),
+            "{error}"
+        );
+        assert_eq!(inspect(&repo, Point::Epoch(1)).identity, before);
+        assert_eq!(inspect(&repo, Point::Latest).identity, before);
+        let batch = rig.batch();
+        assert_eq!(batch.frontiers().published, None);
+        assert_eq!(rig.sequences(), [1, 2]);
+    }
+
+    /// A publish record a batch of one left resumes under a batch: a recorded
+    /// layer whose blob isn't there is rebuilt, the same stele results, and
+    /// the record goes with its seal.
+    #[test]
+    #[ignore = "spawns a registry"]
+    fn a_record_a_single_publish_left_resumes_under_a_batch() {
+        let chain = Chain::spanning(12);
+        let registry = LocalRegistry::spawn();
+        let (single, batched) = (registry.repository("one"), registry.repository("batch"));
+        one_at_a_time(&chain, &single, 3);
+
+        let rig = Rig::new(&chain);
+        publish_through(&rig, &batched, Limits::ONE, 1).unwrap();
+
+        let storage = &rig.node.config.storage.path;
+        let record = dolos_snapshot::registry::record_path_in(storage);
+        let closed = inspect(&single, Point::Epoch(2))
+            .inscription
+            .layers
+            .into_iter()
+            .find(|layer| layer.kind == "blocks" && layer.scope["epoch"] == 1)
+            .unwrap();
+        PublishRecord {
+            origin: Origin {
+                repository: batched.to_string(),
+                dataset_id: MAGIC.into(),
+                parameters: dolos_snapshot::parameters(&retained()),
+                compression: dolos_snapshot::compression(),
+            },
+            layers: vec![WrittenLayer {
+                digests: stelae::digest::LayerDigests {
+                    diff_id: closed.diff_id,
+                    blob_digest: stelae::Digest::compute(b"a blob nothing uploaded"),
+                    compressed_size: 1,
+                    uncompressed_size: closed.uncompressed_size,
+                },
+                descriptor: closed,
+            }],
+        }
+        .save(&record)
+        .unwrap();
+
+        assert_eq!(
+            publish_through(&rig, &batched, limits(2), 3).unwrap(),
+            Outcome::UntilEpoch { sequence: 3 }
+        );
+        assert!(!record.exists());
+        assert_same_steles(&batched, &single, 3);
+    }
 }

@@ -187,6 +187,18 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
         fn latest(&self, _: &Plan) -> Result<Option<batch::Committed>, backfill::Error> {
             unreachable!("a batch of one never asks")
         }
+
+        fn stele(&self, _: u64) -> Result<Option<batch::Held>, backfill::Error> {
+            unreachable!("a batch of one never asks")
+        }
+
+        fn finalize(
+            &self,
+            _: &dolos_snapshot::prepare::Finalizing<'_>,
+            _: &dyn SnapshotSource,
+        ) -> Result<batch::Committed, backfill::Error> {
+            unreachable!("a batch of one prepares nothing")
+        }
     }
 
     let node = Node::new();
@@ -463,14 +475,14 @@ fn a_backfill_spools_under_the_scratch_directory_it_is_given() {
     assert!(!default.exists(), "{error}");
 }
 
-/// A prepared batch has nowhere to go until ordered publication arrives, so no
-/// host entry point starts one.
+/// The host entry point starts a larger batch: this one stops only at the
+/// cancellation it was handed, past where its stores opened.
 #[test]
-fn a_batch_above_one_is_gated_before_anything_opens() {
+fn a_batch_above_one_runs_through_the_host() {
     let node = Node::new();
     let genesis = dolos_cardano::include::preview::load();
     let mut config = node.config.clone();
-    config.storage.path = node.path().join("gated");
+    config.storage.path = node.path().join("batched");
     let options = backfill::Options {
         direct_s3: None,
         repository: "oci://registry.invalid/cardano/preview".parse().unwrap(),
@@ -495,14 +507,10 @@ fn a_batch_above_one_is_gated_before_anything_opens() {
         },
     };
 
-    let error = backfill::run(
-        &config,
-        &genesis,
-        &options,
-        tokio_util::sync::CancellationToken::new(),
-        &Observer::silent(),
-    )
-    .unwrap_err();
-    assert!(matches!(error, backfill::Error::BatchingGated), "{error}");
-    assert!(!config.storage.path.exists());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    let error =
+        backfill::run(&config, &genesis, &options, cancel, &Observer::silent()).unwrap_err();
+    assert!(matches!(error, backfill::Error::Interrupted), "{error}");
+    assert!(config.storage.path.exists());
 }

@@ -5,6 +5,12 @@
 //! naming it. The journal is written after the stores that reached a boundary
 //! closed, so the frontier it names is one the stores really hold, and a cursor
 //! behind it means they were rebuilt or rolled back.
+//!
+//! Publishing drains it from the front. A sequence leaves the journal once the
+//! repository holds it and before its bundle goes, so a crash leaves a sequence
+//! to reconcile or a bundle to sweep, and never a sequence nothing holds. The
+//! journal itself goes last, so a crash while cleaning up only repeats the
+//! cleanup.
 
 use std::{
     fs::{self, File},
@@ -18,11 +24,12 @@ use dolos_snapshot::{
     export::Predecessor,
     facade::SnapshotSource,
     prepare::{self, Bundle, Store},
-    staging::{Budget, Staged},
+    staging::{self, Budget, Staged},
 };
 use serde::{Deserialize, Serialize};
-use stelae::{progress::Observer, Digest};
+use stelae::{inscription::Inscription, progress::Observer, Digest};
 use stelae_driver::preflight::Need;
+use tracing::warn;
 
 /// Version of the journal's layout.
 pub const JOURNAL_FORMAT: u32 = 1;
@@ -114,6 +121,13 @@ impl From<&ChainPoint> for Point {
     }
 }
 
+/// A stele as the repository holds it, under its immutable tag.
+#[derive(Debug, Clone)]
+pub struct Held {
+    pub committed: Committed,
+    pub inscription: Inscription,
+}
+
 /// One prepared boundary, as far as the journal vouches for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -143,8 +157,9 @@ pub enum Flush {
 struct Journal {
     format: u32,
     source: Source,
-    /// The repository's latest stele when the batch began: `None` for an empty
-    /// repository. What the first publication has to follow.
+    /// The stele the next publication has to follow: the repository's latest
+    /// when the batch began, `None` for an empty repository, then each stele
+    /// the batch committed.
     predecessor: Option<Committed>,
     prepared: Vec<Prepared>,
     replay: Point,
@@ -252,8 +267,27 @@ pub enum Error {
         path: PathBuf,
     },
     #[error(
-        "a batch of {prepared} prepared boundaries is pending at {path}: rerun with the \
-         --batch-epochs that prepared it"
+        "the repository holds sequence {sequence} as {found}, and the batch at {path} would \
+         publish {expected} there: another writer published it, or these stores aren't what the \
+         batch was prepared from. Nothing was overwritten. Stop that writer. {REPLAY}"
+    )]
+    Diverged {
+        sequence: u64,
+        found: String,
+        expected: String,
+        path: PathBuf,
+    },
+    #[error(
+        "the batch at {path} publishes {next:?} next, and was told sequence {sequence} landed"
+    )]
+    OutOfTurn {
+        sequence: u64,
+        next: Option<u64>,
+        path: PathBuf,
+    },
+    #[error(
+        "a batch of {prepared} prepared boundaries is pending at {path}: `backfill` or `run` with \
+         a --batch-epochs above 1, --batch-scratch-mib and --batch-reserve-mib publishes it first"
     )]
     Pending { prepared: usize, path: PathBuf },
     #[error(
@@ -268,6 +302,20 @@ pub enum Error {
     },
     #[error("preparing a boundary")]
     Preparing(#[source] Box<dolos_snapshot::Error>),
+    #[error("staging the batch at {path}: {source}")]
+    Staging {
+        path: PathBuf,
+        #[source]
+        source: Box<dolos_snapshot::Error>,
+    },
+    /// The staged runs can't finish a publication. They are disposable, so the
+    /// flush that hears this stages them again, once.
+    #[error("the batch's staged runs at {path} can't be used: {source}")]
+    RunsUnusable {
+        path: PathBuf,
+        #[source]
+        source: Box<dolos_snapshot::Error>,
+    },
 }
 
 /// The recovery from losing what only a batch holds. Over stores still there a
@@ -339,6 +387,33 @@ pub fn refuse_lost_history(storage_path: &Path, sequence: u64) -> Result<(), Err
             sequence,
             path,
         }),
+        _ => Ok(()),
+    }
+}
+
+/// Finish cleaning up a batch every sequence of which committed, so a run that
+/// won't open a batch doesn't leave its runs on the volume.
+pub fn clear_if_drained(storage_path: &Path) -> Result<(), Error> {
+    let dir = dir_in(storage_path);
+    match read_journal(&dir.join(JOURNAL_FILE))? {
+        Some(journal) if journal.prepared.is_empty() => clear_drained(&dir),
+        _ => Ok(()),
+    }
+}
+
+/// Everything under a drained batch is disposable. The journal goes last.
+fn clear_drained(dir: &Path) -> Result<(), Error> {
+    for tree in [STAGING_DIR, PREPARED_DIR] {
+        remove_tree(&dir.join(tree))?;
+    }
+    fs::remove_file(dir.join(JOURNAL_FILE))
+        .and_then(|()| sync_dir(dir))
+        .map_err(io_at(dir))
+}
+
+fn remove_tree(path: &Path) -> Result<(), Error> {
+    match fs::remove_dir_all(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(io_at(path)(error)),
         _ => Ok(()),
     }
 }
@@ -422,7 +497,8 @@ impl Batch {
     /// Open the batch under `dir`, refusing one prepared from another source.
     pub fn open(dir: PathBuf, limits: Limits, source: Source) -> Result<Self, Error> {
         let journal = read_journal(&dir.join(JOURNAL_FILE))?;
-        if let Some(journal) = &journal {
+        // A drained batch has nothing left to continue from another source.
+        if let Some(journal) = journal.as_ref().filter(|j| !j.prepared.is_empty()) {
             let what = differing(&journal.source, &source);
             if let Some(what) = what {
                 return Err(Error::SourceChanged { path: dir, what });
@@ -469,6 +545,11 @@ impl Batch {
         self.journal.as_ref().map_or(&[], |j| &j.prepared)
     }
 
+    /// The stele the next publication has to follow.
+    pub fn predecessor(&self) -> Option<&Committed> {
+        self.predecessor.as_ref()
+    }
+
     /// What the batch holds on disk, staged runs included.
     pub fn used(&self) -> Result<u64, Error> {
         tree_bytes(&self.dir).map_err(io_at(&self.dir))
@@ -512,16 +593,36 @@ impl Batch {
         Ok(())
     }
 
-    /// Refuse a repository that moved since the batch began.
+    /// Refuse a repository that moved since the batch last committed. Only a
+    /// closed batch has uploaded anything, so only there can the latest stele
+    /// be the next sequence, whose identity the flush holds to the batch.
     pub fn check_predecessor(&self, latest: Option<Committed>) -> Result<(), Error> {
-        if latest == self.predecessor {
+        let next = self.prepared().first().map(|p| p.sequence);
+        let reconcilable =
+            self.ready().is_some() && latest.as_ref().map(|l| l.sequence) == next && next.is_some();
+        if latest == self.predecessor || reconcilable {
             return Ok(());
         }
-        Err(Error::PredecessorMoved {
+        Err(self.moved(latest))
+    }
+
+    /// The refusal of a repository that isn't where the journal left it.
+    pub fn moved(&self, found: Option<Committed>) -> Error {
+        Error::PredecessorMoved {
             planned: self.predecessor.clone(),
-            found: latest,
+            found,
             path: self.dir.clone(),
-        })
+        }
+    }
+
+    /// The refusal of a stele that isn't the one this batch publishes.
+    pub fn diverged(&self, sequence: u64, found: String, expected: String) -> Error {
+        Error::Diverged {
+            sequence,
+            found,
+            expected,
+            path: self.dir.clone(),
+        }
     }
 
     /// Read where the stores stand against the journal.
@@ -563,26 +664,10 @@ impl Batch {
             .iter()
             .map(|prepared| {
                 let sequence = prepared.sequence;
-                let bundle = self.store.load(sequence).map_err(|source| {
-                    let path = self.dir.clone();
-                    let unreadable = matches!(
-                        source,
-                        dolos_snapshot::Error::Preparation(prepare::Refusal::Io(_))
-                    );
-                    let source = Box::new(source);
-                    match unreadable {
-                        true => Error::BundleUnreadable {
-                            sequence,
-                            path,
-                            source,
-                        },
-                        false => Error::BundleLost {
-                            sequence,
-                            path,
-                            source,
-                        },
-                    }
-                })?;
+                let bundle = self
+                    .store
+                    .load(sequence)
+                    .map_err(|source| self.unusable(sequence, source))?;
                 let found = bundle_identity(&bundle);
                 if found != prepared.bundle {
                     return Err(Error::BundleChanged {
@@ -593,6 +678,36 @@ impl Batch {
                 Ok(bundle)
             })
             .collect()
+    }
+
+    /// The refusal of runs a publication could not finish from.
+    pub fn runs_unusable(&self, source: Box<dolos_snapshot::Error>) -> Error {
+        Error::RunsUnusable {
+            path: self.dir.clone(),
+            source,
+        }
+    }
+
+    /// Why a bundle can't be used: damage, or a machine that can't read it now.
+    pub fn unusable(&self, sequence: u64, source: dolos_snapshot::Error) -> Error {
+        let path = self.dir.clone();
+        let unreadable = matches!(
+            source,
+            dolos_snapshot::Error::Preparation(prepare::Refusal::Io(_))
+        );
+        let source = Box::new(source);
+        match unreadable {
+            true => Error::BundleUnreadable {
+                sequence,
+                path,
+                source,
+            },
+            false => Error::BundleLost {
+                sequence,
+                path,
+                source,
+            },
+        }
     }
 
     fn save(&self) -> Result<(), Error> {
@@ -704,7 +819,10 @@ impl Batch {
     }
 
     /// Stage what the batch's closed windows need, once, from a frozen view,
-    /// inside what the budget has left.
+    /// inside what the budget has left. Runs that can't serve the batch are
+    /// disposable, so they are staged again, from the stores and under the
+    /// checks of a first staging. Runs cut off by the budget go too, so what
+    /// they hold isn't charged to the rerun.
     pub fn stage(
         &mut self,
         source: &dyn SnapshotSource,
@@ -713,17 +831,129 @@ impl Batch {
     ) -> Result<Staged, Error> {
         let bundles = self.bundles()?;
         let root = self.dir.join(STAGING_DIR);
-        let used = tree_bytes(&self.dir.join(PREPARED_DIR)).map_err(io_at(&self.dir))?;
-        let budget = Budget::new(self.limits.scratch.saturating_sub(used));
-        let staged = source
-            .stage_batch(&root, &bundles, previous, budget, observer)
-            .map_err(|error| Error::Preparing(Box::new(error)))?;
+        let attempt = || -> Result<Staged, Error> {
+            let budget = Budget::new(self.staging_budget()?);
+            source
+                .stage_batch(&root, &bundles, previous, budget, observer)
+                .map_err(|source| Error::Staging {
+                    path: self.dir.clone(),
+                    source: Box::new(source),
+                })
+        };
+        let staged = match attempt() {
+            Err(Error::Staging { source, .. }) if runs_are_stale(&source) => {
+                warn!(error = %source, "the staged runs can't serve this batch: staging them again");
+                remove_tree(&root)?;
+                attempt()
+            }
+            other => other,
+        };
+        if let Err(Error::Staging { source, .. }) = &staged {
+            if matches!(
+                **source,
+                dolos_snapshot::Error::Staging(staging::Refusal::ScratchExceeded { .. })
+            ) {
+                remove_tree(&root)?;
+            }
+        }
+        let staged = staged?;
         if let Some(journal) = self.journal.as_mut() {
             journal.staged = Some(staged.frontier().into());
         }
         self.save()?;
         Ok(staged)
     }
+
+    /// Bytes a staging may write: what the budget has left, and never less than
+    /// the reserve kept for finishing what a capture's overshoot closed the
+    /// batch on.
+    fn staging_budget(&self) -> Result<u64, Error> {
+        let reserved = self
+            .limits
+            .reserve_per_epoch
+            .saturating_mul(self.prepared().len() as u64);
+        let mut held = 0u64;
+        for tree in [PREPARED_DIR, STAGING_DIR] {
+            held = held.saturating_add(tree_bytes(&self.dir.join(tree)).map_err(io_at(&self.dir))?);
+        }
+        Ok(self.limits.scratch.saturating_sub(held).max(reserved))
+    }
+
+    /// Drop the staged runs, so the next staging starts over.
+    pub fn drop_staging(&self) -> Result<(), Error> {
+        remove_tree(&self.dir.join(STAGING_DIR))
+    }
+
+    /// Move past a stele the repository now holds: durably, and only then drop
+    /// its bundle and whatever payload no later one shares.
+    pub fn commit(&mut self, committed: Committed) -> Result<(), Error> {
+        let sequence = committed.sequence;
+        let next = self.prepared().first().map(|prepared| prepared.sequence);
+        let Some(journal) = self.journal.as_mut().filter(|_| next == Some(sequence)) else {
+            return Err(Error::OutOfTurn {
+                sequence,
+                next,
+                path: self.dir.clone(),
+            });
+        };
+        journal.prepared.remove(0);
+        journal.predecessor = Some(committed.clone());
+        journal.horizon = journal.prepared.iter().filter_map(|p| p.horizon).min();
+        self.predecessor = Some(committed);
+        self.save()?;
+        self.store
+            .release(sequence)
+            .map_err(|error| Error::Preparing(Box::new(error)))
+    }
+
+    /// Finish a batch whose every sequence committed. Restartable: anything it
+    /// leaves is cleared by the next run that opens the batch.
+    pub fn clear(&mut self) -> Result<(), Error> {
+        if self.journal.as_ref().is_none_or(|j| !j.prepared.is_empty()) {
+            return Ok(());
+        }
+        clear_drained(&self.dir)?;
+        self.journal = None;
+        self.predecessor = None;
+        self.store = Store::open(self.dir.join(PREPARED_DIR), self.source.repository.clone())
+            .map_err(|error| Error::Preparing(Box::new(error)))?;
+        Ok(())
+    }
+}
+
+/// Whether staged runs fail to serve this batch: damaged, staged for something
+/// else, or short of a window. Anything else names the stores or the budget.
+pub fn runs_are_stale(error: &dolos_snapshot::Error) -> bool {
+    use staging::Refusal as R;
+
+    matches!(
+        error,
+        dolos_snapshot::Error::Staging(
+            R::Corrupt { .. } | R::SourceMismatch { .. } | R::Uncovered { .. }
+        )
+    )
+}
+
+/// Whether the stores can't serve the bundles at all, which staging again can't
+/// mend: they stand on something else, or the archive no longer reaches back.
+pub fn stores_cant_serve(error: &dolos_snapshot::Error) -> bool {
+    matches!(
+        error,
+        dolos_snapshot::Error::Preparation(_)
+            | dolos_snapshot::Error::Staging(staging::Refusal::NotAtFrontier { .. })
+    )
+}
+
+/// Whether publishing stopped because a volume or the budget can't hold it,
+/// which leaves all a batch holds standing for a rerun with room.
+pub fn ran_out_of_room(error: &dolos_snapshot::Error) -> bool {
+    out_of_space(error)
+        || reports_full_volume(error)
+        || matches!(
+            error,
+            dolos_snapshot::Error::NotEnoughSpace(_)
+                | dolos_snapshot::Error::Staging(staging::Refusal::ScratchExceeded { .. })
+        )
 }
 
 /// The first thing `found` differs from `held` in, for a refusal to name.
@@ -774,6 +1004,7 @@ pub fn out_of_space(error: &dolos_snapshot::Error) -> bool {
 
     let source = match error {
         E::Preparation(prepare::Refusal::Io(source)) => source,
+        E::Staging(staging::Refusal::Io(source)) => source,
         E::Stelae(stelae::Error::Io(source)) => source,
         _ => return false,
     };
@@ -1095,6 +1326,61 @@ mod tests {
                 Err(Error::PredecessorMoved { .. })
             ));
         }
+    }
+
+    /// Skipping a sequence or committing one twice is a gap in the history, so
+    /// the journal only ever moves by the next one.
+    #[test]
+    fn only_the_next_sequence_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = [prepared(1, 1), prepared(2, 1)];
+        let mut batch = batch_holding(dir.path(), limits(9, u64::MAX, 0), &held, 0);
+        let stele = |sequence| Committed {
+            sequence,
+            identity: format!("sha256:{sequence}"),
+        };
+        assert!(matches!(
+            batch.commit(stele(2)),
+            Err(Error::OutOfTurn {
+                sequence: 2,
+                next: Some(1),
+                ..
+            })
+        ));
+        assert_eq!(batch.prepared(), &held);
+
+        batch.commit(stele(1)).unwrap();
+        assert_eq!(batch.predecessor(), Some(&stele(1)));
+        assert_eq!(batch.frontiers().published, Some(1));
+        assert_eq!(batch.prepared(), &held[1..]);
+        assert!(matches!(
+            batch.commit(stele(1)),
+            Err(Error::OutOfTurn { .. })
+        ));
+
+        let reopened = Batch::open(dir.path().to_owned(), Limits::ONE, source()).unwrap();
+        assert_eq!(reopened.predecessor(), Some(&stele(1)));
+        assert_eq!(reopened.prepared(), &held[1..]);
+    }
+
+    /// The oldest slot the batch needs moves on as its sequences commit, and
+    /// the last commit leaves nothing to keep.
+    #[test]
+    fn the_horizon_follows_what_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut held = [prepared(1, 1), prepared(2, 1)];
+        held[0].horizon = Some(10);
+        held[1].horizon = Some(20);
+        let mut batch = batch_holding(dir.path(), limits(9, u64::MAX, 0), &held, 0);
+        let stele = |sequence| Committed {
+            sequence,
+            identity: format!("sha256:{sequence}"),
+        };
+
+        batch.commit(stele(1)).unwrap();
+        assert_eq!(batch.frontiers().horizon, Some(20));
+        batch.commit(stele(2)).unwrap();
+        assert_eq!(batch.frontiers().horizon, None);
     }
 
     #[test]
