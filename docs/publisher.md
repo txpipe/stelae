@@ -308,11 +308,10 @@ Three cases read differently:
   tried, so the failed fetch adds the free bytes of the download directory: read a
   low figure as a full volume. A stopped download can also leave partial or absent
   files below the highest one, which a rerun doesn't fetch again, so make room, empty
-  the immutable directory and rerun. A batched run closes the batch and publishes
-  what it prepared first, unless the stores can't shut down or reopen before that,
-  which leaves the batch open. So this failure can arrive beside a room error from
-  the stores or from that publication. The exit names both, and emptying the immutable
-  directory still applies. That can't help once a rerun has imported across
+  the immutable directory and rerun. A batched run tries to close the batch and
+  publish what it prepared first, so this failure can arrive beside a room error. The
+  exit names both, and emptying the immutable directory still applies. That can't
+  help once a rerun has imported across
   an absent file next to an epoch's start, which the chart's own restart can do: every
   run then refuses before any fetch, saying the archive has a gap there, unless the
   repository already holds that boundary. A held boundary isn't checked, so a run over
@@ -381,10 +380,10 @@ A closed batch stays closed across restarts, whatever the controls say then. A
 periodic run reaches `end-of-source` and publishes what it prepared, however few
 boundaries that is: nothing waits at the tip for a full batch. A source that stays
 down past its retries, or a fetch that brings nothing new, closes the batch the same
-way, and the run publishes what it prepared before it exits on that failure. If that
-publication fails too, the exit names both. If the stores can't shut down or reopen
-before that, the batch stays open, and the exit again names both. So an outage during
-a backfill costs one smaller batch, and one more index traversal for the next.
+way, and the run publishes what it prepared before it exits on that failure. If
+anything on that way fails too, the exit names both: a failure before the journal
+records the close leaves the batch open, and one after leaves it closed. So an outage
+during a backfill costs one smaller batch, and one more index traversal for the next.
 
 ### Progress
 

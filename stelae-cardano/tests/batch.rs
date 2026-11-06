@@ -3387,6 +3387,64 @@ fn a_shutdown_failing_with_the_source_leaves_the_batch_open() {
     assert_eq!(rig.repository.tags(), uninterrupted(&chain));
 }
 
+/// The stores the flush opened to read the cursor won't close, before the
+/// journal records the close: the exit keeps the source's failure and the batch
+/// stays open.
+#[test]
+fn a_store_close_failing_before_the_batch_closes_leaves_it_open() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.source_ends_after(6);
+    rig.calls.source_fails.set(Some(|calls| {
+        calls.poison_workspace_close.set(true);
+        source_down(calls)
+    }));
+
+    let error = rig.drain(limits(16), None).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            backfill::Error::SourceAndFlush { flush, failure }
+                if matches!(**flush, backfill::Error::StorePoisoned(_))
+                    && matches!(**failure, backfill::Error::Mithril { .. })
+        ),
+        "{error}"
+    );
+    assert!(rig.repository.uploaded.borrow().is_empty());
+    assert_eq!(rig.batch().ready(), None);
+}
+
+/// A reopen failing after the journal recorded the close: the same exit, but
+/// the batch stays closed and the rerun publishes it whatever the controls say.
+#[test]
+fn a_reopen_failing_after_the_batch_closed_leaves_it_closed() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.source_ends_after(6);
+    rig.calls.source_fails.set(Some(|calls| {
+        calls.open_full_after.set(Some(1));
+        source_down(calls)
+    }));
+
+    let error = rig.drain(limits(16), None).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            backfill::Error::SourceAndFlush { flush, failure }
+                if matches!(**flush, backfill::Error::ReplayFilledVolume(_))
+                    && matches!(**failure, backfill::Error::Mithril { .. })
+        ),
+        "{error}"
+    );
+    assert!(rig.repository.uploaded.borrow().is_empty());
+    assert_eq!(rig.batch().ready(), Some(Flush::EndOfSource));
+
+    rig.calls.source_fails.set(None);
+    rig.restart_with_the_whole_source();
+    assert_eq!(rig.drain(limits(16), None).unwrap(), Outcome::UpToDate);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
 /// A real fetch failing with a batch prepared, then a publication that runs out
 /// of room as it would on the volume the download filled: the exit keeps the
 /// free space the fetch read. Takes the retries' whole backoff.
