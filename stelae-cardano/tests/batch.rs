@@ -3856,6 +3856,35 @@ fn a_tag_deleted_before_the_chain_read_refuses() {
     assert!(followed.repository.inscription(3).is_none());
 }
 
+/// A moved chain read is a refusal and not a failure worth asking again, even
+/// if the tag reads back as the journal says by the next attempt.
+#[test]
+fn a_moved_chain_read_is_refused_at_once() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    let attempts = Cell::new(0);
+    let publisher = Around {
+        inner: &rig.repository,
+        finalize: &|finalizing, predecessor, source| {
+            let publish = |finalizing: &Finalizing<'_>, source: &dyn SnapshotSource| {
+                backfill::Publish::finalize(&rig.repository, finalizing, predecessor, source)
+            };
+            if finalizing.bundle.sequence() != 2 {
+                return publish(finalizing, source);
+            }
+            attempts.set(attempts.get() + 1);
+            let held = rig.repository.latest.borrow_mut().take();
+            let answer = publish(finalizing, source);
+            *rig.repository.latest.borrow_mut() = held;
+            answer
+        },
+    };
+
+    let error = rig.drive(limits(4), None, true, &publisher).unwrap_err();
+    assert_eq!(moved_to(error), None);
+    assert_eq!(attempts.get(), 1);
+}
+
 /// Each sequence reads the repository before it does anything else, so a writer
 /// moving it after a commit stops the next one at that read.
 #[test]
