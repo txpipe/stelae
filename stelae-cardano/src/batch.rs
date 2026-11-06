@@ -284,7 +284,8 @@ pub enum Error {
          aren't what the batch was prepared from. Nothing was overwritten. If you know that tag \
          is another writer's, stop that writer, delete the tag and rerun. Otherwise leave the tag \
          and treat the stores as wrong, because deleting it publishes from them unchecked. \
-         {REPLAY}"
+         {REPLAY}. If this refusal comes back over stores restored that way, they aren't the \
+         cause: stop any writer, delete the tag and rerun"
     )]
     TagTaken {
         sequence: u64,

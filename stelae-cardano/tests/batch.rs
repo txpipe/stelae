@@ -3288,12 +3288,91 @@ fn a_flush_failing_after_the_source_did_reports_both() {
         message.contains(&source_down(&rig.calls).to_string()),
         "{message}"
     );
+    let backfill::Error::SourceAndFlush { failure, flush } = &error else {
+        unreachable!()
+    };
+    assert_eq!(
+        message,
+        format!(
+            "reading the source failed ({failure}), and publishing what the batch prepared then \
+             failed ({flush}). Deal with both before the rerun"
+        )
+    );
     assert_eq!(*rig.repository.uploaded.borrow(), [1]);
     let batch = rig.batch();
     assert_eq!(batch.ready(), Some(Flush::EndOfSource));
     let replay = batch.frontiers().replay.unwrap();
     assert_eq!(replay.slot, rig.cursor().slot());
     assert!(replay.slot > batch.prepared().last().unwrap().point.slot);
+
+    rig.calls.source_fails.set(None);
+    rig.restart_with_the_whole_source();
+    assert_eq!(rig.drain(limits(16), None).unwrap(), Outcome::UpToDate);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// The flush can't reopen the stores on the volume the fetch filled. The exit
+/// keeps the fetch's failure beside that one, and the batch, which nothing
+/// closed, goes on.
+#[test]
+fn a_flush_that_cant_reopen_the_stores_keeps_the_sources_failure() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.source_ends_after(6);
+    rig.calls.source_fails.set(Some(|calls| {
+        calls.open_full.set(true);
+        source_down(calls)
+    }));
+
+    let error = rig.drain(limits(16), None).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            backfill::Error::SourceAndFlush { flush, failure }
+                if matches!(**flush, backfill::Error::ReplayFilledVolume(_))
+                    && matches!(**failure, backfill::Error::Mithril { .. })
+        ),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&source_down(&rig.calls).to_string()),
+        "{error}"
+    );
+    assert!(rig.repository.uploaded.borrow().is_empty());
+    assert_eq!(rig.sequences(), [1, 2]);
+    assert_eq!(rig.batch().ready(), None);
+
+    rig.calls.source_fails.set(None);
+    rig.restart_with_the_whole_source();
+    assert_eq!(rig.drain(limits(16), None).unwrap(), Outcome::UpToDate);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// The stores' shutdown fails with the source, so the run doesn't start a
+/// flush. The exit names both, the batch stays open and the rerun goes on.
+#[test]
+fn a_shutdown_failing_with_the_source_leaves_the_batch_open() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.source_ends_after(6);
+    rig.calls.source_fails.set(Some(source_down));
+    rig.calls.full_finish_at.set(Some(3));
+
+    let error = rig.drain(limits(16), None).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            backfill::Error::ReplayAndShutdown { replay, shutdown }
+                if matches!(**replay, backfill::Error::Mithril { .. })
+                    && matches!(**shutdown, backfill::Error::ReplayFilledVolume(_))
+        ),
+        "{error}"
+    );
+    assert!(rig.repository.uploaded.borrow().is_empty());
+    assert_eq!(rig.sequences(), [1, 2]);
+    assert_eq!(rig.batch().ready(), None);
 
     rig.calls.source_fails.set(None);
     rig.restart_with_the_whole_source();
@@ -3847,6 +3926,25 @@ fn another_writers_immutable_tag_refuses_before_it_is_overwritten() {
     assert!(message.contains("leave the tag"), "{message}");
     assert!(message.contains("clear the storage path"), "{message}");
     assert!(!message.contains("nothing needs clearing"), "{message}");
+    // Each recovery stays with its cause: deleting the tag is for a tag known
+    // to be another writer's, or one a restore has cleared the stores of.
+    assert!(
+        message.contains(
+            "If you know that tag is another writer's, stop that writer, delete the tag and rerun."
+        ),
+        "{message}"
+    );
+    assert!(
+        message.contains("Otherwise leave the tag and treat the stores as wrong"),
+        "{message}"
+    );
+    assert!(
+        message.ends_with(
+            "If this refusal comes back over stores restored that way, they aren't the cause: \
+             stop any writer, delete the tag and rerun"
+        ),
+        "{message}"
+    );
     assert_nothing_moved(&rig, &journal, &[1]);
     assert_eq!(rig.repository.steles.borrow()[&2].identity, theirs.identity);
 }
@@ -4736,7 +4834,9 @@ mod over_a_registry {
     /// check the flush makes, and nothing is sealed on it. Sequence 1 reads
     /// another writer's stele at the sequence it publishes, which the next
     /// try's compare refuses, and sequence 2 reads another stele under the
-    /// number it follows, which refuses at once.
+    /// number it follows, which refuses at once. In both, the chain read's own
+    /// compare gives the first answer, because at sequence 1 the retry alone
+    /// would end the same way.
     #[test]
     #[ignore = "spawns a registry"]
     fn a_latest_moved_before_the_chain_read_refuses_and_seals_nothing() {
@@ -4762,10 +4862,28 @@ mod over_a_registry {
             let publisher = Around {
                 inner: &inner,
                 finalize: &|finalizing, predecessor, source| {
-                    if finalizing.bundle.sequence() == at && !fired.replace(true) {
+                    let moved = finalizing.bundle.sequence() == at && !fired.replace(true);
+                    if moved {
                         registry.move_latest("theirs", &name);
                     }
-                    backfill::Publish::finalize(&inner, finalizing, predecessor, source)
+                    let answer =
+                        backfill::Publish::finalize(&inner, finalizing, predecessor, source);
+                    if moved {
+                        let compared = matches!(
+                            &answer,
+                            Err(backfill::Error::Finalizing(error)) if matches!(
+                                &**error,
+                                dolos_snapshot::Error::Stelae(stelae::Error::PredecessorMoved {
+                                    expected,
+                                    found: Some((1, found)),
+                                }) if expected.is_some() == (at == 2)
+                                    && *found == their_identity.to_string()
+                            )
+                        );
+                        let told = answer.as_ref().err().map(ToString::to_string);
+                        assert!(compared, "at {at}: the chain read answered {told:?}");
+                    }
+                    answer
                 },
             };
 

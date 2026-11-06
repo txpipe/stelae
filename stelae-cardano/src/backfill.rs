@@ -78,10 +78,11 @@ pub enum Error {
         replay: Box<Error>,
         shutdown: Box<Error>,
     },
-    /// A source failure closed the batch and publishing it failed too. A
-    /// download that filled the volume does both, and each needs its own fix.
+    /// A source failure stopped the replay and publishing what the batch
+    /// prepared failed too. A download that filled the volume does both, and
+    /// each needs its own fix.
     #[error(
-        "the source stopped answering ({failure}), and publishing what the batch prepared then \
+        "reading the source failed ({failure}), and publishing what the batch prepared then \
          failed ({flush}). Deal with both before the rerun"
     )]
     SourceAndFlush {
@@ -787,8 +788,8 @@ impl<W: Workspace> Driver<'_, W> {
     /// Replay and publish until the source runs out or `until_epoch` is
     /// published. A periodic run therefore drains what it prepared, however few
     /// boundaries the source offered, and leaves nothing waiting for a full
-    /// batch. A source that stops answering closes the batch too, and the run
-    /// still ends on that failure.
+    /// batch. A failing source closes the batch too, unless shutting the stores
+    /// down fails with it, and the run still ends on that failure.
     pub fn run(&self) -> Result<Outcome, Error> {
         if self.batching.limits.is_one() {
             return self.run_one();
@@ -798,7 +799,7 @@ impl<W: Workspace> Driver<'_, W> {
                 Ok(Outcome::BatchReady { .. }) => self.flush()?,
                 Ok(outcome) => return Ok(outcome),
                 Err(failure) if failure.is_source_failure() && !self.aborted() => {
-                    warn!(error = %failure, "the source stopped answering");
+                    warn!(error = %failure, "reading the source failed");
                     return Err(match self.flush_open_batch() {
                         Ok(()) => failure,
                         Err(flush) => Error::SourceAndFlush {
