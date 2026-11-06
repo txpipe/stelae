@@ -3415,7 +3415,7 @@ fn a_store_close_failing_before_the_batch_closes_leaves_it_open() {
 }
 
 /// A reopen failing after the journal recorded the close: the same exit, but
-/// the batch stays closed and the rerun publishes it whatever the controls say.
+/// the batch stays closed, and the rerun goes on to the same tags.
 #[test]
 fn a_reopen_failing_after_the_batch_closed_leaves_it_closed() {
     let chain = Chain::spanning(12);
