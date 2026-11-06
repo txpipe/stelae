@@ -1268,6 +1268,12 @@ fn is_absent(error: &oci_client::errors::OciDistributionError) -> bool {
 }
 
 impl Error {
+    /// Whether a pull failed because the repository holds no such manifest,
+    /// rather than because the registry could not answer.
+    pub fn is_absent(&self) -> bool {
+        matches!(self, Error::Registry(error) if is_absent(error))
+    }
+
     /// Whether a pull failed because the registry served a blob that is not the
     /// one its descriptor names: bytes that hash to another digest, or more of
     /// them than the descriptor claims.
