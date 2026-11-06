@@ -195,6 +195,7 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
         fn finalize(
             &self,
             _: &dolos_snapshot::prepare::Finalizing<'_>,
+            _: Option<&batch::Committed>,
             _: &dyn SnapshotSource,
         ) -> Result<batch::Committed, backfill::Error> {
             unreachable!("a batch of one prepares nothing")
@@ -513,4 +514,7 @@ fn a_batch_above_one_runs_through_the_host() {
         backfill::run(&config, &genesis, &options, cancel, &Observer::silent()).unwrap_err();
     assert!(matches!(error, backfill::Error::Interrupted), "{error}");
     assert!(config.storage.path.exists());
+    // A batch opens before the first check of the cancellation, and a batch of
+    // one never opens.
+    assert!(batch::dir_in(&config.storage.path).exists());
 }

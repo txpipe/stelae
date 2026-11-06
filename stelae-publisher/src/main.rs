@@ -1157,6 +1157,37 @@ mod tests {
         assert_eq!(options.retained.as_slice(), &[1, 200]);
     }
 
+    /// Dropped on the way to the driver, these would silently publish one
+    /// boundary at a time.
+    #[test]
+    fn backfill_options_carry_the_batch_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config::load(Some(Path::new(&node(dir.path())))).unwrap();
+        let epochs = dir.path().join("state-epochs");
+        std::fs::write(&epochs, "1\n").unwrap();
+
+        let cli = parse(&[
+            "backfill",
+            "--repo",
+            "oci://registry.invalid/cardano/preview",
+            "--state-epochs-file",
+            epochs.to_str().unwrap(),
+            "--batch-epochs",
+            "4",
+            "--batch-scratch-mib",
+            "10",
+            "--batch-reserve-mib",
+            "1",
+        ])
+        .unwrap();
+        let Command::Backfill(args) = cli.command else {
+            panic!("parsed another command");
+        };
+        let options = args.options(&config, &|| Ok(Auth::Anonymous)).unwrap();
+        assert_eq!(options.limits, args.limits().unwrap());
+        assert_eq!(options.limits.max_epochs.get(), 4);
+    }
+
     #[test]
     fn run_restores_with_its_inputs_and_the_registry_credentials() {
         let dir = tempfile::tempdir().unwrap();

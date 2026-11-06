@@ -208,7 +208,13 @@ struct Calls {
     die_after_staging: Cell<bool>,
     /// Refuse the next staging this way.
     stage_refusal: Cell<Option<fn() -> dolos_snapshot::Error>>,
+    /// How many stagings the batch asked for, whether or not they finished.
+    stage_attempts: Cell<u32>,
+    /// Fail every read of the source's height this way.
+    source_fails: Cell<Option<SourceFailure>>,
 }
+
+type SourceFailure = fn(&Calls) -> backfill::Error;
 
 /// What a store says once a background worker has failed.
 const POISONED: &str = "state error: internal store error: fjall error: FjallError: Poisoned";
@@ -339,6 +345,8 @@ impl<S: SnapshotSource> SnapshotSource for Counted<'_, S> {
         budget: Budget,
         observer: &Observer,
     ) -> Result<Staged, dolos_snapshot::Error> {
+        let attempts = &self.calls.stage_attempts;
+        attempts.set(attempts.get() + 1);
         if let Some(refusal) = self.calls.stage_refusal.take() {
             return Err(refusal());
         }
@@ -611,6 +619,7 @@ impl backfill::Publish for Repository {
     fn finalize(
         &self,
         finalizing: &Finalizing<'_>,
+        predecessor: Option<&Committed>,
         source: &dyn SnapshotSource,
     ) -> Result<Committed, backfill::Error> {
         let sequence = finalizing.bundle.sequence();
@@ -634,6 +643,17 @@ impl backfill::Publish for Repository {
                 return Err(backfill::Error::Finalizing(Box::new(full.into())));
             }
             _ => {}
+        }
+
+        // The chain read, held to the journal as the real one is.
+        let latest = self.latest.borrow().clone();
+        if latest.as_ref() != predecessor {
+            let named = |held: Committed| (held.sequence, held.identity);
+            let moved = stelae::Error::PredecessorMoved {
+                expected: predecessor.cloned().map(named),
+                found: latest.map(named),
+            };
+            return Err(backfill::Error::Finalizing(Box::new(moved.into())));
         }
 
         let previous = self.followed();
@@ -666,6 +686,43 @@ impl backfill::Publish for Repository {
             }
             _ => Ok(committed),
         }
+    }
+}
+
+/// A publisher answering as `inner`, whose publications go through `finalize`:
+/// how a test acts at a moment only a publication reaches.
+struct Around<'a> {
+    inner: &'a dyn backfill::Publish,
+    finalize: &'a Finalize<'a>,
+}
+
+type Finalize<'a> = dyn Fn(
+        &Finalizing<'_>,
+        Option<&Committed>,
+        &dyn SnapshotSource,
+    ) -> Result<Committed, backfill::Error>
+    + 'a;
+
+impl backfill::Publish for Around<'_> {
+    fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {
+        self.inner.publish(plan, source)
+    }
+
+    fn latest(&self, plan: &Plan) -> Result<Option<Committed>, backfill::Error> {
+        self.inner.latest(plan)
+    }
+
+    fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+        self.inner.stele(sequence)
+    }
+
+    fn finalize(
+        &self,
+        finalizing: &Finalizing<'_>,
+        predecessor: Option<&Committed>,
+        source: &dyn SnapshotSource,
+    ) -> Result<Committed, backfill::Error> {
+        (self.finalize)(finalizing, predecessor, source)
     }
 }
 
@@ -801,6 +858,9 @@ impl<'a> Rig<'a> {
             // Unless a test says otherwise, the source offers nothing the db does
             // not already hold.
             beacon: &|| {
+                if let Some(failure) = calls.source_fails.get() {
+                    return Err(failure(calls));
+                }
                 if calls.cancel_at_end_of_source.replace(false) {
                     calls.cancel.get().cancel();
                     return Ok(None);
@@ -3096,7 +3156,114 @@ fn successive_batches_drain_in_turn_up_to_the_epoch_asked_for() {
         Outcome::UntilEpoch { sequence: 3 }
     );
     assert_eq!(*rig.repository.uploaded.borrow(), [1, 2, 3]);
-    assert_eq!(rig.calls.stagings.borrow().len(), 2, "one per batch");
+    let stagings = rig.calls.stagings.borrow();
+    assert_eq!(stagings.len(), 2, "one per batch");
+
+    // The second batch spools only what its predecessor doesn't carry, not every
+    // closed epoch up to its boundary.
+    let whole = Rig::new(&chain);
+    whole.drain(limits(3), Some(3)).unwrap();
+    let closed_epochs = whole.calls.stagings.borrow()[0].bytes;
+    assert!(stagings[1].bytes > 0, "{stagings:?}");
+    assert!(
+        stagings[1].bytes < closed_epochs,
+        "{stagings:?} against {closed_epochs}"
+    );
+}
+
+fn source_down(_: &Calls) -> backfill::Error {
+    backfill::Error::Mithril {
+        what: "listing mithril snapshots",
+        reason: "the aggregator didn't answer".to_owned(),
+    }
+}
+
+fn source_stalled(_: &Calls) -> backfill::Error {
+    backfill::Error::StalledWindow {
+        start: 0,
+        end: 1,
+        highest: None,
+        after: None,
+        cursor_slot: 0,
+        contents: String::new(),
+    }
+}
+
+/// A source that stays down publishes what a batch prepared, as a batch of one
+/// already did, and the run still ends on that failure. The next run that can
+/// reach the source goes on.
+#[test]
+fn a_failing_source_doesnt_hold_back_what_a_batch_prepared() {
+    let chain = Chain::spanning(12);
+    let one = Rig::new(&chain);
+    one.source_ends_after(6);
+    one.calls.source_fails.set(Some(source_down));
+    let error = one.drain(Limits::ONE, None).unwrap_err();
+    assert!(matches!(error, backfill::Error::Mithril { .. }), "{error}");
+    assert_eq!(one.calls.published.get(), 2);
+
+    let failures: [SourceFailure; 2] = [source_down, source_stalled];
+    for failure in failures {
+        let rig = Rig::new(&chain);
+        rig.source_ends_after(6);
+        rig.calls.source_fails.set(Some(failure));
+
+        let error = rig.drain(limits(16), None).unwrap_err();
+        assert_eq!(error.to_string(), failure(&rig.calls).to_string());
+        assert_eq!(*rig.repository.uploaded.borrow(), [1, 2]);
+        assert_batch_is_gone(&rig);
+
+        rig.calls.source_fails.set(None);
+        rig.restart_with_the_whole_source();
+        assert_eq!(rig.drain(limits(16), None).unwrap(), Outcome::UpToDate);
+        assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+    }
+}
+
+#[test]
+fn a_failing_source_with_nothing_prepared_only_fails() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.source_ends_after(1);
+    rig.calls.source_fails.set(Some(source_down));
+
+    let error = rig.drain(limits(16), None).unwrap_err();
+    assert!(matches!(error, backfill::Error::Mithril { .. }), "{error}");
+    assert_eq!(rig.calls.stage_attempts.get(), 0);
+}
+
+/// A shutdown is honoured first: a staging would outlast its grace period.
+#[test]
+fn a_shutdown_while_the_source_fails_publishes_nothing() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.source_ends_after(6);
+    rig.calls.source_fails.set(Some(|calls| {
+        calls.cancel.get().cancel();
+        source_down(calls)
+    }));
+
+    let error = rig.drain(limits(16), None).unwrap_err();
+    assert!(matches!(error, backfill::Error::Mithril { .. }), "{error}");
+    assert_eq!(rig.calls.stage_attempts.get(), 0);
+    assert_eq!(rig.sequences(), [1, 2]);
+    assert_eq!(rig.batch().ready(), None);
+}
+
+/// What stopped the publication is what an operator has to act on. The batch
+/// stays closed for the rerun.
+#[test]
+fn a_flush_failing_after_the_source_did_reports_the_flush() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.source_ends_after(6);
+    rig.calls.source_fails.set(Some(source_down));
+    rig.repository.fault.set(Some((2, Fault::FullVolume)));
+
+    let error = rig.drain(limits(16), None).unwrap_err();
+    assert!(matches!(error, backfill::Error::FlushNoRoom(_)), "{error}");
+    assert_eq!(*rig.repository.uploaded.borrow(), [1]);
+    assert_eq!(rig.batch().ready(), Some(Flush::EndOfSource));
 }
 
 /// A batch following a history a batch of one began, whose publish record is
@@ -3229,6 +3396,71 @@ fn a_damaged_run_is_found_at_finalization_and_staged_again() {
     assert_eq!(stagings[1].tag_traversals, 0, "{stagings:?}");
     assert_eq!(stagings[2].tag_traversals, 1, "{stagings:?}");
     assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// Runs that keep failing stop after the one rebuild. Otherwise a flush nobody
+/// watches would walk the stores over and over.
+#[test]
+fn runs_that_stay_unusable_stop_after_one_rebuild() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    let attempts = Cell::new(0);
+    let publisher = Around {
+        inner: &rig.repository,
+        finalize: &|_, _, _| {
+            attempts.set(attempts.get() + 1);
+            assert!(attempts.get() <= 2, "the flush kept staging again");
+            let damaged = dolos_snapshot::staging::Refusal::Corrupt {
+                path: "a-run".into(),
+                reason: "damaged again".to_owned(),
+            };
+            Err(backfill::Error::Finalizing(Box::new(damaged.into())))
+        },
+    };
+
+    let error = rig.drive(limits(4), None, true, &publisher).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            backfill::Error::Batch(batch::Error::RunsUnusable { .. })
+        ),
+        "{error}"
+    );
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(rig.calls.stagings.borrow().len(), 2);
+}
+
+/// A registry failing a publication is asked again, and stays a registry's
+/// failure: nothing tells the operator to clear a healthy batch. The second try
+/// cancels, which spares the rest of the backoff.
+#[test]
+fn a_registry_that_wont_answer_is_asked_again_and_the_batch_stands() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    let attempts = Cell::new(0);
+    let publisher = Around {
+        inner: &rig.repository,
+        finalize: &|_, _, _| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 2 {
+                rig.calls.cancel.get().cancel();
+            }
+            let refused =
+                stelae::Error::Registry(oci_client::errors::OciDistributionError::ServerError {
+                    code: 503,
+                    url: "https://registry.invalid/v2/x/blobs/uploads/".to_owned(),
+                    message: "unavailable".to_owned(),
+                });
+            Err(backfill::Error::Finalizing(Box::new(refused.into())))
+        },
+    };
+
+    let error = rig.drive(limits(4), None, true, &publisher).unwrap_err();
+    assert!(matches!(error, backfill::Error::Finalizing(_)), "{error}");
+    assert!(!error.to_string().contains("clear"), "{error}");
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(rig.sequences(), [1, 2, 3, 4]);
+    assert_eq!(rig.batch().frontiers().published, None);
 }
 
 #[test]
@@ -3495,7 +3727,8 @@ fn another_writers_stele_at_the_next_sequence_refuses() {
 }
 
 /// A writer that left only its immutable tag is caught before a seal could
-/// write over that tag.
+/// write over that tag, and the refusal says what gets past it: `latest` still
+/// follows the batch, so nothing needs clearing.
 #[test]
 fn another_writers_immutable_tag_refuses_before_it_is_overwritten() {
     let chain = Chain::spanning(12);
@@ -3511,12 +3744,141 @@ fn another_writers_immutable_tag_refuses_before_it_is_overwritten() {
     assert!(
         matches!(
             error,
-            backfill::Error::Batch(batch::Error::Diverged { sequence: 2, .. })
+            backfill::Error::Batch(batch::Error::TagTaken { sequence: 2, .. })
         ),
         "{error}"
     );
+    let message = error.to_string();
+    assert!(message.contains("nothing needs clearing"), "{message}");
+    assert!(message.contains("delete the tag and rerun"), "{message}");
+    assert!(!message.contains("clear the storage path"), "{message}");
     assert_nothing_moved(&rig, &journal, &[1]);
     assert_eq!(rig.repository.steles.borrow()[&2].identity, theirs.identity);
+}
+
+/// The refusal's recovery works as written, and keeps the batch.
+#[test]
+fn deleting_another_writers_immutable_tag_lets_the_batch_go_on() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    stopped_after_the_first_commit(&rig);
+    let mut theirs = rig.repository.steles.borrow()[&1].clone();
+    theirs.identity = stelae::Digest::compute(b"another writer");
+    rig.repository.steles.borrow_mut().insert(2, theirs);
+    rig.drain(limits(4), None).unwrap_err();
+
+    rig.repository.steles.borrow_mut().remove(&2);
+    assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
+    assert_eq!(rig.repository.tags(), uninterrupted(&chain));
+}
+
+/// Put another writer's stele under `latest` at `sequence`, as a rewrite of its
+/// tags would.
+fn rewrite_latest(repository: &Repository, sequence: u64) -> Committed {
+    let mut theirs = repository.inscription(sequence).unwrap();
+    theirs.parameters = serde_json::json!({ "another-writer": true });
+    let document = Document {
+        canonical: theirs.canonicalize().unwrap(),
+        identity: theirs.digest().unwrap(),
+        layers: theirs.layers.len(),
+        uncompressed_size: theirs.uncompressed_size(),
+    };
+    let committed = Repository::committed(sequence, &document);
+    *repository.latest.borrow_mut() = Some(committed.clone());
+    repository.steles.borrow_mut().insert(sequence, document);
+    committed
+}
+
+/// Run a batch whose repository moves once, as `at` goes to publish: past every
+/// check the flush makes itself, and before the read it chains from.
+fn drain_moving_before_chaining(
+    rig: &Rig<'_>,
+    limits: Limits,
+    at: u64,
+    move_it: &dyn Fn(&Repository),
+) -> Result<Outcome, backfill::Error> {
+    let fired = Cell::new(false);
+    let publisher = Around {
+        inner: &rig.repository,
+        finalize: &|finalizing, predecessor, source| {
+            if finalizing.bundle.sequence() == at && !fired.replace(true) {
+                move_it(&rig.repository);
+            }
+            backfill::Publish::finalize(&rig.repository, finalizing, predecessor, source)
+        },
+    };
+    rig.drive(limits, None, true, &publisher)
+}
+
+fn moved_to(error: backfill::Error) -> Option<Committed> {
+    match error {
+        backfill::Error::Batch(batch::Error::PredecessorMoved { found, .. }) => found,
+        other => panic!("expected a moved repository, got {other}"),
+    }
+}
+
+/// Stele 2 would otherwise attest a digest nothing checked, and the next read
+/// would match it.
+#[test]
+fn a_predecessor_rewritten_before_the_chain_read_refuses() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    let theirs = RefCell::new(None);
+    let error = drain_moving_before_chaining(&rig, limits(4), 2, &|repository| {
+        *theirs.borrow_mut() = Some(rewrite_latest(repository, 1));
+    })
+    .unwrap_err();
+
+    assert_eq!(moved_to(error), theirs.into_inner());
+    assert!(rig.repository.inscription(2).is_none());
+    assert_eq!(*rig.repository.uploaded.borrow(), [1]);
+    assert_eq!(rig.sequences(), [2, 3, 4]);
+}
+
+/// A tag deleted under a batch begun over an empty repository would otherwise
+/// seal stele 2 with no history at all, and under a followed one lose the
+/// chain.
+#[test]
+fn a_tag_deleted_before_the_chain_read_refuses() {
+    let chain = Chain::spanning(12);
+    let delete = |repository: &Repository| *repository.latest.borrow_mut() = None;
+
+    let first = Rig::new(&chain);
+    let error = drain_moving_before_chaining(&first, limits(4), 2, &delete).unwrap_err();
+    assert_eq!(moved_to(error), None);
+    assert!(first.repository.inscription(2).is_none());
+
+    let followed = Rig::new(&chain);
+    followed.repository.keep_singles.set(true);
+    followed.run(Limits::ONE, Some(1)).unwrap();
+    let error = drain_moving_before_chaining(&followed, limits(3), 3, &delete).unwrap_err();
+    assert_eq!(moved_to(error), None);
+    assert!(followed.repository.inscription(3).is_none());
+}
+
+/// Each sequence reads the repository before it does anything else, so a writer
+/// moving it after a commit stops the next one at that read.
+#[test]
+fn a_repository_moved_between_two_sequences_refuses() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    let published = RefCell::new(Vec::new());
+    let theirs = RefCell::new(None);
+    let publisher = Around {
+        inner: &rig.repository,
+        finalize: &|finalizing, predecessor, source| {
+            published.borrow_mut().push(finalizing.bundle.sequence());
+            let committed =
+                backfill::Publish::finalize(&rig.repository, finalizing, predecessor, source)?;
+            *theirs.borrow_mut() = Some(rewrite_latest(&rig.repository, committed.sequence));
+            Ok(committed)
+        },
+    };
+
+    let error = rig.drive(limits(4), None, true, &publisher).unwrap_err();
+    assert_eq!(moved_to(error), theirs.into_inner());
+    assert_eq!(*published.borrow(), [1], "refused before it could chain");
+    assert_eq!(rig.sequences(), [2, 3, 4]);
 }
 
 #[test]
@@ -3713,6 +4075,7 @@ fn a_staging_past_the_budget_stops_until_it_is_raised() {
     assert!(error.to_string().contains("--batch-scratch-mib"), "{error}");
     assert!(!batch_dir(&rig).join("staging").exists());
     assert_nothing_moved(&rig, &journal, &[]);
+    assert_eq!(rig.calls.stage_attempts.get(), 1, "started from nothing");
 
     assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
     assert_eq!(rig.repository.tags(), uninterrupted(&chain));
@@ -3739,19 +4102,19 @@ fn a_batch_a_capture_overshot_stages_within_its_reserve() {
 }
 
 /// What a restarted staging reuses counts against its budget, so a family it
-/// walks again can't take the batch past the limit.
+/// walks again can't take the batch past the limit. One byte short of what the
+/// runs take, walking `indexes` alone would fit if the others went uncharged.
 #[test]
 fn a_restarted_staging_is_charged_for_the_runs_it_holds() {
     let chain = Chain::spanning(12);
     let rig = Rig::new(&chain);
     ready(rig.run(limits(4), None));
     let bytes = stage_under(&rig, limits(4)).unwrap();
-    assert!(bytes > 0);
+    assert!(tree_bytes(&batch_dir(&rig).join("staging/indexes")) < bytes - 1);
 
     std::fs::remove_file(batch_dir(&rig).join("staging/indexes.json")).unwrap();
-    let used = tree_bytes(&batch_dir(&rig));
     let one_short = Limits {
-        scratch: used,
+        scratch: tree_bytes(&batch_dir(&rig).join("prepared")) + bytes - 1,
         ..limits(4)
     };
     let error = stage_under(&rig, one_short).unwrap_err();
@@ -3768,6 +4131,25 @@ fn a_restarted_staging_is_charged_for_the_runs_it_holds() {
         ),
         "{error}"
     );
+    assert!(!batch_dir(&rig).join("staging").exists());
+}
+
+/// Runs a kill left are charged until their family is walked again, so a batch
+/// that fits starts over rather than stopping on them and asking for more
+/// budget.
+#[test]
+fn a_staging_that_fits_isnt_stopped_by_what_a_kill_left() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    ready(rig.run(limits(4), None));
+    let bytes = stage_under(&rig, limits(4)).unwrap();
+
+    std::fs::remove_file(batch_dir(&rig).join("staging/indexes.json")).unwrap();
+    let same = Limits {
+        scratch: tree_bytes(&batch_dir(&rig)),
+        ..limits(4)
+    };
+    assert_eq!(stage_under(&rig, same).unwrap(), bytes);
 }
 
 /// A batch's pending refusal names flags that really continue it, and they do.
@@ -3793,8 +4175,8 @@ mod over_a_registry {
         Auth, Inspected, Point, Repository, SnapshotRepository, Tuning,
     };
     use stelae::transport::WrittenLayer;
-    use stelae_cardano::publisher::{BackfillPublisher, RepositoryPublish};
-    use stelae_driver::publish::{Origin, PublishRecord};
+    use stelae_cardano::publisher::{BackfillPublisher, Publisher, RepositoryPublish};
+    use stelae_driver::publish::{Chained, Origin, PublishRecord};
 
     use super::*;
 
@@ -3857,6 +4239,55 @@ mod over_a_registry {
             format!("oci://127.0.0.1:{}/cardano/{name}", self.port)
                 .parse()
                 .unwrap()
+        }
+
+        /// One request, and the status and body it got.
+        fn request(&self, method: &str, path: &str, media: &str, body: &[u8]) -> (u16, Vec<u8>) {
+            use std::io::{Read as _, Write as _};
+
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+            let head = format!(
+                "{method} {path} HTTP/1.0\r\nHost: localhost\r\nAccept: {media}\r\nContent-Type: \
+                 {media}\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            let mut answer = Vec::new();
+            stream.read_to_end(&mut answer).unwrap();
+            let status = std::str::from_utf8(&answer[9..12])
+                .unwrap()
+                .parse()
+                .unwrap();
+            let start = answer
+                .windows(4)
+                .position(|end| end == b"\r\n\r\n")
+                .unwrap();
+            (status, answer[start + 4..].to_vec())
+        }
+
+        /// Point `to`'s `latest` at what `from`'s names, as another writer's
+        /// push would: its blobs mounted, then its manifest. Nothing
+        /// else in the transport writes a stele under a number the
+        /// repository already holds.
+        fn move_latest(&self, from: &str, to: &str) {
+            const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+
+            let path = format!("/v2/cardano/{from}/manifests/latest");
+            let (status, manifest) = self.request("GET", &path, MANIFEST, &[]);
+            assert_eq!(status, 200);
+            let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+            let layers = parsed["layers"].as_array().unwrap();
+            for blob in layers.iter().chain([&parsed["config"]]) {
+                let digest = blob["digest"].as_str().unwrap();
+                let path =
+                    format!("/v2/cardano/{to}/blobs/uploads/?mount={digest}&from=cardano/{from}");
+                let (status, _) = self.request("POST", &path, MANIFEST, &[]);
+                assert_eq!(status, 201, "{digest}");
+            }
+            let path = format!("/v2/cardano/{to}/manifests/latest");
+            let (status, _) = self.request("PUT", &path, MANIFEST, &manifest);
+            assert_eq!(status, 201);
         }
     }
 
@@ -3996,9 +4427,10 @@ mod over_a_registry {
         fn finalize(
             &self,
             finalizing: &Finalizing<'_>,
+            predecessor: Option<&Committed>,
             source: &dyn SnapshotSource,
         ) -> Result<Committed, backfill::Error> {
-            let committed = self.inner.finalize(finalizing, source)?;
+            let committed = self.inner.finalize(finalizing, predecessor, source)?;
             self.uploads.borrow_mut().push(committed.sequence);
             if committed.sequence == self.at && !self.cancel.is_cancelled() {
                 self.cancel.cancel();
@@ -4073,6 +4505,236 @@ mod over_a_registry {
         let batch = rig.batch();
         assert_eq!(batch.frontiers().published, None);
         assert_eq!(rig.sequences(), [1, 2]);
+    }
+
+    /// The chain read itself, on the real transport: `latest` moves past every
+    /// check the flush makes, and nothing is sealed on it. Sequence 1 reads
+    /// another writer's where the batch began over an empty repository, and
+    /// sequence 2 reads another stele under the number it follows.
+    #[test]
+    #[ignore = "spawns a registry"]
+    fn a_latest_moved_before_the_chain_read_refuses_and_seals_nothing() {
+        let chain = Chain::spanning(12);
+        let registry = LocalRegistry::spawn();
+        let theirs = registry.repository("theirs");
+        let other = Rig::new(&chain);
+        *other.retained.borrow_mut() = dolos_snapshot::planning::retained_epochs(&[3]).unwrap();
+        one_at_a_time_on(&other, &theirs, 1);
+        let their_identity = inspect(&theirs, Point::Latest).identity;
+
+        for at in [1, 2] {
+            let name = format!("moved-at-{at}");
+            let repo = registry.repository(&name);
+            let rig = Rig::new(&chain);
+            let observer = Observer::silent();
+            let inner = BackfillPublisher {
+                config: &rig.node.config,
+                settings: settings(&repo),
+                observer: &observer,
+            };
+            let fired = Cell::new(false);
+            let publisher = Around {
+                inner: &inner,
+                finalize: &|finalizing, predecessor, source| {
+                    if finalizing.bundle.sequence() == at && !fired.replace(true) {
+                        registry.move_latest("theirs", &name);
+                    }
+                    backfill::Publish::finalize(&inner, finalizing, predecessor, source)
+                },
+            };
+
+            let error = rig.drive(limits(4), Some(4), true, &publisher).unwrap_err();
+            let backfill::Error::Batch(batch::Error::PredecessorMoved { found, .. }) = &error
+            else {
+                panic!("at {at}: {error}");
+            };
+            let expected = Committed {
+                sequence: 1,
+                identity: their_identity.to_string(),
+            };
+            assert_eq!(found.as_ref(), Some(&expected), "at {at}");
+            assert_eq!(inspect(&repo, Point::Latest).identity, their_identity);
+            assert_eq!(rig.sequences().first(), Some(&at), "the journal stands");
+            assert!(
+                held_at(&repo, at).is_none(),
+                "at {at}: another stele was sealed on what it read"
+            );
+        }
+    }
+
+    /// What the immutable tag holds, reading no further than a publish does.
+    fn held_at(repo: &Repository, sequence: u64) -> Option<Held> {
+        let scratch = tempfile::tempdir().unwrap();
+        Publisher::open_explicit(
+            repo,
+            true,
+            Auth::Anonymous,
+            scratch.path().join("scratch"),
+            scratch.path().join("record"),
+            false,
+            Tuning::default(),
+        )
+        .unwrap()
+        .stele(sequence)
+        .unwrap()
+    }
+
+    /// `adopt` keeps a layer that is already there from being built and
+    /// uploaded again. Dropping it still produces the same bytes, so only
+    /// the count tells.
+    #[test]
+    #[ignore = "spawns a registry"]
+    fn a_stele_that_inherits_carries_its_layers_forward() {
+        let chain = Chain::spanning(12);
+        let registry = LocalRegistry::spawn();
+        let repo = registry.repository("reuse");
+        let rig = Rig::new(&chain);
+        let observer = Observer::silent();
+        let inner = BackfillPublisher {
+            config: &rig.node.config,
+            settings: settings(&repo),
+            observer: &observer,
+        };
+        let reused = RefCell::new(BTreeMap::new());
+        let publisher = Around {
+            inner: &inner,
+            finalize: &|finalizing, predecessor, source| {
+                let published = Publisher::open(&rig.node.config, &settings(&repo))
+                    .and_then(|publisher| {
+                        publisher.finalize(finalizing, predecessor, source, &observer)
+                    })
+                    .map_err(|error| backfill::Error::Finalizing(Box::new(error)))?;
+                let sequence = published.inscription.sequence;
+                reused
+                    .borrow_mut()
+                    .insert(sequence, published.layers_reused);
+                Ok(Committed {
+                    sequence,
+                    identity: published.identity.to_string(),
+                })
+            },
+        };
+
+        rig.drive(limits(4), Some(4), true, &publisher).unwrap();
+        let reused = reused.into_inner();
+        assert_eq!(reused[&1], 0, "{reused:?}");
+        for sequence in 2..=4 {
+            assert!(reused[&sequence] > 0, "{reused:?}");
+        }
+    }
+
+    /// A port nothing listens on.
+    fn dead_registry() -> Repository {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("oci://127.0.0.1:{port}/cardano/dead")
+            .parse()
+            .unwrap()
+    }
+
+    /// Read as no tag, a registry that didn't answer would let a seal push over
+    /// whatever that tag holds. Needs no server.
+    #[test]
+    fn a_tag_the_registry_cant_serve_isnt_read_as_absent() {
+        let dead = dead_registry();
+        let scratch = tempfile::tempdir().unwrap();
+        let open = |repo: &Repository| {
+            Publisher::open_explicit(
+                repo,
+                true,
+                Auth::Anonymous,
+                scratch.path().join("scratch"),
+                scratch.path().join("record"),
+                false,
+                Tuning::default(),
+            )
+            .unwrap()
+        };
+
+        let empty: Repository = empty_registry().parse().unwrap();
+        assert!(open(&empty).stele(2).unwrap().is_none());
+        assert!(open(&dead).stele(2).is_err());
+    }
+
+    /// A real publication's failure is told apart from a damaged bundle by its
+    /// shape, so the real publisher has to keep it. Needs no server: the
+    /// repository the flush reads is the fake, and only the publication goes
+    /// out. Cancelling spares the backoff.
+    #[test]
+    fn a_dead_registry_surfaces_as_a_publication_failure() {
+        let chain = Chain::spanning(12);
+        let dead = dead_registry();
+        let rig = Rig::new(&chain);
+        let observer = Observer::silent();
+        let real = BackfillPublisher {
+            config: &rig.node.config,
+            settings: settings(&dead),
+            observer: &observer,
+        };
+        let publisher = Around {
+            inner: &rig.repository,
+            finalize: &|finalizing, predecessor, source| {
+                let answer = backfill::Publish::finalize(&real, finalizing, predecessor, source);
+                rig.calls.cancel.get().cancel();
+                answer
+            },
+        };
+
+        let error = rig.drive(limits(4), None, true, &publisher).unwrap_err();
+        assert!(matches!(error, backfill::Error::Finalizing(_)), "{error}");
+        assert_eq!(rig.sequences(), [1, 2, 3, 4]);
+    }
+
+    /// The driver's half of a deleted tag, which a real registry here can't do:
+    /// nothing under `latest` refuses a publish held to a stele, and only that.
+    #[test]
+    fn a_publish_held_to_a_stele_refuses_a_repository_holding_nothing() {
+        let dead = dead_registry();
+        let scratch = tempfile::tempdir().unwrap();
+        let registry = stelae_driver::publish::open(
+            &dead,
+            true,
+            Auth::Anonymous,
+            scratch.path().to_owned(),
+            Tuning::default(),
+        )
+        .unwrap();
+        let origin = Origin {
+            repository: dead.to_string(),
+            dataset_id: MAGIC.into(),
+            parameters: dolos_snapshot::parameters(&retained()),
+            compression: dolos_snapshot::compression(),
+        };
+        let chained = |publishing| {
+            Chained::new(
+                &dolos_snapshot::DolosProfile,
+                publishing,
+                None,
+                2,
+                &serde_json::json!({}),
+                origin.clone(),
+            )
+            .err()
+        };
+
+        let held = (1, stelae::Digest::compute(b"the stele it follows"));
+        let refused = chained(Publishing::new(&registry).following(Some(held)));
+        assert!(
+            matches!(
+                refused,
+                Some(stelae_driver::Error::Stelae(
+                    stelae::Error::PredecessorMoved {
+                        expected: Some(_),
+                        found: None,
+                    }
+                ))
+            ),
+            "{refused:?}"
+        );
+        assert!(chained(Publishing::new(&registry)).is_none());
+        assert!(chained(Publishing::new(&registry).following(None)).is_none());
     }
 
     /// A publish record a batch of one left resumes under a batch: a recorded

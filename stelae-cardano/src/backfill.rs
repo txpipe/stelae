@@ -194,6 +194,12 @@ impl Error {
     fn is_refusal(&self) -> bool {
         matches!(self, Self::Batch(_) | Self::FlushNoRoom(_))
     }
+
+    /// The source stopped answering, past its retries. A rerun may find it
+    /// back.
+    fn is_source_failure(&self) -> bool {
+        matches!(self, Self::Mithril { .. } | Self::StalledWindow { .. })
+    }
 }
 
 /// Refuse stores whose state has passed the archive. Dolos commits a block's
@@ -317,12 +323,14 @@ pub trait Publish {
     fn latest(&self, plan: &Plan) -> Result<Option<Committed>, Error>;
     /// The stele the repository holds under `sequence`'s immutable tag.
     fn stele(&self, sequence: u64) -> Result<Option<Held>, Error>;
-    /// Publish a prepared boundary, chained to the repository's latest stele.
-    /// Failures of the publication itself are [`Error::Finalizing`], which is
-    /// what tells a damaged bundle from a registry that didn't answer.
+    /// Publish a prepared boundary, chained to the repository's latest stele,
+    /// which has to be `predecessor`. Failures of the publication itself are
+    /// [`Error::Finalizing`], which is what tells a damaged bundle from a
+    /// registry that didn't answer.
     fn finalize(
         &self,
         finalizing: &Finalizing<'_>,
+        predecessor: Option<&Committed>,
         source: &dyn SnapshotSource,
     ) -> Result<Committed, Error>;
 }
@@ -714,6 +722,12 @@ fn finalizing_failure(batch: &Batch, sequence: u64, error: Error) -> Error {
         return error;
     };
     match &*source {
+        E::Stelae(stelae::Error::PredecessorMoved { found, .. }) => {
+            let found = found
+                .clone()
+                .map(|(sequence, identity)| Committed { sequence, identity });
+            batch.moved(found).into()
+        }
         error if batch::ran_out_of_room(error) => Error::FlushNoRoom(source),
         error if batch::runs_are_stale(error) => batch.runs_unusable(source).into(),
         E::Preparation(_) => batch.unusable(sequence, *source).into(),
@@ -759,17 +773,41 @@ impl<W: Workspace> Driver<'_, W> {
     /// Replay and publish until the source runs out or `until_epoch` is
     /// published. A periodic run therefore drains what it prepared, however few
     /// boundaries the source offered, and leaves nothing waiting for a full
-    /// batch.
+    /// batch. A source that stops answering closes the batch too, and the run
+    /// still ends on that failure.
     pub fn run(&self) -> Result<Outcome, Error> {
         if self.batching.limits.is_one() {
             return self.run_one();
         }
         loop {
-            match self.prepare()? {
-                Outcome::BatchReady { .. } => self.flush()?,
-                outcome => return Ok(outcome),
+            match self.prepare() {
+                Ok(Outcome::BatchReady { .. }) => self.flush()?,
+                Ok(outcome) => return Ok(outcome),
+                Err(failure) if failure.is_source_failure() && !self.aborted() => {
+                    warn!(error = %failure, "the source stopped answering: publishing what the batch prepared");
+                    self.flush_open_batch()?;
+                    return Err(failure);
+                }
+                Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Close what the batch prepared at the frontier the stores reached, and
+    /// publish it.
+    fn flush_open_batch(&self) -> Result<(), Error> {
+        let mut batch = self.open_batch()?;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let workspace = self.open()?;
+        let cursor = workspace
+            .snapshot()
+            .committed_position()
+            .map_err(Error::Planning);
+        let cursor = finish_both(cursor, workspace.finish().map_err(Error::in_replay))?;
+        batch.close(Flush::EndOfSource, cursor.as_ref())?;
+        self.flush()
     }
 
     /// Prepare until a batch closes, which publishes nothing.
@@ -991,17 +1029,20 @@ impl<W: Workspace> Driver<'_, W> {
         // tag here is a seal that stopped half way, or another writer's. Sealing
         // again only repeats what this batch would write.
         if let Some(held) = self.publish.stele(sequence)? {
-            self.confirm(source, batch, &finalizing, &held.committed)?;
+            let expected = self.reproduce(source, batch, &finalizing, sequence)?;
+            if expected != held.committed.identity {
+                let found = held.committed.identity;
+                return Err(batch.tag_taken(sequence, found, expected).into());
+            }
         }
         self.publish.announce(&plan)?;
         self.publish
-            .finalize(&finalizing, source)
+            .finalize(&finalizing, batch.predecessor(), source)
             .map_err(|error| finalizing_failure(batch, sequence, error))
     }
 
-    /// Hold a stele the repository already has at the next sequence to what
-    /// this batch publishes there: the immutable identity of one reproduced
-    /// from the same bundle, runs and predecessor.
+    /// Hold a `latest` stele already at the next sequence to what this batch
+    /// publishes there.
     fn confirm(
         &self,
         source: &dyn SnapshotSource,
@@ -1010,21 +1051,36 @@ impl<W: Workspace> Driver<'_, W> {
         found: &Committed,
     ) -> Result<(), Error> {
         let sequence = found.sequence;
-        let followed = self.followed(batch)?;
-        let previous = following(followed.as_ref(), sequence)?;
-        warn!(sequence, found = %found.identity, "the repository already holds this sequence: reproducing it to compare");
-        let document = source
-            .finalize_document(finalizing, &*previous)
-            .map_err(|error| {
-                finalizing_failure(batch, sequence, Error::Finalizing(error.into()))
-            })?;
-        let expected = document.identity.to_string();
+        let expected = self.reproduce(source, batch, finalizing, sequence)?;
         if expected == found.identity {
             return Ok(());
         }
         Err(batch
             .diverged(sequence, found.identity.clone(), expected)
             .into())
+    }
+
+    /// The identity this batch publishes at `sequence`, reproduced from the
+    /// same bundle, runs and predecessor.
+    fn reproduce(
+        &self,
+        source: &dyn SnapshotSource,
+        batch: &Batch,
+        finalizing: &Finalizing<'_>,
+        sequence: u64,
+    ) -> Result<String, Error> {
+        let followed = self.followed(batch)?;
+        let previous = following(followed.as_ref(), sequence)?;
+        warn!(
+            sequence,
+            "the repository already holds this sequence: reproducing it to compare"
+        );
+        let document = source
+            .finalize_document(finalizing, &*previous)
+            .map_err(|error| {
+                finalizing_failure(batch, sequence, Error::Finalizing(error.into()))
+            })?;
+        Ok(document.identity.to_string())
     }
 
     fn ready(&self, batch: &Batch, flush: Flush) -> Outcome {

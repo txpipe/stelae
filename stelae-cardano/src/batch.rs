@@ -278,6 +278,18 @@ pub enum Error {
         path: PathBuf,
     },
     #[error(
+        "the repository's latest stele still follows the batch at {path}, and the immutable tag \
+         of sequence {sequence} holds {found} where this batch would publish {expected}: another \
+         writer stopped before moving the latest tag. Nothing was overwritten and nothing needs \
+         clearing: check that tag, stop that writer, delete the tag and rerun"
+    )]
+    TagTaken {
+        sequence: u64,
+        found: String,
+        expected: String,
+        path: PathBuf,
+    },
+    #[error(
         "the batch at {path} publishes {next:?} next, and was told sequence {sequence} landed"
     )]
     OutOfTurn {
@@ -625,6 +637,17 @@ impl Batch {
         }
     }
 
+    /// The refusal of an immutable tag this batch didn't write, under a
+    /// `latest` that still follows the batch.
+    pub fn tag_taken(&self, sequence: u64, found: String, expected: String) -> Error {
+        Error::TagTaken {
+            sequence,
+            found,
+            expected,
+            path: self.dir.clone(),
+        }
+    }
+
     /// Read where the stores stand against the journal.
     pub fn position(&self, cursor: Option<&ChainPoint>, epoch: u64) -> Result<Position, Error> {
         let (Some(journal), Some(last)) = (&self.journal, self.last_sequence()) else {
@@ -831,6 +854,7 @@ impl Batch {
     ) -> Result<Staged, Error> {
         let bundles = self.bundles()?;
         let root = self.dir.join(STAGING_DIR);
+        let restarted = tree_bytes(&root).map_err(io_at(&root))? > 0;
         let attempt = || -> Result<Staged, Error> {
             let budget = Budget::new(self.staging_budget()?);
             source
@@ -846,13 +870,17 @@ impl Batch {
                 remove_tree(&root)?;
                 attempt()
             }
+            // What a kill left is charged until its family is walked again, so
+            // only a staging from nothing says the budget is really short.
+            Err(Error::Staging { source, .. }) if restarted && past_budget(&source) => {
+                warn!(error = %source, "a restarted staging ran past the budget: staging it all again");
+                remove_tree(&root)?;
+                attempt()
+            }
             other => other,
         };
         if let Err(Error::Staging { source, .. }) = &staged {
-            if matches!(
-                **source,
-                dolos_snapshot::Error::Staging(staging::Refusal::ScratchExceeded { .. })
-            ) {
+            if past_budget(source) {
                 remove_tree(&root)?;
             }
         }
@@ -919,6 +947,13 @@ impl Batch {
             .map_err(|error| Error::Preparing(Box::new(error)))?;
         Ok(())
     }
+}
+
+fn past_budget(error: &dolos_snapshot::Error) -> bool {
+    matches!(
+        error,
+        dolos_snapshot::Error::Staging(staging::Refusal::ScratchExceeded { .. })
+    )
 }
 
 /// Whether staged runs fail to serve this batch: damaged, staged for something

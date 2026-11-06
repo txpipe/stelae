@@ -371,11 +371,14 @@ gets the last one published.
 | `until-epoch` | the boundary `--until-epoch` names |
 | `scratch-budget` | the last boundary before the next would cross the budget |
 | `disk-pressure` | the last boundary before the next would not fit the volume, or a capture that filled it, whose payloads go so the batch is charged only for what its journal names |
-| `end-of-source` | the last captured boundary. The epoch in progress has none and stays unpublished. |
+| `end-of-source` | the last captured boundary, when the source runs out or stops answering. The epoch in progress has none and stays unpublished. |
 
 A closed batch stays closed across restarts, whatever the controls say then. A
 periodic run reaches `end-of-source` and publishes what it prepared, however few
-boundaries that is: nothing waits at the tip for a full batch.
+boundaries that is: nothing waits at the tip for a full batch. A source that stays
+down past its retries closes the batch the same way, and the run publishes what it
+prepared before it exits on that failure. So an outage during a backfill costs one
+smaller batch, and one more index traversal for the next.
 
 ### Progress
 
@@ -411,8 +414,17 @@ from the sequence the journal names:
 | the stele the journal says comes before this sequence, and nothing under this sequence | publishes it |
 | this sequence under its immutable tag only: a seal that stopped half way | reproduces it, compares identities and seals again |
 | this sequence as `latest`: an upload whose answer was lost | reproduces it, compares identities, journals it and doesn't upload it again |
-| this sequence with another identity | refuses, and overwrites nothing: another writer published it, or these stores aren't what the batch was prepared from |
+| this sequence as `latest` with another identity | refuses, and overwrites nothing: another writer published it, or these stores aren't what the batch was prepared from. The recovery below applies |
+| this sequence with another identity under its immutable tag only | refuses, and overwrites nothing: another writer stopped before moving `latest`. Nothing needs clearing: check that tag, stop that writer, delete the tag and rerun |
 | anything else: past this sequence, behind the journal, or a predecessor under another identity | refuses: the repository moved |
+
+A batch of one has no such check on the immutable tag and overwrites it, as it
+always has.
+
+The read a publication chains from is held to the journal too, so `latest` moving
+after these checks refuses before anything is uploaded. The registry has no
+compare-and-set, so a writer moving it during the upload is only found at the next
+sequence.
 
 Reproducing a sequence costs what assembling its layers costs, without the upload.
 Staged runs are disposable. Missing, damaged or staged for something else, they are
@@ -423,8 +435,10 @@ with the recovery below, and the earlier sequences stay published.
 
 A publication that runs out of room stops without moving the journal: make room and
 rerun. Staging is held to what `--batch-scratch-mib` has left, or the reserve for what
-the batch holds where a capture overshot the budget. Past that it stops, and drops the
-runs it cut short, so raise the budget and rerun.
+the batch holds where a capture overshot the budget. Runs a stopped staging left count
+against it, so a restarted staging that runs out starts over from nothing first, which
+repeats its traversals. Past the budget from nothing it stops and drops its runs, so
+raise the budget and rerun.
 
 Stopping a publisher mid-batch and starting a batch of one, a smaller `--batch-epochs`
 or a newer image are different things. A smaller limit continues the batch. A batch of

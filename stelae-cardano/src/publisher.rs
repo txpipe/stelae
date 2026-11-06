@@ -178,14 +178,20 @@ impl Publisher {
         source.publish_repository(self.publishing(), plan, observer)
     }
 
-    /// Publish a prepared boundary, chained to the repository's latest stele.
+    /// Publish a prepared boundary, chained to the repository's latest stele,
+    /// which has to be `predecessor`.
     pub fn finalize(
         &self,
         finalizing: &Finalizing<'_>,
+        predecessor: Option<&Committed>,
         source: &dyn SnapshotSource,
         observer: &Observer,
     ) -> Result<Published, dolos_snapshot::Error> {
-        source.finalize_repository(self.publishing(), finalizing, observer)
+        let predecessor = predecessor
+            .map(|held| Ok::<_, stelae::Error>((held.sequence, held.identity.parse()?)))
+            .transpose()?;
+        let publishing = self.publishing().following(predecessor);
+        source.finalize_repository(publishing, finalizing, observer)
     }
 
     fn publishing(&self) -> Publishing<'_> {
@@ -229,12 +235,13 @@ impl backfill::Publish for BackfillPublisher<'_> {
     fn finalize(
         &self,
         finalizing: &Finalizing<'_>,
+        predecessor: Option<&Committed>,
         source: &dyn SnapshotSource,
     ) -> Result<Committed, backfill::Error> {
         let published = Publisher::open(self.config, &self.settings)
             .and_then(|publisher| {
                 publisher.preflight()?;
-                publisher.finalize(finalizing, source, self.observer)
+                publisher.finalize(finalizing, predecessor, source, self.observer)
             })
             .map_err(|error| backfill::Error::Finalizing(Box::new(error)))?;
         tracing::info!(

@@ -3128,6 +3128,18 @@ mod tests {
         assert!(!is_absent(&OciDistributionError::GenericError(None)));
     }
 
+    /// What a caller outside this module asks: a registry that didn't answer is
+    /// never a tag it doesn't hold, so nothing writes over that tag.
+    #[test]
+    fn only_a_missing_manifest_reads_as_absent_through_the_error() {
+        assert!(Error::Registry(server_error(404)).is_absent());
+        assert!(Error::Registry(envelope(OciErrorCode::ManifestUnknown)).is_absent());
+        assert!(!Error::Registry(server_error(500)).is_absent());
+        assert!(!Error::Registry(server_error(403)).is_absent());
+        assert!(!Error::Registry(envelope(OciErrorCode::Denied)).is_absent());
+        assert!(!Error::NonCanonicalInscription.is_absent());
+    }
+
     /// A password never reaches a log through this type.
     ///
     /// [`Options`] derives `Debug` and error context is printed freely, so this
