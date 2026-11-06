@@ -3351,7 +3351,8 @@ fn a_flush_that_cant_reopen_the_stores_keeps_the_sources_failure() {
 }
 
 /// The stores' shutdown fails with the source, so the run doesn't start a
-/// flush. The exit names both, the batch stays open and the rerun goes on.
+/// flush. The exit names both and the batch stays open. The fixture's stores
+/// did close, so its rerun goes on.
 #[test]
 fn a_shutdown_failing_with_the_source_leaves_the_batch_open() {
     let chain = Chain::spanning(12);
@@ -3370,6 +3371,12 @@ fn a_shutdown_failing_with_the_source_leaves_the_batch_open() {
         ),
         "{error}"
     );
+    let message = error.to_string();
+    assert!(
+        message.contains(&source_down(&rig.calls).to_string()),
+        "{message}"
+    );
+    assert!(message.contains("ran out of room"), "{message}");
     assert!(rig.repository.uploaded.borrow().is_empty());
     assert_eq!(rig.sequences(), [1, 2]);
     assert_eq!(rig.batch().ready(), None);
@@ -3926,22 +3933,25 @@ fn another_writers_immutable_tag_refuses_before_it_is_overwritten() {
     assert!(message.contains("leave the tag"), "{message}");
     assert!(message.contains("clear the storage path"), "{message}");
     assert!(!message.contains("nothing needs clearing"), "{message}");
-    // Each recovery stays with its cause: deleting the tag is for a tag known
-    // to be another writer's, or one a restore has cleared the stores of.
+    let backfill::Error::Batch(batch::Error::TagTaken {
+        found, expected, ..
+    }) = &error
+    else {
+        unreachable!()
+    };
+    assert!(
+        message.contains(&format!(
+            "holds {found} where this batch would publish {expected}"
+        )),
+        "{message}"
+    );
+    // Each recovery stays with its cause: deleting the tag only for a tag known
+    // to be another writer's, and the warning and the replay for everything else.
     assert!(
         message.contains(
-            "If you know that tag is another writer's, stop that writer, delete the tag and rerun."
-        ),
-        "{message}"
-    );
-    assert!(
-        message.contains("Otherwise leave the tag and treat the stores as wrong"),
-        "{message}"
-    );
-    assert!(
-        message.ends_with(
-            "If this refusal comes back over stores restored that way, they aren't the cause: \
-             stop any writer, delete the tag and rerun"
+            "If you know that tag is another writer's, stop that writer, delete the tag and \
+             rerun. Otherwise leave the tag and treat the stores as wrong, because deleting it \
+             publishes from them unchecked. Nothing else holds those boundaries"
         ),
         "{message}"
     );

@@ -309,10 +309,10 @@ Three cases read differently:
   low figure as a full volume. A stopped download can also leave partial or absent
   files below the highest one, which a rerun doesn't fetch again, so make room, empty
   the immutable directory and rerun. A batched run closes the batch and publishes
-  what it prepared first, unless shutting the stores down fails as well, which leaves
-  the batch open for the rerun. So this failure can arrive beside a room error from
-  either. The exit names both, and emptying the immutable directory still
-  applies. That can't help once a rerun has imported across
+  what it prepared first, unless the stores can't shut down or reopen before that,
+  which leaves the batch open. So this failure can arrive beside a room error from
+  the stores or from that publication. The exit names both, and emptying the immutable
+  directory still applies. That can't help once a rerun has imported across
   an absent file next to an epoch's start, which the chart's own restart can do: every
   run then refuses before any fetch, saying the archive has a gap there, unless the
   repository already holds that boundary. A held boundary isn't checked, so a run over
@@ -382,8 +382,8 @@ periodic run reaches `end-of-source` and publishes what it prepared, however few
 boundaries that is: nothing waits at the tip for a full batch. A source that stays
 down past its retries, or a fetch that brings nothing new, closes the batch the same
 way, and the run publishes what it prepared before it exits on that failure. If that
-publication fails too, the exit names both. If shutting the stores down fails first,
-the batch stays open for the rerun, and the exit again names both. So an outage during
+publication fails too, the exit names both. If the stores can't shut down or reopen
+before that, the batch stays open, and the exit again names both. So an outage during
 a backfill costs one smaller batch, and one more index traversal for the next.
 
 ### Progress
@@ -421,7 +421,7 @@ from the sequence the journal names:
 | this sequence under its immutable tag only: a seal that stopped half way | reproduces it, compares identities and seals again |
 | this sequence as `latest`: an upload whose answer was lost | reproduces it, compares identities, journals it and doesn't upload it again |
 | this sequence as `latest` with another identity | refuses, and overwrites nothing: another writer published it, or these stores aren't what the batch was prepared from. The recovery below applies |
-| this sequence with another identity under its immutable tag only | refuses, and overwrites nothing: another writer stopped before moving `latest`, or this publisher did and these stores aren't what the batch was prepared from. If you know that tag is another writer's, stop that writer, delete the tag and rerun. Otherwise leave the tag and treat the stores as wrong, because deleting it publishes from them unchecked: the recovery below applies. If this refusal comes back over stores restored that way, they aren't the cause: stop any writer, delete the tag and rerun |
+| this sequence with another identity under its immutable tag only | refuses, and overwrites nothing: another writer stopped before moving `latest`, or this publisher did and these stores aren't what the batch was prepared from. If you know that tag is another writer's, stop that writer, delete the tag and rerun. Otherwise leave the tag and treat the stores as wrong, because deleting it publishes from them unchecked: the recovery below applies |
 | anything else: past this sequence, behind the journal, or a predecessor under another identity | refuses: the repository moved |
 
 A batch of one has no such check on the immutable tag and overwrites it, as it

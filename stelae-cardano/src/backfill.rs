@@ -788,8 +788,8 @@ impl<W: Workspace> Driver<'_, W> {
     /// Replay and publish until the source runs out or `until_epoch` is
     /// published. A periodic run therefore drains what it prepared, however few
     /// boundaries the source offered, and leaves nothing waiting for a full
-    /// batch. A failing source closes the batch too, unless shutting the stores
-    /// down fails with it, and the run still ends on that failure.
+    /// batch. A failing source closes the batch too, unless the stores can't
+    /// shut down or reopen before that, and the run still ends on that failure.
     pub fn run(&self) -> Result<Outcome, Error> {
         if self.batching.limits.is_one() {
             return self.run_one();
