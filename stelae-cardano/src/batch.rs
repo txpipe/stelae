@@ -1240,7 +1240,8 @@ mod tests {
     }
 
     /// Built from each store's own types and a real OS error, so a pin moving
-    /// their words fails here too. That text has no "(os error 28)".
+    /// their words fails here too. The stores keep fjall's rendering of it, which
+    /// has no "(os error 28)".
     #[cfg(unix)]
     #[test]
     fn a_full_volume_reads_the_same_from_every_store() {
