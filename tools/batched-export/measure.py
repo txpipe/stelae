@@ -382,14 +382,25 @@ def command_prepare(args):
         loopback.stop()
 
 
-def record(root, observation):
-    """Append a row, or failing that print it: the row is what a run leaves."""
+def record(root, observation, name="observations.jsonl"):
+    """Append a row, or failing that print it: the row is what a run leaves.
+
+    A row a full volume cut short gets its line ended first, so this one stays
+    whole. Nothing is truncated, because concurrent runs share the file. Returns
+    the error if the row only reached stderr.
+    """
     line = json.dumps(observation) + "\n"
     try:
-        with open(root / "observations.jsonl", "a") as out:
-            out.write(line)
+        with open(root / name, "ab+") as out:
+            if out.seek(0, os.SEEK_END):
+                out.seek(-1, os.SEEK_END)
+                if out.read(1) != b"\n":
+                    out.write(b"\n")
+            out.write(line.encode())
     except OSError as error:
         print(f"observation not written, {error}: {line}", file=sys.stderr, flush=True)
+        return error
+    return None
 
 
 def measure(args, arm, run_dir, observation):
@@ -446,7 +457,10 @@ def measure(args, arm, run_dir, observation):
     )
     observation["tag_writes"] = len(accounting["tags"])
     observation["publications"] = publications(registry)
-    observation["succeeded"] = legs[-1]["exit"] == 0
+    # A run that exhausts its chain files exits 0 short of what it was asked for.
+    observation["succeeded"] = (
+        legs[-1]["exit"] == 0 and f"epoch-{args.until}" in observation["publications"]
+    )
 
 
 def command_run(args):
@@ -488,7 +502,8 @@ def command_run(args):
         observation["error"] = f"{type(error).__name__}: {error}"
     observation["wall_seconds_total"] = sum(leg["wall_seconds"] for leg in observation["legs"])
     # Before anything that needs room: this is the run a full volume stopped.
-    record(root, observation)
+    unrecorded = record(root, observation)
+    failure = failure or unrecorded
     print(json.dumps({key: observation[key] for key in
                       ["run", "arm", "workload", "round", "succeeded", "wall_seconds_total",
                        "uploaded_bytes"]}), flush=True)
@@ -507,8 +522,17 @@ def command_run(args):
 
 
 def read_observations(root):
+    """Every whole row. One a full volume cut short is named and left out."""
     path = Path(root) / "observations.jsonl"
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    rows = []
+    for number, line in enumerate(path.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            print(f"{path}:{number}: not a whole row, left out", file=sys.stderr, flush=True)
+    return rows
 
 
 def command_compare(args):
@@ -617,11 +641,17 @@ def command_restore(args):
                 raise
             finally:
                 failures += not line["reproduced"]
-                with open(root / "restores.jsonl", "a") as sink:
-                    sink.write(json.dumps(line) + "\n")
+                failures += record(root, line, "restores.jsonl") is not None
                 print(json.dumps(line), flush=True)
-            shutil.copyfile(out / "log", root / "evidence" / args.run / f"restore-{sequence}.log")
-            shutil.rmtree(out)
+            try:
+                shutil.copyfile(
+                    out / "log", root / "evidence" / args.run / f"restore-{sequence}.log"
+                )
+                shutil.rmtree(out)
+            except OSError as error:
+                failures += 1
+                print(f"{args.run} {sequence}: {error}. Its files stay in {out}",
+                      file=sys.stderr, flush=True)
     finally:
         loopback.stop()
     return 1 if failures else 0
@@ -793,8 +823,10 @@ def main():
     sub.add_argument("--binary", action="append", default=[])
     sub.set_defaults(handler=command_provenance)
 
-    for number in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(number, stop_on_signal)
+    signal.signal(signal.SIGTERM, stop_on_signal)
+    # Under nohup a hang-up is meant to be survived.
+    if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, stop_on_signal)
     args = parser.parse_args()
     sys.exit(args.handler(args) or 0)
 

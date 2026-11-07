@@ -24,6 +24,13 @@ python3 "$ROOT/bin/measure.py" prepare --root "$ROOT" --corpus "$ROOT/corpus/pre
 # A candidate batch takes the base to 276. Its stores and repository, less the chain
 # files and the spool, are what every run on base/preprod-276 clones.
 python3 "$ROOT/bin/measure.py" run --root "$ROOT/extend" --corpus "$ROOT/corpus/preprod/immutable" --state-epochs "$ROOT/state-epochs" --loopback "$ROOT/loopback" --workload base-256-to-276 --base "$ROOT/base/preprod" --until 276 --first-file 5041 --last-file 5450 --timeout 7000 --keep --arm "{\"name\":\"w20\",\"binary\":\"$ROOT/stelae-publisher-candidate\",\"flags\":[\"--batch-epochs\",\"20\",\"--batch-scratch-mib\",\"400000\",\"--batch-reserve-mib\",\"1024\"]}"
+# A run that failed or timed out exits 0 with partial stores, which aren't a base.
+if ! tail -1 "$ROOT/extend/observations.jsonl" | grep -q '"succeeded": true'; then
+  echo "extend-base: the last run didn't reach 276, so there is no base to move" >&2; exit 1
+fi
+if [ -e "$ROOT/base/preprod-276/registry" ]; then
+  echo "extend-base: base/preprod-276 already holds a registry" >&2; exit 1
+fi
 EXTENDED="$ROOT/extend/runs/$(ls -t "$ROOT/extend/runs" | head -1)"
 mkdir -p "$ROOT/base/preprod-276/data"
 mv "$EXTENDED/registry" "$ROOT/base/preprod-276/registry"
@@ -98,6 +105,11 @@ python3 "$M" run --root "$R" --corpus "$R/corpus/preprod/immutable" --state-epoc
 # ---- faults, second session ----
 # The upgrade again with the old exporter part way through a publication, its publish
 # record on disk, and refused uploads with a registry that counts refused bodies.
+R="$ROOT"
+M="$R/bin/measure.py"
+C="$R/stelae-publisher-candidate"; O="$R/stelae-publisher-old"
+OLD="{\"name\":\"old\",\"binary\":\"$O\"}"
+W6="{\"name\":\"w6\",\"binary\":\"$C\",\"flags\":[\"--batch-epochs\",\"6\",\"--batch-scratch-mib\",\"400000\",\"--batch-reserve-mib\",\"1024\"]}"
 common=(--root "$R" --corpus "$R/corpus/preprod/immutable" --state-epochs "$R/state-epochs" --loopback "$R/loopback-recount" --workload faults-276-to-282 --base base/preprod-276 --until 282 --first-file 5442 --last-file 5570 --timeout 3600)
 python3 "$M" run "${common[@]}" --arm "$OLD" --kill-on 'layer 3000/4464:' --rerun-arm "$W6"
 python3 "$M" run "${common[@]}" --arm "$W6" --fail-every 40
@@ -143,10 +155,22 @@ common=(--root "$R" --corpus "$R/corpus/preprod/immutable" --state-epochs "$R/st
 window() { echo "{\"name\":\"profile-w$1\",\"binary\":\"$C\",\"flags\":[\"--batch-epochs\",\"$1\",\"--batch-scratch-mib\",\"400000\",\"--batch-reserve-mib\",\"1024\"]}"; }
 sampled() { # arm-name sequence output, then the arguments of the run
   local name="$1" sequence="$2" output="$3"; shift 3
+  # A directory from before this run is an earlier run's, and the sample it left isn't this one's.
+  local before; before=$(ls -d "$R"/runs/*-"$name" 2>/dev/null || true)
+  rm -f "$P/$output.txt"
   python3 "$M" run "${common[@]}" "$@" &
   local running=$! found=""
-  until found=$(ls -td "$R"/runs/*-"$name" 2>/dev/null | head -1) && [ -n "$found" ] && [ -f "$found/publisher.log" ]; do /bin/sleep 1; done
-  "$R/bin/sample-run.sh" "$found" "$sequence" "$P/$output.txt"
+  while kill -0 "$running" 2>/dev/null; do
+    found=$(ls -td "$R"/runs/*-"$name" 2>/dev/null | grep -vxF -- "$before" | head -1)
+    if [ -n "$found" ] && [ -f "$found/publisher.log" ]; then break; fi
+    found=""
+    /bin/sleep 1
+  done
+  if [ -n "$found" ]; then
+    "$R/bin/sample-run.sh" "$found" "$sequence" "$P/$output.txt" "$running" || echo "$name: not sampled" >&2
+  else
+    echo "$name: the run ended before its log appeared, so it wasn't sampled" >&2
+  fi
   wait "$running"
 }
 sampled profile-w12 278 w12-early --until 288 --arm "$(window 12)"
@@ -165,5 +189,7 @@ RUN=$(ls -t "$R/runs" | grep -- '-w4$' | head -1)
 python3 "$M" restore --root "$R" --run "$RUN" --sequence 277 --sequence 280 --sequence 281 --sequence 284 --consumer "$OLD_DOLOS" --publisher "$C" --loopback "$R/loopback" --state-epochs "$R/state-epochs"
 
 # ---- read them ----
+R="$ROOT"
+M="$R/bin/measure.py"
 python3 "$M" compare --root "$R" --separate rollback-over-an-empty-repository
 python3 "$M" summarize --root "$R" --pair old:w16 --pair w1:w16 --pair w1:w4
