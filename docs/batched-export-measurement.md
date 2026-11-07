@@ -21,7 +21,8 @@ upload, with the same stores, chain, predecessor and retained list on every arm.
   samples disk use and load once a second, and appends one line to
   `observations.jsonl` for every run: one whose publisher failed, one the tool couldn't
   finish and one it was told to stop, which also stops what it started. SIGKILL of the
-  tool leaves no line, and on a volume too full to take the line it goes to stderr.
+  tool leaves no line, and on a volume too full to take the line it goes to stderr. A line
+  cut short gets ended by the next, and `summarize` and `compare` name it and leave it out.
   `test_measure.py` beside it holds it to that, and nothing in CI runs either.
 
 ## Procedure
@@ -87,6 +88,9 @@ costs a run something, so give those runs their own workload.
 
 ## What the numbers mean
 
+- **`succeeded`** means the last process exited 0 and the repository holds `epoch-<until>`. A
+  run out of chain files exits 0 short of that, and it doesn't count. `summarize` medians and
+  `compare` read only runs that succeeded.
 - **Wall time** is the process's, from spawn to exit. Inputs are cloned before the
   clock starts.
 - **The OS cache** is neither controlled nor measured. Clones are separate files, so a run

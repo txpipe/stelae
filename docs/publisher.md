@@ -371,11 +371,21 @@ follows the state and not the indexes. On preprod at this height:
 | Growth of the stores from replay, chain files aside | 95 to 112 MiB an epoch | the stores |
 | Download window, until consumed | 51 MiB an epoch | `--download-dir` |
 
-Two costs don't scale with the window. However long a run, the stores at their highest
-stood about 1 GiB above where they started, net of the chain files replay deleted: 0.86 GiB
-over 4 epochs, 1.06 over 16 and 0.96 to 1.08 over 24. And each publication checks first that
-its volume can stage its largest layers at once, which takes about 0.65 GiB at this height
-and refuses a shortfall.
+The stores keep that growth for good, so a run of `N` epochs needs it on top of everything
+else here: 9.3 to 10.9 GiB for 100 preprod epochs. The runs measured here don't show it,
+because they had all their chain files on the volume from the start and replay deleted them
+as it went. A real run downloads a window at a time, and nothing offsets it. Net of those
+files, the stores at their highest stood 0.86 GiB up over 4 epochs, 1.06 over 16 and 0.96 to
+1.08 over 24. About 0.7 GiB of the first is above what replay keeps, so allow a transient of
+up to about 1 GiB, whatever the window.
+
+Each publication also checks first that its volume can stage what it stages at once, and
+refuses a shortfall. That is every state layer of the latest stele, retained dumps included,
+and its largest other layers, as many as `--concurrency`. At this height, on a lineage with
+no dump yet, it takes 0.65 GiB at `--concurrency 4`, which these runs used, and 0.79 at the
+default of 8. At epoch 300, with one dump, it takes 1.04 and 1.17. A lineage from genesis
+holds 11 dumps at this height, which wasn't measured, so add yours up from the sizes in its
+`latest` manifest.
 
 Layers staged for upload are unlinked files, so they show only as the volume's free
 space falling. On these runs it fell 4 to 5 GiB past the batch's own high-water, with
@@ -383,25 +393,28 @@ everything else on that volume counted in, so read that as an upper bound.
 
 Before replay leaves a boundary, the batch must have room for what it holds, for the
 reserve of every boundary it would then hold, and for one more boundary as large as
-its largest. Both limits are held to that sum. The free-space line adds the two costs
-above, which the batch doesn't hold itself to. So a window of `W` needs about
+its largest. Both limits are held to that sum. The free-space line adds the costs above,
+which the batch doesn't hold itself to. So a window of `W` over a run of `N` epochs needs about
 
 ```text
 --batch-scratch-mib   >=  W x (bundle + reserve)
-free space on volume  >=  W x (bundle + reserve) + one publication's check + one-off growth
+free space on volume  >=  W x (bundle + reserve) + one publication's check + transient + N x growth
 ```
 
-For a window of 4 here that's about 2.1 GiB of budget and 3.8 GiB free. That is the floor a
-run should get through, not what it was seen to take: window 4 runs that didn't overlap
-another run saw the volume fall 6.2 to 6.3 GiB, other work on it included. A batch of one
-holds none of the batch's terms, and needs its index spool, the check and the growth. No run
-has tried that floor. One that runs short stops on the room it lacks, which is recoverable:
-see [A volume that fills](#a-volume-that-fills).
+For a window of 4 here, on a lineage with no dump at `--concurrency 4`, that's about 2.1 GiB
+of budget and 3.8 GiB free with the download elsewhere, and 2.3 and 4.0 on the default layout,
+where it shares the volume. Those free figures leave out `N x growth`. The default concurrency
+adds 0.13 GiB, and a lineage's dumps add what its manifest says. That is the floor a run should
+get through, not what it was seen to take: the one window 4 run that held its window with the
+registry off this volume saw it fall 6.2 GiB over 16 epochs, other work on it included. A batch
+of one holds none of the batch's terms, and needs its index spool, the check, the transient and
+`N x growth`. No run has tried that floor. One that runs short stops on the room it lacks, which
+is recoverable: see [A volume that fills](#a-volume-that-fills).
 
-`--batch-reserve-mib` should cover a boundary's staged runs, replay growth and download,
-about 105 MiB here, and up to about 125 MiB at the fastest growth above, with the download
-on top where it shares the volume until consumed. A budget that holds one boundary doesn't
-fail when it's too small for the window: at `--batch-reserve-mib 512`, a
+`--batch-reserve-mib` should cover a boundary's staged runs and replay growth, about 105 MiB
+here and up to about 125 MiB at the fastest growth above, plus the download where it shares the
+volume until consumed, as it does by default: about 158 to 175 MiB. A budget that holds one
+boundary doesn't fail when it's too small for the window: at `--batch-reserve-mib 512`, a
 `--batch-scratch-mib` of 2048 closed each batch of 4 at two boundaries, and 1024 with a
 reserve of 256 closed each at one, and 4096 with a reserve of 512 held all 4. Each
 smaller batch costs its own traversals, so a budget that keeps closing early is worse
@@ -617,21 +630,29 @@ happens:
   stele and a publish would leave a gap. It publishes nothing, and the batch is untouched.
   Go back to the image that prepared it and the batch finishes, to the same bytes. This
   ran over real preprod, at three sequences ahead.
-- **The stores are one sequence past it.** A batch stopped during its last sequence can
-  leave this, when it closed holding that boundary. The older image finds nothing to
-  refuse: it publishes that sequence, with the right bytes, and replays on, leaving
-  `.stelae-batch` on the volume. The image that prepared the batch then refuses those
-  stores, so going back means the recovery above. This comes from reading both releases
-  and hasn't been run.
+- **The stores are one sequence past it, and past that boundary.** Any window above 1 stands
+  here while it replays toward its next boundary, and so does a batch that closed on
+  `end-of-source` past that boundary and stopped during its last sequence. The older image
+  fails on every retry, saying to restore that epoch's stele. It publishes nothing and the
+  batch is untouched, so clear nothing: go back to the image that prepared it, and the batch
+  goes on. Like the next case, this comes from reading both releases and hasn't been run.
+- **The stores are one sequence past it, on that boundary.** A batch stopped during its last
+  sequence can leave this, when it closed holding that boundary. The older image finds nothing
+  to refuse: it publishes that sequence, with the right bytes, and replays on, leaving
+  `.stelae-batch` on the volume. The image that prepared the batch then refuses those stores,
+  so going back means the recovery above. This comes from reading both releases and hasn't
+  been run.
 - **The repository is empty.** On a boundary nothing refuses. The older image doesn't read
   `.stelae-batch-began.json`, so it starts the history where the stores stand, and
   every sequence the batch held is gone from that lineage for good: a batch stopped at
   its third boundary and continued by the last release published `epoch-3` onward,
   with no `epoch-1` or `epoch-2`. Past a boundary it fails on every retry instead, asking
-  for a stele of that epoch to restore, and there isn't one. Don't roll back over a first
-  batch. If it has happened, stop the writer, delete the tags, clear the storage path and
-  any store configured outside it (on a claim, delete the claim), then run with
-  `--allow-genesis`. Without the clearing, the same stores publish a wider gap.
+  for a stele of that epoch to restore, and there isn't one. It publishes nothing and the
+  batch is untouched, so go back to the image that prepared it, and the batch finishes: this
+  comes from reading both releases. Don't roll back over a first batch. If the older image has
+  published, stop the writer, delete the tags, clear the storage path and any store configured
+  outside it (on a claim, delete the claim), then run with `--allow-genesis`. Without the
+  clearing, the same stores publish a wider gap.
 
 Losing the batch directory is a different thing, and so is losing `/data`: see the
 recovery above. On an emptyDir, or a claim you deleted, the batch goes with the stores,

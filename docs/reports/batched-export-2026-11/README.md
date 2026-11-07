@@ -111,7 +111,8 @@ These are findings for a decision, not fixes: nothing here changes the exporter.
    waiting for it. The samples cover the first part of a publication, so they don't give
    its whole share. The early and late samples aren't like for like, window 12 at median
    load 5.2 and window 8 at 17.1, so the fall from 93% to 70% doesn't read as a change
-   within a batch.
+   within a batch. That run's chain files ran out at epoch 286, so the chain closed its
+   batch at 10 boundaries, and its row reads `succeeded` from before the tool checked `--until`.
 
 A batch's gain therefore depends on what a traversal costs against everything else, and
 preprod's is small: about 20 s against about 41 s of layers. In one exploratory index-only
@@ -188,11 +189,20 @@ A bundle is about 0.42 GiB and a staged window about 12 MiB, so it is the state 
 the index spool that sizes a batch: 35 to one here. The 6.97 GB spool of the earlier
 index-only benchmark would have understated a batch by a long way.
 
-"Stores' growth" is net of the chain files replay deleted, about 51 MiB an epoch, and doesn't
-scale with a run: the old exporter's stood 0.86 GiB up over 4 epochs, 1.06 over 16 and 0.96
-to 1.08 over 24. The stores themselves grew 94 to 99 MiB an epoch on these runs, and 112 from
-256 to 276, without their chain files. A publication's own check of its staging takes about
-0.65 GiB at this height, read off the `epoch-286` manifest.
+"Stores' growth" is net of the chain files replay deleted, about 51 MiB an epoch. The tool
+seeds a run's whole slice of chain files under the storage path, so `stores_at_start` follows
+the slice's length, 14.86 to 15.75 GiB, and those deletions offset what the stores keep: the
+old exporter's stood 0.86 GiB up over 4 epochs, 1.06 over 16 and 0.96 to 1.08 over 24. A real
+run downloads bounded windows, and nothing offsets it. The stores themselves grew 94 to 99 MiB
+an epoch on these runs, about 2.2 GiB over 24 epochs, and 112 from 256 to 276, without their
+chain files. The 0.86 GiB is about 0.68 above growth less the slice, so about 0.7 GiB is
+transient.
+
+A publication's own check of its staging sums every state layer of the latest stele, retained
+dumps included, and its largest other layers, as many as `--concurrency`. Read off the
+manifests, `epoch-286` takes 0.65 GiB at these runs' `--concurrency 4` and 0.79 at the default
+of 8, and `epoch-300`, with one dump, takes 1.04 and 1.17. This base carries no dump before
+300, and a lineage from genesis holds 11 at this height, which wasn't measured.
 
 | Window, scratch, reserve (MiB) | Batches over 8 epochs | Traversals tag/exact/entity |
 | --- | --: | --- |
