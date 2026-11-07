@@ -267,10 +267,11 @@ fn a_kill_after_a_staging_marker_converges() {
 #[test]
 fn a_kill_during_an_upload_converges() {
     let run = Run::new();
+    const HELD_FROM: u64 = 20;
     run.loopback.rule(from_the_nth(
         |request| request.method == "PUT" && request.path.contains("/blobs/uploads/"),
-        20,
-        Verdict::Hold,
+        HELD_FROM,
+        Verdict::HoldUnserved,
     ));
     let mut child = run.spawn();
     run.kill_on_hold(&mut child);
@@ -278,6 +279,14 @@ fn a_kill_during_an_upload_converges() {
         !run.tag_exists(1),
         "the kill was meant to land before a seal"
     );
+    let completed: u64 = run
+        .loopback
+        .accounting(NAME)
+        .uploads
+        .values()
+        .map(|(_, count)| count)
+        .sum();
+    assert!(completed < HELD_FROM, "a held upload landed: {completed}");
     run.rerun_converges();
 }
 
@@ -285,7 +294,7 @@ fn a_kill_during_an_upload_converges() {
 fn a_kill_between_a_seals_two_tags_converges() {
     let run = Run::new();
     run.loopback
-        .rule(from_the_nth(sets_latest, 2, Verdict::Hold));
+        .rule(from_the_nth(sets_latest, 2, Verdict::HoldUnserved));
     let mut child = run.spawn();
     run.kill_on_hold(&mut child);
     assert!(run.tag_exists(2) && run.latest_is(1), "not half a seal");
@@ -333,7 +342,8 @@ fn a_kill_between_two_sequences_converges() {
     run.rerun_converges();
 }
 
-/// A retry repeats only what the registry refused.
+/// A retry repeats only what the registry refused, and what it refused still
+/// crossed the wire.
 #[test]
 fn uploads_the_registry_refuses_are_retried_to_the_same_repository() {
     let run = Run::new();
@@ -347,7 +357,12 @@ fn uploads_the_registry_refuses_are_retried_to_the_same_repository() {
     });
     run.rerun_converges();
     let log = run.log();
-    assert!(!log.contains("repository moved"), "{log}");
+    assert!(!log.contains("another writer moved it"), "{log}");
+    let accounting = run.loopback.accounting(NAME);
+    assert!(
+        accounting.received > accounting.uploaded(),
+        "{accounting:?}"
+    );
 }
 
 #[test]

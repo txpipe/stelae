@@ -18,8 +18,9 @@ use dolos_testing::{
     tx_sequence_to_hash, utxo_with_value,
 };
 use pallas::{
-    crypto::hash::Hash,
+    crypto::hash::{Hash, Hasher},
     ledger::{
+        addresses::Address,
         primitives::{
             conway::{Certificate, Value},
             RationalNumber, Set, StakeCredential,
@@ -51,13 +52,29 @@ pub struct Chain {
 /// What [`delegation_certificates`] take in deposits on the preview genesis.
 const DELEGATION_DEPOSITS: u64 = 2_000_000 + 500_000_000;
 
-/// A stake credential registered and delegated to a pool registered beside it,
-/// so every boundary writes an account row that settles one boundary late.
-fn delegation_certificates() -> Vec<Certificate> {
-    let operator = Hash::new([7; 28]);
-    let credential = StakeCredential::AddrKeyhash(Hash::new([9; 28]));
+/// The key every synthetic block names as its issuer, so the pool hashed from
+/// it mints all of them.
+const ISSUER_VKEY: [u8; 2] = [0x10, 0x11];
+
+/// What each transaction pays the delegating account: enough that its share of
+/// a few blocks' rewards comes to more than a lovelace.
+const DELEGATED_LOVELACE: u64 = 1_000_000_000_000;
+
+/// `address`'s stake credential registered and delegated to the pool that mints
+/// every block. Its rows are written with the stake leg alone and rewritten
+/// with the rewards a boundary later, so they settle as they do on a real
+/// chain.
+fn delegation_certificates(address: &str) -> Vec<Certificate> {
+    let operator: Hash<28> = Hasher::<224>::hash(&ISSUER_VKEY);
+    let address = Address::from_bech32(address).expect("a synthetic address");
+    let (credential, _) = dolos_cardano::pallas_extras::address_as_stake_cred(&address)
+        .expect("a synthetic address has a stake part");
+    let StakeCredential::AddrKeyhash(owner) = credential else {
+        panic!("a synthetic address delegates by key");
+    };
     let mut reward_account = vec![0xe0];
-    reward_account.extend_from_slice(&[9; 28]);
+    reward_account.extend_from_slice(owner.as_ref());
+    let credential = StakeCredential::AddrKeyhash(owner);
     vec![
         Certificate::StakeRegistration(credential.clone()),
         Certificate::PoolRegistration {
@@ -70,7 +87,7 @@ fn delegation_certificates() -> Vec<Certificate> {
                 denominator: 1,
             },
             reward_account: reward_account.into(),
-            pool_owners: Set::from(vec![Hash::new([9; 28])]),
+            pool_owners: Set::from(vec![owner]),
             relays: Vec::new(),
             pool_metadata: None,
         },
@@ -123,14 +140,16 @@ impl Chain {
         }
     }
 
-    /// [`Self::shelley`] with an account delegating from the first block, and a
-    /// new asset each epoch but for the epochs in `no_new_assets`, whose entity
-    /// layers don't exist.
+    /// [`Self::shelley`] with an account delegating from the first block to the
+    /// pool minting every block, and a new asset each epoch but for the epochs
+    /// in `no_new_assets`, whose entity layers don't exist.
     pub fn delegating(epochs: usize, no_new_assets: &[usize]) -> Self {
         let blocks = epochs * 2;
         Self::shelley(blocks, |config| {
+            config.lovelace = DELEGATED_LOVELACE;
+            config.seed_amount = DELEGATED_LOVELACE + 7;
             let mut certificates = vec![Vec::new(); blocks];
-            certificates[0] = vec![delegation_certificates()];
+            certificates[0] = vec![delegation_certificates(&config.address)];
             config.extra_certs_by_block = certificates;
             config.asset_names_by_block = (0..blocks)
                 .map(|block| {

@@ -39,6 +39,9 @@ const UNTIL: u64 = 8;
 const RETAINED: [u64; 2] = [3, 7];
 /// The epoch no new asset appears in, which leaves a hole in `entity-asset`.
 const HOLE: u64 = 2;
+/// The first window whose account rows take rewards: Dolos pays none for the
+/// first stake epoch.
+const FIRST_REWARDED: u64 = 3;
 
 fn provider() {
     static ONCE: Once = Once::new();
@@ -324,14 +327,24 @@ fn the_reference_holds_every_case_the_comparisons_are_about() {
         .contains(&(HOLE + 1)));
 
     // Settling account rows: each publication holds the window its boundary
-    // stands in, and a closed window once it has settled.
+    // stands in. A closed window's rows hold the stake leg alone at the next
+    // stele and take their rewards at the one after, where they stay. Rewards
+    // start from the window of FIRST_REWARDED, so a later view can't stand in.
     let settling = reference.epochs_of(UNTIL, "log-account-epochs");
     assert!(settling.contains(&UNTIL) && settling.contains(&(UNTIL - 1)));
-    let settled = reference.window(UNTIL - 2, "log-account-epochs", UNTIL - 3);
-    assert_eq!(
-        settled,
-        reference.window(UNTIL, "log-account-epochs", UNTIL - 3)
-    );
+    for epoch in FIRST_REWARDED..=UNTIL - 3 {
+        let row = |sequence| {
+            reference
+                .window(sequence, "log-account-epochs", epoch)
+                .unwrap()
+        };
+        assert_ne!(
+            row(epoch + 1),
+            row(epoch + 2),
+            "window {epoch} never settled"
+        );
+        assert_eq!(row(epoch + 2), row(epoch + 3), "window {epoch} moved twice");
+    }
 
     // Inherited layers: a closed window is carried, not uploaded again.
     let closed = reference.window(2, "blocks", 1).unwrap();

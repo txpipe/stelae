@@ -29,7 +29,8 @@ const MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 pub struct Accounting {
     /// Each digest's size, and how many uploads completed under it.
     pub uploads: BTreeMap<String, (u64, u64)>,
-    /// Blob bytes received, in completed uploads or not.
+    /// Blob bytes that crossed the wire: completed, refused and interrupted
+    /// uploads alike, so what exceeds [`Self::uploaded`] went for nothing.
     pub received: u64,
     /// Manifest tags in the order they were written, with what each then held.
     pub tags: Vec<(String, String)>,
@@ -59,8 +60,12 @@ pub enum Verdict {
     Proceed,
     /// Answer this status and do nothing.
     Refuse(u16),
-    /// Do nothing until [`Loopback::release`], then serve it.
+    /// Do nothing until [`Loopback::release`], then serve it: a write that
+    /// lands after whoever sent it has gone.
     Hold,
+    /// Do nothing until [`Loopback::release`], then drop the connection with
+    /// the request unserved: a write that never lands.
+    HoldUnserved,
     /// Serve it, then hold the answer until [`Loopback::release`], then drop
     /// the connection: a write whose answer was lost.
     HoldAnswer,
@@ -323,6 +328,47 @@ fn copy_body(reader: &mut impl BufRead, head: &Head, sink: &mut dyn Write) -> io
     Ok(copied)
 }
 
+/// A writer that remembers how much went through it.
+struct Counted<'a> {
+    sink: &'a mut dyn Write,
+    bytes: u64,
+}
+
+impl Write for Counted<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.sink.write(buffer)?;
+        self.bytes += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.sink.flush()
+    }
+}
+
+/// Copy a blob's body into `sink`, charging its repository for what arrived
+/// whether or not all of it did.
+fn receive_blob(
+    reader: &mut impl BufRead,
+    head: &Head,
+    shared: &Shared,
+    name: &str,
+    sink: &mut dyn Write,
+) -> io::Result<u64> {
+    let mut counted = Counted { sink, bytes: 0 };
+    let copied = copy_body(reader, head, &mut counted);
+    let mut accounting = shared.accounting.lock().unwrap();
+    accounting.entry(name.to_owned()).or_default().received += counted.bytes;
+    copied
+}
+
+/// The repository a request sends blob bytes to, if it does.
+fn upload_target(head: &Head) -> Option<&str> {
+    let rest = head.path().strip_prefix("/v2/")?;
+    let (name, _) = rest.rsplit_once("/blobs/uploads/")?;
+    matches!(head.method.as_str(), "PATCH" | "PUT").then_some(name)
+}
+
 struct Answer {
     status: u16,
     headers: Vec<(&'static str, String)>,
@@ -410,12 +456,18 @@ fn connection(stream: TcpStream, shared: &Shared) -> io::Result<()> {
                     path: head.path(),
                 })
             });
-        if verdict == Verdict::Hold {
+        if matches!(verdict, Verdict::Hold | Verdict::HoldUnserved) {
             held_until_released(shared);
+        }
+        if verdict == Verdict::HoldUnserved {
+            return Ok(());
         }
         let answer = match verdict {
             Verdict::Refuse(status) => {
-                copy_body(&mut reader, &head, &mut io::sink())?;
+                match upload_target(&head) {
+                    Some(name) => receive_blob(&mut reader, &head, shared, name, &mut io::sink())?,
+                    None => copy_body(&mut reader, &head, &mut io::sink())?,
+                };
                 Answer::status(status)
             }
             _ => route(&head, &mut reader, shared)?,
@@ -507,18 +559,13 @@ fn upload(
                 .headers
                 .get("content-length")
                 .and_then(|length| length.parse().ok());
-            let received = if discard_above > 0 && length.unwrap_or(u64::MAX) > discard_above {
-                let received = copy_body(reader, head, &mut io::sink())?;
+            if discard_above > 0 && length.unwrap_or(u64::MAX) > discard_above {
+                let received = receive_blob(reader, head, shared, name, &mut io::sink())?;
                 file.set_len(file.metadata()?.len() + received)?;
-                received
             } else {
-                copy_body(reader, head, &mut file)?
-            };
-            drop(file);
-            {
-                let mut accounting = shared.accounting.lock().unwrap();
-                accounting.entry(name.to_owned()).or_default().received += received;
+                receive_blob(reader, head, shared, name, &mut file)?;
             }
+            drop(file);
             if head.method == "PATCH" {
                 let size = fs::metadata(&path)?.len();
                 return Ok(Answer::status(202)
@@ -649,4 +696,69 @@ fn manifest(
         ],
         body: Payload::Bytes(body),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NAME: &str = "cardano/counted";
+
+    /// Send one upload's head and `body`, promising `length` bytes, then hang
+    /// up without reading an answer.
+    fn send(loopback: &Loopback, id: &str, length: usize, body: &[u8]) {
+        let mut stream = TcpStream::connect(("127.0.0.1", loopback.port())).unwrap();
+        let path = format!("/v2/{NAME}/blobs/uploads/{id}?digest=sha256:0");
+        let head = format!("PUT {path} HTTP/1.1\r\nContent-Length: {length}\r\n\r\n");
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+    }
+
+    fn start_upload(loopback: &Loopback) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", loopback.port())).unwrap();
+        let head = format!("POST /v2/{NAME}/blobs/uploads/ HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+        stream.write_all(head.as_bytes()).unwrap();
+        let mut answer = String::new();
+        let mut reader = BufReader::new(stream);
+        while reader.read_line(&mut answer).unwrap() > 2 {}
+        let line = answer
+            .lines()
+            .find_map(|line| line.strip_prefix("Docker-Upload-UUID: "));
+        line.expect("an upload id").to_owned()
+    }
+
+    fn eventually_received(loopback: &Loopback, expected: u64) {
+        let began = std::time::Instant::now();
+        while loopback.accounting(NAME).received != expected {
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(30),
+                "received {}, not {expected}",
+                loopback.accounting(NAME).received
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_refused_upload_and_an_interrupted_one_still_count_as_received() {
+        let root = tempfile::tempdir().unwrap();
+        let loopback = Loopback::serve(root.path()).unwrap();
+
+        // Cut off: 40 of the 100 bytes it promised.
+        let id = start_upload(&loopback);
+        send(&loopback, &id, 100, &[7; 40]);
+        eventually_received(&loopback, 40);
+
+        // Refused: all of it arrived, and none of it was kept.
+        loopback.rule(|request| match request.method {
+            "PUT" => Verdict::Refuse(503),
+            _ => Verdict::Proceed,
+        });
+        send(&loopback, "refused", 25, &[7; 25]);
+        eventually_received(&loopback, 65);
+
+        let accounting = loopback.accounting(NAME);
+        assert_eq!(accounting.uploaded(), 0);
+        assert!(accounting.uploads.is_empty());
+    }
 }
