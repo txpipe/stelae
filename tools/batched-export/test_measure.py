@@ -431,14 +431,23 @@ class Summarize(Harness):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("Median 30.0%, so the 25% target is met.", done.stdout)
 
-    def rounds(self, *walls):
-        """One baseline and one candidate wall time a round, from rounds 1 on."""
+    def test_a_reduction_on_the_target_is_met(self):
+        done = self.paired(100, 75)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("Median 25.0%, so the 25% target is met.", done.stdout)
+
+    def rounds(self, *walls, failed=()):
+        """One baseline and one candidate wall time a round, from round 1 on. In a round
+        named in `failed`, the candidate's run failed."""
         for name, position in [("baseline", "1"), ("candidate", "2")]:
             self.run_tool(self.publisher(name), "--round", "1", "--position", position)
         baseline, candidate = self.rows()
-        rows = [dict(row, round=number, wall_seconds_total=seconds)
-                for number, pair in enumerate(walls, start=1)
-                for row, seconds in zip([baseline, candidate], pair)]
+        rows = []
+        for number, pair in enumerate(walls, start=1):
+            for row, seconds in zip([baseline, candidate], pair):
+                failing = row is candidate and number in failed
+                rows.append(dict(row, round=number, wall_seconds_total=seconds,
+                                 succeeded=row["succeeded"] and not failing))
         (self.root / "observations.jsonl").write_text(
             "".join(json.dumps(row) + "\n" for row in rows)
         )
@@ -446,17 +455,25 @@ class Summarize(Harness):
 
     def test_the_verdict_is_the_median_of_the_rounds(self):
         # The baselines differ, so a candidate held to another round's baseline gives other
-        # figures. The far round would carry a mean over the target.
-        done = self.rounds((100, 90), (200, 176), (50, 15))
+        # figures. The far round would carry a mean over the target, and it comes first so
+        # the median isn't the middle round.
+        done = self.rounds((50, 15), (100, 90), (200, 176))
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("3 pairs: 10.0%, 12.0%, 70.0%. Median 12.0%, so the 25% target is NOT met.",
+        self.assertIn("3 pairs: 70.0%, 10.0%, 12.0%. Median 12.0%, so the 25% target is NOT met.",
                       done.stdout)
 
     def test_a_median_past_the_target_is_met_with_one_round_short(self):
-        # Neither the lowest round nor the mean reaches it.
-        done = self.rounds((100, 90), (200, 140), (50, 35))
+        # Neither the lowest round, which comes last, nor the mean reaches it.
+        done = self.rounds((200, 140), (50, 35), (100, 90))
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("3 pairs: 10.0%, 30.0%, 30.0%. Median 30.0%, so the 25% target is met.",
+        self.assertIn("3 pairs: 30.0%, 30.0%, 10.0%. Median 30.0%, so the 25% target is met.",
+                      done.stdout)
+
+    def test_a_round_missing_its_candidate_pairs_nothing(self):
+        # Two pairs left, so the median is their mean, and the next round's run fills no gap.
+        done = self.rounds((100, 90), (200, 20), (50, 35), failed={2})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("2 pairs: 10.0%, 30.0%. Median 20.0%, so the 25% target is NOT met.",
                       done.stdout)
 
     def test_every_kind_of_row_is_read(self):
