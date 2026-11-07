@@ -98,7 +98,10 @@ naming.
    writer.
 2. Delete every tag in the repository, `latest` first. The first run must
    find it empty. With `persistence.enabled: true`, also delete any claim an
-   earlier attempt left, because initialization resumes kept stores.
+   earlier attempt left, because initialization resumes kept stores. A
+   deleted `persistence.existingClaim` must be created again, empty, before
+   step 3: until it exists the pod stays Pending (see the chart README's
+   [Data volume](../k8s/dolos-publisher/README.md#data-volume)).
 3. Install or upgrade with the candidate's image, the network's v2
    `dolosToml` with full history (no `[history]` window), its retained epochs in `stateEpochs`,
    `allowGenesisFallback: true` and a bumped `run`. From an emptyDir or a fresh

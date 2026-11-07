@@ -630,8 +630,8 @@ happens:
   stele and a publish would leave a gap. It publishes nothing, and the batch is untouched.
   Go back to the image that prepared it and the batch finishes, to the same bytes. This
   ran over real preprod, at three sequences ahead.
-- **The stores are one sequence past it, and past that boundary.** Any window above 1 stands
-  here while it replays toward its next boundary, and so does a batch that closed on
+- **The stores are one sequence past it, and past that boundary.** A batch stands here while
+  it holds its first boundary and replays toward its second, and so does a batch that closed on
   `end-of-source` past that boundary and stopped during its last sequence. The older image
   fails on every retry, saying to restore that epoch's stele. It publishes nothing and the
   batch is untouched, so clear nothing: go back to the image that prepared it, and the batch
