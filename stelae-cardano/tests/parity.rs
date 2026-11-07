@@ -357,6 +357,9 @@ fn the_reference_holds_every_case_the_comparisons_are_about() {
         .collect();
     assert!(repeated.is_empty(), "uploaded twice: {repeated:?}");
     assert!(accounting.uploaded() > 0);
+    // With no fault nothing goes for nothing, which is what the report's retry
+    // cost subtracts.
+    assert_eq!(accounting.received, accounting.uploaded());
 }
 
 /// Every window in order: every tag, manifest and blob the same as one boundary
