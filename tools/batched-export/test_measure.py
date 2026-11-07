@@ -167,6 +167,13 @@ class Runs(Harness):
         self.assertIn("epoch-1", row["publications"])
         self.assertFalse(row["succeeded"])
 
+    def test_a_publisher_that_fails_after_publishing_until_does_not_succeed(self):
+        self.run_tool(self.publisher("fails-late", then="sys.exit(1)"))
+        row = self.rows()[0]
+        self.assertEqual(row["legs"][0]["exit"], 1)
+        self.assertIn("epoch-1", row["publications"])
+        self.assertFalse(row["succeeded"])
+
     def test_a_binary_that_is_not_there_leaves_a_row_and_no_legs(self):
         done = self.run_tool(self.root / "absent")
         self.assertEqual(done.returncode, 1)
@@ -423,6 +430,22 @@ class Summarize(Harness):
         done = self.paired(100, 70)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("Median 30.0%, so the 25% target is met.", done.stdout)
+
+    def test_the_verdict_is_the_median_of_the_rounds(self):
+        # One round far off the others doesn't carry it, and each round pairs only its own runs.
+        for name, position in [("baseline", "1"), ("candidate", "2")]:
+            self.run_tool(self.publisher(name), "--round", "1", "--position", position)
+        baseline, candidate = self.rows()
+        rows = [dict(row, round=number, wall_seconds_total=seconds)
+                for number, walls in enumerate([(100, 90), (100, 88), (100, 60)], start=1)
+                for row, seconds in zip([baseline, candidate], walls)]
+        (self.root / "observations.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in rows)
+        )
+        done = self.read_with("summarize", "--pair", "baseline:candidate")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("3 pairs: 10.0%, 12.0%, 40.0%. Median 12.0%, so the 25% target is NOT met.",
+                      done.stdout)
 
     def test_every_kind_of_row_is_read(self):
         self.run_tool(self.publisher("ok"))
