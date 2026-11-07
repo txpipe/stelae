@@ -326,13 +326,13 @@ A batch prepares several boundaries before it publishes any, so one index
 traversal serves them all. Replay may stand past the repository's latest stele
 only while every sequence in between is a complete bundle the journal names.
 `run` and `backfill` take the controls below. `publish` stays a batch of one. The
-chart passes none of them, so a deployment doesn't change until its command does.
+chart passes none of them, so a deployment doesn't batch until its command says to.
 
 | Control | Meaning |
 | --- | --- |
 | `--batch-epochs N` | Boundaries in a batch. 1, the default, captures nothing and publishes before it advances. |
 | `--batch-scratch-mib M` | What a batch may hold on disk: bundles and staged runs. Required above one epoch. |
-| `--batch-reserve-mib M` | Kept free per prepared boundary: what staging and finalizing it take, and what an epoch's replay and download add to this volume. Required above one epoch. |
+| `--batch-reserve-mib M` | Kept free per prepared boundary: what staging it takes, and what an epoch's replay and download add to this volume. Required above one epoch. |
 
 `--batch-epochs` stays 1 unless a command says otherwise, because no window has yet
 shown the reduction batching is for: see below. The two sizes have no defaults, since
@@ -351,8 +351,9 @@ registry with the same bytes on every arm ([report](reports/batched-export-2026-
 | 16 | 2036 s | 448 s | 6.7 GiB |
 | 24 | 2151 s | 618 s | 10.3 GiB |
 
-So 4 is the window to start from, and on a network like preprod it isn't free: it is
-slower than the release before batches, and a batch of one is slower still. A batch
+So 4 is the window to start from, on the strength of one unpaired run, and on a network
+like preprod it isn't free: it is slower than the release before batches, and a batch of
+one is slower still. A batch
 saves index traversals, about 20 s a boundary here, and pays about 9 s a boundary to
 capture. It should gain more where a traversal costs more: on mainnet one took about
 410 s in an index-only measurement. No complete run has measured that, so treat a
@@ -367,8 +368,14 @@ follows the state and not the indexes. On preprod at this height:
 | --- | --- | --- |
 | Bundle | 0.42 GiB | `.stelae-batch/prepared` |
 | Staged runs | 12 MiB a window | `.stelae-batch/staging` |
-| Growth of the stores from replay | 43 MiB an epoch | the stores |
+| Growth of the stores from replay, chain files aside | 95 to 112 MiB an epoch | the stores |
 | Download window, until consumed | 51 MiB an epoch | `--download-dir` |
+
+Two costs don't scale with the window. However long a run, the stores at their highest
+stood about 1 GiB above where they started, net of the chain files replay deleted: 0.86 GiB
+over 4 epochs, 1.06 over 16 and 0.96 to 1.08 over 24. And each publication checks first that
+its volume can stage its largest layers at once, which takes about 0.65 GiB at this height
+and refuses a shortfall.
 
 Layers staged for upload are unlinked files, so they show only as the volume's free
 space falling. On these runs it fell 4 to 5 GiB past the batch's own high-water, with
@@ -376,15 +383,25 @@ everything else on that volume counted in, so read that as an upper bound.
 
 Before replay leaves a boundary, the batch must have room for what it holds, for the
 reserve of every boundary it would then hold, and for one more boundary as large as
-its largest. Both limits are held to that sum, so a window of `W` needs about
+its largest. Both limits are held to that sum. The free-space line adds the two costs
+above, which the batch doesn't hold itself to. So a window of `W` needs about
 
 ```text
 --batch-scratch-mib   >=  W x (bundle + reserve)
-free space on volume  >=  W x (bundle + reserve)
+free space on volume  >=  W x (bundle + reserve) + one publication's check + one-off growth
 ```
 
+For a window of 4 here that's about 2.1 GiB of budget and 3.8 GiB free. That is the floor a
+run should get through, not what it was seen to take: window 4 runs that didn't overlap
+another run saw the volume fall 6.2 to 6.3 GiB, other work on it included. A batch of one
+holds none of the batch's terms, and needs its index spool, the check and the growth. No run
+has tried that floor. One that runs short stops on the room it lacks, which is recoverable:
+see [A volume that fills](#a-volume-that-fills).
+
 `--batch-reserve-mib` should cover a boundary's staged runs, replay growth and download,
-about 105 MiB here. Too small a budget doesn't fail: at `--batch-reserve-mib 512`, a
+about 105 MiB here, and up to about 125 MiB at the fastest growth above, with the download
+on top where it shares the volume until consumed. A budget that holds one boundary doesn't
+fail when it's too small for the window: at `--batch-reserve-mib 512`, a
 `--batch-scratch-mib` of 2048 closed each batch of 4 at two boundaries, and 1024 with a
 reserve of 256 closed each at one, and 4096 with a reserve of 512 held all 4. Each
 smaller batch costs its own traversals, so a budget that keeps closing early is worse
@@ -565,31 +582,56 @@ too: make room or raise the budget and rerun.
 
 ### Upgrade and rollback
 
-**Upgrade.** The last release before batches, on the `1db3e41f` pin, can stop at any
-point and this one takes over its stores: they carry over, and a publication it left
-unfinished is published first. Over real preprod, a run of that release killed in
-mid-publish and continued at `--batch-epochs 6` published the same bytes as one that
-was never interrupted. A release on an older pin still needs what
-[Source and dependency identity](#source-and-dependency-identity) says. Nothing changes for a deployment until its command names a
-batch, because `--batch-epochs` stays 1 by default and the chart passes none of these.
+**Upgrade.** The last release before batches, on the `1db3e41f` pin, can be stopped by a
+signal at any point, or killed during a publication, and this one takes over its stores:
+they carry over, and a publication it left unfinished is published first. Over real
+preprod, a run of that release killed part way through a publication and continued at
+`--batch-epochs 6` published the same bytes as one that was never interrupted. A kill or
+a full volume during replay is different: it can leave
+[stores whose state passed the archive](#stores-whose-state-passed-the-archive), which
+this one refuses until they're replaced. A release on an older pin still needs what
+[Source and dependency identity](#source-and-dependency-identity) says.
+
+Batching stays off until a command names a batch, because `--batch-epochs` stays 1 by
+default and the chart passes none of these. The upgrade itself still costs a deployment
+something, on a batch of one: on preprod a run takes about 49% longer than the last release
+before batches ([Choosing a window](#choosing-a-window); mainnet isn't measured), it spools
+index runs under `--scratch-dir`, tens of gigabytes on a mainnet first publish where the
+older pin spooled nothing, and it gains the refusal above. Size the claim and any deadline
+for that before upgrading.
 
 **Rollback.** The stores can stand ahead of `latest` while a batch is open, and an image
 from before batches can't read the journal that accounts for that. So drain first:
-run the image that prepared the batch until the journal is gone, then roll back. After
-that nothing is different from any other rollback.
+run the image that prepared the batch with `--until-epoch` set to the last prepared
+sequence, which exits there with the journal gone, then roll back. After that nothing is
+different from any other rollback. The exception is rolling back from an image you suspect
+of a bad export: don't drain it, because that seals more steles from it, and clear the
+stores and restore instead, and the batch goes with them
+([the chart's data volume](../k8s/dolos-publisher/README.md#data-volume)).
 
-If a rollback reaches a pending batch anyway, the repository decides what happens:
+If a rollback reaches a pending batch anyway, the repository and the stores decide what
+happens:
 
-- **The repository holds a stele.** The older image refuses, after its retries, saying
-  the node is sequences ahead of the latest stele and a publish would leave a gap. It
-  publishes nothing, and the batch is untouched. Go back to the image that prepared it
-  and the batch finishes, to the same bytes. This ran over real preprod.
-- **The repository is empty.** Nothing refuses. The older image doesn't read
+- **The stores are two or more sequences past the repository's latest stele.** The older
+  image refuses, after its retries, saying the node is sequences ahead of the latest
+  stele and a publish would leave a gap. It publishes nothing, and the batch is untouched.
+  Go back to the image that prepared it and the batch finishes, to the same bytes. This
+  ran over real preprod, at three sequences ahead.
+- **The stores are one sequence past it.** A batch stopped during its last sequence can
+  leave this, when it closed holding that boundary. The older image finds nothing to
+  refuse: it publishes that sequence, with the right bytes, and replays on, leaving
+  `.stelae-batch` on the volume. The image that prepared the batch then refuses those
+  stores, so going back means the recovery above. This comes from reading both releases
+  and hasn't been run.
+- **The repository is empty.** On a boundary nothing refuses. The older image doesn't read
   `.stelae-batch-began.json`, so it starts the history where the stores stand, and
   every sequence the batch held is gone from that lineage for good: a batch stopped at
   its third boundary and continued by the last release published `epoch-3` onward,
-  with no `epoch-1` or `epoch-2`. Don't roll back over a first batch. If it has
-  happened, stop the writer, delete the tags and start over from an empty repository.
+  with no `epoch-1` or `epoch-2`. Past a boundary it fails on every retry instead, asking
+  for a stele of that epoch to restore, and there isn't one. Don't roll back over a first
+  batch. If it has happened, stop the writer, delete the tags, clear the storage path and
+  any store configured outside it (on a claim, delete the claim), then run with
+  `--allow-genesis`. Without the clearing, the same stores publish a wider gap.
 
 Losing the batch directory is a different thing, and so is losing `/data`: see the
 recovery above. On an emptyDir, or a claim you deleted, the batch goes with the stores,
@@ -609,7 +651,8 @@ predecessor.
    about 250 GiB on mainnet.
 2. Delete every tag in the repository, `latest` first, so no earlier pin's
    stele is restored or chained onto.
-3. Start the first run with `--allow-genesis`. Initialization finds no
+3. Clear any stores an earlier attempt left, then start the first run with
+   `--allow-genesis`. Initialization finds no
    `latest`, opts into genesis and replays from block 0, publishing each
    epoch boundary before it replays past it.
 4. Run every later invocation without `--allow-genesis`. Initialization then

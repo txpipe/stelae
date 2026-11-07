@@ -42,6 +42,8 @@ runs. `Stores growth` includes the batch directory, which sits under the storage
 | 20261107T132249-w4 | restored-by-the-old-consumer | w4 | None/None | 0 | 901 | 152 | 86 | 34 | 630 | 543 | 1.42 | 1.66 | 0.00 | 2.83 | 2.84 | 2/2/2 | 6.1 |
 | 20261107T133611-profile-w8 | profile | profile-w8 | None/None | 0 | 1092 | 224 | 126 | 20 | 723 | 627 | 1.28 | 3.30 | 0.00 | 4.42 | 2.84 | 1/1/1 | 17.1 |
 | 20261107T140010-profile-old | profile | profile-old | None/None | 0 | 288 | 65 | 0 | 0 | 222 | 263 | 2.21 | 0.00 | 0.00 | 0.86 | 1.40 | not logged | 6.1 |
+| 20261107T153927-old | faults-276-to-282 | old (layer 3000/4464:) | None/None | 0 | 663 | 175 | 77 | 19 | 393 | 525 | 2.11 | 1.66 | 0.00 | 2.06 | 2.12 | 1/1/1 | 12.9 |
+| 20261107T155034-w6 | faults-276-to-282 | w6 (fail upload every 40) | None/None | 0 | 897 | 171 | 93 | 19 | 613 | 468 | 1.71 | 2.47 | 0.00 | 2.72 | 2.12 | 1/1/1 | 16.2 |
 
 
 ### epochs-276-to-292-registry-off-the-disk

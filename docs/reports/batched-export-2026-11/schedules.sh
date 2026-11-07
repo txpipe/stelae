@@ -1,5 +1,33 @@
 #!/bin/bash
-# The schedules behind this report, as run. Set ROOT and OLD_DOLOS for your own host.
+# The schedules behind this report, in the order they ran, with a later session's
+# faults beside the others. Every row in observations.jsonl comes from a line here, but
+# for the first trial, whose rows in observations-early.jsonl carry their flags. Run in
+# sections: each takes hours.
+#
+# Set ROOT, on the volume being measured, and OLD_DOLOS, a Dolos binary from before
+# batches. Under ROOT:
+#   bin/                        tools/batched-export/
+#   stelae-publisher-candidate  built from the candidate, see provenance.json
+#   stelae-publisher-old        built from the last release before batches
+#   loopback, loopback-discard  the example, built from the candidate
+#   loopback-recount            the same, as of the registry counting refused bodies
+#   corpus/preprod/immutable    preprod's certified immutable files
+#   state-epochs                the retained list in provenance.json, one to a line
+: "${ROOT:?set ROOT}" "${OLD_DOLOS:?set OLD_DOLOS}"
+
+# ---- base ----
+# Replay to epoch 256 and seed a repository with its stele, under base/preprod. As run
+# these were the same two commands by hand: `loopback replay`, then `publish`.
+python3 "$ROOT/bin/measure.py" prepare --root "$ROOT" --corpus "$ROOT/corpus/preprod/immutable" --state-epochs "$ROOT/state-epochs" --loopback "$ROOT/loopback" --publisher "$ROOT/stelae-publisher-candidate" --base-epoch 256
+
+# ---- extend-base ----
+# A candidate batch takes the base to 276. Its stores and repository, less the chain
+# files and the spool, are what every run on base/preprod-276 clones.
+python3 "$ROOT/bin/measure.py" run --root "$ROOT/extend" --corpus "$ROOT/corpus/preprod/immutable" --state-epochs "$ROOT/state-epochs" --loopback "$ROOT/loopback" --workload base-256-to-276 --base "$ROOT/base/preprod" --until 276 --first-file 5041 --last-file 5450 --timeout 7000 --keep --arm "{\"name\":\"w20\",\"binary\":\"$ROOT/stelae-publisher-candidate\",\"flags\":[\"--batch-epochs\",\"20\",\"--batch-scratch-mib\",\"400000\",\"--batch-reserve-mib\",\"1024\"]}"
+EXTENDED="$ROOT/extend/runs/$(ls -t "$ROOT/extend/runs" | head -1)"
+mkdir -p "$ROOT/base/preprod-276/data"
+mv "$EXTENDED/registry" "$ROOT/base/preprod-276/registry"
+for part in archive cache state wal; do mv "$EXTENDED/data/$part" "$ROOT/base/preprod-276/data/"; done
 
 # ---- genesis-parity ----
 # Real preprod from genesis to epoch 24: Byron boundary blocks, every era crossing
@@ -13,9 +41,11 @@ python3 "$M" run "${common[@]}" --arm "{\"name\":\"old\",\"binary\":\"$O\"}"
 python3 "$M" run "${common[@]}" --arm "{\"name\":\"w1\",\"binary\":\"$C\"}"
 python3 "$M" run "${common[@]}" --arm "{\"name\":\"w4\",\"binary\":\"$C\",\"flags\":$(flags 4)}"
 python3 "$M" run "${common[@]}" --keep --arm "{\"name\":\"w16\",\"binary\":\"$C\",\"flags\":$(flags 16)}"
-
-# ---- extend-base ----
-python3 "$ROOT/bin/measure.py" run --root "$ROOT/extend" --corpus "$ROOT/corpus/preprod/immutable" --state-epochs "$ROOT/state-epochs" --loopback "$ROOT/loopback" --workload base-256-to-276 --base "$ROOT/base/preprod" --until 276 --first-file 5041 --last-file 5450 --timeout 7000 --keep --arm '{"name":"w20","binary":"$ROOT/stelae-publisher-candidate","flags":["--batch-epochs","20","--batch-scratch-mib","400000","--batch-reserve-mib","1024"]}'
+# The Dolos binary from before batches restores each of the 24, and the publisher
+# reproduces each from what it restored.
+RUN=$(ls -t "$R/runs" | grep -- '-w16$' | head -1)
+sequences=(); for n in $(seq 1 24); do sequences+=(--sequence "$n"); done
+python3 "$M" restore --root "$R" --run "$RUN" "${sequences[@]}" --consumer "$OLD_DOLOS" --publisher "$C" --loopback "$R/loopback" --state-epochs "$R/state-epochs"
 
 # ---- rounds ----
 # Paired complete-pipeline runs: three rounds of three arms with each arm once in
@@ -65,6 +95,13 @@ run --arm "$W6" --kill-on 'batch frontiers published=Some\(276\) prepared=Some\(
 # The same with nothing published yet: nothing tells the old exporter what it skips.
 python3 "$M" run --root "$R" --corpus "$R/corpus/preprod/immutable" --state-epochs "$R/state-epochs" --loopback "$R/loopback" --workload rollback-over-an-empty-repository --from-genesis --until 6 --first-file 0 --last-file 110 --timeout 1800 --arm "$(window 4)" --kill-on 'batch frontiers published=None prepared=Some\(3\)' --rerun-arm "$OLD"
 
+# ---- faults, second session ----
+# The upgrade again with the old exporter part way through a publication, its publish
+# record on disk, and refused uploads with a registry that counts refused bodies.
+common=(--root "$R" --corpus "$R/corpus/preprod/immutable" --state-epochs "$R/state-epochs" --loopback "$R/loopback-recount" --workload faults-276-to-282 --base base/preprod-276 --until 282 --first-file 5442 --last-file 5570 --timeout 3600)
+python3 "$M" run "${common[@]}" --arm "$OLD" --kill-on 'layer 3000/4464:' --rerun-arm "$W6"
+python3 "$M" run "${common[@]}" --arm "$W6" --fail-every 40
+
 # ---- sensitivity ----
 # The same arms with the registry's large blobs off the volume being measured, to
 # tell the publisher's own time from the two competing for one disk. Then a sampled
@@ -90,6 +127,32 @@ limits() { echo "{\"name\":\"$1\",\"binary\":\"$C\",\"flags\":[\"--batch-epochs\
 common=(--root "$R" --corpus "$R/corpus/preprod/immutable" --state-epochs "$R/state-epochs" --loopback "$R/loopback-discard" --base base/preprod-276 --until 284 --first-file 5442 --last-file 5610 --timeout 3600)
 python3 "$M" run "${common[@]}" --workload limits-as-documented --arm "$(limits w4-documented 4 2048 512)"
 python3 "$M" run "${common[@]}" --workload limits-too-small-for-the-window --arm "$(limits w4-budget-1024 4 1024 256)"
+python3 "$M" run "${common[@]}" --workload limits-that-hold-the-window --arm "$(limits w4-held 4 4096 512)"
+
+# ---- profile ----
+# Where a publication's time goes: 20 s samples of the process, early and late in a
+# batch and in the old exporter. These runs are their own workload, because sampling
+# costs them something. A first attempt at each of the first two watched the log
+# differently and sampled the same way. `profile-summary.py` reads the shares from the
+# samples into profiles.txt.
+R="$ROOT"
+M="$R/bin/measure.py"
+C="$R/stelae-publisher-candidate"; O="$R/stelae-publisher-old"
+P="$R/evidence/profiles"; mkdir -p "$P"
+common=(--root "$R" --corpus "$R/corpus/preprod/immutable" --state-epochs "$R/state-epochs" --loopback "$R/loopback" --workload profile --base base/preprod-276 --first-file 5442 --last-file 5650 --timeout 3600)
+window() { echo "{\"name\":\"profile-w$1\",\"binary\":\"$C\",\"flags\":[\"--batch-epochs\",\"$1\",\"--batch-scratch-mib\",\"400000\",\"--batch-reserve-mib\",\"1024\"]}"; }
+sampled() { # arm-name sequence output, then the arguments of the run
+  local name="$1" sequence="$2" output="$3"; shift 3
+  python3 "$M" run "${common[@]}" "$@" &
+  local running=$! found=""
+  until found=$(ls -td "$R"/runs/*-"$name" 2>/dev/null | head -1) && [ -n "$found" ] && [ -f "$found/publisher.log" ]; do /bin/sleep 1; done
+  "$R/bin/sample-run.sh" "$found" "$sequence" "$P/$output.txt"
+  wait "$running"
+}
+sampled profile-w12 278 w12-early --until 288 --arm "$(window 12)"
+sampled profile-w8 283 w8-late --until 284 --arm "$(window 8)"
+sampled profile-old 279 old --until 280 --arm "{\"name\":\"profile-old\",\"binary\":\"$O\"}"
+python3 "$R/bin/profile-summary.py" "$P/old.txt" "$P/w12-early.txt" "$P/w8-late.txt"
 
 # ---- restore-real ----
 # A batch over real full-history stores, restored at both ends and at a batch's edge
@@ -98,4 +161,9 @@ R="$ROOT"
 M="$R/bin/measure.py"; C="$R/stelae-publisher-candidate"
 python3 "$M" run --root "$R" --corpus "$R/corpus/preprod/immutable" --state-epochs "$R/state-epochs" --loopback "$R/loopback" --base base/preprod-276 --until 284 --first-file 5442 --last-file 5610 --timeout 3600 --keep --workload restored-by-the-old-consumer --arm "{\"name\":\"w4\",\"binary\":\"$C\",\"flags\":[\"--batch-epochs\",\"4\",\"--batch-scratch-mib\",\"400000\",\"--batch-reserve-mib\",\"1024\"]}"
 RUN=$(ls -t "$R/runs" | grep -- '-w4$' | head -1)
+# 280 and 281 were stopped by hand and never rerun, as the report says.
 python3 "$M" restore --root "$R" --run "$RUN" --sequence 277 --sequence 280 --sequence 281 --sequence 284 --consumer "$OLD_DOLOS" --publisher "$C" --loopback "$R/loopback" --state-epochs "$R/state-epochs"
+
+# ---- read them ----
+python3 "$M" compare --root "$R" --separate rollback-over-an-empty-repository
+python3 "$M" summarize --root "$R" --pair old:w16 --pair w1:w16 --pair w1:w4

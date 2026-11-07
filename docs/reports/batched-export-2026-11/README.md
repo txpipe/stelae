@@ -2,8 +2,11 @@
 
 Complete publisher runs over real preprod, from replay through the last publication,
 on one shared host and local disposable transports. The procedure is
-[batched-export-measurement.md](../../batched-export-measurement.md), and every run,
-including failed and faulted ones, is in [observations.jsonl](observations.jsonl).
+[batched-export-measurement.md](../../batched-export-measurement.md). Every run the tool
+got to record, faults included, is in [observations.jsonl](observations.jsonl), and each
+of those ended with its last process exiting 0. Runs stopped by hand left nothing, and
+are listed under [Runs stopped by hand](#runs-stopped-by-hand): the tool has since been
+changed so that they would leave a row.
 
 ## Verdict
 
@@ -31,9 +34,24 @@ including failed and faulted ones, is in [observations.jsonl](observations.jsonl
 | Registry | The loopback registry, on the measured volume except where noted |
 | Host | Apple M4, 10 cores, 16 GiB, external PCIe SSD on APFS, shared with other work: median load 4.6 to 5.2 across the paired runs |
 
-Binary hashes and the retained list are in [provenance.json](provenance.json), and the
-exact schedules in [schedules.sh](schedules.sh). All runs are in
-[tables.md](tables.md).
+Binary hashes and the retained list are in [provenance.json](provenance.json), the
+schedules in [schedules.sh](schedules.sh), and all runs in [tables.md](tables.md).
+
+**What the rows leave out.** The runs were recorded with the names of the host's busiest
+processes. Those names are out of the committed rows and the tool no longer collects them,
+so `busiest_at_start` holds CPU figures only. Load, free memory and volume space at the
+start are in `host_at_start`. The logs, the raw samples and the runs' manifests stayed on
+the host. `provenance.json` is the tool's output less its line naming the host, with the
+commits added by hand. The first 26 rows have no `volume_drop_bytes`, which the tool gained
+after them.
+
+**Cache.** The OS cache was neither controlled nor measured: `inblock` and `oublock` read
+0 on every leg. Clones are separate files, so a run shouldn't find another's pages cached,
+but nothing here shows it. Free memory at the start ran 0.09 to 4.72 GiB across all runs,
+and 2.69 to 4.72 across the paired ones. Within the pairs an arm's later positions ran from
+1% slower to 4% faster than its first (old 1357, 1345, 1340 s; window 1 2004, 2020, 2003 s;
+window 16 2087, 2036, 2003 s). Three rounds can't separate that from load, and it is far
+smaller than the gap between the old exporter and window 1.
 
 ## Paired runs
 
@@ -88,9 +106,12 @@ These are findings for a decision, not fixes: nothing here changes the exporter.
    layer that lands, and a publication here carries about 4,500 of them
    (`stelae-driver/src/publish.rs:670`). In 20 s samples taken in mid-publish, a save was
    under way for 97% of the old exporter's, 93% of a batch's early and 70% of its late,
-   with the file sync 44 to 77% of the time. This predates batches, and it sits on top of
-   everything above: a publication's layers are mostly waiting for it. The samples cover
-   the first part of a publication, so they don't give its whole share.
+   with the file sync 44 to 77% of the time ([profiles.txt](profiles.txt)). This predates
+   batches, and it sits on top of everything above: a publication's layers are mostly
+   waiting for it. The samples cover the first part of a publication, so they don't give
+   its whole share. The early and late samples aren't like for like, window 12 at median
+   load 5.2 and window 8 at 17.1, so the fall from 93% to 70% doesn't read as a change
+   within a batch.
 
 A batch's gain therefore depends on what a traversal costs against everything else, and
 preprod's is small: about 20 s against about 41 s of layers. In one exploratory index-only
@@ -106,7 +127,7 @@ capture. That model is not a measurement.
 | Genesis to 24 | Byron boundary blocks beside main blocks, every era crossing to 24, retained 4, 5, 6, 7 and 12 | old, 1, 4, 16 | 25 | identical |
 | 276 to 300 | Full history, settling account logs, delayed seals, inherited layers, retained 300, a small final batch at 16 | 11 | 46 | identical |
 | 276 to 292, registry off the disk | The same bytes, without a registry on the volume | 4 | 38 | identical |
-| 276 to 282, with faults | Every kill, retry and upgrade below | 9 | 28 | identical |
+| 276 to 282, with faults | Every kill, retry and upgrade below | 11 | 28 | identical |
 
 `compare` also holds each `epoch-N` across all workloads on one lineage. The rollback over
 an empty repository is left out of that, because it's meant to differ.
@@ -131,13 +152,21 @@ total is both processes.
 | Registry refusing every 40th upload | 6 | | | 478 s | none |
 
 Differences this small are within what this host varies by, so read these as "a stop costs
-at most about what it interrupted". Nothing uploaded twice in any of them.
+at most about what it interrupted". No upload completed twice in any of them, but a refused
+one still crossed the wire. The log of the refusing row holds 13 refusals on 12 blobs,
+47,659,965 bytes sent again against 2,274,877,727 uploaded, about 2%. The registry in these
+runs counted only bodies it kept, so `received_bytes` equals `uploaded_bytes` on all of them.
+A later run of the same fault, on a registry that counts refused bodies, received 47,802,989
+bytes more than it kept from 13 refusals, and uploaded the same bytes. That run and the second
+upgrade below shared the host with builds, at load 10 to 17 as they started, so their wall
+times aren't comparable with these.
 
 ## Upgrade and rollback
 
 | Case | Result |
 | --- | --- |
-| Old killed in mid-publish, then window 6 on the same stores | Finishes, identical bytes |
+| Old killed as a publication started, before it uploaded anything, then window 6 on the same stores | Finishes, identical bytes |
+| Old killed part way through a publication, 2,996 layers in its publish record, then window 6 on the same stores | Window 6 carries those 2,996 layers forward, finishes with identical bytes and uploads no blob twice |
 | Window 6 stopped with the stores ahead of `latest`, then old | Old refuses after its retries, 41 s, exit 1, publishes nothing. Window 6 then drains the batch, identical bytes |
 | Window 4 stopped at its third boundary over an empty repository, then old | **Old publishes `epoch-3` onward, and `epoch-1` and `epoch-2` never exist** |
 
@@ -159,6 +188,12 @@ A bundle is about 0.42 GiB and a staged window about 12 MiB, so it is the state 
 the index spool that sizes a batch: 35 to one here. The 6.97 GB spool of the earlier
 index-only benchmark would have understated a batch by a long way.
 
+"Stores' growth" is net of the chain files replay deleted, about 51 MiB an epoch, and doesn't
+scale with a run: the old exporter's stood 0.86 GiB up over 4 epochs, 1.06 over 16 and 0.96
+to 1.08 over 24. The stores themselves grew 94 to 99 MiB an epoch on these runs, and 112 from
+256 to 276, without their chain files. A publication's own check of its staging takes about
+0.65 GiB at this height, read off the `epoch-286` manifest.
+
 | Window, scratch, reserve (MiB) | Batches over 8 epochs | Traversals tag/exact/entity |
 | --- | --: | --- |
 | 4, 4096, 512 | 2 | 2/2/2, as asked |
@@ -179,7 +214,9 @@ anyway, 4 is the window these runs support, and
   far more than a sync does on the deployed storage. That inflates finding 4 by an unknown
   amount, and may bear on finding 3.
 - **A real full volume during publication.** The volume filled during these runs from
-  other work, on another disk. Nothing here exercised it.
+  other work, on another disk. Nothing here exercised it, and neither did anything try the
+  free-space floor in [publisher.md](../../publisher.md#how-much-room-a-batch-takes).
+- **A rollback with the stores one sequence ahead.** Read from both releases, not run.
 - **Windows 4 and 24 have one run each,** the 4, 2048 and 4, 1024 limits runs and the
   registry-off runs have one run each, and the 4, 4096 run shared the host with other runs
   of this work, so its wall time isn't comparable.
@@ -190,9 +227,9 @@ anyway, 4 is the window these runs support, and
 
 The host's system disk filled while the last checks ran. They were stopped to see if they
 were the cause, and they weren't: the space didn't come back, and their data was on the
-other disk. A first profile of the old exporter and the restores of epochs 280 and 281
-recorded nothing. The profile and the restore of epoch 284 ran again, and 280 and 281
-did not. A first attempt at the window 8 profile also sampled another run's process, and
+other disk. Under the tool as it then was, a first profile of the old exporter and the
+restores of epochs 280 and 281 recorded nothing. The profile and the restore of epoch 284 ran
+again, and 280 and 281 did not. A first attempt at the window 8 profile also sampled another run's process, and
 that sample was discarded and taken again.
 
 The first three-arm trial, and the run that took the base from epoch 256 to 276, ran under

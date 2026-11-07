@@ -13,12 +13,16 @@ upload, with the same stores, chain, predecessor and retained list on every arm.
 - `stelae-publisher backfill`, unmodified, on each arm. The old exporter is the same
   command from the last release before batches, built from its tag.
 - A loopback registry and Mithril listing, `stelae-cardano/examples/loopback.rs`. It
-  writes blobs to disk, checks each against its digest and counts what it received.
+  writes blobs to disk, checks each against its digest and counts what it received,
+  refused and interrupted uploads included.
   The listing offers nothing past the files already on disk, so a run fetches nothing.
   No network, no cloud and no production repository is involved.
 - `tools/batched-export/measure.py`, which clones the inputs, starts both processes,
   samples disk use and load once a second, and appends one line to
-  `observations.jsonl` for every run, failed ones included.
+  `observations.jsonl` for every run: one whose publisher failed, one the tool couldn't
+  finish and one it was told to stop, which also stops what it started. SIGKILL of the
+  tool leaves no line, and on a volume too full to take the line it goes to stderr.
+  `test_measure.py` beside it holds it to that, and nothing in CI runs either.
 
 ## Procedure
 
@@ -63,20 +67,32 @@ repository in place for `restore`.
 Then read them:
 
 ```sh
-measure.py compare --root ROOT      # every publication, against the workload's first run
+measure.py compare --root ROOT --separate rollback-over-an-empty-repository
 measure.py summarize --root ROOT --pair old:w16 --pair w1:w16
 measure.py restore --root ROOT --run RUN --sequence N --consumer OLD_DOLOS \
   --publisher PUBLISHER --loopback LOOPBACK --state-epochs EPOCHS
 ```
 
+`compare` holds every publication against its workload's first run, and each `epoch-N`
+across workloads on one lineage. `--separate` names a workload that isn't on that lineage,
+which is why the rollback over an empty repository goes there: it differs on purpose, and
+without the flag `compare` reports it and exits 1.
+
 `restore` has a Dolos binary from before batches restore each named publication, then
 has the publisher digest the restored stores and compares the document byte for byte.
+
+To see where a publication waits, `tools/batched-export/sample-run.sh` samples a run's
+publisher with macOS `sample`, and `profile-summary.py` reads the shares from that. Sampling
+costs a run something, so give those runs their own workload.
 
 ## What the numbers mean
 
 - **Wall time** is the process's, from spawn to exit. Inputs are cloned before the
-  clock starts. Clones share blocks but not page cache, so each run reads its stores
-  cold, whatever ran before. The OS cache isn't otherwise controlled.
+  clock starts.
+- **The OS cache** is neither controlled nor measured. Clones are separate files, so a run
+  shouldn't find another's pages cached, but nothing here shows that: `inblock` and
+  `oublock` read 0 on macOS, on every leg of the report's runs. Free memory at the start is
+  the one figure kept, so read a comparison through arm order and spread.
 - **Replay, capture, stage and publish** are spans between log lines, so they're as
   good as the log's timestamps. On a batch of one, staging falls inside publishing.
   The old exporter logs no traversal and walks its indexes beside its layers, so it
@@ -86,12 +102,15 @@ has the publisher digest the restored stores and compares the document byte for 
 - **High-water marks** are sampled once a second, so a shorter peak can be missed:
   `prepared` and `staged` under the batch directory, `spool` under the scratch
   directory, and growth of everything under the storage path.
-- **Upload bytes** are what the registry received, not what the publisher reports.
+- **Upload bytes** come from the registry, not the publisher. `uploaded_bytes` counts
+  completed uploads. `received_bytes` counts everything that crossed the wire, so the
+  difference is what refused and interrupted uploads cost.
 - **Peak RSS** and **CPU** come from the kernel's accounting for the process. The
   registry isn't counted, and it runs on the same host and volume, so its hashing and
   writes are competing for the same disk. A real registry over a network takes longer,
   and takes the same time on every arm, because every arm uploads the same bytes. That
   dilutes any reduction measured here.
-- **Host noise** is recorded and not removed: load at the start and through each run.
-  A shared host's load makes a small difference unreadable, so compare pairs and read
-  their spread before a median.
+- **Host noise** is recorded and not removed: load, free memory and volume space at the
+  start, the CPU of the five busiest processes, and load through each run. Processes are
+  figures with no names, since rows get committed. A shared host's load makes a small
+  difference unreadable, so compare pairs and read their spread before a median.

@@ -5,7 +5,9 @@
     "stelae-publisher-candidate": "4e3772d674177144dd997baddc27f44fc7d2a815319eafa96fa3ef6ce7f936f5",
     "stelae-publisher-old": "eddb2d01145165fd39bfcc8061a23be23704f281d9a7980e5d0cf150c3487bd4",
     "loopback": "d02f059a14822f0476d409433d82158d0ee25fe0724ea4c1eb44dde47228a7f1",
-    "dolos-4ac2f90a": "6db837b4b1a678107caa4cd72c216b2ed902148bbded85525885135f514cb6c0"
+    "dolos-4ac2f90a": "6db837b4b1a678107caa4cd72c216b2ed902148bbded85525885135f514cb6c0",
+    "loopback-discard": "96d31f2d017bf482894399c727d01a6a8abe28282ff31725c196319acd54075b",
+    "loopback-recount": "a73c8f3ebee247036bf42052e46487851b1a8fd8986014665c668c8e669390f5"
   },
   "state_epochs": [
     "4",
@@ -30,5 +32,6 @@
   "old_tag": "v0.5.2",
   "old_dolos": "1db3e41fd04bca64bf245f50b54ca656719764ca",
   "os": "macOS 26.5.2, arm64",
-  "rust": "1.93"
+  "rust": "1.93",
+  "loopback_recount_commit": "aafdac523dbdc9571ba76541453f4c0a5754a125"
 }
