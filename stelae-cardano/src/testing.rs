@@ -1,6 +1,9 @@
 //! A bounded preview node for tests, here so the publisher's binary tests can
 //! build one without a Dolos edge of their own.
 
+pub mod chain;
+pub mod loopback;
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -80,6 +83,14 @@ impl Node {
 
     pub fn config_path(&self) -> PathBuf {
         self.path().join("dolos.toml")
+    }
+
+    /// Write this configuration where a process reads it from.
+    pub fn write_config(&self) -> PathBuf {
+        let path = self.config_path();
+        let document = toml::Value::try_from(&self.config).unwrap();
+        std::fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+        path
     }
 
     /// Replays the last block of epoch 0 and the first of epoch 1, stopping on

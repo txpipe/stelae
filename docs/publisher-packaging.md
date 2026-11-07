@@ -97,11 +97,12 @@ naming.
    terminate. Helm's resource replacement order does not guarantee a single
    writer.
 2. Delete every tag in the repository, `latest` first. The first run must
-   find it empty.
+   find it empty. With `persistence.enabled: true`, also delete any claim an
+   earlier attempt left, because initialization resumes kept stores.
 3. Install or upgrade with the candidate's image, the network's v2
    `dolosToml` with full history (no `[history]` window), its retained epochs in `stateEpochs`,
-   `allowGenesisFallback: true` and a bumped `run`. The Job replays from
-   genesis and publishes every epoch boundary on the way.
+   `allowGenesisFallback: true` and a bumped `run`. From an emptyDir or a fresh
+   claim, the Job replays from genesis and publishes every epoch boundary on the way.
 4. Set `allowGenesisFallback: false` for every later run. Initialization
    then restores the published `latest`, or resumes the kept stores on a
    persistent claim, and fails closed if it cannot.
