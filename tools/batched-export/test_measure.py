@@ -438,15 +438,23 @@ class Summarize(Harness):
 
     def rounds(self, *walls, failed=()):
         """One baseline and one candidate wall time a round, from round 1 on. In a round
-        named in `failed`, the candidate's run failed."""
+        named in `failed`, the candidate's run failed.
+
+        As in the report's rounds, a third arm runs beside them, and the order turns
+        every other round, so a pair is told by its arms and not by where they ran.
+        """
         for name, position in [("baseline", "1"), ("candidate", "2")]:
             self.run_tool(self.publisher(name), "--round", "1", "--position", position)
         baseline, candidate = self.rows()
         rows = []
         for number, pair in enumerate(walls, start=1):
-            for row, seconds in zip([baseline, candidate], pair):
+            arms = [(baseline, pair[0]), (candidate, pair[1]), (dict(baseline, arm="other"), 1)]
+            if number % 2 == 0:
+                arms.reverse()
+            for position, (row, seconds) in enumerate(arms, start=1):
                 failing = row is candidate and number in failed
-                rows.append(dict(row, round=number, wall_seconds_total=seconds,
+                rows.append(dict(row, round=number, position_in_round=position,
+                                 wall_seconds_total=seconds,
                                  succeeded=row["succeeded"] and not failing))
         (self.root / "observations.jsonl").write_text(
             "".join(json.dumps(row) + "\n" for row in rows)
