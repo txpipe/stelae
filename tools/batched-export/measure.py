@@ -2,9 +2,11 @@
 """Measure complete publisher runs on one host, over disposable local transports.
 
 Every run starts from a copy-on-write clone of the same stores, chain files and
-seeded repository. It ends with one line in observations.jsonl, whatever
-happened: nothing here overwrites or drops a run. See
-docs/batched-export-measurement.md for the procedure.
+seeded repository. It ends with one line in observations.jsonl, whether the
+publisher failed, this tool hit an error or it was told to stop, and nothing here
+overwrites a line. SIGKILL of this tool leaves none, and on a volume too full to
+take the line it goes to stderr instead. See docs/batched-export-measurement.md
+for the procedure.
 
 Standard library only. macOS and Linux.
 """
@@ -31,6 +33,14 @@ SAMPLE_SECONDS = 1.0
 TRAVERSAL = re.compile(r'index staging traversal started.*?traversal="?(\w+)')
 COMMITTED = re.compile(r'committed sequence=(\d+)')
 TIMESTAMP = re.compile(r'^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+)Z')
+
+
+class Stopped(Exception):
+    """This tool was told to stop, so what it started has to stop with it."""
+
+
+def stop_on_signal(number, _frame):
+    raise Stopped(signal.Signals(number).name)
 
 
 def clone(source, destination):
@@ -83,7 +93,11 @@ class Loopback:
         self.process = subprocess.Popen(
             [str(binary), str(root), "0"], stdout=subprocess.PIPE, text=True, env=env
         )
-        self.port = int(self.process.stdout.readline())
+        try:
+            self.port = int(self.process.stdout.readline())
+        except BaseException:
+            self.stop()
+            raise
 
     def repository(self):
         return f"oci://127.0.0.1:{self.port}/{REPOSITORY}"
@@ -135,19 +149,21 @@ class Sampler(threading.Thread):
 
 
 def busiest():
-    """The host's busiest processes: what a noisy measurement shared with."""
+    """The CPU of the host's busiest processes: what a noisy measurement shared.
+
+    Figures only. Observations get committed, and a process's name says what else
+    a host runs.
+    """
     listing = subprocess.run(
-        ["ps", "-Ao", "pcpu=,comm="], capture_output=True, text=True, check=False
-    ).stdout.splitlines()
-    rows = []
-    for line in listing:
-        parts = line.split(None, 1)
-        if len(parts) == 2:
-            try:
-                rows.append((float(parts[0]), os.path.basename(parts[1])))
-            except ValueError:
-                pass
-    return sorted(rows, reverse=True)[:5]
+        ["ps", "-Ao", "pcpu="], capture_output=True, text=True, check=False
+    ).stdout.split()
+    figures = []
+    for figure in listing:
+        try:
+            figures.append(float(figure))
+        except ValueError:
+            pass
+    return sorted(figures, reverse=True)[:5]
 
 
 def host_state(path):
@@ -256,54 +272,74 @@ def publisher_command(arm, config, loopback, args):
     return command + arm.get("flags", [])
 
 
-def run_once(command, log_path, data, kill_on=None, timeout=None):
-    """One process to its end, and what it cost. `kill_on` is (pattern, nth)."""
+def kill(process):
+    """SIGKILL, without the reaping `Popen.kill` may do behind `os.wait4`."""
+    try:
+        os.kill(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def run_once(command, log_path, data, legs, kill_on=None, timeout=None):
+    """One process to its end, and what it cost, added to `legs`.
+
+    `kill_on` is (pattern, nth). However this ends, the process is gone by the
+    time it returns or raises, and a process that started has its leg.
+    """
     sampler = Sampler(data)
     sampler.start()
     began = time.perf_counter()
     env = dict(os.environ, NO_COLOR="1")
-    with open(log_path, "ab") as log:
-        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=log, env=env)
+    process = None
     killed = False
     status = None
     usage = None
-    while status is None:
-        pid, wait_status, usage = os.wait4(process.pid, os.WNOHANG)
-        if pid:
-            status = wait_status
-            break
-        if timeout and time.perf_counter() - began > timeout:
-            process.kill()
-            killed = "timeout"
-        if kill_on and not killed:
-            pattern, nth = kill_on
-            text = Path(log_path).read_text(errors="replace")
-            if len(re.findall(pattern, text)) >= nth:
-                process.kill()
-                killed = "planned"
-        time.sleep(0.05)
-    wall = time.perf_counter() - began
-    process.returncode = os.waitstatus_to_exitcode(status)
-    sampler.halt.set()
-    sampler.join()
-    return {
-        "exit": process.returncode,
-        "killed": killed,
-        "wall_seconds": wall,
-        "user_seconds": usage.ru_utime,
-        "system_seconds": usage.ru_stime,
-        # Bytes on macOS, KiB on Linux.
-        "peak_rss_bytes": usage.ru_maxrss * (1 if sys.platform == "darwin" else 1024),
-        "inblock": usage.ru_inblock,
-        "oublock": usage.ru_oublock,
-        "high_water": sampler.high,
-        "stores_at_start": sampler.stores_at_start,
-        "volume_drop_bytes": sampler.volume_at_start - sampler.volume_low,
-        "batch_high_water": sampler.batch_high,
-        "load_median": statistics.median(sampler.load) if sampler.load else None,
-        "load_max": max(sampler.load) if sampler.load else None,
-        "samples": sampler.samples,
-    }
+    try:
+        with open(log_path, "ab") as log:
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=log, env=env)
+        while status is None:
+            pid, wait_status, wait_usage = os.wait4(process.pid, os.WNOHANG)
+            if pid:
+                status, usage = wait_status, wait_usage
+                break
+            if timeout and not killed and time.perf_counter() - began > timeout:
+                kill(process)
+                killed = "timeout"
+            if kill_on and not killed:
+                pattern, nth = kill_on
+                text = Path(log_path).read_text(errors="replace")
+                if len(re.findall(pattern, text)) >= nth:
+                    kill(process)
+                    killed = "planned"
+            time.sleep(0.05)
+    finally:
+        if process is not None and status is None:
+            kill(process)
+            _, status, usage = os.wait4(process.pid, 0)
+            killed = killed or "tool stopped"
+        wall = time.perf_counter() - began
+        sampler.halt.set()
+        sampler.join()
+        if process is not None:
+            process.returncode = os.waitstatus_to_exitcode(status)
+            legs.append({
+                "exit": process.returncode,
+                "killed": killed,
+                "wall_seconds": wall,
+                "user_seconds": usage.ru_utime,
+                "system_seconds": usage.ru_stime,
+                # Bytes on macOS, KiB on Linux.
+                "peak_rss_bytes": usage.ru_maxrss * (1 if sys.platform == "darwin" else 1024),
+                "inblock": usage.ru_inblock,
+                "oublock": usage.ru_oublock,
+                "high_water": sampler.high,
+                "stores_at_start": sampler.stores_at_start,
+                "volume_drop_bytes": sampler.volume_at_start - sampler.volume_low,
+                "batch_high_water": sampler.batch_high,
+                "load_median": statistics.median(sampler.load) if sampler.load else None,
+                "load_max": max(sampler.load) if sampler.load else None,
+                "samples": sampler.samples,
+            })
 
 
 def immutable_slice(corpus, target, first, last):
@@ -346,15 +382,23 @@ def command_prepare(args):
         loopback.stop()
 
 
-def command_run(args):
-    """One observation, appended whatever its outcome."""
+def record(root, observation):
+    """Append a row, or failing that print it: the row is what a run leaves."""
+    line = json.dumps(observation) + "\n"
+    try:
+        with open(root / "observations.jsonl", "a") as out:
+            out.write(line)
+    except OSError as error:
+        print(f"observation not written, {error}: {line}", file=sys.stderr, flush=True)
+
+
+def measure(args, arm, run_dir, observation):
+    """Fill in `observation` as far as the run gets."""
     root = Path(args.root)
-    arm = json.loads(args.arm)
-    run_id = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{arm['name']}"
-    run_dir = root / "runs" / run_id
     run_dir.mkdir(parents=True)
     base = root / args.base
     data, registry = run_dir / "data", run_dir / "registry"
+    observation["binary_sha256"] = sha256_of(arm["binary"])
     prepared_at = time.perf_counter()
     if args.from_genesis:
         data.mkdir()
@@ -367,67 +411,99 @@ def command_run(args):
     )
     config = run_dir / "dolos.toml"
     write_config(config, args.network, data)
-    clone_seconds = time.perf_counter() - prepared_at
+    observation["clone_seconds"] = time.perf_counter() - prepared_at
 
     environment = {}
     if args.fail_every:
         environment["LOOPBACK_FAIL_UPLOAD_EVERY"] = str(args.fail_every)
     if args.discard_above:
         environment["LOOPBACK_DISCARD_ABOVE"] = str(args.discard_above)
+    observation["busiest_at_start"] = busiest()
+    observation["host_at_start"] = host_state(run_dir)
     loopback = Loopback(args.loopback, registry, environment)
     log = run_dir / "publisher.log"
-    busy = busiest()
-    host = host_state(run_dir)
-    legs = []
+    legs = observation["legs"]
     try:
         command = publisher_command(arm, config, loopback, args)
         kill_on = (args.kill_on, args.kill_nth) if args.kill_on else None
-        legs.append(run_once(command, log, data, kill_on, args.timeout))
+        run_once(command, log, data, legs, kill_on, args.timeout)
         if kill_on and legs[-1]["killed"] == "planned":
             # The same arm again, or the arms named: an upgrade or a rollback.
             for rerun in [json.loads(a) for a in args.rerun_arm] or [arm]:
                 rerun_command = publisher_command(rerun, config, loopback, args)
-                legs.append(run_once(rerun_command, log, data, None, args.timeout))
+                run_once(rerun_command, log, data, legs, None, args.timeout)
                 legs[-1]["arm"] = rerun["name"]
         accounting = loopback.accounting()
     finally:
+        if log.exists():
+            observation["phases"] = phases(log)
         loopback.stop()
-    found = publications(registry)
-    keep_evidence(registry, root / "evidence" / run_id)
-    shutil.copyfile(log, root / "evidence" / run_id / "publisher.log")
+    observation["uploaded_bytes"] = sum(s * c for s, c in accounting["uploads"].values())
+    observation["received_bytes"] = accounting["received"]
+    observation["blobs_uploaded"] = len(accounting["uploads"])
+    observation["blobs_uploaded_more_than_once"] = sum(
+        1 for _, c in accounting["uploads"].values() if c > 1
+    )
+    observation["tag_writes"] = len(accounting["tags"])
+    observation["publications"] = publications(registry)
+    observation["succeeded"] = legs[-1]["exit"] == 0
 
+
+def command_run(args):
+    """One observation, appended whatever its outcome."""
+    root = Path(args.root)
+    arm = json.loads(args.arm)
+    run_id = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{arm['name']}"
+    run_dir = root / "runs" / run_id
     observation = {
         "run": run_id,
         "arm": arm["name"],
         "flags": arm.get("flags", []),
-        "binary_sha256": sha256_of(arm["binary"]),
+        "binary_sha256": None,
         "workload": args.workload,
         "round": args.round,
         "position_in_round": args.position,
         "fault": args.kill_on or (f"fail upload every {args.fail_every}" if args.fail_every else None),
         "until_epoch": args.until,
         "started_utc": run_id.split("-")[0],
-        "clone_seconds": clone_seconds,
-        "busiest_at_start": busy,
-        "host_at_start": host,
-        "legs": legs,
-        "wall_seconds_total": sum(leg["wall_seconds"] for leg in legs),
-        "phases": phases(log),
-        "uploaded_bytes": sum(s * c for s, c in accounting["uploads"].values()),
-        "received_bytes": accounting["received"],
-        "blobs_uploaded": len(accounting["uploads"]),
-        "blobs_uploaded_more_than_once": sum(1 for _, c in accounting["uploads"].values() if c > 1),
-        "tag_writes": len(accounting["tags"]),
-        "publications": found,
-        "succeeded": legs[-1]["exit"] == 0,
+        "clone_seconds": None,
+        "busiest_at_start": [],
+        "host_at_start": {},
+        "legs": [],
+        "wall_seconds_total": 0,
+        "phases": None,
+        "uploaded_bytes": None,
+        "received_bytes": None,
+        "blobs_uploaded": None,
+        "blobs_uploaded_more_than_once": None,
+        "tag_writes": None,
+        "publications": {},
+        "succeeded": False,
     }
-    with open(root / "observations.jsonl", "a") as out:
-        out.write(json.dumps(observation) + "\n")
+    failure = None
+    try:
+        measure(args, arm, run_dir, observation)
+    except (Exception, KeyboardInterrupt) as error:
+        failure = error
+        observation["error"] = f"{type(error).__name__}: {error}"
+    observation["wall_seconds_total"] = sum(leg["wall_seconds"] for leg in observation["legs"])
+    # Before anything that needs room: this is the run a full volume stopped.
+    record(root, observation)
     print(json.dumps({key: observation[key] for key in
                       ["run", "arm", "workload", "round", "succeeded", "wall_seconds_total",
                        "uploaded_bytes"]}), flush=True)
+    try:
+        keep_evidence(run_dir / "registry", root / "evidence" / run_id)
+        if (run_dir / "publisher.log").exists():
+            shutil.copyfile(run_dir / "publisher.log", root / "evidence" / run_id / "publisher.log")
+    except OSError as error:
+        failure = failure or error
+    if failure:
+        print(f"{run_id}: {failure}. Its files stay in {run_dir}", file=sys.stderr, flush=True)
+        return 1
     if not args.keep:
         shutil.rmtree(run_dir)
+    return 0
 
 
 def read_observations(root):
@@ -491,54 +567,68 @@ def command_restore(args):
         manifest = json.loads((tags / f"epoch-{sequence}").read_bytes())
         return blobs / manifest["config"]["digest"].split(":")[1]
 
+    def restore_one(sequence, line):
+        out = work / str(sequence)
+        shutil.rmtree(out, ignore_errors=True)
+        out.mkdir(parents=True)
+        config = out / "dolos.toml"
+        write_config(config, args.network, out / "data")
+        log = out / "log"
+        began = time.perf_counter()
+        with open(log, "wb") as sink:
+            restored = subprocess.run(
+                [args.consumer, "-c", str(config), "bootstrap", "stelae",
+                 "--source", loopback.repository(), "--point", f"epoch-{sequence}",
+                 "--insecure", "--skip-space-check"],
+                stdout=sink, stderr=sink, check=False,
+            )
+        line["restore_exit"] = restored.returncode
+        line["restore_seconds"] = time.perf_counter() - began
+        digest = out / "digest.json"
+        command = [args.publisher, "--config", str(config), "digest",
+                   "--state-epochs-file", str(args.state_epochs), "--output", str(digest)]
+        if (tags / f"epoch-{sequence - 1}").exists():
+            command += ["--chain-from", str(inscription_of(sequence - 1))]
+        began = time.perf_counter()
+        with open(log, "ab") as sink:
+            digested = subprocess.run(
+                command, stdout=sink, stderr=sink, check=False,
+                env=dict(os.environ, NO_COLOR="1"),
+            )
+        line["digest_exit"] = digested.returncode
+        line["digest_seconds"] = time.perf_counter() - began
+        line["reproduced"] = (
+            restored.returncode == 0 and digested.returncode == 0
+            and digest.read_bytes() == inscription_of(sequence).read_bytes()
+        )
+        return out
+
     failures = 0
     try:
         for sequence in args.sequence:
-            out = work / str(sequence)
-            shutil.rmtree(out, ignore_errors=True)
-            out.mkdir(parents=True)
-            config = out / "dolos.toml"
-            write_config(config, args.network, out / "data")
-            log = out / "log"
-            began = time.perf_counter()
-            with open(log, "wb") as sink:
-                restored = subprocess.run(
-                    [args.consumer, "-c", str(config), "bootstrap", "stelae",
-                     "--source", loopback.repository(), "--point", f"epoch-{sequence}",
-                     "--insecure", "--skip-space-check"],
-                    stdout=sink, stderr=sink, check=False,
-                )
-            restore_seconds = time.perf_counter() - began
-            digest = out / "digest.json"
-            command = [args.publisher, "--config", str(config), "digest",
-                       "--state-epochs-file", str(args.state_epochs), "--output", str(digest)]
-            if (tags / f"epoch-{sequence - 1}").exists():
-                command += ["--chain-from", str(inscription_of(sequence - 1))]
-            began = time.perf_counter()
-            with open(log, "ab") as sink:
-                digested = subprocess.run(
-                    command, stdout=sink, stderr=sink, check=False,
-                    env=dict(os.environ, NO_COLOR="1"),
-                )
-            digest_seconds = time.perf_counter() - began
-            same = (
-                restored.returncode == 0 and digested.returncode == 0
-                and digest.read_bytes() == inscription_of(sequence).read_bytes()
-            )
-            failures += not same
             line = {
-                "run": args.run, "sequence": sequence, "restore_exit": restored.returncode,
-                "digest_exit": digested.returncode, "reproduced": same,
-                "restore_seconds": restore_seconds, "digest_seconds": digest_seconds,
+                "run": args.run, "sequence": sequence, "restore_exit": None, "digest_exit": None,
+                "reproduced": False, "restore_seconds": None, "digest_seconds": None,
             }
-            with open(root / "restores.jsonl", "a") as sink:
-                sink.write(json.dumps(line) + "\n")
-            print(json.dumps(line), flush=True)
-            shutil.copyfile(log, root / "evidence" / args.run / f"restore-{sequence}.log")
+            try:
+                out = restore_one(sequence, line)
+            except (Exception, KeyboardInterrupt) as error:
+                line["error"] = f"{type(error).__name__}: {error}"
+                raise
+            finally:
+                failures += not line["reproduced"]
+                with open(root / "restores.jsonl", "a") as sink:
+                    sink.write(json.dumps(line) + "\n")
+                print(json.dumps(line), flush=True)
+            shutil.copyfile(out / "log", root / "evidence" / args.run / f"restore-{sequence}.log")
             shutil.rmtree(out)
     finally:
         loopback.stop()
     return 1 if failures else 0
+
+
+NO_PHASES = {"traversals": {}, "capture_seconds": 0, "stage_seconds": 0, "publish_seconds": 0,
+             "log_seconds": None, "committed": []}
 
 
 def fmt_gib(value):
@@ -553,15 +643,21 @@ def command_summarize(args):
           "Stores growth GiB | Uploaded GiB | Traversals tag/exact/entity | Load median |")
     print("|---|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|--:|")
     for o in observations:
+        label = o["arm"] + (f" ({o['fault']})" if o["fault"] else "")
+        if o.get("error"):
+            label += f" (error: {o['error']})"
+        if not o["legs"]:
+            print(f"| {o['run']} | {o['workload']} | {label} | "
+                  f"{o['round']}/{o['position_in_round']} | none |" + " |" * 13)
+            continue
         leg = o["legs"][-1]
-        t = o["phases"]
+        t = o["phases"] or NO_PHASES
         counts = t["traversals"]
         cpu = sum(l["user_seconds"] + l["system_seconds"] for l in o["legs"])
         rss = max(l["peak_rss_bytes"] for l in o["legs"])
         batch = max(l["batch_high_water"] for l in o["legs"])
         spool = max(l["high_water"]["spool"] for l in o["legs"])
         growth = max(l["high_water"]["stores"] - o["legs"][0]["stores_at_start"] for l in o["legs"])
-        label = o["arm"] + (f" ({o['fault']})" if o["fault"] else "")
         stage_inside = t["stage_seconds"] if o["arm"] == "w1" else 0
         log = t["log_seconds"] or 0
         replay = log - t["capture_seconds"] - t["publish_seconds"]
@@ -573,7 +669,7 @@ def command_summarize(args):
               f"{leg['exit']} | {o['wall_seconds_total']:.0f} | {replay:.0f} | "
               f"{t['capture_seconds']:.0f} | {t['stage_seconds']:.0f} | {t['publish_seconds']:.0f} | "
               f"{cpu:.0f} | {fmt_gib(rss)} | {fmt_gib(batch)} | {fmt_gib(spool)} | "
-              f"{fmt_gib(growth)} | {fmt_gib(o['uploaded_bytes'])} | {traversed} | {load} |")
+              f"{fmt_gib(growth)} | {fmt_gib(o['uploaded_bytes'] or 0)} | {traversed} | {load} |")
     print()
     for workload in sorted({o["workload"] for o in observations}):
         runs = [o for o in observations if o["workload"] == workload and o["succeeded"]
@@ -697,6 +793,8 @@ def main():
     sub.add_argument("--binary", action="append", default=[])
     sub.set_defaults(handler=command_provenance)
 
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(number, stop_on_signal)
     args = parser.parse_args()
     sys.exit(args.handler(args) or 0)
 
