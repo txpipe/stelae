@@ -8,6 +8,7 @@ use dolos_snapshot::{
     facade::SnapshotSource,
     node,
     planning::PlanReport,
+    prepare::Finalizing,
     registry::{
         self, Auth, Point, Preview, Published, Publishing, Repository, SnapshotRepository, Tuning,
     },
@@ -18,7 +19,7 @@ use stelae_driver::Standing;
 
 use crate::{
     backfill,
-    batch::{self, Committed},
+    batch::{self, Committed, Held},
 };
 
 /// Resolved repository publication settings.
@@ -141,6 +142,21 @@ impl Publisher {
         }))
     }
 
+    /// The stele under `sequence`'s immutable tag, if the repository holds one.
+    pub fn stele(&self, sequence: u64) -> Result<Option<Held>, dolos_snapshot::Error> {
+        match self.repository.inspect(Point::Epoch(sequence)) {
+            Ok(held) => Ok(Some(Held {
+                committed: Committed {
+                    sequence: held.inscription.sequence,
+                    identity: held.identity.to_string(),
+                },
+                inscription: held.inscription,
+            })),
+            Err(dolos_snapshot::Error::Stelae(error)) if error.is_absent() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn preflight(&self) -> Result<(), dolos_snapshot::Error> {
         self.repository.preflight()
     }
@@ -160,6 +176,22 @@ impl Publisher {
         observer: &Observer,
     ) -> Result<Published, dolos_snapshot::Error> {
         source.publish_repository(self.publishing(), plan, observer)
+    }
+
+    /// Publish a prepared boundary, chained to the repository's latest stele,
+    /// which has to be `predecessor`.
+    pub fn finalize(
+        &self,
+        finalizing: &Finalizing<'_>,
+        predecessor: Option<&Committed>,
+        source: &dyn SnapshotSource,
+        observer: &Observer,
+    ) -> Result<Published, dolos_snapshot::Error> {
+        let predecessor = predecessor
+            .map(|held| Ok::<_, stelae::Error>((held.sequence, held.identity.parse()?)))
+            .transpose()?;
+        let publishing = self.publishing().following(predecessor);
+        source.finalize_repository(publishing, finalizing, observer)
     }
 
     fn publishing(&self) -> Publishing<'_> {
@@ -192,6 +224,37 @@ impl backfill::Publish for BackfillPublisher<'_> {
         Publisher::open(self.config, &self.settings)
             .and_then(|publisher| publisher.latest(plan))
             .map_err(backfill::Error::caller)
+    }
+
+    fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+        Publisher::open(self.config, &self.settings)
+            .and_then(|publisher| publisher.stele(sequence))
+            .map_err(backfill::Error::caller)
+    }
+
+    fn finalize(
+        &self,
+        finalizing: &Finalizing<'_>,
+        predecessor: Option<&Committed>,
+        source: &dyn SnapshotSource,
+    ) -> Result<Committed, backfill::Error> {
+        let published = Publisher::open(self.config, &self.settings)
+            .and_then(|publisher| {
+                publisher.preflight()?;
+                publisher.finalize(finalizing, predecessor, source, self.observer)
+            })
+            .map_err(|error| backfill::Error::Finalizing(Box::new(error)))?;
+        tracing::info!(
+            sequence = published.inscription.sequence,
+            identity = %published.identity,
+            built = published.layers_built,
+            reused = published.layers_reused,
+            "published prepared boundary"
+        );
+        Ok(Committed {
+            sequence: published.inscription.sequence,
+            identity: published.identity.to_string(),
+        })
     }
 
     fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {

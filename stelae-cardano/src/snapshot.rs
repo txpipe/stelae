@@ -169,6 +169,7 @@ fn refused_stele(error: &stelae::Error) -> bool {
         E::Io(_)
         | E::CborEncode(_)
         | E::HistoryBreak { .. }
+        | E::PredecessorMoved { .. }
         | E::BlobMissing { .. }
         | E::LayerNotWritten(_)
         | E::InvalidRepository { .. }

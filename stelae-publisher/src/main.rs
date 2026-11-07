@@ -250,8 +250,8 @@ struct BackfillArgs {
     until_epoch: Option<u64>,
     #[arg(long, action)]
     skip_validation: bool,
-    /// Boundaries prepared before they are published in order. Above 1 is
-    /// refused until ordered publication and recovery are integrated.
+    /// Boundaries prepared before they are published in order. Above 1 a
+    /// sequence appears in the repository only when its batch closes.
     #[arg(long, default_value = "1", value_name = "EPOCHS")]
     batch_epochs: NonZeroU64,
     /// MiB a batch may hold on disk; required above one epoch.
@@ -266,22 +266,18 @@ impl BackfillArgs {
     fn limits(&self) -> miette::Result<Limits> {
         const MIB: u64 = 1024 * 1024;
 
-        let limits = match (self.batch_scratch_mib, self.batch_reserve_mib) {
-            (None, None) if self.batch_epochs.get() == 1 => Limits::ONE,
-            (Some(scratch), Some(reserve)) if self.batch_epochs.get() > 1 => Limits {
+        match (self.batch_scratch_mib, self.batch_reserve_mib) {
+            (None, None) if self.batch_epochs.get() == 1 => Ok(Limits::ONE),
+            (Some(scratch), Some(reserve)) if self.batch_epochs.get() > 1 => Ok(Limits {
                 max_epochs: self.batch_epochs,
                 scratch: scratch.saturating_mul(MIB),
                 reserve_per_epoch: reserve.saturating_mul(MIB),
-            },
-            _ => {
-                return Err(miette::miette!(
-                    "--batch-scratch-mib and --batch-reserve-mib go together, with a \
-                     --batch-epochs above 1"
-                ))
-            }
-        };
-        backfill::gate(&limits).into_diagnostic()?;
-        Ok(limits)
+            }),
+            _ => Err(miette::miette!(
+                "--batch-scratch-mib and --batch-reserve-mib go together, with a --batch-epochs \
+                 above 1"
+            )),
+        }
     }
 
     /// Every backfill input, resolved before a store opens.
@@ -1079,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn a_larger_batch_needs_its_budget_and_is_gated() {
+    fn a_larger_batch_needs_its_budget_and_reads_it_in_mib() {
         for flags in [
             ["--batch-epochs", "4"].as_slice(),
             ["--batch-epochs", "4", "--batch-scratch-mib", "10"].as_slice(),
@@ -1087,7 +1083,7 @@ mod tests {
             let error = limits(flags).unwrap_err().to_string();
             assert!(error.contains("go together"), "{flags:?}: {error}");
         }
-        let error = limits(&[
+        let read = limits(&[
             "--batch-epochs",
             "4",
             "--batch-scratch-mib",
@@ -1095,9 +1091,10 @@ mod tests {
             "--batch-reserve-mib",
             "1",
         ])
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("not active yet"), "{error}");
+        .unwrap();
+        assert_eq!(read.max_epochs.get(), 4);
+        assert_eq!(read.scratch, 10 * 1024 * 1024);
+        assert_eq!(read.reserve_per_epoch, 1024 * 1024);
     }
 
     #[test]
@@ -1158,6 +1155,37 @@ mod tests {
         };
         let options = args.options(&config, &|| Ok(Auth::Anonymous)).unwrap();
         assert_eq!(options.retained.as_slice(), &[1, 200]);
+    }
+
+    /// Dropped on the way to the driver, these would silently publish one
+    /// boundary at a time.
+    #[test]
+    fn backfill_options_carry_the_batch_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config::load(Some(Path::new(&node(dir.path())))).unwrap();
+        let epochs = dir.path().join("state-epochs");
+        std::fs::write(&epochs, "1\n").unwrap();
+
+        let cli = parse(&[
+            "backfill",
+            "--repo",
+            "oci://registry.invalid/cardano/preview",
+            "--state-epochs-file",
+            epochs.to_str().unwrap(),
+            "--batch-epochs",
+            "4",
+            "--batch-scratch-mib",
+            "10",
+            "--batch-reserve-mib",
+            "1",
+        ])
+        .unwrap();
+        let Command::Backfill(args) = cli.command else {
+            panic!("parsed another command");
+        };
+        let options = args.options(&config, &|| Ok(Auth::Anonymous)).unwrap();
+        assert_eq!(options.limits, args.limits().unwrap());
+        assert_eq!(options.limits.max_epochs.get(), 4);
     }
 
     #[test]

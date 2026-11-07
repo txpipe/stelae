@@ -210,6 +210,20 @@ pub enum Error {
     #[error("history invariant violated: {0}")]
     HistoryInvariant(String),
 
+    /// A publish held to one predecessor, reading another under the moving tag.
+    ///
+    /// Raised before anything is uploaded, so nothing attests a stele the
+    /// caller never checked and nothing starts the history over.
+    #[cfg(feature = "oci")]
+    #[error(
+        "this publish follows {expected:?}, and the repository's latest stele is {found:?}: \
+         another writer moved it"
+    )]
+    PredecessorMoved {
+        expected: Option<(u64, String)>,
+        found: Option<(u64, String)>,
+    },
+
     /// A publish that would not extend the repository's chain.
     ///
     /// Both sequences are in the message because the fix depends on which of

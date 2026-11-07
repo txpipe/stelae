@@ -141,6 +141,11 @@ pub struct Publishing<'a> {
     /// The operator's `--rebuild`: build every layer, inherit none, and start
     /// the record over.
     pub rebuild: bool,
+
+    /// What the caller already holds this publish to follow: a stele, or inside
+    /// it `None` for an empty repository. Outer `None` follows whatever is
+    /// there.
+    pub follows: Option<Option<(u64, Digest)>>,
 }
 
 impl<'a> Publishing<'a> {
@@ -150,6 +155,16 @@ impl<'a> Publishing<'a> {
             registry,
             record_path: None,
             rebuild: false,
+            follows: None,
+        }
+    }
+
+    /// The same publish, refused before anything is uploaded unless the
+    /// repository's latest stele is `predecessor`.
+    pub fn following(self, predecessor: Option<(u64, Digest)>) -> Self {
+        Self {
+            follows: Some(predecessor),
+            ..self
         }
     }
 
@@ -496,9 +511,28 @@ impl<'a> Chained<'a> {
             registry,
             record_path,
             rebuild,
+            follows,
         } = publishing;
 
         let inscription = latest.map(|stele| stele.read_inscription()).transpose()?;
+
+        let predecessor = inscription
+            .as_ref()
+            .map(|previous| Ok::<_, Error>((previous.sequence, previous.digest()?)))
+            .transpose()?;
+
+        // Ahead of every other check on this read, so a moved tag is told as
+        // that and not as whatever the other writer's stele fails.
+        if let Some(expected) = follows.filter(|expected| *expected != predecessor) {
+            let named = |stele: Option<(u64, Digest)>| {
+                stele.map(|(sequence, identity)| (sequence, identity.to_string()))
+            };
+            return Err(stelae::Error::PredecessorMoved {
+                expected: named(expected),
+                found: named(predecessor),
+            }
+            .into());
+        }
 
         if let Some(previous) = &inscription {
             // The pull that fetched this checked as a reader; this is the
@@ -508,11 +542,6 @@ impl<'a> Chained<'a> {
         }
 
         let history = stelae::inscription::history_for(inscription.as_ref(), sequence)?;
-
-        let predecessor = inscription
-            .as_ref()
-            .map(|previous| Ok::<_, Error>((previous.sequence, previous.digest()?)))
-            .transpose()?;
 
         // Built only when it can be used. `rebuild` is the publisher choosing
         // to reproduce rather than inherit, and it stops here rather than at

@@ -187,6 +187,19 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
         fn latest(&self, _: &Plan) -> Result<Option<batch::Committed>, backfill::Error> {
             unreachable!("a batch of one never asks")
         }
+
+        fn stele(&self, _: u64) -> Result<Option<batch::Held>, backfill::Error> {
+            unreachable!("a batch of one never asks")
+        }
+
+        fn finalize(
+            &self,
+            _: &dolos_snapshot::prepare::Finalizing<'_>,
+            _: Option<&batch::Committed>,
+            _: &dyn SnapshotSource,
+        ) -> Result<batch::Committed, backfill::Error> {
+            unreachable!("a batch of one prepares nothing")
+        }
     }
 
     let node = Node::new();
@@ -463,15 +476,10 @@ fn a_backfill_spools_under_the_scratch_directory_it_is_given() {
     assert!(!default.exists(), "{error}");
 }
 
-/// A prepared batch has nowhere to go until ordered publication arrives, so no
-/// host entry point starts one.
-#[test]
-fn a_batch_above_one_is_gated_before_anything_opens() {
-    let node = Node::new();
-    let genesis = dolos_cardano::include::preview::load();
-    let mut config = node.config.clone();
-    config.storage.path = node.path().join("gated");
-    let options = backfill::Options {
+/// A larger batch through the host entry point, with a source nothing answers
+/// at.
+fn batched_options() -> backfill::Options {
+    backfill::Options {
         direct_s3: None,
         repository: "oci://registry.invalid/cardano/preview".parse().unwrap(),
         auth: Auth::Anonymous,
@@ -493,16 +501,57 @@ fn a_batch_above_one_is_gated_before_anything_opens() {
             scratch: u64::MAX,
             reserve_per_epoch: 0,
         },
-    };
+    }
+}
+
+/// The host entry point starts a larger batch: this one stops only at the
+/// cancellation it was handed, past where its stores opened.
+#[test]
+fn a_batch_above_one_runs_through_the_host() {
+    let node = Node::new();
+    let genesis = dolos_cardano::include::preview::load();
+    let mut config = node.config.clone();
+    config.storage.path = node.path().join("batched");
+    let options = batched_options();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    let error =
+        backfill::run(&config, &genesis, &options, cancel, &Observer::silent()).unwrap_err();
+    assert!(matches!(error, backfill::Error::Interrupted), "{error}");
+    assert!(config.storage.path.exists());
+    // A batch opens before the first check of the cancellation, and a batch of
+    // one never opens.
+    assert!(batch::dir_in(&config.storage.path).exists());
+}
+
+/// A real listing that fails stays the source failure a larger batch closes on,
+/// so an outage can't hold back what it prepared. Takes the retries' whole
+/// backoff.
+#[test]
+fn an_aggregator_that_doesnt_answer_fails_a_batched_run_as_the_source() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let node = Node::new();
+    let genesis = dolos_cardano::include::preview::load();
+    let mut config = node.config.clone();
+    config.storage.path = node.path().join("batched");
 
     let error = backfill::run(
         &config,
         &genesis,
-        &options,
+        &batched_options(),
         tokio_util::sync::CancellationToken::new(),
         &Observer::silent(),
     )
     .unwrap_err();
-    assert!(matches!(error, backfill::Error::BatchingGated), "{error}");
-    assert!(!config.storage.path.exists());
+    assert!(
+        matches!(
+            error,
+            backfill::Error::Mithril {
+                what: "listing mithril snapshots",
+                ..
+            }
+        ),
+        "{error}"
+    );
 }

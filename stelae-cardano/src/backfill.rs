@@ -3,9 +3,10 @@
 //! A batch of one publishes the committed boundary before it advances and
 //! prunes only after that publish succeeds. A larger batch prepares each
 //! boundary durably instead and replays on until [`crate::batch`] closes it, so
-//! the cursor may pass the published sequence only over journaled work. Both
-//! download bounded Mithril windows and close the replay engine on every
-//! result.
+//! the cursor may pass the published sequence only over journaled work. Then it
+//! stages once and publishes every prepared sequence in order before replay
+//! moves again. Both download bounded Mithril windows and close the replay
+//! engine on every result.
 //!
 //! Ordering at a prepared boundary: capture while the importing session still
 //! holds the block's index delta, finish that session so the stores are
@@ -13,8 +14,15 @@
 //! or start replaying. Nothing pending reads an immutable file: bundles and the
 //! archive hold it all, and a replay after a lost bundle downloads them again,
 //! once a window left from the lost replay is out of the way.
+//!
+//! Ordering at a commit: read what the repository really holds, hold it to the
+//! journal, publish, and journal the stele before its bundle goes. A stele the
+//! repository already holds at the next sequence is an upload whose
+//! acknowledgement was lost, or another writer's, and only its identity tells
+//! them apart: it is reproduced and compared, and a difference refuses.
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -27,21 +35,27 @@ use dolos_core::{
 use dolos_mithril as mithril;
 use dolos_mithril::{mithril_client::feedback::FeedbackReceiver, MithrilSource};
 use dolos_snapshot::{
-    export::Plan,
+    export::{history_for, Plan, Predecessor, Settling},
     node,
-    prepare::{self, Bundle, IndexTail},
+    prepare::{self, Bundle, Finalizing, IndexTail},
     registry::Auth,
     source::SnapshotSource,
-    RetainedEpochs,
+    staging::Staged,
+    DolosProfile, RetainedEpochs,
 };
 use itertools::Itertools as _;
-use stelae::progress::Observer;
-use stelae_driver::Standing;
+use stelae::{
+    inscription::{HistoryEntry, Inscription, LayerDescriptor},
+    progress::Observer,
+};
+use stelae_driver::{publish::inheritable_layers, First, Standing};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::{
-    batch::{self, Admission, Batch, Committed, Flush, Frontiers, Limits, Position, START_OVER},
+    batch::{
+        self, Admission, Batch, Committed, Flush, Frontiers, Held, Limits, Position, START_OVER,
+    },
     publisher::{BackfillPublisher, PolicyError, RepositoryPublish},
 };
 
@@ -63,6 +77,17 @@ pub enum Error {
     ReplayAndShutdown {
         replay: Box<Error>,
         shutdown: Box<Error>,
+    },
+    /// A source failure stopped the replay and publishing what the batch
+    /// prepared failed too. A download that filled the volume does both, and
+    /// each needs its own fix.
+    #[error(
+        "reading the source failed ({failure}), and publishing what the batch prepared then \
+         failed ({flush}). Deal with both before the rerun"
+    )]
+    SourceAndFlush {
+        failure: Box<Error>,
+        flush: Box<Error>,
     },
     #[error("iterating the local immutable db: {0}")]
     ImmutableDb(String),
@@ -137,11 +162,13 @@ pub enum Error {
         cursor: BlockSlot,
         tip: Option<BlockSlot>,
     },
+    #[error("publishing a prepared boundary: {0}")]
+    Finalizing(#[source] Box<dolos_snapshot::Error>),
     #[error(
-        "--batch-epochs above 1 is not active yet: publishing a prepared batch arrives with \
-         ordered publication and recovery"
+        "publishing the batch ran out of room: {0}. All it holds stands: make room, or raise \
+         --batch-scratch-mib where that budget is what ran out, and rerun"
     )]
-    BatchingGated,
+    FlushNoRoom(#[source] Box<dolos_snapshot::Error>),
 }
 
 fn archive_end(tip: &Option<BlockSlot>) -> String {
@@ -172,6 +199,17 @@ impl Error {
 
     fn fills_stores(&self) -> bool {
         matches!(self, Self::ReplayFilledVolume(_) | Self::StorePoisoned(_))
+    }
+
+    /// What publishing a sequence can't get past by trying again.
+    fn is_refusal(&self) -> bool {
+        matches!(self, Self::Batch(_) | Self::FlushNoRoom(_))
+    }
+
+    /// The source stopped answering past its retries, or a fetch brought
+    /// nothing new. A rerun may find it back.
+    fn is_source_failure(&self) -> bool {
+        matches!(self, Self::Mithril { .. } | Self::StalledWindow { .. })
     }
 }
 
@@ -294,6 +332,68 @@ pub trait Publish {
     fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), Error>;
     /// The repository's latest stele as `plan` finds it: what a batch follows.
     fn latest(&self, plan: &Plan) -> Result<Option<Committed>, Error>;
+    /// The stele the repository holds under `sequence`'s immutable tag.
+    fn stele(&self, sequence: u64) -> Result<Option<Held>, Error>;
+    /// Publish a prepared boundary, chained to the repository's latest stele,
+    /// which has to be `predecessor`. Failures of the publication itself are
+    /// [`Error::Finalizing`], which is what tells a damaged bundle from a
+    /// registry that didn't answer.
+    fn finalize(
+        &self,
+        finalizing: &Finalizing<'_>,
+        predecessor: Option<&Committed>,
+        source: &dyn SnapshotSource,
+    ) -> Result<Committed, Error>;
+}
+
+/// What a stele is chained to and carries forward, read from its predecessor's
+/// document by the rules a chained publish applies. It arranges no transport,
+/// so it serves a forecast and a reproduction, never a real upload.
+struct Carrying {
+    history: Vec<HistoryEntry>,
+    inheritable: BTreeMap<(String, String), LayerDescriptor>,
+}
+
+impl Predecessor for Carrying {
+    fn history(&self) -> &[HistoryEntry] {
+        &self.history
+    }
+
+    fn adopt(
+        &self,
+        kind: &str,
+        scope: &serde_json::Value,
+    ) -> Result<Option<LayerDescriptor>, stelae_driver::Error> {
+        let key = stelae_driver::scope_key(kind, scope)?;
+        Ok(self.inheritable.get(&key).cloned())
+    }
+
+    fn carried_forward(
+        &self,
+        kind: &str,
+        scope: &serde_json::Value,
+    ) -> Result<bool, stelae_driver::Error> {
+        let key = stelae_driver::scope_key(kind, scope)?;
+        Ok(self.inheritable.contains_key(&key))
+    }
+}
+
+/// What a publication at `sequence` following `previous` would inherit, without
+/// a transport to inherit it through.
+pub fn following(
+    previous: Option<&Inscription>,
+    sequence: u64,
+) -> Result<Box<dyn Predecessor>, Error> {
+    let Some(previous) = previous else {
+        return Ok(Box::new(First));
+    };
+    let planning = |error: dolos_snapshot::Error| Error::Planning(error);
+    let carrying = Carrying {
+        history: history_for(Some(previous), sequence).map_err(|e| planning(e.into()))?,
+        inheritable: inheritable_layers(previous, &DolosProfile).map_err(|e| planning(e.into()))?,
+    };
+    let settling = Settling::new(carrying, Some(previous)).map_err(planning)?;
+    Ok(Box::new(settling))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,8 +402,9 @@ pub enum Outcome {
         sequence: u64,
     },
     UpToDate,
-    /// Every boundary of a closed batch is prepared and journaled, and nothing
-    /// of it is published.
+    /// Every boundary of a closed batch is prepared and journaled, and what
+    /// isn't published yet is what [`Driver::prepare`] leaves to the flush.
+    /// [`Driver::run`] publishes it and never returns this.
     BatchReady {
         flush: Flush,
         frontiers: Frontiers,
@@ -477,14 +578,6 @@ pub struct Batching<'a> {
     pub observer: &'a Observer,
 }
 
-/// Refuse a batch above one until a prepared batch can be published.
-pub fn gate(limits: &Limits) -> Result<(), Error> {
-    match limits.is_one() {
-        true => Ok(()),
-        false => Err(Error::BatchingGated),
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Options {
     pub direct_s3: Option<Box<stelae::oci::s3_upload::Config>>,
@@ -529,7 +622,6 @@ pub fn run(
     cancel: CancellationToken,
     observer: &stelae::progress::Observer,
 ) -> Result<Outcome, Error> {
-    gate(&options.limits)?;
     crate::config::require_full_history(config).map_err(Error::caller)?;
     require_synchronous_context()?;
     let download_dir = options
@@ -632,6 +724,32 @@ fn finish_both<T>(work: Result<T, Error>, finish: Result<(), Error>) -> Result<T
     }
 }
 
+/// Say what a failed publication means for the batch: no room, a bundle or runs
+/// that can't serve it, or else a repository worth asking again.
+fn finalizing_failure(batch: &Batch, sequence: u64, error: Error) -> Error {
+    use dolos_snapshot::Error as E;
+
+    let Error::Finalizing(source) = error else {
+        return error;
+    };
+    match &*source {
+        // At this very sequence it can be this batch's own seal, applied after
+        // its answer was lost, so the next try's first read compares it.
+        E::Stelae(stelae::Error::PredecessorMoved { found, .. })
+            if found.as_ref().is_none_or(|(held, _)| *held != sequence) =>
+        {
+            let found = found
+                .clone()
+                .map(|(sequence, identity)| Committed { sequence, identity });
+            batch.moved(found).into()
+        }
+        error if batch::ran_out_of_room(error) => Error::FlushNoRoom(source),
+        error if batch::runs_are_stale(error) => batch.runs_unusable(source).into(),
+        E::Preparation(_) => batch.unusable(sequence, *source).into(),
+        _ => Error::Finalizing(source),
+    }
+}
+
 /// The epoch the stores stand in, which a cursor with no hash can't give.
 fn anchored_epoch(source: &dyn SnapshotSource, slot: BlockSlot) -> Result<u64, Error> {
     match source.epoch() {
@@ -667,21 +785,76 @@ impl<W: Workspace> Driver<'_, W> {
         (self.open_workspace)().map_err(Error::in_replay)
     }
 
+    /// Replay and publish until the source runs out or `until_epoch` is
+    /// published. A periodic run therefore drains what it prepared, however few
+    /// boundaries the source offered, and leaves nothing waiting for a full
+    /// batch. A failing source closes the batch too, unless something fails
+    /// before the journal records that, and the run still ends on that failure.
     pub fn run(&self) -> Result<Outcome, Error> {
+        if self.batching.limits.is_one() {
+            return self.run_one();
+        }
+        loop {
+            match self.prepare() {
+                Ok(Outcome::BatchReady { .. }) => self.flush()?,
+                Ok(outcome) => return Ok(outcome),
+                Err(failure) if failure.is_source_failure() && !self.aborted() => {
+                    warn!(error = %failure, "reading the source failed");
+                    return Err(match self.flush_open_batch() {
+                        Ok(()) => failure,
+                        Err(flush) => Error::SourceAndFlush {
+                            failure: Box::new(failure),
+                            flush: Box::new(flush),
+                        },
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Close what the batch prepared at the frontier the stores reached, and
+    /// publish it.
+    fn flush_open_batch(&self) -> Result<(), Error> {
+        let mut batch = self.open_batch()?;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        warn!("publishing what the batch prepared before the run ends");
+        let workspace = self.open()?;
+        let cursor = workspace
+            .snapshot()
+            .committed_position()
+            .map_err(Error::Planning);
+        let cursor = finish_both(cursor, workspace.finish().map_err(Error::in_replay))?;
+        batch.close(Flush::EndOfSource, cursor.as_ref())?;
+        self.flush()
+    }
+
+    /// Prepare until a batch closes, which publishes nothing.
+    pub fn prepare(&self) -> Result<Outcome, Error> {
+        let width = self.begin()?;
+        self.run_batched(width)
+    }
+
+    /// What every run asks first, and the geometry it replays by.
+    fn begin(&self) -> Result<u64, Error> {
         if self.window == 0 {
             return Err(Error::EmptyWindow);
         }
         (self.check_stores)().map_err(Error::in_replay)?;
         let width = slots_per_immutable_file(self.genesis);
-        let immutable_dir = self.immutable_dir();
         info!(
             slots_per_immutable_file = width,
             "derived immutable chunk size from genesis"
         );
+        Ok(width)
+    }
 
-        if !self.batching.limits.is_one() {
-            return self.run_batched(width);
-        }
+    fn run_one(&self) -> Result<Outcome, Error> {
+        let width = self.begin()?;
+        let immutable_dir = self.immutable_dir();
+        batch::clear_if_drained(&self.batching.storage_path)?;
         batch::refuse_pending(&self.batching.storage_path)?;
 
         loop {
@@ -752,7 +925,183 @@ impl<W: Workspace> Driver<'_, W> {
             dolos_revision: crate::DOLOS_REVISION.to_owned(),
         };
         let dir = batch::dir_in(&self.batching.storage_path);
-        Ok(Batch::open(dir, self.batching.limits, source)?)
+        let mut batch = Batch::open(dir, self.batching.limits, source)?;
+        batch.clear()?;
+        Ok(batch)
+    }
+
+    /// Stage a closed batch once and publish it in order, reading the stores
+    /// and writing none, so replay stays where the batch closed until the last
+    /// sequence commits.
+    fn flush(&self) -> Result<(), Error> {
+        let mut batch = self.open_batch()?;
+        let workspace = self.open()?;
+        let result = self.publish_batch(&workspace.snapshot(), &mut batch);
+        finish_both(result, workspace.finish().map_err(Error::in_replay))?;
+        Ok(batch.clear()?)
+    }
+
+    fn publish_batch(&self, source: &dyn SnapshotSource, batch: &mut Batch) -> Result<(), Error> {
+        // A crash after the journal moved left that bundle behind.
+        batch.sweep()?;
+        let mut rebuilt = false;
+        loop {
+            let staged = self.stage(source, batch)?;
+            match self.publish_staged(source, batch, &staged) {
+                Err(Error::Batch(batch::Error::RunsUnusable { source, .. })) if !rebuilt => {
+                    warn!(error = %source, "the staged runs can't finish a publication: staging them again");
+                    rebuilt = true;
+                    batch.drop_staging()?;
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
+    fn stage(&self, source: &dyn SnapshotSource, batch: &mut Batch) -> Result<Staged, Error> {
+        let next = batch.prepared().first().map_or(0, |next| next.sequence);
+        let followed = self.followed(batch)?;
+        let previous = following(followed.as_ref(), next)?;
+        let staged = batch.stage(source, &*previous, self.batching.observer);
+        self.report(batch);
+        staged.map_err(|error| match error {
+            batch::Error::Staging { source, .. } if batch::ran_out_of_room(&source) => {
+                Error::FlushNoRoom(source)
+            }
+            batch::Error::Staging { source, .. } if batch::stores_cant_serve(&source) => {
+                batch.unusable(next, *source).into()
+            }
+            other => other.into(),
+        })
+    }
+
+    /// The document the journal says the next publication follows, held to the
+    /// identity the journal recorded.
+    fn followed(&self, batch: &Batch) -> Result<Option<Inscription>, Error> {
+        let Some(planned) = batch.predecessor() else {
+            return Ok(None);
+        };
+        let held = stelae_driver::retry::transient(
+            "reading the stele a batch follows",
+            &|| self.aborted(),
+            || self.publish.stele(planned.sequence),
+        )?;
+        match held {
+            Some(held) if held.committed == *planned => Ok(Some(held.inscription)),
+            held => Err(batch.moved(held.map(|held| held.committed)).into()),
+        }
+    }
+
+    fn publish_staged(
+        &self,
+        source: &dyn SnapshotSource,
+        batch: &mut Batch,
+        staged: &Staged,
+    ) -> Result<(), Error> {
+        for bundle in batch.bundles()? {
+            if self.aborted() {
+                return Err(Error::Interrupted);
+            }
+            // Each try reads the repository again, so one whose acknowledgement
+            // was lost reconciles rather than publishing over itself.
+            let committed = stelae_driver::retry::transient(
+                "publishing a prepared sequence",
+                &|| self.aborted(),
+                || match self.commit_next(source, batch, &bundle, staged) {
+                    Err(error) if error.is_refusal() => Ok(Err(error)),
+                    other => other.map(Ok),
+                },
+            )??;
+            info!(sequence = committed.sequence, identity = %committed.identity, "committed");
+            batch.commit(committed)?;
+            self.report(batch);
+        }
+        Ok(())
+    }
+
+    /// Bring the repository to hold `bundle`'s sequence on exactly what the
+    /// journal says it follows.
+    fn commit_next(
+        &self,
+        source: &dyn SnapshotSource,
+        batch: &Batch,
+        bundle: &Bundle,
+        staged: &Staged,
+    ) -> Result<Committed, Error> {
+        let sequence = bundle.sequence();
+        let plan = bundle.plan();
+        let finalizing = Finalizing {
+            store: batch.store(),
+            bundle,
+            staged,
+            producers: plan.producers,
+        };
+        let latest = self.publish.latest(&plan)?;
+        if latest.as_ref() != batch.predecessor() {
+            return match latest {
+                Some(found) if found.sequence == sequence => {
+                    self.confirm(source, batch, &finalizing, &found)?;
+                    Ok(found)
+                }
+                found => Err(batch.moved(found).into()),
+            };
+        }
+        // A seal writes the immutable tag before it moves the latest one, so a
+        // tag here is a seal that stopped half way, or another writer's. Sealing
+        // again only repeats what this batch would write.
+        if let Some(held) = self.publish.stele(sequence)? {
+            let expected = self.reproduce(source, batch, &finalizing, sequence)?;
+            if expected != held.committed.identity {
+                let found = held.committed.identity;
+                return Err(batch.tag_taken(sequence, found, expected).into());
+            }
+        }
+        self.publish.announce(&plan)?;
+        self.publish
+            .finalize(&finalizing, batch.predecessor(), source)
+            .map_err(|error| finalizing_failure(batch, sequence, error))
+    }
+
+    /// Hold a `latest` stele already at the next sequence to what this batch
+    /// publishes there.
+    fn confirm(
+        &self,
+        source: &dyn SnapshotSource,
+        batch: &Batch,
+        finalizing: &Finalizing<'_>,
+        found: &Committed,
+    ) -> Result<(), Error> {
+        let sequence = found.sequence;
+        let expected = self.reproduce(source, batch, finalizing, sequence)?;
+        if expected == found.identity {
+            return Ok(());
+        }
+        Err(batch
+            .diverged(sequence, found.identity.clone(), expected)
+            .into())
+    }
+
+    /// The identity this batch publishes at `sequence`, reproduced from the
+    /// same bundle, runs and predecessor.
+    fn reproduce(
+        &self,
+        source: &dyn SnapshotSource,
+        batch: &Batch,
+        finalizing: &Finalizing<'_>,
+        sequence: u64,
+    ) -> Result<String, Error> {
+        let followed = self.followed(batch)?;
+        let previous = following(followed.as_ref(), sequence)?;
+        warn!(
+            sequence,
+            "the repository already holds this sequence: reproducing it to compare"
+        );
+        let document = source
+            .finalize_document(finalizing, &*previous)
+            .map_err(|error| {
+                finalizing_failure(batch, sequence, Error::Finalizing(error.into()))
+            })?;
+        Ok(document.identity.to_string())
     }
 
     fn ready(&self, batch: &Batch, flush: Flush) -> Outcome {

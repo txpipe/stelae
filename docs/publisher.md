@@ -239,8 +239,10 @@ only while the current run explicitly opts into genesis.
 
 The backfill state machine preserves these rules from the accepted Dolos host:
 
-- publish a committed epoch boundary before replaying past it;
-- prune history only after that publication succeeds;
+- publish a committed epoch boundary before replaying past it, or on a larger
+  batch, hold it as journaled prepared work until it is published;
+- prune history only after that publication succeeds, and on a larger batch only
+  after its last sequence commits;
 - retain two immutable files of cleanup/download margin using the configured
   network's genesis chunk geometry;
 - retry transient repository work in place using the publication journal;
@@ -306,7 +308,10 @@ Three cases read differently:
   tried, so the failed fetch adds the free bytes of the download directory: read a
   low figure as a full volume. A stopped download can also leave partial or absent
   files below the highest one, which a rerun doesn't fetch again, so make room, empty
-  the immutable directory and rerun. That can't help once a rerun has imported across
+  the immutable directory and rerun. A batched run tries to close the batch and
+  publish what it prepared first, so this failure can arrive beside a room error. The
+  exit names both, and emptying the immutable directory still applies. That can't
+  help once a rerun has imported across
   an absent file next to an epoch's start, which the chart's own restart can do: every
   run then refuses before any fetch, saying the archive has a gap there, unless the
   repository already holds that boundary. A held boundary isn't checked, so a run over
@@ -316,14 +321,11 @@ Three cases read differently:
 
 ## Prepared batches
 
-**Not active yet.** `--batch-epochs` above 1 is refused, because a prepared batch
-can't be published until ordered publication and recovery are integrated. The
-state machine below is in place and tested through the library, and `run`,
-`backfill` and `publish` all stay on a batch of one until then.
-
 A batch prepares several boundaries before it publishes any, so one index
 traversal serves them all. Replay may stand past the repository's latest stele
 only while every sequence in between is a complete bundle the journal names.
+`run` and `backfill` take the controls below. `publish` stays a batch of one. The
+chart passes none of them, so a deployment doesn't change until its command does.
 
 | Control | Meaning |
 | --- | --- |
@@ -333,6 +335,12 @@ only while every sequence in between is a complete bundle the journal names.
 
 Defaults above one epoch are not chosen yet: they wait for complete-pipeline
 measurements.
+
+**Sequences appear later.** A sequence reaches the repository only when its batch
+closes, stages and gets to it, so `latest` trails the stores by up to a batch while
+replay runs. Every sequence still appears, each with the same content a batch of one
+gives it, and `latest` moves through them in order. A consumer restoring meanwhile
+gets the last one published.
 
 ### State transitions
 
@@ -350,6 +358,15 @@ measurements.
    work reads none of them, and a replay after a lost bundle downloads them again,
    once the window the lost replay left is gone: see the recovery below.
 6. **Close the batch** with the reason it stopped growing, or go back to 1.
+7. **Stage** the closed windows once, from the stores as they stand. Replay doesn't
+   move again until the last commit, so that view stays frozen.
+8. **Commit each sequence in order.** Read what the repository holds, and hold it
+   to the journal. Publish through the existing transport, chained to the real
+   predecessor. Journal the stele, then release its bundle and any payload no later
+   bundle shares.
+9. **Clean up** after the last commit: the staged runs, then the bundles, then the
+   journal. A crash at any point only repeats this. Pruning resumes here, and replay
+   goes back to 1.
 
 | A batch closes on | At |
 | --- | --- |
@@ -357,14 +374,22 @@ measurements.
 | `until-epoch` | the boundary `--until-epoch` names |
 | `scratch-budget` | the last boundary before the next would cross the budget |
 | `disk-pressure` | the last boundary before the next would not fit the volume, or a capture that filled it, whose payloads go so the batch is charged only for what its journal names |
-| `end-of-source` | the last captured boundary. The epoch in progress has none and stays unpublished. |
+| `end-of-source` | the last captured boundary, when the source runs out or stops answering. The epoch in progress has none and stays unpublished. |
 
-A closed batch stays closed across restarts, whatever the controls say then.
+A closed batch stays closed across restarts, whatever the controls say then. A
+periodic run reaches `end-of-source` and publishes what it prepared, however few
+boundaries that is: nothing waits at the tip for a full batch. A source that stays
+down past its retries, or a fetch that brings nothing new, closes the batch the same
+way, and the run publishes what it prepared before it exits on that failure. If
+anything on that way fails too, the exit names both: a failure before the journal
+records the close leaves the batch open, and one after leaves it closed. So an outage
+during a backfill costs one smaller batch, and one more index traversal for the next.
 
 ### Progress
 
-Each journal write logs and reports the frontiers: `published`, the repository's
-latest stele when the batch began; `prepared`, the last journaled sequence;
+Each journal write logs and reports the frontiers: `published`, the stele the next
+publication follows, which moves with each commit; `prepared`, the last journaled
+sequence;
 `staged`, where the runs were staged from; `replay`, the slot the stores reached;
 and `horizon`, the oldest slot the archive has to keep for the batch.
 
@@ -381,11 +406,65 @@ These refuse too, and none is repaired automatically: a repository whose latest
 stele is not the one the batch follows, a journal or bundle that is missing or
 damaged, and another repository, network, store contract, retained list or Dolos
 revision than the batch was prepared from. A batch of one and a repository
-`publish` refuse to run past a pending batch. A bundle the machine can't read
-right now, through permissions or a failing disk, may be intact: that refusal says
-so, and a rerun goes on once it is readable.
+`publish` refuse to run past a pending batch, and the refusal names the flags that
+publish it. A bundle the machine can't read right now, through permissions or a
+failing disk, may be intact: that refusal says so, and a rerun goes on once it is
+readable.
 
-The recovery starts the stores over from what the repository holds. A restore
+A run that stopped during publication reads the repository first, so it goes on
+from the sequence the journal names:
+
+| The repository holds | The run |
+| --- | --- |
+| the stele the journal says comes before this sequence, and nothing under this sequence | publishes it |
+| this sequence under its immutable tag only: a seal that stopped half way | reproduces it, compares identities and seals again |
+| this sequence as `latest`: an upload whose answer was lost | reproduces it, compares identities, journals it and doesn't upload it again |
+| this sequence as `latest` with another identity | refuses, and overwrites nothing: another writer published it, or these stores aren't what the batch was prepared from. The recovery below applies |
+| this sequence with another identity under its immutable tag only | refuses, and overwrites nothing: another writer stopped before moving `latest`, or this publisher did and these stores aren't what the batch was prepared from. If you know that tag is another writer's, stop that writer, delete the tag and rerun. Otherwise leave the tag and treat the stores as wrong, because deleting it publishes from them unchecked: the recovery below applies |
+| anything else: past this sequence, behind the journal, or a predecessor under another identity | refuses: the repository moved |
+
+A batch of one has no such check on the immutable tag and overwrites it, as it
+always has.
+
+The read a publication chains from is held to the journal too, so `latest` moving
+after these checks refuses before anything is uploaded. The exception is `latest`
+moving to this very sequence, which can be this batch's own seal applied after its
+answer was lost: the next try compares it as the table says.
+
+The registry has no compare-and-set, so nothing guards the upload that follows that
+read. Another writer's seal landing during the upload is overwritten by this batch's
+at both tags and never found, on a batch's last sequence as on any other. While a
+later sequence is left to publish, a `latest` landing after this batch's own refuses
+at that sequence's read, and a tag that writer left at that sequence refuses as the
+table says. So keep to one publisher per repository.
+
+Reproducing a sequence costs what assembling its layers costs, without the upload.
+Staged runs are disposable. Missing, damaged or staged for something else, they are
+staged again from the stores, once in a run, under the checks a first staging makes
+(the store contract, the network and how far back the archive reaches). A bundle
+isn't: damage to it, or an archive pruned past its horizon, stops at that sequence
+with the recovery below, and the earlier sequences stay published.
+
+A publication that runs out of room stops without moving the journal: make room and
+rerun. Staging is held to what `--batch-scratch-mib` has left, or the reserve for what
+the batch holds where a capture overshot the budget. Runs a stopped staging left count
+against it, so a restarted staging that runs out starts over from nothing first, which
+repeats its traversals. Past the budget from nothing it stops and drops its runs, so
+raise the budget and rerun.
+
+Stopping a publisher mid-batch and starting a batch of one, a smaller `--batch-epochs`
+or a newer image are different things. A smaller limit continues the batch. A batch of
+one refuses until it drains. A new image on another Dolos revision refuses as above,
+so drain a pending batch with the image that prepared it before upgrading.
+
+An interrupted single publish leaves `<storage.path>/.snapshot-publish.json`. A batch
+reads it as a batch of one would: whatever it names under this repository and these
+parameters is carried forward if the repository still holds the blob, and rebuilt if
+not. A record that doesn't parse stops the publication: delete the file and rerun,
+which costs only re-uploading what it named.
+
+The recovery starts the stores over from what the repository holds, which after a
+partial publication includes the sequences this batch already committed. A restore
 changes nothing over stores that are still there, and deleting the batch alone
 leaves stores past the repository, which refuse, so clear them first:
 
@@ -412,8 +491,10 @@ held. The record means nothing once the repository holds a stele. Delete it only
 to start a history past those sequences on purpose.
 
 Cancelling keeps all of it: a shutdown signal neither publishes nor manufactures
-a boundary, and a rerun continues. Not even one boundary fitting is a recoverable
-stop too: make room or raise the budget and rerun.
+a boundary, and a rerun continues. During publication it is honoured between
+sequences, and an in-flight staging or upload finishes first or dies with the
+process, which a rerun resumes. Not even one boundary fitting is a recoverable stop
+too: make room or raise the budget and rerun.
 
 ## First publication
 
