@@ -565,11 +565,12 @@ too: make room or raise the budget and rerun.
 
 ### Upgrade and rollback
 
-**Upgrade.** A publisher from before batches can stop at any point, and this one takes
-over its stores: stores at the earlier pin carry over, and a publication it left
-unfinished is published first. Over real preprod, a run of the last release killed in
+**Upgrade.** The last release before batches, on the `1db3e41f` pin, can stop at any
+point and this one takes over its stores: they carry over, and a publication it left
+unfinished is published first. Over real preprod, a run of that release killed in
 mid-publish and continued at `--batch-epochs 6` published the same bytes as one that
-was never interrupted. Nothing changes for a deployment until its command names a
+was never interrupted. A release on an older pin still needs what
+[Source and dependency identity](#source-and-dependency-identity) says. Nothing changes for a deployment until its command names a
 batch, because `--batch-epochs` stays 1 by default and the chart passes none of these.
 
 **Rollback.** The stores can stand ahead of `latest` while a batch is open, and an image
