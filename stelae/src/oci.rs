@@ -148,8 +148,8 @@
 //!
 //! - **a `5xx`** — the registry answered, and what it said was about itself
 //!   rather than about the request. Asking again is the whole remedy;
-//! - **no answer at all** — a connection refused, a request that timed out, a
-//!   socket that went away mid-body.
+//! - **no answer at all** — a connection refused, or a request that timed out
+//!   or could not be sent.
 //!
 //! Nothing else. A `4xx` is the registry saying something true about *this*
 //! request — the credential, the digest, the name — and repeating it four times
@@ -170,6 +170,29 @@
 //! Every retry is announced through [`Event::Retry`], because a transport that
 //! silently absorbed the failure class would have hidden the measurement that
 //! motivated absorbing it.
+//!
+//! ### Reads get a longer budget
+//!
+//! A restore's failures are a different shape. A layer `GET` is redirected to
+//! object storage and can run for minutes, and what ends it early is a transfer
+//! that drops or comes up short partway through — not a registry that answers
+//! `500` and then recovers within a second. So the three read round trips (the
+//! manifest `GET`, the config blob and each layer blob) are attempted
+//! [`Options::read_attempts`] times, waiting [`Options::read_delay`] first and
+//! doubling up to [`READ_DELAY_CAP`]: with the defaults, waits of 2, 4, 8, 16
+//! and 32 seconds. On those paths three more failures count as transient:
+//!
+//! - **a body that fails after the response started** — a connection reset or
+//!   closed partway through, which `reqwest` reports as a body or decode error;
+//! - **a blob shorter than its descriptor**, which arrives as one of those or,
+//!   when the registry announced the short length itself, as a digest mismatch;
+//! - **a blob whose digest does not match the descriptor**.
+//!
+//! Each attempt is a new request to the registry, so it follows a new redirect
+//! rather than resuming the old one. `4xx`, a blob longer than its descriptor
+//! and local failures still end the read on the first attempt. A read that
+//! fails transiently on every attempt returns [`Error::RetriesExhausted`],
+//! naming the digest or reference, the attempt count and the last cause.
 //!
 //! ## TLS, and the second rule it comes with
 //!
@@ -464,6 +487,22 @@ pub const DEFAULT_ATTEMPTS: u32 = 4;
 /// night does not show up as a slower publish.
 const RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// How many times a read round trip — the manifest, the config blob, a layer
+/// blob — is made before its failure is the caller's.
+///
+/// More than [`DEFAULT_ATTEMPTS`], because a lost read is a restore that has to
+/// start over, and the failures it meets (a transfer dropped minutes in) take
+/// longer to clear than a registry's momentary `500`.
+pub const DEFAULT_READ_ATTEMPTS: u32 = 6;
+
+/// The wait after a read's first failed attempt; each later wait doubles, up
+/// to [`READ_DELAY_CAP`]. With [`DEFAULT_READ_ATTEMPTS`] that is waits of 2, 4,
+/// 8, 16 and 32 seconds.
+pub const DEFAULT_READ_DELAY: Duration = Duration::from_secs(2);
+
+/// The longest single wait between read attempts.
+pub const READ_DELAY_CAP: Duration = Duration::from_secs(60);
+
 /// How to reach a registry.
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -532,7 +571,24 @@ pub struct Options {
     /// Only the failures the module documentation lists are retried; a
     /// registry's refusal of *this* request is never one of them, so raising
     /// this does not slow down a publish that was going to fail anyway.
+    ///
+    /// Publish round trips only; reads use [`Options::read_attempts`].
     pub attempts: u32,
+
+    /// How many times a read round trip is made before its failure is the
+    /// caller's.
+    ///
+    /// Defaults to [`DEFAULT_READ_ATTEMPTS`]; `0` is read as `1`, as for
+    /// [`Options::attempts`]. Covers the manifest `GET`, the config blob and
+    /// every layer blob, with the wider transient class the module
+    /// documentation lists for reads.
+    pub read_attempts: u32,
+
+    /// The wait after a read's first failed attempt.
+    ///
+    /// Defaults to [`DEFAULT_READ_DELAY`]. Each later wait doubles, and none
+    /// exceeds [`READ_DELAY_CAP`].
+    pub read_delay: Duration,
 
     /// The largest layer to push as one request rather than as a `PATCH` chain.
     ///
@@ -568,6 +624,8 @@ impl Default for Options {
             concurrency: DEFAULT_CONCURRENCY,
             verify_adopted: false,
             attempts: DEFAULT_ATTEMPTS,
+            read_attempts: DEFAULT_READ_ATTEMPTS,
+            read_delay: DEFAULT_READ_DELAY,
             monolithic_max: DEFAULT_MONOLITHIC_MAX,
             upload_memory: DEFAULT_UPLOAD_MEMORY,
         }
@@ -754,6 +812,10 @@ struct Shared {
     concurrency: usize,
     /// [`Options::attempts`], as it was resolved.
     attempts: u32,
+    /// [`Options::read_attempts`], as it was resolved.
+    read_attempts: u32,
+    /// [`Options::read_delay`], as it was given.
+    read_delay: Duration,
     /// The resident-byte budget, one permit per byte.
     ///
     /// A second bound beside `permits`, and a different unit on purpose. That
@@ -927,6 +989,8 @@ impl Registry {
                 verify_adopted: options.verify_adopted,
                 concurrency,
                 attempts: options.attempts.max(1),
+                read_attempts: options.read_attempts.max(1),
+                read_delay: options.read_delay,
                 resident: Arc::new(tokio::sync::Semaphore::new(upload_memory as usize)),
                 monolithic_max,
             }),
@@ -1018,7 +1082,9 @@ impl Registry {
 
         let reference = self.shared.tagged(tag);
 
-        let (manifest, _digest) = self.shared.retrying(|| {
+        let subject = format!("manifest {reference}");
+
+        let (manifest, _digest) = self.shared.reading(&subject, || {
             Ok(self.shared.runtime.block_on(
                 self.shared
                     .client
@@ -1271,7 +1337,11 @@ impl Error {
     /// Whether a pull failed because the repository holds no such manifest,
     /// rather than because the registry could not answer.
     pub fn is_absent(&self) -> bool {
-        matches!(self, Error::Registry(error) if is_absent(error))
+        match self {
+            Error::Registry(error) => is_absent(error),
+            Error::RetriesExhausted { source, .. } => source.is_absent(),
+            _ => false,
+        }
     }
 
     /// Whether a pull failed because the registry served a blob that is not the
@@ -1288,6 +1358,8 @@ impl Error {
             Error::Registry(E::IoError(io)) => io
                 .get_ref()
                 .is_some_and(|inner| inner.is::<BlobPastDescriptor>()),
+            // A registry that served the wrong bytes on every attempt.
+            Error::RetriesExhausted { source, .. } => source.is_blob_refusal(),
             _ => false,
         }
     }
@@ -1340,6 +1412,67 @@ fn is_transient(error: &Error) -> bool {
     }
 }
 
+/// [`is_transient`], widened for a read round trip.
+///
+/// A read is idempotent and its result is checked against the descriptor, so
+/// a transfer that broke or arrived wrong is worth fetching again: a body that
+/// failed after the response started, and a blob whose digest does not match
+/// (which is also how a blob shorter than an honestly announced length
+/// arrives). A blob *longer* than its descriptor ([`BlobPastDescriptor`]) and
+/// any other local write failure stay final — they are `IoError`, not these.
+fn is_transient_read(error: &Error) -> bool {
+    use oci_client::errors::{DigestError, OciDistributionError as E};
+
+    if is_transient(error) {
+        return true;
+    }
+
+    let Error::Registry(error) = error else {
+        return false;
+    };
+
+    match error {
+        E::RequestError(source) => {
+            source.status().is_none() && (source.is_body() || source.is_decode())
+        }
+        E::DigestError(DigestError::VerificationError { .. }) => true,
+        _ => false,
+    }
+}
+
+/// What a round trip's retries are allowed: how many attempts, the first wait,
+/// the longest wait, and which failures are worth another attempt.
+#[derive(Clone, Copy)]
+struct Policy {
+    attempts: u32,
+    delay: Duration,
+    cap: Duration,
+    transient: fn(&Error) -> bool,
+}
+
+impl Policy {
+    /// A publish round trip: [`Options::attempts`] from [`RETRY_DELAY`].
+    fn publish(attempts: u32) -> Self {
+        Self {
+            attempts,
+            delay: RETRY_DELAY,
+            cap: Duration::MAX,
+            transient: is_transient,
+        }
+    }
+
+    /// A read round trip: [`Options::read_attempts`] from
+    /// [`Options::read_delay`], capped at [`READ_DELAY_CAP`].
+    fn read(attempts: u32, delay: Duration) -> Self {
+        Self {
+            attempts,
+            delay,
+            cap: READ_DELAY_CAP,
+            transient: is_transient_read,
+        }
+    }
+}
+
 /// What a bounded retry keeps between attempts: how many are left, and how long
 /// the next wait is.
 ///
@@ -1352,15 +1485,25 @@ struct Backoff {
     attempted: u32,
     attempts: u32,
     delay: Duration,
+    cap: Duration,
+    transient: fn(&Error) -> bool,
 }
 
 impl Backoff {
-    fn new(attempts: u32, delay: Duration) -> Self {
+    fn new(policy: Policy) -> Self {
         Self {
             attempted: 0,
-            attempts: attempts.max(1),
-            delay,
+            attempts: policy.attempts.max(1),
+            delay: policy.delay.min(policy.cap),
+            cap: policy.cap,
+            transient: policy.transient,
         }
+    }
+
+    /// Whether `error`, which [`Backoff::wait_after`] declined to retry, ended
+    /// the round trip by using up its attempts rather than by being final.
+    fn exhausted(&self, error: &Error) -> bool {
+        self.attempted >= self.attempts && (self.transient)(error)
     }
 
     /// How long to wait before making the round trip again, or `None` if this
@@ -1374,7 +1517,7 @@ impl Backoff {
 
         let remaining = self.attempts - self.attempted;
 
-        if remaining == 0 || !is_transient(error) {
+        if remaining == 0 || !(self.transient)(error) {
             return None;
         }
 
@@ -1385,7 +1528,7 @@ impl Backoff {
         });
 
         let waiting = self.delay;
-        self.delay = self.delay.saturating_mul(2);
+        self.delay = self.delay.saturating_mul(2).min(self.cap);
 
         Some(waiting)
     }
@@ -1403,13 +1546,44 @@ fn retrying<T>(
     observer: &Observer,
     mut op: impl FnMut() -> Result<T, Error>,
 ) -> Result<T, Error> {
-    let mut backoff = Backoff::new(attempts, RETRY_DELAY);
+    let mut backoff = Backoff::new(Policy::publish(attempts));
 
     loop {
         match op() {
             Ok(value) => return Ok(value),
             Err(error) => match backoff.wait_after(&error, observer) {
                 Some(waiting) => std::thread::sleep(waiting),
+                None => return Err(error),
+            },
+        }
+    }
+}
+
+/// [`retrying`] for a read round trip, under [`Policy::read`].
+///
+/// A read that fails transiently on its last attempt is returned as
+/// [`Error::RetriesExhausted`] naming `subject`; a final failure on any attempt
+/// is returned as itself, so a `404` still reads as absence.
+fn reading<T>(
+    policy: Policy,
+    subject: &str,
+    observer: &Observer,
+    mut op: impl FnMut() -> Result<T, Error>,
+) -> Result<T, Error> {
+    let mut backoff = Backoff::new(policy);
+
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error) => match backoff.wait_after(&error, observer) {
+                Some(waiting) => std::thread::sleep(waiting),
+                None if backoff.exhausted(&error) => {
+                    return Err(Error::RetriesExhausted {
+                        subject: subject.to_owned(),
+                        attempts: backoff.attempted,
+                        source: Box::new(error),
+                    })
+                }
                 None => return Err(error),
             },
         }
@@ -1434,7 +1608,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, Error>>,
 {
-    let mut backoff = Backoff::new(attempts, RETRY_DELAY);
+    let mut backoff = Backoff::new(Policy::publish(attempts));
 
     loop {
         match op().await {
@@ -1562,6 +1736,14 @@ impl Shared {
     /// before the policy existed.
     fn retrying<T>(&self, op: impl FnMut() -> Result<T, Error>) -> Result<T, Error> {
         retrying(self.attempts, &self.observer(), op)
+    }
+
+    /// [`reading`], with this transport's read budget and observer. The three
+    /// read round trips — manifest, config blob, layer blob — go through here.
+    fn reading<T>(&self, subject: &str, op: impl FnMut() -> Result<T, Error>) -> Result<T, Error> {
+        let policy = Policy::read(self.read_attempts, self.read_delay);
+
+        reading(policy, subject, &self.observer(), op)
     }
 
     fn blob_exists(&self, digest: &Digest) -> Result<bool, Error> {
@@ -1922,7 +2104,7 @@ impl Shared {
         // No observer: the config blob is the inscription, not a layer, and a
         // watcher summing byte deltas against a layer total would find them
         // disagreeing by however large the document is.
-        self.retrying(|| {
+        self.reading(&format!("blob {}", descriptor.digest), || {
             // Emptied rather than reused, so a second attempt writes the
             // document and not the document twice. `Blocking` counts from zero
             // per attempt for the same reason, which it gets by being built
@@ -1967,7 +2149,7 @@ impl Shared {
             bytes: descriptor.size.max(0) as u64,
         });
 
-        self.retrying(|| {
+        self.reading(&format!("blob {}", descriptor.digest), || {
             // Back to empty before each attempt, for the reason a staged layer
             // is rewound before each of its own: what a half-finished download
             // left behind is not a prefix of what the next one writes, it is
@@ -2897,7 +3079,10 @@ mod tests {
         observer: &Observer,
         mut op: impl FnMut() -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let mut backoff = Backoff::new(attempts, Duration::ZERO);
+        let mut backoff = Backoff::new(Policy {
+            delay: Duration::ZERO,
+            ..Policy::publish(attempts)
+        });
 
         loop {
             match op() {
@@ -2992,6 +3177,102 @@ mod tests {
         assert_eq!(calls, 1, "a refusal must cost one round trip");
         assert!(matches!(refused, Error::Registry(_)));
         assert!(watcher.0.lock().unwrap().is_empty());
+    }
+
+    fn mismatch() -> OciDistributionError {
+        OciDistributionError::DigestError(oci_client::errors::DigestError::VerificationError {
+            expected: "sha256:aa".to_owned(),
+            actual: "sha256:bb".to_owned(),
+        })
+    }
+
+    /// A read also retries a blob that arrived wrong; a publish does not, and
+    /// neither retries a blob longer than its descriptor or a refusal.
+    #[test]
+    fn a_read_retries_a_broken_transfer_and_a_publish_does_not() {
+        assert!(is_transient_read(&Error::Registry(mismatch())));
+        assert!(!is_transient(&Error::Registry(mismatch())));
+
+        // Everything the publish side retries, a read retries too.
+        assert!(is_transient_read(&Error::Registry(server_error(503))));
+        assert!(is_transient_read(&Error::Registry(request_error(500))));
+
+        let past = std::io::Error::other(BlobPastDescriptor {
+            digest: "sha256:aa".to_owned(),
+            limit: 2,
+        });
+        assert!(!is_transient_read(&Error::Registry(past.into())));
+
+        for code in [404, 429] {
+            assert!(!is_transient_read(&Error::Registry(server_error(code))));
+            assert!(!is_transient_read(&Error::Registry(request_error(code))));
+        }
+        assert!(!is_transient_read(&Error::Io(std::io::Error::other(
+            "disk"
+        ))));
+    }
+
+    /// Waits of 2, 4, 8, 16 and 32 seconds for the default six attempts, and
+    /// never more than a minute however many are allowed.
+    #[test]
+    fn read_waits_double_from_two_seconds_up_to_a_minute() {
+        let waits = |attempts| {
+            let mut backoff = Backoff::new(Policy::read(attempts, DEFAULT_READ_DELAY));
+            let failure = Error::Registry(server_error(503));
+
+            std::iter::from_fn(|| backoff.wait_after(&failure, &Observer::silent()))
+                .map(|wait| wait.as_secs())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(waits(DEFAULT_READ_ATTEMPTS), vec![2, 4, 8, 16, 32]);
+        assert_eq!(waits(9), vec![2, 4, 8, 16, 32, 60, 60, 60]);
+
+        // The publish side is untouched: three waits from half a second.
+        let mut publish = Backoff::new(Policy::publish(DEFAULT_ATTEMPTS));
+        let failure = Error::Registry(server_error(500));
+        let waits: Vec<_> =
+            std::iter::from_fn(|| publish.wait_after(&failure, &Observer::silent())).collect();
+        assert_eq!(waits, [500, 1000, 2000].map(Duration::from_millis).to_vec());
+    }
+
+    /// A read that never got through says what it read, how often, and why;
+    /// one the registry refused is returned as the refusal.
+    #[test]
+    fn an_exhausted_read_names_its_subject_and_a_refused_one_does_not_wrap() {
+        let policy = Policy::read(3, Duration::ZERO);
+        let mut calls = 0;
+
+        let exhausted = reading(policy, "blob sha256:aa", &Observer::silent(), || {
+            calls += 1;
+            Err::<(), _>(Error::Registry(mismatch()))
+        })
+        .unwrap_err();
+
+        assert_eq!(calls, 3);
+        let Error::RetriesExhausted {
+            subject, attempts, ..
+        } = &exhausted
+        else {
+            panic!("{exhausted:?}");
+        };
+        assert_eq!((subject.as_str(), *attempts), ("blob sha256:aa", 3));
+        let message = exhausted.to_string();
+        assert!(message.contains("sha256:aa") && message.contains("3 attempt"));
+        assert!(message.contains("sha256:bb"), "the last cause: {message}");
+
+        // Still a refusal of the stele underneath.
+        assert!(exhausted.is_blob_refusal());
+
+        let mut calls = 0;
+        let absent = reading(policy, "manifest x", &Observer::silent(), || {
+            calls += 1;
+            Err::<(), _>(Error::Registry(server_error(404)))
+        })
+        .unwrap_err();
+
+        assert_eq!(calls, 1);
+        assert!(matches!(absent, Error::Registry(_)) && absent.is_absent());
     }
 
     /// `0` attempts is one attempt, for the reason `0` concurrency is one

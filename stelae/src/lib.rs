@@ -384,6 +384,21 @@ pub enum Error {
     #[cfg(feature = "oci")]
     #[error("registry error: {0}")]
     Registry(#[from] oci_client::errors::OciDistributionError),
+
+    /// A read round trip that failed transiently on every attempt it was
+    /// allowed — see [`oci::Options::read_attempts`].
+    ///
+    /// `subject` names what was being read (a blob digest or a manifest
+    /// reference) and `source` is the last attempt's failure, so the message
+    /// says what was retried, how often, and why it kept failing.
+    #[cfg(feature = "oci")]
+    #[error("reading {subject} failed after {attempts} attempt(s): {source}")]
+    RetriesExhausted {
+        subject: String,
+        attempts: u32,
+        #[source]
+        source: Box<Error>,
+    },
 }
 
 impl Error {

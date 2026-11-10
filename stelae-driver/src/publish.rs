@@ -81,6 +81,10 @@ pub fn open(
             // where `stelae-publisher backfill` re-runs the whole publish rather than
             // dying into a pod restart.
             attempts: stelae::oci::DEFAULT_ATTEMPTS,
+            // The read budget, for the same reason: it is sized to the
+            // transfers a restore loses, not to how fast it should go.
+            read_attempts: stelae::oci::DEFAULT_READ_ATTEMPTS,
+            read_delay: stelae::oci::DEFAULT_READ_DELAY,
             // Nor these, for a related reason: both are facts about the
             // registry this publishes to and about the pod the publisher runs
             // in, measured rather than chosen, and neither moves when an

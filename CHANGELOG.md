@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### 🚀 Features
+
+- [**breaking**] Retry failed and truncated registry reads with a longer backoff: manifest, config and layer `GET`s get `Options::read_attempts` (default 6) with waits from `Options::read_delay` (2 s) doubling up to 60 s, also retry a body that fails mid-transfer, a blob short of its descriptor and a digest mismatch, and report exhaustion as `Error::RetriesExhausted`. Publish round trips keep `Options::attempts`.
+
 ## [0.5.2] - 2026-11-04
 
 ### 🚀 Features
