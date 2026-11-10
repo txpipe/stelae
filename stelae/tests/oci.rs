@@ -101,7 +101,8 @@ use stelae::{
     inscription::LayerDescriptor,
     oci::{
         build_manifest, manifest_bytes, read_manifest, Auth, Options, Registry, DEFAULT_ATTEMPTS,
-        DEFAULT_READ_ATTEMPTS, DIFF_ID_ANNOTATION, KIND_ANNOTATION, SCOPE_ANNOTATION,
+        DEFAULT_READ_ATTEMPTS, DEFAULT_READ_DELAY, DIFF_ID_ANNOTATION, KIND_ANNOTATION,
+        SCOPE_ANNOTATION,
     },
     progress::{Event, Observer, Progress},
     Compression, Digest, Error, HistoryEntry, Inscription, LayerDigests, LayerSpec, Profile,
@@ -2896,11 +2897,13 @@ fn a_layer_reset_mid_transfer_is_fetched_again() {
 
 /// The first read wait the transport was opened with is the one a retry
 /// waits: the option reaches the round trip rather than stopping at `Options`.
+/// The delay sits between the publish wait (500 ms) and the default read wait,
+/// so a retry that waited either of those instead fails one bound or the other.
 #[test]
 fn a_read_retry_waits_the_configured_delay() {
     let _serial = exclusive();
 
-    let delay = std::time::Duration::from_millis(200);
+    let delay = std::time::Duration::from_secs(1);
     let (fault, registry, inscription, retries) = published_waiting("stelae/waited", delay);
     let layer = fault.layers()[0].clone();
 
@@ -2912,7 +2915,7 @@ fn a_read_retry_waits_the_configured_delay() {
 
     assert_eq!(retries.seen(), vec![(1, DEFAULT_READ_ATTEMPTS - 1)]);
     assert!(
-        elapsed >= delay,
+        elapsed >= delay && elapsed < DEFAULT_READ_DELAY,
         "the retry waited {elapsed:?}, not the configured {delay:?}",
     );
 }
