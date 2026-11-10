@@ -88,7 +88,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard,
     },
 };
 
@@ -100,13 +100,18 @@ use stelae::{
     frame::{encode, CanonicalCbor, Limits},
     inscription::LayerDescriptor,
     oci::{
-        build_manifest, manifest_bytes, read_manifest, Auth, Options, Registry, DIFF_ID_ANNOTATION,
-        KIND_ANNOTATION, SCOPE_ANNOTATION,
+        build_manifest, manifest_bytes, read_manifest, Auth, Options, Registry, DEFAULT_ATTEMPTS,
+        DEFAULT_READ_ATTEMPTS, DEFAULT_READ_DELAY, DIFF_ID_ANNOTATION, KIND_ANNOTATION,
+        SCOPE_ANNOTATION,
     },
     progress::{Event, Observer, Progress},
     Compression, Digest, Error, HistoryEntry, Inscription, LayerDigests, LayerSpec, Profile,
     RecordSink, SteleReader, SteleWriter, WrittenLayer,
 };
+
+mod fault_registry;
+
+use fault_registry::{Fault, FaultRegistry};
 
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
@@ -2732,17 +2737,20 @@ fn a_deferred_upload_that_fails_fails_every_seal() {
     );
 }
 
-/// What a transport said about the round trips it made again.
+/// What a transport said about the round trips it made again, and why.
 #[derive(Default)]
-struct Retries(Mutex<Vec<(u32, u32)>>);
+struct Retries(Mutex<Vec<(u32, u32)>>, Mutex<Vec<String>>);
 
 impl Progress for Retries {
     fn on(&self, event: Event<'_>) {
         if let Event::Retry {
-            attempt, remaining, ..
+            attempt,
+            remaining,
+            reason,
         } = event
         {
             self.0.lock().unwrap().push((attempt, remaining));
+            self.1.lock().unwrap().push(reason.to_owned());
         }
     }
 }
@@ -2750,6 +2758,10 @@ impl Progress for Retries {
 impl Retries {
     fn seen(&self) -> Vec<(u32, u32)> {
         self.0.lock().unwrap().clone()
+    }
+
+    fn reasons(&self) -> Vec<String> {
+        self.1.lock().unwrap().clone()
     }
 }
 
@@ -2799,4 +2811,254 @@ fn direct_s3_blobs_are_readable_through_zot() {
     );
     let again = write_stele(&registry, 3);
     assert_eq!(again, inscription);
+}
+
+/// A transport on the fault registry, with the read waits shortened so a test
+/// spends milliseconds where a restore would spend a minute.
+fn faulty(fault: &FaultRegistry, repository: &str) -> Registry {
+    faulty_waiting(fault, repository, std::time::Duration::from_millis(1))
+}
+
+/// [`faulty`], with the first read wait the test chooses.
+fn faulty_waiting(
+    fault: &FaultRegistry,
+    repository: &str,
+    read_delay: std::time::Duration,
+) -> Registry {
+    install_crypto_provider();
+
+    Registry::open(
+        &fault.url(repository).parse().unwrap(),
+        Options {
+            insecure: true,
+            read_delay,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+/// A stele published to a fresh fault registry, and the transport that did it,
+/// watched for retries.
+fn published(repository: &str) -> (FaultRegistry, Registry, Inscription, Arc<Retries>) {
+    published_waiting(repository, std::time::Duration::from_millis(1))
+}
+
+/// [`published`], with the first read wait the test chooses.
+fn published_waiting(
+    repository: &str,
+    read_delay: std::time::Duration,
+) -> (FaultRegistry, Registry, Inscription, Arc<Retries>) {
+    let fault = FaultRegistry::spawn();
+    let registry = faulty_waiting(&fault, repository, read_delay);
+    let inscription = write_stele(&registry, 3);
+
+    let retries = Arc::new(Retries::default());
+    registry.observe(Observer::new(retries.clone()));
+
+    (fault, registry, inscription, retries)
+}
+
+/// The first layer's stream, or the error that ended its download.
+fn first_layer(registry: &Registry, inscription: &Inscription) -> Result<(), Error> {
+    let stele = registry.pull_latest(&ToyProfile)?;
+    let index = stele.blob_index()?;
+
+    stele
+        .stream_layer(
+            &index,
+            &ToyProfile,
+            &inscription.layers[0],
+            Limits::default(),
+        )
+        .map(drop)
+}
+
+/// A layer whose transfer is cut off once is fetched again, and the restore
+/// goes on with exactly one retry to show for it.
+#[test]
+fn a_layer_reset_mid_transfer_is_fetched_again() {
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, retries) = published("stelae/reset");
+    let layer = fault.layers()[0].clone();
+
+    fault.fail_next(&layer, &[Fault::Truncate]);
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let expected = records_of(&stele, &inscription);
+
+    assert_eq!(retries.seen(), vec![(1, DEFAULT_READ_ATTEMPTS - 1)]);
+    assert_eq!(fault.gets(&layer), 2, "the retry was not a new request");
+
+    // And what came back is the stele, not the stele plus a broken prefix.
+    assert_eq!(records_of(&stele, &inscription), expected);
+}
+
+/// The first read wait the transport was opened with is the one a retry
+/// waits: the option reaches the round trip rather than stopping at `Options`.
+/// The delay sits between the publish wait (500 ms) and the default read wait,
+/// so a retry that waited either of those instead fails one bound or the other.
+#[test]
+fn a_read_retry_waits_the_configured_delay() {
+    let _serial = exclusive();
+
+    let delay = std::time::Duration::from_secs(1);
+    let (fault, registry, inscription, retries) = published_waiting("stelae/waited", delay);
+    let layer = fault.layers()[0].clone();
+
+    fault.fail_next(&layer, &[Fault::Truncate]);
+
+    let started = std::time::Instant::now();
+    first_layer(&registry, &inscription).unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(retries.seen(), vec![(1, DEFAULT_READ_ATTEMPTS - 1)]);
+    assert!(
+        elapsed >= delay && elapsed < DEFAULT_READ_DELAY,
+        "the retry waited {elapsed:?}, not the configured {delay:?}",
+    );
+}
+
+/// A blob that arrives short of its descriptor — announced short, so the
+/// transfer itself completes — is fetched again rather than refused.
+#[test]
+fn a_blob_served_short_is_fetched_again() {
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, retries) = published("stelae/short");
+    let layer = fault.layers()[0].clone();
+
+    fault.fail_next(&layer, &[Fault::Short]);
+
+    first_layer(&registry, &inscription).unwrap();
+
+    assert_eq!(retries.seen(), vec![(1, DEFAULT_READ_ATTEMPTS - 1)]);
+    assert_eq!(fault.gets(&layer), 2);
+}
+
+/// The manifest and the config blob are read under the same budget as a layer.
+#[test]
+fn every_read_round_trip_is_retried() {
+    let _serial = exclusive();
+
+    let (fault, registry, _inscription, retries) = published("stelae/every");
+
+    fault.fail_next("manifests/latest", &[Fault::Truncate]);
+    fault.fail_next(&fault.config(), &[Fault::Truncate]);
+
+    registry.pull_latest(&ToyProfile).unwrap();
+
+    let first = (1, DEFAULT_READ_ATTEMPTS - 1);
+    assert_eq!(retries.seen(), vec![first, first]);
+    assert_eq!(fault.gets("manifests/latest"), 2);
+    assert_eq!(fault.gets(&fault.config()), 2);
+}
+
+/// A blob that never arrives whole is given up on after the read budget, and
+/// the error says which blob, how many attempts, and why.
+#[test]
+fn a_blob_that_always_fails_exhausts_the_read_budget() {
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, retries) = published("stelae/exhausted");
+    let layer = fault.layers()[0].clone();
+
+    fault.fail_always(&layer, Fault::Truncate);
+
+    let failed = first_layer(&registry, &inscription).unwrap_err();
+
+    let Error::RetriesExhausted {
+        attempts, source, ..
+    } = &failed
+    else {
+        panic!("not an exhausted read: {failed:?}");
+    };
+
+    assert_eq!(*attempts, 6);
+    assert!(matches!(**source, Error::Registry(_)), "{source:?}");
+
+    let message = failed.to_string();
+    assert!(message.contains(&layer), "the digest is missing: {message}");
+    assert!(
+        message.contains("6 attempt"),
+        "the count is missing: {message}"
+    );
+    // The transport's own cause, from below `reqwest`'s top-level text.
+    let cause = "end of file before message length reached";
+    assert!(message.contains(cause), "the cause is missing: {message}");
+    println!("{message}");
+
+    for reason in retries.reasons() {
+        assert!(reason.contains(cause), "a retry hid its cause: {reason}");
+    }
+
+    assert_eq!(fault.gets(&layer), 6);
+    assert_eq!(
+        retries.seen(),
+        vec![(1, 5), (2, 4), (3, 3), (4, 2), (5, 1)],
+        "every attempt but the last was announced",
+    );
+
+    // A transfer that kept breaking is not a stele that was wrong.
+    assert!(!failed.is_blob_refusal());
+}
+
+/// A registry's refusal of the request is the caller's on the first attempt.
+#[test]
+fn a_refused_blob_read_is_not_retried() {
+    let _serial = exclusive();
+
+    for (code, repository) in [(404, "stelae/missing"), (429, "stelae/rationed")] {
+        let (fault, registry, inscription, retries) = published(repository);
+        let layer = fault.layers()[0].clone();
+
+        fault.fail_always(&layer, Fault::Status(code));
+
+        let failed = first_layer(&registry, &inscription).unwrap_err();
+
+        assert!(
+            matches!(failed, Error::Registry(_)),
+            "a {code} was wrapped or reclassified: {failed:?}",
+        );
+        assert_eq!(fault.gets(&layer), 1, "a {code} was retried");
+        assert!(
+            retries.seen().is_empty(),
+            "a {code} was announced as a retry"
+        );
+    }
+}
+
+/// The publish side keeps its own budget: [`DEFAULT_ATTEMPTS`] per round trip,
+/// whatever the read budget says.
+#[test]
+fn a_publish_round_trip_keeps_its_attempt_count() {
+    let _serial = exclusive();
+
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/publish");
+
+    let retries = Arc::new(Retries::default());
+    registry.observe(Observer::new(retries.clone()));
+
+    fault.fail_heads(500);
+
+    write_stele_fallibly(&registry, 3).expect_err("published past a registry answering 500");
+
+    let heads = fault.heads();
+    assert!(!heads.is_empty(), "the publish made no existence check");
+    for (digest, count) in &heads {
+        assert_eq!(
+            *count, DEFAULT_ATTEMPTS as usize,
+            "{digest} was asked about the wrong number of times",
+        );
+    }
+
+    let seen = retries.seen();
+    assert!(!seen.is_empty());
+    assert!(
+        seen.iter()
+            .all(|&(attempt, remaining)| attempt + remaining == DEFAULT_ATTEMPTS),
+        "a publish retry counted against another budget: {seen:?}",
+    );
 }

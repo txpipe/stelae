@@ -139,6 +139,8 @@ fn refused_stele(error: &stelae::Error) -> bool {
     match error {
         // The digest check `pull_blob` runs, and the size ceiling beside it.
         E::Registry(_) => error.is_blob_refusal(),
+        // Classified by what the last attempt hit, as a layer failure is.
+        E::RetriesExhausted { source, .. } => refused_stele(source),
         E::Json(_)
         | E::NonCanonicalCbor { .. }
         | E::TruncatedCbor { .. }
