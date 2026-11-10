@@ -68,33 +68,38 @@ pub fn open(
 ) -> Result<Registry, Error> {
     Ok(Registry::open(
         repository,
-        Options {
-            direct_s3: tuning.direct_s3,
-            insecure,
-            scratch_dir: Some(scratch_dir),
-            auth,
-            concurrency: tuning.concurrency.map_or(DEFAULT_CONCURRENCY, Into::into),
-            verify_adopted: tuning.verify_adopted,
-            // Not an operator's knob and deliberately not one: the number that
-            // absorbs a registry's transient `5xx` is the transport's own
-            // measurement, and an outage longer than it is answered a level up,
-            // where `stelae-publisher backfill` re-runs the whole publish rather than
-            // dying into a pod restart.
-            attempts: stelae::oci::DEFAULT_ATTEMPTS,
-            // The read budget, for the same reason: it is sized to the
-            // transfers a restore loses, not to how fast it should go.
-            read_attempts: stelae::oci::DEFAULT_READ_ATTEMPTS,
-            read_delay: stelae::oci::DEFAULT_READ_DELAY,
-            // Nor these, for a related reason: both are facts about the
-            // registry this publishes to and about the pod the publisher runs
-            // in, measured rather than chosen, and neither moves when an
-            // operator changes how fast a publish goes. `upload_memory` in
-            // particular is what keeps `--concurrency` from being a claim on
-            // memory — raising one does not raise the other.
-            monolithic_max: stelae::oci::DEFAULT_MONOLITHIC_MAX,
-            upload_memory: stelae::oci::DEFAULT_UPLOAD_MEMORY,
-        },
+        options(insecure, auth, scratch_dir, tuning),
     )?)
+}
+
+/// The transport options [`open`] passes, apart so a test can read them.
+fn options(insecure: bool, auth: Auth, scratch_dir: PathBuf, tuning: Tuning) -> Options {
+    Options {
+        direct_s3: tuning.direct_s3,
+        insecure,
+        scratch_dir: Some(scratch_dir),
+        auth,
+        concurrency: tuning.concurrency.map_or(DEFAULT_CONCURRENCY, Into::into),
+        verify_adopted: tuning.verify_adopted,
+        // Not an operator's knob and deliberately not one: the number that
+        // absorbs a registry's transient `5xx` is the transport's own
+        // measurement, and an outage longer than it is answered a level up,
+        // where `stelae-publisher backfill` re-runs the whole publish rather than
+        // dying into a pod restart.
+        attempts: stelae::oci::DEFAULT_ATTEMPTS,
+        // The read budget, for the same reason: it is sized to the
+        // transfers a restore loses, not to how fast it should go.
+        read_attempts: stelae::oci::DEFAULT_READ_ATTEMPTS,
+        read_delay: stelae::oci::DEFAULT_READ_DELAY,
+        // Nor these, for a related reason: both are facts about the
+        // registry this publishes to and about the pod the publisher runs
+        // in, measured rather than chosen, and neither moves when an
+        // operator changes how fast a publish goes. `upload_memory` in
+        // particular is what keeps `--concurrency` from being a claim on
+        // memory — raising one does not raise the other.
+        monolithic_max: stelae::oci::DEFAULT_MONOLITHIC_MAX,
+        upload_memory: stelae::oci::DEFAULT_UPLOAD_MEMORY,
+    }
 }
 
 /// What an operator may set about *how* a publish moves, as against where it
@@ -958,6 +963,17 @@ fn staging_need(peak: Option<StagingPeak>, scratch_dir: &Path) -> crate::preflig
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registry a node opens through here, as Dolos does for a restore,
+    /// reads under the transport's default budget rather than a shortened one.
+    #[test]
+    fn an_opened_registry_reads_under_the_default_budget() {
+        let options = options(false, Auth::default(), PathBuf::new(), Tuning::default());
+
+        assert_eq!(options.read_attempts, stelae::oci::DEFAULT_READ_ATTEMPTS);
+        assert_eq!(options.read_delay, stelae::oci::DEFAULT_READ_DELAY);
+        assert_eq!(options.attempts, stelae::oci::DEFAULT_ATTEMPTS);
+    }
 
     /// The publish half of the one policy, over a peak this test supplies.
     ///

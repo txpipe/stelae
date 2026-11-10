@@ -2736,17 +2736,20 @@ fn a_deferred_upload_that_fails_fails_every_seal() {
     );
 }
 
-/// What a transport said about the round trips it made again.
+/// What a transport said about the round trips it made again, and why.
 #[derive(Default)]
-struct Retries(Mutex<Vec<(u32, u32)>>);
+struct Retries(Mutex<Vec<(u32, u32)>>, Mutex<Vec<String>>);
 
 impl Progress for Retries {
     fn on(&self, event: Event<'_>) {
         if let Event::Retry {
-            attempt, remaining, ..
+            attempt,
+            remaining,
+            reason,
         } = event
         {
             self.0.lock().unwrap().push((attempt, remaining));
+            self.1.lock().unwrap().push(reason.to_owned());
         }
     }
 }
@@ -2754,6 +2757,10 @@ impl Progress for Retries {
 impl Retries {
     fn seen(&self) -> Vec<(u32, u32)> {
         self.0.lock().unwrap().clone()
+    }
+
+    fn reasons(&self) -> Vec<String> {
+        self.1.lock().unwrap().clone()
     }
 }
 
@@ -2808,13 +2815,22 @@ fn direct_s3_blobs_are_readable_through_zot() {
 /// A transport on the fault registry, with the read waits shortened so a test
 /// spends milliseconds where a restore would spend a minute.
 fn faulty(fault: &FaultRegistry, repository: &str) -> Registry {
+    faulty_waiting(fault, repository, std::time::Duration::from_millis(1))
+}
+
+/// [`faulty`], with the first read wait the test chooses.
+fn faulty_waiting(
+    fault: &FaultRegistry,
+    repository: &str,
+    read_delay: std::time::Duration,
+) -> Registry {
     install_crypto_provider();
 
     Registry::open(
         &fault.url(repository).parse().unwrap(),
         Options {
             insecure: true,
-            read_delay: std::time::Duration::from_millis(1),
+            read_delay,
             ..Default::default()
         },
     )
@@ -2824,8 +2840,16 @@ fn faulty(fault: &FaultRegistry, repository: &str) -> Registry {
 /// A stele published to a fresh fault registry, and the transport that did it,
 /// watched for retries.
 fn published(repository: &str) -> (FaultRegistry, Registry, Inscription, Arc<Retries>) {
+    published_waiting(repository, std::time::Duration::from_millis(1))
+}
+
+/// [`published`], with the first read wait the test chooses.
+fn published_waiting(
+    repository: &str,
+    read_delay: std::time::Duration,
+) -> (FaultRegistry, Registry, Inscription, Arc<Retries>) {
     let fault = FaultRegistry::spawn();
-    let registry = faulty(&fault, repository);
+    let registry = faulty_waiting(&fault, repository, read_delay);
     let inscription = write_stele(&registry, 3);
 
     let retries = Arc::new(Retries::default());
@@ -2868,6 +2892,29 @@ fn a_layer_reset_mid_transfer_is_fetched_again() {
 
     // And what came back is the stele, not the stele plus a broken prefix.
     assert_eq!(records_of(&stele, &inscription), expected);
+}
+
+/// The first read wait the transport was opened with is the one a retry
+/// waits: the option reaches the round trip rather than stopping at `Options`.
+#[test]
+fn a_read_retry_waits_the_configured_delay() {
+    let _serial = exclusive();
+
+    let delay = std::time::Duration::from_millis(200);
+    let (fault, registry, inscription, retries) = published_waiting("stelae/waited", delay);
+    let layer = fault.layers()[0].clone();
+
+    fault.fail_next(&layer, &[Fault::Truncate]);
+
+    let started = std::time::Instant::now();
+    first_layer(&registry, &inscription).unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(retries.seen(), vec![(1, DEFAULT_READ_ATTEMPTS - 1)]);
+    assert!(
+        elapsed >= delay,
+        "the retry waited {elapsed:?}, not the configured {delay:?}",
+    );
 }
 
 /// A blob that arrives short of its descriptor — announced short, so the
@@ -2934,7 +2981,14 @@ fn a_blob_that_always_fails_exhausts_the_read_budget() {
         message.contains("6 attempt"),
         "the count is missing: {message}"
     );
+    // The transport's own cause, from below `reqwest`'s top-level text.
+    let cause = "end of file before message length reached";
+    assert!(message.contains(cause), "the cause is missing: {message}");
     println!("{message}");
+
+    for reason in retries.reasons() {
+        assert!(reason.contains(cause), "a retry hid its cause: {reason}");
+    }
 
     assert_eq!(fault.gets(&layer), 6);
     assert_eq!(

@@ -228,8 +228,8 @@ pub enum Event<'a> {
     /// `attempt` is the one that just failed, counting from one; `remaining` is
     /// how many are left after it, so a watcher can tell a hiccup from a
     /// transport about to give up. `reason` is the failure as it rendered
-    /// itself, because what an operator reads is the binary's business and not
-    /// this crate's.
+    /// itself, with its causes, because what an operator reads is the binary's
+    /// business and not this crate's.
     Retry {
         attempt: u32,
         remaining: u32,

@@ -1358,7 +1358,7 @@ impl Error {
             Error::Registry(E::IoError(io)) => io
                 .get_ref()
                 .is_some_and(|inner| inner.is::<BlobPastDescriptor>()),
-            // A registry that served the wrong bytes on every attempt.
+            // Judged by the last attempt: the wrong bytes on that one.
             Error::RetriesExhausted { source, .. } => source.is_blob_refusal(),
             _ => false,
         }
@@ -1438,6 +1438,30 @@ fn is_transient_read(error: &Error) -> bool {
         E::DigestError(DigestError::VerificationError { .. }) => true,
         _ => false,
     }
+}
+
+/// `error` and every cause under it, on one line and joined with `": "`.
+///
+/// A failed transfer's top-level text is `reqwest`'s "error decoding response
+/// body" whatever broke it; the reset, early EOF or timeout is further down.
+/// A cause whose text the line already ends with is left out, which is how
+/// transparent wrappers say nothing twice.
+pub(crate) fn with_causes(error: &impl std::error::Error) -> String {
+    let mut line = error.to_string();
+    let mut cause = error.source();
+
+    while let Some(next) = cause {
+        let said = next.to_string();
+
+        if !line.ends_with(&said) {
+            line.push_str(": ");
+            line.push_str(&said);
+        }
+
+        cause = next.source();
+    }
+
+    line
 }
 
 /// What a round trip's retries are allowed: how many attempts, the first wait,
@@ -1524,7 +1548,7 @@ impl Backoff {
         observer.emit(Event::Retry {
             attempt: self.attempted,
             remaining,
-            reason: &error.to_string(),
+            reason: &with_causes(error),
         });
 
         let waiting = self.delay;
@@ -1731,9 +1755,9 @@ impl Shared {
 
     /// [`retrying`], with this transport's own bound and observer.
     ///
-    /// Every round trip made on a caller's thread goes through here, so the
-    /// policy is stated once and no seam is left out by having been written
-    /// before the policy existed.
+    /// Every publish round trip made on a caller's thread goes through here,
+    /// so the policy is stated once and no seam is left out by having been
+    /// written before the policy existed. Reads go through [`Shared::reading`].
     fn retrying<T>(&self, op: impl FnMut() -> Result<T, Error>) -> Result<T, Error> {
         retrying(self.attempts, &self.observer(), op)
     }
@@ -3234,6 +3258,34 @@ mod tests {
         let waits: Vec<_> =
             std::iter::from_fn(|| publish.wait_after(&failure, &Observer::silent())).collect();
         assert_eq!(waits, [500, 1000, 2000].map(Duration::from_millis).to_vec());
+    }
+
+    /// A transport opened on default options gets the read budget the
+    /// contract states, not whatever the test helpers shorten it to.
+    #[test]
+    fn default_options_carry_the_read_budget() {
+        let options = Options::default();
+
+        assert_eq!(options.read_attempts, DEFAULT_READ_ATTEMPTS);
+        assert_eq!(options.read_delay, DEFAULT_READ_DELAY);
+        assert_eq!(options.attempts, DEFAULT_ATTEMPTS);
+    }
+
+    /// A cause the top-level text does not already end with is spelled out;
+    /// one it does end with, as behind a transparent wrapper, is not repeated.
+    #[test]
+    fn a_cause_chain_renders_each_cause_once() {
+        #[derive(Debug, thiserror::Error)]
+        enum Chain {
+            #[error("outer: {0}")]
+            Wrapping(#[source] Box<Chain>),
+            #[error("middle")]
+            Middle(#[source] std::io::Error),
+        }
+
+        let chain = Chain::Wrapping(Box::new(Chain::Middle(std::io::Error::other("cause"))));
+
+        assert_eq!(with_causes(&chain), "outer: middle: cause");
     }
 
     /// A read that never got through says what it read, how often, and why;

@@ -390,9 +390,14 @@ pub enum Error {
     ///
     /// `subject` names what was being read (a blob digest or a manifest
     /// reference) and `source` is the last attempt's failure, so the message
-    /// says what was retried, how often, and why it kept failing.
+    /// says what was retried, how often, and why it kept failing. The message
+    /// spells out `source`'s whole cause chain, because the last cause of a
+    /// broken transfer is several levels below its top-level text.
     #[cfg(feature = "oci")]
-    #[error("reading {subject} failed after {attempts} attempt(s): {source}")]
+    #[error(
+        "reading {subject} failed after {attempts} attempt(s): {}",
+        crate::oci::with_causes(.source)
+    )]
     RetriesExhausted {
         subject: String,
         attempts: u32,
