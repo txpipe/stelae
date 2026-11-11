@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### 🚀 Features
 
+- `SteleReader::stream_layers` streams the layers a caller names, in that order, opening each `LayerReader` when it is taken. A registry `Stele` pulls up to `ahead` blobs ahead of the caller as tasks on the transport's runtime, and dropping the stream cancels them; other readers, and a depth of 0 or 1, read one layer at a time as `stream_layer` does. Each read retry's `Event::Retry` reason now starts with the blob or manifest it retries.
 - [**breaking**] Retry failed and truncated registry reads with a longer backoff: manifest, config and layer `GET`s get `Options::read_attempts` (default 6) with waits from `Options::read_delay` (2 s) doubling up to 60 s, also retry a body that fails mid-transfer, a blob short of its descriptor and a digest mismatch, and report exhaustion as `Error::RetriesExhausted`. That message and each `Event::Retry` reason spell out the failure's whole cause chain. Publish round trips keep `Options::attempts`.
 
 ## [0.5.2] - 2026-11-04

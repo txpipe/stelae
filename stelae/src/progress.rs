@@ -229,7 +229,8 @@ pub enum Event<'a> {
     /// how many are left after it, so a watcher can tell a hiccup from a
     /// transport about to give up. `reason` is the failure as it rendered
     /// itself, with its causes, because what an operator reads is the binary's
-    /// business and not this crate's.
+    /// business and not this crate's. A read's reason starts with the blob or
+    /// manifest it fetches, since several reads can be retrying at once.
     Retry {
         attempt: u32,
         remaining: u32,

@@ -75,8 +75,8 @@ pub use plan::{Remaining, RestoreProgress, Resume};
 pub use profile::{MediaType, Profile};
 pub use progress::{Event, Observer, Outcome, Progress};
 pub use transport::{
-    BlobIndex, Discarding, DiscardingSink, LayerSpec, RecordSink, SteleReader, SteleWriter,
-    WrittenLayer,
+    BlobIndex, Discarding, DiscardingSink, LayerSpec, LayerStream, RecordSink, SteleReader,
+    SteleWriter, WrittenLayer,
 };
 
 /// Artifact type of a Stelae snapshot's manifest. Generic tooling discovers

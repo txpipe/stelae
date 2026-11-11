@@ -3,8 +3,9 @@
 //! Enough of the distribution API for a [`stelae::oci::Registry`] to publish a
 //! stele and pull it back over plaintext HTTP — monolithic blob uploads, blob
 //! `HEAD`/`GET`, manifest `PUT`/`GET` — plus scripted faults on the reads: a
-//! body cut off partway, a body that is honestly short, or a status code. No
-//! container, so the read-retry tests run under plain `cargo test`.
+//! body cut off partway, a body that is honestly short, or a status code, and
+//! a wait before a layer blob's first byte. No container, so the read-retry
+//! and read-ahead tests run under plain `cargo test`.
 //!
 //! Every response closes its connection, so each attempt the client makes is a
 //! fresh request that this server sees and counts.
@@ -14,6 +15,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use sha2::{Digest as _, Sha256};
@@ -56,6 +58,15 @@ struct State {
     gets: HashMap<String, usize>,
     heads: HashMap<String, usize>,
     uploads: usize,
+    /// The wait before a layer blob's first byte, by digest.
+    delays: HashMap<String, Duration>,
+    /// Layer blob `GET`s in the order they arrived, and in the order their
+    /// answers were done.
+    arrived: Vec<String>,
+    served: Vec<String>,
+    /// Layer blob `GET`s being answered now, and the most there were at once.
+    active: usize,
+    peak: usize,
 }
 
 pub struct FaultRegistry {
@@ -130,6 +141,37 @@ impl FaultRegistry {
     /// How many `HEAD`s each blob digest received.
     pub fn heads(&self) -> HashMap<String, usize> {
         self.state().heads.clone()
+    }
+
+    /// Wait `delay` before the first byte of every `GET` of these blobs.
+    pub fn delay(&self, digests: &[String], delay: Duration) {
+        let mut state = self.state();
+        for digest in digests {
+            state.delays.insert(digest.clone(), delay);
+        }
+    }
+
+    /// Layer blob `GET`s in the order they arrived.
+    pub fn arrived(&self) -> Vec<String> {
+        self.state().arrived.clone()
+    }
+
+    /// Layer blob `GET`s in the order their answers were done.
+    pub fn served(&self) -> Vec<String> {
+        self.state().served.clone()
+    }
+
+    /// The most layer blob `GET`s answered at once.
+    pub fn peak(&self) -> usize {
+        self.state().peak
+    }
+
+    /// Forget the layer `GET`s logged so far, and the peak.
+    pub fn forget(&self) {
+        let mut state = self.state();
+        state.arrived.clear();
+        state.served.clear();
+        state.peak = state.active;
     }
 }
 
@@ -279,7 +321,25 @@ fn handle(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
         };
 
         let head = request.method == "HEAD";
-        return match (blob, fault) {
+
+        // Only layer `GET`s are logged and delayed, so a test reads the order a
+        // restore fetched its layers in without the config blob in it.
+        let layer = !head && lock().layers.contains(&digest);
+        if layer {
+            let delay = {
+                let mut state = lock();
+                state.arrived.push(digest.clone());
+                state.active += 1;
+                state.peak = state.peak.max(state.active);
+                state.delays.get(&digest).copied()
+            };
+
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
+        }
+
+        let answered = match (blob, fault) {
             (_, Some(Fault::Status(code))) => respond(&stream, code, &[], 0, b""),
             (None, _) => respond(&stream, 404, &[], 0, b""),
             (Some(blob), _) if head => {
@@ -293,6 +353,14 @@ fn handle(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
             }
             (Some(blob), fault) => serve(&stream, &[], &blob, fault),
         };
+
+        if layer {
+            let mut state = lock();
+            state.active -= 1;
+            state.served.push(digest);
+        }
+
+        return answered;
     }
 
     if let Some(index) = rest.find("/manifests/") {
