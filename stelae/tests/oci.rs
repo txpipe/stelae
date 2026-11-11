@@ -3536,7 +3536,7 @@ fn dropping_a_read_ahead_cancels_its_pulls() {
 fn dropping_a_read_ahead_cancels_a_pull_waiting_to_retry() {
     let _serial = exclusive();
 
-    let backoff = Duration::from_secs(5);
+    let backoff = Duration::from_secs(1);
     let fault = FaultRegistry::spawn();
     let registry = faulty_waiting(&fault, "stelae/ahead-drop-retry", backoff);
     let inscription = write_layers(&registry, 8);
@@ -3567,6 +3567,10 @@ fn dropping_a_read_ahead_cancels_a_pull_waiting_to_retry() {
         dropping.elapsed() < backoff / 5,
         "the drop waited out a retry's backoff instead of cancelling it",
     );
+
+    // Past the backoff, so a pull that had not been cancelled would have tried
+    // again by now.
+    std::thread::sleep(backoff + Duration::from_millis(200));
     assert_eq!(fault.gets(&blob), 1, "the cancelled pull tried again");
 }
 
@@ -3670,9 +3674,13 @@ fn a_read_ahead_of_two_fetches_one_layer_ahead() {
     );
     prove(first, &inscription.layers[0]);
 
-    for (reader, descriptor) in stream.zip(&inscription.layers[1..]) {
-        prove(reader.unwrap(), descriptor);
+    for descriptor in &inscription.layers[1..] {
+        prove(stream.next().unwrap().unwrap(), descriptor);
     }
+    assert!(
+        stream.next().is_none(),
+        "a layer past the last was handed over"
+    );
 }
 
 /// The wall clock the read-ahead buys: 200 small layers, each behind a 300 ms
