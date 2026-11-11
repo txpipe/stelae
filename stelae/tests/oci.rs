@@ -3354,6 +3354,43 @@ fn a_read_ahead_opens_a_layer_only_when_it_is_taken() {
     assert_eq!(opening.opened(), vec![caller; inscription.layers.len()]);
 }
 
+/// Each take opens the layer it hands over and no other, however many staged
+/// layers behind it have finished.
+#[test]
+fn a_read_ahead_opens_only_the_layer_each_take_hands_over() {
+    let _serial = exclusive();
+
+    let (_fault, registry, inscription, moved) =
+        published_layers("stelae/ahead-open-each", 4, None);
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+    let total: u64 = stele.manifest().layers.iter().map(|l| l.size as u64).sum();
+    let layers = inscription.layers.clone();
+    let opening = Opening::default();
+    let caller = std::thread::current().id();
+
+    let mut stream = stele.stream_layers(&index, &opening, layers, Limits::default(), 4);
+
+    for (taken, descriptor) in inscription.layers.iter().enumerate() {
+        let reader = stream.next().unwrap().unwrap();
+
+        if taken == 0 {
+            // Landed is not yet finished: give the pulls time to hand their
+            // files back, so the next take finds them all staged.
+            eventually("every blob to land", || moved.bytes() == total);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        assert_eq!(
+            opening.opened(),
+            vec![caller; taken + 1],
+            "take {taken} opened a layer it did not hand over",
+        );
+        prove(reader, descriptor);
+    }
+}
+
 /// A layer that fails on every attempt is reported at its own turn, after
 /// every layer before it, and the stream ends there with nothing left running.
 #[test]
@@ -3403,6 +3440,49 @@ fn a_read_ahead_reports_a_failed_layer_at_its_turn() {
     assert_eq!(moved.bytes(), bytes, "a pull was still writing");
 }
 
+/// A layer the manifest does not place is refused at its own turn on a
+/// read-ahead as well, and nothing named after it is fetched.
+#[test]
+fn a_read_ahead_refuses_an_unplaced_layer_at_its_turn() {
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, _) = published_layers("stelae/ahead-absent", 4, None);
+    let blobs = fault.layers();
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+
+    let mut absent = inscription.layers[0].clone();
+    absent.diff_id = Digest::from_bytes([0xab; 32]);
+    let layers = vec![
+        inscription.layers[0].clone(),
+        absent,
+        inscription.layers[1].clone(),
+        inscription.layers[2].clone(),
+    ];
+
+    let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), 8);
+
+    prove(stream.next().unwrap().unwrap(), &inscription.layers[0]);
+
+    // Time for any pull started past the refusal to reach the registry.
+    std::thread::sleep(Duration::from_millis(100));
+
+    assert!(matches!(
+        stream.next(),
+        Some(Err(Error::LayerNotFound { .. }))
+    ));
+    assert!(
+        stream.next().is_none(),
+        "a layer was handed over after the refusal"
+    );
+    assert_eq!(
+        fault.arrived(),
+        vec![blobs[0].clone()],
+        "a layer named after the refusal was fetched",
+    );
+}
+
 /// Dropping the stream partway cancels the pulls in flight and drops the staged
 /// ones: nothing is fetched or written after the drop returns, and the staging
 /// directory holds nothing.
@@ -3448,6 +3528,46 @@ fn dropping_a_read_ahead_cancels_its_pulls() {
     assert_eq!(fault.arrived().len(), gets, "a GET started after the drop");
     assert_eq!(moved.bytes(), bytes, "a pull wrote after the drop");
     assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+}
+
+/// Dropping the stream cancels a pull that is waiting out its retry backoff:
+/// the drop returns at once, and the pull never makes its next attempt.
+#[test]
+fn dropping_a_read_ahead_cancels_a_pull_waiting_to_retry() {
+    let _serial = exclusive();
+
+    let backoff = Duration::from_secs(5);
+    let fault = FaultRegistry::spawn();
+    let registry = faulty_waiting(&fault, "stelae/ahead-drop-retry", backoff);
+    let inscription = write_layers(&registry, 8);
+    let moved = Arc::new(Moved::default());
+    registry.observe(Observer::new(moved.clone()));
+
+    // The fifth layer's first transfer is cut off, so its pull is waiting to
+    // try again when the stream is dropped.
+    let blob = fault.layers()[4].clone();
+    fault.fail_next(&blob, &[Fault::Truncate]);
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+    let layers = inscription.layers.clone();
+
+    let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), 4);
+
+    for descriptor in &inscription.layers[..2] {
+        prove(stream.next().unwrap().unwrap(), descriptor);
+    }
+    eventually("the fifth pull to be cut off", || {
+        moved.retries().len() == 1
+    });
+
+    let dropping = Instant::now();
+    drop(stream);
+    assert!(
+        dropping.elapsed() < backoff / 5,
+        "the drop waited out a retry's backoff instead of cancelling it",
+    );
+    assert_eq!(fault.gets(&blob), 1, "the cancelled pull tried again");
 }
 
 /// A transfer cut off once inside a read-ahead is fetched again: exactly one
@@ -3521,6 +3641,37 @@ fn a_read_ahead_of_one_is_a_stream_layer_loop() {
         }
 
         assert_eq!(fault.arrived(), looped, "depth {ahead} is not the loop");
+    }
+}
+
+/// At a depth of two, the smallest that reads ahead, one layer is fetched
+/// while the caller holds another, and no more.
+#[test]
+fn a_read_ahead_of_two_fetches_one_layer_ahead() {
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, _) = published_layers("stelae/ahead-two", 4, None);
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+    let layers = inscription.layers.clone();
+
+    let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), 2);
+
+    let first = stream.next().unwrap().unwrap();
+    eventually("the second pull to reach the registry", || {
+        fault.arrived().len() == 2
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        fetched(&fault),
+        sorted(&fault.layers()[..2]),
+        "depth 2 did not fetch exactly one layer ahead",
+    );
+    prove(first, &inscription.layers[0]);
+
+    for (reader, descriptor) in stream.zip(&inscription.layers[1..]) {
+        prove(reader.unwrap(), descriptor);
     }
 }
 
