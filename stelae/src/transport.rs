@@ -12,10 +12,21 @@
 //!   inscription;
 //! - the **read** half ([`SteleReader`]) reads an inscription, hands over the
 //!   identity→blob map, and streams a layer named by a [`LayerDescriptor`]
-//!   under [`Limits`].
+//!   under [`Limits`] — or, through [`SteleReader::stream_layers`], the layers
+//!   a caller names, one after another in the order it named them.
 //!
 //! Both are exactly what a directory already did, so the directory keeps
 //! working unchanged and a registry lands beside it.
+//!
+//! ## An ordered read, fetched ahead by the transport that can
+//!
+//! A restore drains its layers one at a time and knows the whole list before
+//! the first. [`SteleReader::stream_layers`] takes that list and a depth, and
+//! hands the layers back in list order, each [`LayerReader`] opened when the
+//! caller takes it. What happens before that is the transport's: a directory's
+//! blobs are already local, so the default reads one layer at a time; a
+//! registry ([`crate::oci::Stele`]) downloads up to the depth ahead of the
+//! caller on its own runtime, so the network wait overlaps the caller's work.
 //!
 //! ## `BlobIndex` is the concept that generalizes
 //!
@@ -539,6 +550,24 @@ pub trait SteleReader {
         limits: Limits,
     ) -> Result<LayerReader<Self::Blob>, Error>;
 
+    /// Stream the layers in `layers`, in that order, one reader per layer.
+    ///
+    /// Each [`LayerReader`] is opened when the caller takes it, and the stream
+    /// ends after the first error. `ahead` is how many layers the caller has
+    /// not yet taken a transport may fetch at once; `0` and `1` mean one at a
+    /// time. The default is one at a time whatever `ahead` says, since a reader
+    /// whose blobs are local has nothing to fetch ahead.
+    fn stream_layers<'s>(
+        &'s self,
+        index: &'s BlobIndex,
+        profile: &'s dyn Profile,
+        layers: Vec<LayerDescriptor>,
+        limits: Limits,
+        _ahead: usize,
+    ) -> LayerStream<'s, Self::Blob> {
+        LayerStream::serial(self, index, profile, layers, limits)
+    }
+
     /// Report what this transport moves to `observer`, for as long as it is
     /// attached.
     ///
@@ -548,4 +577,89 @@ pub trait SteleReader {
     /// restore that reported only what the profile driver sees would be silent
     /// for the download — and on a restore the download *is* the work.
     fn observe(&self, _observer: Observer) {}
+}
+
+/// The layers [`SteleReader::stream_layers`] hands back, in the order they
+/// were named.
+///
+/// An iterator of one reader per layer, which stops after the first error
+/// whatever the source behind it would yield next. Dropping it ends any work
+/// the transport started ahead of the caller.
+pub struct LayerStream<'s, B: std::io::Read> {
+    layers: Box<dyn Iterator<Item = Result<LayerReader<B>, Error>> + 's>,
+    ended: bool,
+}
+
+impl<'s, B: std::io::Read> LayerStream<'s, B> {
+    /// A stream over `layers`, ended at its first error.
+    ///
+    /// For a transport overriding [`SteleReader::stream_layers`]; whatever
+    /// `layers` holds is dropped with the stream.
+    pub fn new(layers: impl Iterator<Item = Result<LayerReader<B>, Error>> + 's) -> Self {
+        Self {
+            layers: Box::new(layers),
+            ended: false,
+        }
+    }
+
+    /// One [`SteleReader::stream_layer`] call per layer, made when the caller
+    /// asks for that layer: the default stream, and the one an override falls
+    /// back to when it has nothing to fetch ahead.
+    pub fn serial<R>(
+        reader: &'s R,
+        index: &'s BlobIndex,
+        profile: &'s dyn Profile,
+        layers: Vec<LayerDescriptor>,
+        limits: Limits,
+    ) -> Self
+    where
+        R: SteleReader<Blob = B> + ?Sized,
+    {
+        Self::new(Serial {
+            reader,
+            index,
+            profile,
+            layers: layers.into_iter(),
+            limits,
+        })
+    }
+}
+
+impl<B: std::io::Read> Iterator for LayerStream<'_, B> {
+    type Item = Result<LayerReader<B>, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ended {
+            return None;
+        }
+
+        let next = self.layers.next();
+        self.ended = !matches!(next, Some(Ok(_)));
+
+        next
+    }
+}
+
+/// [`LayerStream::serial`]'s source. A named type rather than a closure, so
+/// the stream outlives `'s` on the strength of its borrows alone and a caller
+/// generic over the reader owes no bound on its blob type.
+struct Serial<'s, R: ?Sized> {
+    reader: &'s R,
+    index: &'s BlobIndex,
+    profile: &'s dyn Profile,
+    layers: std::vec::IntoIter<LayerDescriptor>,
+    limits: Limits,
+}
+
+impl<R: SteleReader + ?Sized> Iterator for Serial<'_, R> {
+    type Item = Result<LayerReader<R::Blob>, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let descriptor = self.layers.next()?;
+
+        Some(
+            self.reader
+                .stream_layer(self.index, self.profile, &descriptor, self.limits),
+        )
+    }
 }
