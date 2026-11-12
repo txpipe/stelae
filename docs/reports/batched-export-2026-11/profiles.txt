@@ -1,0 +1,27 @@
+old: 15073 samples, save 97%, file sync 77%
+    45215 dolos_snapshot::export::Pool::drain
+    15073 stelae_driver::retry::bounded
+    15073 dolos_snapshot::registry::publish_into
+    15073 dolos_snapshot::export::export
+    15073 dolos_snapshot::export::produce
+    14559 stelae_driver::publish::PublishRecord::save
+      207 dolos_snapshot::export::route_index
+       82 stelae_driver::reporting::Cursor::open
+w12-early: 16697 samples, save 93%, file sync 50%
+    66780 dolos_snapshot::export::Pool::drain
+    66613 dolos_snapshot::export::landed
+    16697 stelae_driver::retry::bounded
+    16697 dolos_snapshot::registry::publish_prepared
+    16697 dolos_snapshot::prepare::finalize
+    16697 dolos_snapshot::export::assemble
+    16697 dolos_snapshot::export::produce
+    15556 stelae_driver::publish::PublishRecord::save
+w8-late: 15241 samples, save 70%, file sync 44%
+    51273 dolos_snapshot::export::Pool::drain
+    46155 dolos_snapshot::export::landed
+    15241 stelae_driver::retry::bounded
+    15241 dolos_snapshot::registry::publish_prepared
+    15241 dolos_snapshot::prepare::finalize
+    15241 dolos_snapshot::export::assemble
+    15241 dolos_snapshot::export::produce
+    10679 stelae_driver::publish::PublishRecord::save

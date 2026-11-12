@@ -38,6 +38,10 @@ toml = { version = "0.8.13", optional = true }
 [features]
 testing = ["dep:dolos-testing", "dep:tempfile", "dep:toml"]
 
+[[example]]
+name = "loopback"
+required-features = ["testing"]
+
 [dev-dependencies]
 stelae-cardano = { path = ".", features = ["testing"] }
 dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "bf66dcc66cd65228539c8401e291807e947c61ec" }
