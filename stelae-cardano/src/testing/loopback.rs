@@ -78,6 +78,8 @@ struct Shared {
     port: u16,
     highest_immutable: AtomicU64,
     uploads: AtomicU64,
+    /// Names each manifest write's file before it moves under its tag.
+    partials: AtomicU64,
     /// Past this size a blob isn't written or checked, only counted. Zero keeps
     /// everything.
     discard_above: AtomicU64,
@@ -111,6 +113,7 @@ impl Loopback {
             port: listener.local_addr()?.port(),
             highest_immutable: AtomicU64::new(0),
             uploads: AtomicU64::new(0),
+            partials: AtomicU64::new(0),
             discard_above: AtomicU64::new(0),
             accounting: Mutex::default(),
             rule: RwLock::new(None),
@@ -199,6 +202,25 @@ impl Loopback {
             .collect()
     }
 
+    /// Every digest a tag's manifest names that the repository doesn't hold at
+    /// the size the manifest gives: what a restore of that tag would miss.
+    pub fn absent_blobs(&self, name: &str) -> BTreeMap<String, u64> {
+        let held = self.blobs(name);
+        let mut absent = BTreeMap::new();
+        for manifest in self.manifests(name).values() {
+            let manifest: serde_json::Value = serde_json::from_slice(manifest).unwrap_or_default();
+            let layers = manifest["layers"].as_array().cloned().unwrap_or_default();
+            for named in std::iter::once(&manifest["config"]).chain(&layers) {
+                let digest = named["digest"].as_str().unwrap_or_default().to_owned();
+                let size = named["size"].as_u64().unwrap_or_default();
+                if held.get(&digest) != Some(&size) {
+                    absent.insert(digest, size);
+                }
+            }
+        }
+        absent
+    }
+
     /// Apply a rule to every request from now on. A rule is told nothing about
     /// what came before, so one that counts holds its own count.
     pub fn rule(&self, rule: impl Fn(&Seen<'_>) -> Verdict + Send + Sync + 'static) {
@@ -229,6 +251,21 @@ impl Loopback {
 
 fn tag_path(root: &Path, name: &str, tag: &str) -> PathBuf {
     root.join(name).join("manifests/tags").join(tag)
+}
+
+/// Whether a part of a request's path stays under the root once joined to it:
+/// relative, with no empty, `.` or `..` component.
+fn confined(part: &str) -> bool {
+    !part.contains('\\')
+        && part
+            .split('/')
+            .all(|component| !matches!(component, "" | "." | ".."))
+}
+
+/// A digest's hex, if it is nothing else.
+fn digest_hex(digest: &str) -> Option<&str> {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    (!hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(hex)
 }
 
 fn held_until_released(shared: &Shared) {
@@ -343,6 +380,28 @@ impl Write for Counted<'_> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.sink.flush()
+    }
+}
+
+/// A writer into `file` that keeps the first `keep` bytes and only counts the
+/// rest, so a blob past the limit costs the volume nothing.
+struct Capped<'a> {
+    file: &'a mut File,
+    keep: u64,
+    seen: u64,
+}
+
+impl Write for Capped<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let room = self.keep.saturating_sub(self.seen);
+        let kept = usize::try_from(room).map_or(buffer.len(), |room| room.min(buffer.len()));
+        self.file.write_all(&buffer[..kept])?;
+        self.seen += buffer.len() as u64;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
     }
 }
 
@@ -497,17 +556,38 @@ fn route(head: &Head, reader: &mut impl BufRead, shared: &Shared) -> io::Result<
         copy_body(reader, head, &mut io::sink())?;
         return Ok(Answer::status(404));
     };
+    // A request names files under the root, and only there.
+    let leaf = |part: &str| !part.contains('/') && (part.is_empty() || confined(part));
     if let Some((name, id)) = rest.rsplit_once("/blobs/uploads/") {
+        if !confined(name) || !leaf(id) {
+            return refuse_outside(head, reader);
+        }
         return upload(head, reader, shared, name, id);
     }
     if let Some((name, digest)) = rest.rsplit_once("/blobs/") {
+        if !confined(name) || digest_hex(digest).is_none() {
+            return refuse_outside(head, reader);
+        }
         return blob(head, shared, name, digest);
     }
     if let Some((name, reference)) = rest.rsplit_once("/manifests/") {
+        let named = match reference.strip_prefix("sha256:") {
+            Some(_) => digest_hex(reference).is_some(),
+            None => !reference.is_empty() && leaf(reference),
+        };
+        if !confined(name) || !named {
+            return refuse_outside(head, reader);
+        }
         return manifest(head, reader, shared, name, reference);
     }
     copy_body(reader, head, &mut io::sink())?;
     Ok(Answer::status(404))
+}
+
+fn refuse_outside(head: &Head, reader: &mut impl BufRead) -> io::Result<Answer> {
+    copy_body(reader, head, &mut io::sink())?;
+    let body = br#"{"errors":[{"code":"NAME_INVALID","message":"outside the root","detail":{}}]}"#;
+    Ok(Answer::json(400, body.to_vec()))
 }
 
 /// One snapshot's listing: the client reads only its beacon, and needs the rest
@@ -559,11 +639,21 @@ fn upload(
                 .headers
                 .get("content-length")
                 .and_then(|length| length.parse().ok());
-            if discard_above > 0 && length.unwrap_or(u64::MAX) > discard_above {
-                let received = receive_blob(reader, head, shared, name, &mut io::sink())?;
-                file.set_len(file.metadata()?.len() + received)?;
-            } else {
-                receive_blob(reader, head, shared, name, &mut file)?;
+            // A body of unknown length is kept until it passes the limit.
+            let keep = match (discard_above, length) {
+                (0, _) => u64::MAX,
+                (limit, Some(length)) if length > limit => 0,
+                (limit, _) => limit,
+            };
+            let start = file.metadata()?.len();
+            let mut capped = Capped {
+                file: &mut file,
+                keep,
+                seen: 0,
+            };
+            let received = receive_blob(reader, head, shared, name, &mut capped)?;
+            if received > keep {
+                file.set_len(start + received)?;
             }
             drop(file);
             if head.method == "PATCH" {
@@ -591,8 +681,10 @@ fn finish_upload(
     let digest = digest.map(|digest| digest.replace("%3A", ":"));
     let size = fs::metadata(path)?.len();
     let discard_above = shared.discard_above.load(Ordering::SeqCst);
+    let trusted = discard_above > 0 && size > discard_above;
     let found = match digest.clone() {
-        Some(digest) if discard_above > 0 && size > discard_above => digest,
+        // Taken on trust, but still only as a name under the root.
+        Some(digest) if trusted && digest_hex(&digest).is_some() => digest,
         _ => {
             let (found, _) = digest_reader(File::open(path)?).map_err(io::Error::other)?;
             let found = format!("sha256:{}", found.to_hex());
@@ -665,8 +757,10 @@ fn manifest(
         fs::create_dir_all(root.join("tags"))?;
         fs::create_dir_all(&digests)?;
         fs::write(digests.join(&digest), &body)?;
-        // Moved into place, so a read of the tag sees one manifest or the other.
-        let partial = root.join(format!(".partial-{}", std::process::id()));
+        // Moved into place, so a read of the tag sees one manifest or the other,
+        // from a file no other write shares.
+        let write = shared.partials.fetch_add(1, Ordering::SeqCst);
+        let partial = root.join(format!(".partial-{write}"));
         fs::write(&partial, &body)?;
         fs::rename(&partial, &path)?;
         let mut accounting = shared.accounting.lock().unwrap();
@@ -760,5 +854,101 @@ mod tests {
         let accounting = loopback.accounting(NAME);
         assert_eq!(accounting.uploaded(), 0);
         assert!(accounting.uploads.is_empty());
+    }
+
+    /// Send one request and read the status it was answered with.
+    fn status_of(loopback: &Loopback, head: &str, body: &[u8]) -> u16 {
+        let mut stream = TcpStream::connect(("127.0.0.1", loopback.port())).unwrap();
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        line.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
+
+    fn put_blob(loopback: &Loopback, framing: &str, body: &[u8]) -> (String, u16) {
+        let id = start_upload(loopback);
+        let digest = format!("sha256:{}", Digest::compute(body).to_hex());
+        let path = format!("/v2/{NAME}/blobs/uploads/{id}?digest={digest}");
+        let head = format!("PUT {path} HTTP/1.1\r\n{framing}\r\n\r\n");
+        (digest, status_of(loopback, &head, body))
+    }
+
+    #[test]
+    fn a_request_naming_a_path_outside_the_root_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("registry");
+        let loopback = Loopback::serve(&root).unwrap();
+        fs::write(dir.path().join("secret"), b"not the registry's").unwrap();
+        let id = start_upload(&loopback);
+        for (method, target) in [
+            ("PUT", format!("/v2/{NAME}/manifests/../../../escaped")),
+            ("PUT", "/v2/../escaped/manifests/latest".to_owned()),
+            ("PUT", format!("/v2/{NAME}/manifests/sha256:../../escaped")),
+            (
+                "PUT",
+                format!("/v2/{NAME}/blobs/uploads/../../{id}?digest=sha256:00"),
+            ),
+            (
+                "GET",
+                format!("/v2/{NAME}/blobs/sha256:../../../../../secret"),
+            ),
+        ] {
+            let head = format!("{method} {target} HTTP/1.1\r\nContent-Length: 2\r\n\r\n");
+            assert_eq!(status_of(&loopback, &head, b"{}"), 400, "{method} {target}");
+        }
+        let mut beside: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        beside.sort();
+        assert_eq!(beside, ["registry", "secret"]);
+    }
+
+    #[test]
+    fn a_body_of_unknown_length_is_kept_until_it_passes_the_discard_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let loopback = Loopback::serve(root.path()).unwrap();
+        loopback.discard_above(10);
+        for (body, kept) in [(&b"small"[..], true), (&[7u8; 25][..], false)] {
+            let mut framed = format!("{:x}\r\n", body.len()).into_bytes();
+            framed.extend_from_slice(body);
+            framed.extend_from_slice(b"\r\n0\r\n\r\n");
+            let id = start_upload(&loopback);
+            let digest = format!("sha256:{}", Digest::compute(body).to_hex());
+            let path = format!("/v2/{NAME}/blobs/uploads/{id}?digest={digest}");
+            let head = format!("PUT {path} HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+            assert_eq!(status_of(&loopback, &head, &framed), 201);
+            let stored = fs::read(
+                root.path()
+                    .join(NAME)
+                    .join("blobs/sha256")
+                    .join(&digest[7..]),
+            );
+            let stored = stored.unwrap();
+            assert_eq!(stored.len(), body.len());
+            assert_eq!(stored == body, kept, "{} bytes", body.len());
+        }
+        assert_eq!(loopback.accounting(NAME).received, 30);
+    }
+
+    #[test]
+    fn a_manifest_naming_a_blob_the_repository_lacks_is_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let loopback = Loopback::serve(root.path()).unwrap();
+        let (held, status) = put_blob(&loopback, "Content-Length: 4", b"held");
+        assert_eq!(status, 201);
+        let missing = format!("sha256:{}", "0".repeat(64));
+        let manifest = serde_json::json!({
+            "config": { "digest": held, "size": 4 },
+            "layers": [{ "digest": held, "size": 4 }, { "digest": missing, "size": 3 }],
+        })
+        .to_string();
+        let length = manifest.len();
+        let head =
+            format!("PUT /v2/{NAME}/manifests/latest HTTP/1.1\r\nContent-Length: {length}\r\n\r\n");
+        assert_eq!(status_of(&loopback, &head, manifest.as_bytes()), 201);
+        assert_eq!(loopback.absent_blobs(NAME), BTreeMap::from([(missing, 3)]));
     }
 }
