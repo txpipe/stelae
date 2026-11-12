@@ -46,8 +46,11 @@ measure.py prepare --root ROOT --corpus IMMUTABLE --state-epochs EPOCHS \
 ```
 
 A replay that stops leaves its stores, so `prepare` records the epoch a replay finished
-at in `base/<network>/replayed-to` and refuses stores without that record, or with
-another epoch's: delete them and prepare again.
+at in `base/<network>/replayed-to`, and refuses stores without that record, or with
+another epoch's: delete `base/<network>`, which holds the stores, the seed and the record,
+and prepare again. A replay drops an earlier record and seed before it starts, since they
+describe stores that are gone. A base made before the record, once known whole, is
+adopted with `echo 256 > ROOT/base/preprod/replayed-to`.
 
 Run the arms, with each arm once in each position across rounds. `--first-file` is two
 immutable files below the base's cursor and `--last-file` is a few past the boundary
@@ -95,10 +98,12 @@ sampler stops waiting when the tool ends, and without it once the run's row is w
 ## What the numbers mean
 
 - **`succeeded`** means the last process exited 0, the repository holds `epoch-<until>`, and
-  a `--kill-on` the run asked for came (`kill_fired`). A run out of chain files exits 0 short
-  of that, and one whose pattern never matched measured no fault: neither counts. `summarize`
+  a `--kill-on` the run asked for came and its SIGKILL ended the process (`kill_fired`). A run
+  out of chain files exits 0 short of that, and one whose pattern never matched, or matched a
+  line logged as the process exited, measured no fault: neither counts. `summarize`
   medians and `compare` read only runs that succeeded, and `summarize` keeps runs to
-  different epochs in separate tables. A rerun leg records its arm, binary hash and flags.
+  different epochs in separate tables. A rerun leg records its arm, binary hash and flags,
+  one the tool's stop cut short included.
 - **Wall time** is the process's, from spawn to exit. Inputs are cloned before the
   clock starts.
 - **The OS cache** is neither controlled nor measured. Clones are separate files, so a run

@@ -351,6 +351,11 @@ def run_once(command, log_path, data, legs, kill_on=None, timeout=None):
             kill(process)
             _, status, usage = os.wait4(process.pid, 0)
             killed = killed or "tool stopped"
+        # The pattern can match a line logged just before an exit that the kill then misses.
+        if killed == "planned" and not (
+            os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+        ):
+            killed = False
         wall = time.perf_counter() - began
         sampler.halt.set()
         sampler.join()
@@ -399,7 +404,12 @@ def command_prepare(args):
     base.mkdir(parents=True, exist_ok=True)
     # Written once the replay succeeds: a replay that stopped leaves its stores too.
     replayed = base / "replayed-to"
+    seed = base / "registry"
     if not (base / "data").exists():
+        # An earlier replay's record and seed describe stores that are gone.
+        replayed.unlink(missing_ok=True)
+        if seed.exists():
+            shutil.rmtree(seed)
         write_config(config, args.network, base / "data")
         subprocess.run(
             [args.loopback, "replay", str(config), str(args.corpus), str(args.base_epoch)],
@@ -409,9 +419,8 @@ def command_prepare(args):
     elif not replayed.is_file() or replayed.read_text().split() != [str(args.base_epoch)]:
         raise SystemExit(
             f"{base / 'data'} isn't a finished replay to epoch {args.base_epoch}, as "
-            f"{replayed} would say: delete it and prepare again"
+            f"{replayed} would say: delete {base} and prepare again"
         )
-    seed = base / "registry"
     loopback = Loopback(args.loopback, seed)
     try:
         subprocess.run(
@@ -486,8 +495,14 @@ def measure(args, arm, run_dir, observation):
                 rerun_command = publisher_command(rerun, config, loopback, args)
                 identity = {"arm": rerun["name"], "binary_sha256": sha256_of(rerun["binary"]),
                             "flags": rerun.get("flags", [])}
-                run_once(rerun_command, log, data, legs, None, args.timeout)
-                legs[-1].update(identity)
+                # A leg the tool's stop cut short is still this arm's; one that never
+                # started has no leg to name.
+                before = len(legs)
+                try:
+                    run_once(rerun_command, log, data, legs, None, args.timeout)
+                finally:
+                    if len(legs) > before:
+                        legs[-1].update(identity)
         accounting = loopback.accounting()
     finally:
         try:

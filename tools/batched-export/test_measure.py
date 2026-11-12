@@ -7,6 +7,7 @@ minute or so and needs nothing built. Nothing in CI runs it:
 """
 
 import hashlib
+import importlib.util
 import json
 import os
 import resource
@@ -77,14 +78,15 @@ if found != (None if sequence == 1 else "inscription-" + str(sequence - 1)):
 output.write_text({prefix!r} + str(sequence))
 """
 
-# `replay` makes the storage path its config names, records the epoch asked for, and
-# exits 1 while `fails` exists. Anything else serves as the registry.
+# `replay` makes the storage path its config names, records the epoch asked for there
+# and in `calls`, and exits 1 while `fails` exists. Anything else serves as the registry.
 REPLAYING_REGISTRY = """#!{python}
 import re, sys
 from pathlib import Path
 if sys.argv[1] == "replay":
     storage = re.search(r'path = "(.*)"', Path(sys.argv[2]).read_text()).group(1)
     Path(storage).mkdir(parents=True, exist_ok=True)
+    Path(storage, "epoch").write_text(sys.argv[4])
     with open({calls!r}, "a") as calls:
         calls.write(sys.argv[4] + "\\n")
     sys.exit(1 if Path({fails!r}).exists() else 0)
@@ -95,6 +97,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
 print(server.server_address[1], flush=True)
 server.serve_forever()
+"""
+
+# Tags the seed beside its config with the epoch its stores were replayed to.
+SEEDING_PUBLISHER = """#!{python}
+import re, sys
+from pathlib import Path
+config = Path(sys.argv[sys.argv.index("--config") + 1])
+storage = re.search(r'path = "(.*)"', config.read_text()).group(1)
+tags = config.parent / "registry" / "cardano" / "measured" / "manifests" / "tags"
+tags.mkdir(parents=True, exist_ok=True)
+(tags / ("epoch-" + Path(storage, "epoch").read_text())).write_text("{{}}")
 """
 
 # Timestamped lines, as the publisher's log has them.
@@ -431,6 +444,56 @@ class Faults(Harness):
         self.assertEqual(row["legs"][0]["exit"], -9)
         self.assertEqual(row["legs"][1]["exit"], 0)
 
+    def test_a_rerun_leg_the_tool_stopped_keeps_its_arm(self):
+        pid_file = self.root / "second.pid"
+        first = self.script("first", '#!/bin/sh\necho "reached the point" >&2\nexec sleep 600\n')
+        second = self.script("second", f'#!/bin/sh\necho $$ > "{pid_file}"\nexec sleep 600\n')
+        rerun = {"name": "second", "binary": str(second), "flags": ["--batch-epochs", "4"]}
+        tool = subprocess.Popen(
+            self.command(first, "--kill-on", "reached the point", "--rerun-arm", json.dumps(rerun)),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=default_stop_signals,
+        )
+        self.addCleanup(tool.kill)
+        self.wait_for(pid_file)
+        tool.send_signal(signal.SIGTERM)
+        self.assertEqual(tool.wait(timeout=60), 1)
+        leg = self.rows()[0]["legs"][1]
+        self.assertEqual(leg["killed"], "tool stopped")
+        self.assertEqual(leg["arm"], "second")
+        self.assertEqual(leg["binary_sha256"], hashlib.sha256(second.read_bytes()).hexdigest())
+        self.assertEqual(leg["flags"], ["--batch-epochs", "4"])
+        self.assertTrue(gone(int(pid_file.read_text())), "the rerun outlived the tool")
+
+    def test_a_rerun_that_never_starts_names_no_leg(self):
+        first = self.script("first", '#!/bin/sh\necho "reached the point" >&2\nexec sleep 600\n')
+        second = self.root / "not-executable"
+        second.write_text("#!/bin/sh\nexit 0\n")
+        rerun = {"name": "second", "binary": str(second)}
+        done = self.run_tool(first, "--kill-on", "reached the point",
+                             "--rerun-arm", json.dumps(rerun))
+        self.assertEqual(done.returncode, 1, done.stderr)
+        row = self.rows()[0]
+        self.assertIn("PermissionError", row["error"])
+        self.assertEqual(len(row["legs"]), 1)
+        self.assertNotIn("arm", row["legs"][0])
+        self.assertEqual(row["legs"][0]["killed"], "planned")
+
+    def test_a_kill_that_finds_its_process_gone_is_not_a_planned_kill(self):
+        spec = importlib.util.spec_from_file_location("measure_under_test", TOOL)
+        measure = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(measure)
+        # The kill misses, as one sent after the process exited does.
+        sent = []
+        measure.kill = sent.append
+        data, log = self.root / "data", self.root / "missed.log"
+        data.mkdir()
+        legs = []
+        measure.run_once(["/bin/sh", "-c", 'echo "reached the point" >&2; sleep 0.5'],
+                         log, data, legs, ("reached the point", 1), timeout=30)
+        self.assertEqual(len(sent), 1, "the pattern never matched")
+        self.assertEqual(legs[0]["exit"], 0)
+        self.assertIs(legs[0]["killed"], False)
+
 
 class Figures(Harness):
     def test_the_batch_high_water_counts_bundles_and_staged_runs(self):
@@ -705,7 +768,8 @@ class Prepare(Harness):
         self.calls, self.fails = self.root / "replays", self.root / "replay-fails"
         self.registry = self.script("replaying", REPLAYING_REGISTRY.format(
             python=sys.executable, calls=str(self.calls), fails=str(self.fails)))
-        self.publisher = self.script("publishes", "#!/bin/sh\nexit 0\n")
+        self.publisher = self.script("publishes", SEEDING_PUBLISHER.format(python=sys.executable))
+        self.base = self.root / "base" / "preprod"
 
     def prepare(self, epoch):
         return subprocess.run(
@@ -715,6 +779,54 @@ class Prepare(Harness):
              "--publisher", str(self.publisher), "--base-epoch", str(epoch)],
             capture_output=True, text=True, timeout=60,
         )
+
+    def prepared(self, epoch):
+        done = self.prepare(epoch)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def seeded(self):
+        return sorted(os.listdir(self.base / "registry/cardano/measured/manifests/tags"))
+
+    def replay_stops(self, epoch):
+        self.fails.write_text("")
+        self.assertNotEqual(self.prepare(epoch).returncode, 0)
+        self.fails.unlink()
+
+    def test_an_earlier_replays_record_does_not_vouch_for_a_replay_that_stopped(self):
+        self.prepared(256)
+        shutil.rmtree(self.base / "data")
+        self.replay_stops(256)
+        done = self.prepare(256)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("isn't a finished replay to epoch 256", done.stderr)
+        self.assertEqual(self.calls.read_text().split(), ["256", "256"])
+
+    def test_a_replay_to_another_epoch_that_stopped_is_not_taken_for_the_first(self):
+        self.prepared(256)
+        self.assertNotEqual(self.prepare(260).returncode, 0)
+        shutil.rmtree(self.base / "data")
+        self.replay_stops(260)
+        done = self.prepare(256)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("isn't a finished replay to epoch 256", done.stderr)
+        self.assertEqual(self.calls.read_text().split(), ["256", "260"])
+
+    def test_the_refusals_remedy_leaves_no_seed_from_another_epoch(self):
+        self.prepared(256)
+        self.assertEqual(self.seeded(), ["epoch-256"])
+        done = self.prepare(200)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn(f"delete {self.base} and prepare again", done.stderr)
+        shutil.rmtree(self.base)
+        self.prepared(200)
+        self.assertEqual(self.seeded(), ["epoch-200"])
+
+    def test_a_new_replay_starts_a_new_seed(self):
+        self.prepared(256)
+        shutil.rmtree(self.base / "data")
+        self.prepared(200)
+        self.assertEqual(self.seeded(), ["epoch-200"])
+        self.assertEqual((self.base / "replayed-to").read_text().split(), ["200"])
 
     def test_a_replay_that_stopped_is_not_taken_for_a_base(self):
         self.fails.write_text("")
