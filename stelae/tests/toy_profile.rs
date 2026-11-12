@@ -380,6 +380,76 @@ fn a_layer_streams_back_record_for_record() {
     );
 }
 
+/// A reader with nothing to fetch ahead streams the layers `stream_layer`
+/// reads, in the order the caller names them and whatever the depth, and
+/// stops at the first layer it cannot read.
+#[test]
+fn a_directory_streams_layers_as_stream_layer_reads_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let (inscription, _) = write_stele(temp.path());
+
+    let stele = SteleDir::open(temp.path()).unwrap();
+    let index = stele.blob_index().unwrap();
+
+    let read = |mut reader: LayerReader<std::fs::File>| {
+        let header = reader.header().clone();
+        let mut records = Vec::new();
+        while let Some(record) = reader.next_record() {
+            records.push(record.unwrap().to_vec());
+        }
+
+        (header, records, reader.finish().unwrap())
+    };
+
+    // Back to front, so the order is the caller's and not the inscription's.
+    let named: Vec<LayerDescriptor> = inscription.layers.iter().rev().cloned().collect();
+
+    let looped: Vec<_> = named
+        .iter()
+        .map(|descriptor| {
+            read(
+                stele
+                    .stream_layer(&index, &ToyProfile, descriptor, Limits::default())
+                    .unwrap(),
+            )
+        })
+        .collect();
+
+    for ahead in [0, 1, 8] {
+        let streamed: Vec<_> = stele
+            .stream_layers(&index, &ToyProfile, named.clone(), Limits::default(), ahead)
+            .map(|reader| read(reader.unwrap()))
+            .collect();
+
+        assert_eq!(streamed, looped, "depth {ahead}");
+    }
+
+    let mut absent = inscription.layers[0].clone();
+    absent.diff_id = stelae::Digest::from_bytes([0xab; 32]);
+
+    let mut stream = stele.stream_layers(
+        &index,
+        &ToyProfile,
+        vec![
+            inscription.layers[0].clone(),
+            absent,
+            inscription.layers[1].clone(),
+        ],
+        Limits::default(),
+        8,
+    );
+
+    assert!(stream.next().unwrap().is_ok());
+    assert!(matches!(
+        stream.next(),
+        Some(Err(Error::LayerNotFound { .. }))
+    ));
+    assert!(
+        stream.next().is_none(),
+        "a layer was handed over after an error"
+    );
+}
+
 /// `finish` is the confirmation, and it does not depend on the caller having
 /// been diligent: a reader dropped after one record proves nothing, and a
 /// reader finished without consuming anything still reads the whole layer,

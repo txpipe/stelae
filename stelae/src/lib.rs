@@ -75,8 +75,8 @@ pub use plan::{Remaining, RestoreProgress, Resume};
 pub use profile::{MediaType, Profile};
 pub use progress::{Event, Observer, Outcome, Progress};
 pub use transport::{
-    BlobIndex, Discarding, DiscardingSink, LayerSpec, RecordSink, SteleReader, SteleWriter,
-    WrittenLayer,
+    BlobIndex, Discarding, DiscardingSink, LayerSpec, LayerStream, RecordSink, SteleReader,
+    SteleWriter, WrittenLayer,
 };
 
 /// Artifact type of a Stelae snapshot's manifest. Generic tooling discovers
@@ -384,6 +384,26 @@ pub enum Error {
     #[cfg(feature = "oci")]
     #[error("registry error: {0}")]
     Registry(#[from] oci_client::errors::OciDistributionError),
+
+    /// A read round trip that failed transiently on every attempt it was
+    /// allowed — see [`oci::Options::read_attempts`].
+    ///
+    /// `subject` names what was being read (a blob digest or a manifest
+    /// reference) and `source` is the last attempt's failure, so the message
+    /// says what was retried, how often, and why it kept failing. The message
+    /// spells out `source`'s whole cause chain, because the last cause of a
+    /// broken transfer is several levels below its top-level text.
+    #[cfg(feature = "oci")]
+    #[error(
+        "reading {subject} failed after {attempts} attempt(s): {}",
+        crate::oci::with_causes(.source)
+    )]
+    RetriesExhausted {
+        subject: String,
+        attempts: u32,
+        #[source]
+        source: Box<Error>,
+    },
 }
 
 impl Error {

@@ -87,9 +87,10 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard,
     },
+    time::{Duration, Instant},
 };
 
 use serde_json::json;
@@ -100,13 +101,18 @@ use stelae::{
     frame::{encode, CanonicalCbor, Limits},
     inscription::LayerDescriptor,
     oci::{
-        build_manifest, manifest_bytes, read_manifest, Auth, Options, Registry, DIFF_ID_ANNOTATION,
-        KIND_ANNOTATION, SCOPE_ANNOTATION,
+        build_manifest, manifest_bytes, read_manifest, Auth, Options, Registry, DEFAULT_ATTEMPTS,
+        DEFAULT_READ_ATTEMPTS, DEFAULT_READ_DELAY, DIFF_ID_ANNOTATION, KIND_ANNOTATION,
+        SCOPE_ANNOTATION,
     },
     progress::{Event, Observer, Progress},
-    Compression, Digest, Error, HistoryEntry, Inscription, LayerDigests, LayerSpec, Profile,
-    RecordSink, SteleReader, SteleWriter, WrittenLayer,
+    Compression, Digest, Error, HistoryEntry, Inscription, LayerDigests, LayerReader, LayerSpec,
+    Profile, RecordSink, SteleReader, SteleWriter, WrittenLayer,
 };
+
+mod fault_registry;
+
+use fault_registry::{Fault, FaultRegistry};
 
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
@@ -2732,17 +2738,20 @@ fn a_deferred_upload_that_fails_fails_every_seal() {
     );
 }
 
-/// What a transport said about the round trips it made again.
+/// What a transport said about the round trips it made again, and why.
 #[derive(Default)]
-struct Retries(Mutex<Vec<(u32, u32)>>);
+struct Retries(Mutex<Vec<(u32, u32)>>, Mutex<Vec<String>>);
 
 impl Progress for Retries {
     fn on(&self, event: Event<'_>) {
         if let Event::Retry {
-            attempt, remaining, ..
+            attempt,
+            remaining,
+            reason,
         } = event
         {
             self.0.lock().unwrap().push((attempt, remaining));
+            self.1.lock().unwrap().push(reason.to_owned());
         }
     }
 }
@@ -2750,6 +2759,10 @@ impl Progress for Retries {
 impl Retries {
     fn seen(&self) -> Vec<(u32, u32)> {
         self.0.lock().unwrap().clone()
+    }
+
+    fn reasons(&self) -> Vec<String> {
+        self.1.lock().unwrap().clone()
     }
 }
 
@@ -2799,4 +2812,929 @@ fn direct_s3_blobs_are_readable_through_zot() {
     );
     let again = write_stele(&registry, 3);
     assert_eq!(again, inscription);
+}
+
+/// A transport on the fault registry, with the read waits shortened so a test
+/// spends milliseconds where a restore would spend a minute.
+fn faulty(fault: &FaultRegistry, repository: &str) -> Registry {
+    faulty_waiting(fault, repository, std::time::Duration::from_millis(1))
+}
+
+/// [`faulty`], with the first read wait the test chooses.
+fn faulty_waiting(
+    fault: &FaultRegistry,
+    repository: &str,
+    read_delay: std::time::Duration,
+) -> Registry {
+    install_crypto_provider();
+
+    Registry::open(
+        &fault.url(repository).parse().unwrap(),
+        Options {
+            insecure: true,
+            read_delay,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+/// A stele published to a fresh fault registry, and the transport that did it,
+/// watched for retries.
+fn published(repository: &str) -> (FaultRegistry, Registry, Inscription, Arc<Retries>) {
+    published_waiting(repository, std::time::Duration::from_millis(1))
+}
+
+/// [`published`], with the first read wait the test chooses.
+fn published_waiting(
+    repository: &str,
+    read_delay: std::time::Duration,
+) -> (FaultRegistry, Registry, Inscription, Arc<Retries>) {
+    let fault = FaultRegistry::spawn();
+    let registry = faulty_waiting(&fault, repository, read_delay);
+    let inscription = write_stele(&registry, 3);
+
+    let retries = Arc::new(Retries::default());
+    registry.observe(Observer::new(retries.clone()));
+
+    (fault, registry, inscription, retries)
+}
+
+/// The first layer's stream, or the error that ended its download.
+fn first_layer(registry: &Registry, inscription: &Inscription) -> Result<(), Error> {
+    let stele = registry.pull_latest(&ToyProfile)?;
+    let index = stele.blob_index()?;
+
+    stele
+        .stream_layer(
+            &index,
+            &ToyProfile,
+            &inscription.layers[0],
+            Limits::default(),
+        )
+        .map(drop)
+}
+
+/// A layer whose transfer is cut off once is fetched again, and the restore
+/// goes on with exactly one retry to show for it.
+#[test]
+fn a_layer_reset_mid_transfer_is_fetched_again() {
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, retries) = published("stelae/reset");
+    let layer = fault.layers()[0].clone();
+
+    fault.fail_next(&layer, &[Fault::Truncate]);
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let expected = records_of(&stele, &inscription);
+
+    assert_eq!(retries.seen(), vec![(1, DEFAULT_READ_ATTEMPTS - 1)]);
+    assert_eq!(fault.gets(&layer), 2, "the retry was not a new request");
+
+    // And what came back is the stele, not the stele plus a broken prefix.
+    assert_eq!(records_of(&stele, &inscription), expected);
+}
+
+/// The first read wait the transport was opened with is the one a retry
+/// waits: the option reaches the round trip rather than stopping at `Options`.
+/// The delay sits between the publish wait (500 ms) and the default read wait,
+/// so a retry that waited either of those instead fails one bound or the other.
+#[test]
+fn a_read_retry_waits_the_configured_delay() {
+    let _serial = exclusive();
+
+    let delay = std::time::Duration::from_secs(1);
+    let (fault, registry, inscription, retries) = published_waiting("stelae/waited", delay);
+    let layer = fault.layers()[0].clone();
+
+    fault.fail_next(&layer, &[Fault::Truncate]);
+
+    let started = std::time::Instant::now();
+    first_layer(&registry, &inscription).unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(retries.seen(), vec![(1, DEFAULT_READ_ATTEMPTS - 1)]);
+    assert!(
+        elapsed >= delay && elapsed < DEFAULT_READ_DELAY,
+        "the retry waited {elapsed:?}, not the configured {delay:?}",
+    );
+}
+
+/// A blob that arrives short of its descriptor — announced short, so the
+/// transfer itself completes — is fetched again rather than refused.
+#[test]
+fn a_blob_served_short_is_fetched_again() {
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, retries) = published("stelae/short");
+    let layer = fault.layers()[0].clone();
+
+    fault.fail_next(&layer, &[Fault::Short]);
+
+    first_layer(&registry, &inscription).unwrap();
+
+    assert_eq!(retries.seen(), vec![(1, DEFAULT_READ_ATTEMPTS - 1)]);
+    assert_eq!(fault.gets(&layer), 2);
+}
+
+/// The manifest and the config blob are read under the same budget as a layer.
+#[test]
+fn every_read_round_trip_is_retried() {
+    let _serial = exclusive();
+
+    let (fault, registry, _inscription, retries) = published("stelae/every");
+
+    fault.fail_next("manifests/latest", &[Fault::Truncate]);
+    fault.fail_next(&fault.config(), &[Fault::Truncate]);
+
+    registry.pull_latest(&ToyProfile).unwrap();
+
+    let first = (1, DEFAULT_READ_ATTEMPTS - 1);
+    assert_eq!(retries.seen(), vec![first, first]);
+    assert_eq!(fault.gets("manifests/latest"), 2);
+    assert_eq!(fault.gets(&fault.config()), 2);
+}
+
+/// A blob that never arrives whole is given up on after the read budget, and
+/// the error says which blob, how many attempts, and why.
+#[test]
+fn a_blob_that_always_fails_exhausts_the_read_budget() {
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, retries) = published("stelae/exhausted");
+    let layer = fault.layers()[0].clone();
+
+    fault.fail_always(&layer, Fault::Truncate);
+
+    let failed = first_layer(&registry, &inscription).unwrap_err();
+
+    let Error::RetriesExhausted {
+        attempts, source, ..
+    } = &failed
+    else {
+        panic!("not an exhausted read: {failed:?}");
+    };
+
+    assert_eq!(*attempts, 6);
+    assert!(matches!(**source, Error::Registry(_)), "{source:?}");
+
+    let message = failed.to_string();
+    assert!(message.contains(&layer), "the digest is missing: {message}");
+    assert!(
+        message.contains("6 attempt"),
+        "the count is missing: {message}"
+    );
+    // The transport's own cause, from below `reqwest`'s top-level text.
+    let cause = "end of file before message length reached";
+    assert!(message.contains(cause), "the cause is missing: {message}");
+    println!("{message}");
+
+    for reason in retries.reasons() {
+        assert!(reason.contains(cause), "a retry hid its cause: {reason}");
+    }
+
+    assert_eq!(fault.gets(&layer), 6);
+    assert_eq!(
+        retries.seen(),
+        vec![(1, 5), (2, 4), (3, 3), (4, 2), (5, 1)],
+        "every attempt but the last was announced",
+    );
+
+    // A transfer that kept breaking is not a stele that was wrong.
+    assert!(!failed.is_blob_refusal());
+}
+
+/// A registry's refusal of the request is the caller's on the first attempt.
+#[test]
+fn a_refused_blob_read_is_not_retried() {
+    let _serial = exclusive();
+
+    for (code, repository) in [(404, "stelae/missing"), (429, "stelae/rationed")] {
+        let (fault, registry, inscription, retries) = published(repository);
+        let layer = fault.layers()[0].clone();
+
+        fault.fail_always(&layer, Fault::Status(code));
+
+        let failed = first_layer(&registry, &inscription).unwrap_err();
+
+        assert!(
+            matches!(failed, Error::Registry(_)),
+            "a {code} was wrapped or reclassified: {failed:?}",
+        );
+        assert_eq!(fault.gets(&layer), 1, "a {code} was retried");
+        assert!(
+            retries.seen().is_empty(),
+            "a {code} was announced as a retry"
+        );
+    }
+}
+
+/// The publish side keeps its own budget: [`DEFAULT_ATTEMPTS`] per round trip,
+/// whatever the read budget says.
+#[test]
+fn a_publish_round_trip_keeps_its_attempt_count() {
+    let _serial = exclusive();
+
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/publish");
+
+    let retries = Arc::new(Retries::default());
+    registry.observe(Observer::new(retries.clone()));
+
+    fault.fail_heads(500);
+
+    write_stele_fallibly(&registry, 3).expect_err("published past a registry answering 500");
+
+    let heads = fault.heads();
+    assert!(!heads.is_empty(), "the publish made no existence check");
+    for (digest, count) in &heads {
+        assert_eq!(
+            *count, DEFAULT_ATTEMPTS as usize,
+            "{digest} was asked about the wrong number of times",
+        );
+    }
+
+    let seen = retries.seen();
+    assert!(!seen.is_empty());
+    assert!(
+        seen.iter()
+            .all(|&(attempt, remaining)| attempt + remaining == DEFAULT_ATTEMPTS),
+        "a publish retry counted against another budget: {seen:?}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reading layers ahead of the caller
+// ---------------------------------------------------------------------------
+
+/// `count` notes layers, each its own blob, published as one stele: more
+/// layers than a read-ahead's depth.
+fn write_layers<W: SteleWriter>(stele: &W, count: u64) -> Inscription {
+    let layers = (0..count)
+        .map(|chapter| {
+            let (header, scope) = notes_scope(chapter);
+            let records: Vec<CanonicalCbor> = (0..=chapter).map(note_record).collect();
+
+            stele
+                .write_layer(
+                    &ToyProfile,
+                    &LayerSpec::new("notes", header, scope),
+                    COMPRESSION_LEVEL,
+                    &records,
+                )
+                .unwrap()
+                .descriptor
+        })
+        .collect();
+
+    let mut inscription = Inscription::new(
+        &ToyProfile,
+        count,
+        json!({"chapter": count, "shelf": "east"}),
+        json!({"noteWidth": 40}),
+        Compression {
+            algo: "zstd".to_owned(),
+            level: COMPRESSION_LEVEL as i64,
+        },
+    );
+
+    inscription.layers = layers;
+    stele.seal(&ToyProfile, &inscription).unwrap();
+
+    inscription
+}
+
+/// What a transport reported while it read: bytes landed, and each retry with
+/// its reason.
+#[derive(Default)]
+struct Moved {
+    bytes: AtomicU64,
+    retries: Mutex<Vec<(u32, u32, String)>>,
+}
+
+impl Progress for Moved {
+    fn on(&self, event: Event<'_>) {
+        match event {
+            Event::Bytes(bytes) => {
+                self.bytes.fetch_add(bytes, Ordering::SeqCst);
+            }
+            Event::Retry {
+                attempt,
+                remaining,
+                reason,
+            } => self
+                .retries
+                .lock()
+                .unwrap()
+                .push((attempt, remaining, reason.to_owned())),
+            _ => {}
+        }
+    }
+}
+
+impl Moved {
+    fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::SeqCst)
+    }
+
+    fn retries(&self) -> Vec<(u32, u32, String)> {
+        self.retries.lock().unwrap().clone()
+    }
+}
+
+/// A transport on `fault` with the read waits shortened, staging where
+/// `scratch_dir` says.
+fn faulty_in(fault: &FaultRegistry, repository: &str, scratch_dir: Option<PathBuf>) -> Registry {
+    install_crypto_provider();
+
+    Registry::open(
+        &fault.url(repository).parse().unwrap(),
+        Options {
+            insecure: true,
+            read_delay: Duration::from_millis(1),
+            scratch_dir,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+/// A stele of `count` layers on a fresh fault registry, the transport that
+/// published it watched from then on.
+fn published_layers(
+    repository: &str,
+    count: u64,
+    scratch_dir: Option<PathBuf>,
+) -> (FaultRegistry, Registry, Inscription, Arc<Moved>) {
+    let fault = FaultRegistry::spawn();
+    let registry = faulty_in(&fault, repository, scratch_dir);
+    let inscription = write_layers(&registry, count);
+
+    let moved = Arc::new(Moved::default());
+    registry.observe(Observer::new(moved.clone()));
+
+    (fault, registry, inscription, moved)
+}
+
+/// The layer `GET`s the registry has seen, as a set: pulls started together
+/// reach it in any order.
+fn fetched(fault: &FaultRegistry) -> Vec<String> {
+    let mut arrived = fault.arrived();
+    arrived.sort();
+    arrived
+}
+
+/// `blobs`, sorted to compare with [`fetched`].
+fn sorted(blobs: &[String]) -> Vec<String> {
+    let mut blobs = blobs.to_vec();
+    blobs.sort();
+    blobs
+}
+
+/// Read a taken layer to its end and prove it against its descriptor.
+fn prove(mut reader: LayerReader<std::fs::File>, descriptor: &LayerDescriptor) {
+    while let Some(record) = reader.next_record() {
+        record.unwrap();
+    }
+
+    assert_eq!(reader.finish().unwrap().diff_id, descriptor.diff_id);
+}
+
+/// Wait until `done` holds, failing after a few seconds.
+fn eventually(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Layers come back in the order they were named when later downloads finish
+/// first, and each one proves its own layer.
+#[test]
+fn a_read_ahead_hands_layers_back_in_order() {
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, _) = published_layers("stelae/ahead-order", 4, None);
+    let blobs = fault.layers();
+
+    // The earliest layer is the slowest, so the downloads land back to front.
+    for (position, blob) in blobs.iter().enumerate() {
+        let delay = Duration::from_millis(100 * (blobs.len() - position) as u64);
+        fault.delay(std::slice::from_ref(blob), delay);
+    }
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+    let layers = inscription.layers.clone();
+
+    let mut taken = 0;
+    for (reader, descriptor) in stele
+        .stream_layers(&index, &ToyProfile, layers, Limits::default(), 8)
+        .zip(&inscription.layers)
+    {
+        prove(reader.unwrap(), descriptor);
+        taken += 1;
+    }
+
+    assert_eq!(taken, inscription.layers.len());
+
+    let mut back_to_front = blobs.clone();
+    back_to_front.reverse();
+    assert_eq!(
+        fault.served(),
+        back_to_front,
+        "the downloads did not finish out of order",
+    );
+}
+
+/// No more than the depth of layers are downloading or staged beyond the one
+/// the caller holds: a staged layer the caller has not taken holds back the
+/// next pull.
+#[test]
+fn a_read_ahead_is_bounded_by_its_depth() {
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, _) = published_layers("stelae/ahead-bound", 8, None);
+    fault.delay(&fault.layers(), Duration::from_millis(50));
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+    let layers = inscription.layers.clone();
+
+    let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), 3);
+
+    // Holding the first layer, the two behind it land and are staged, and
+    // nothing past them starts.
+    let first = stream.next().unwrap().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(fetched(&fault), sorted(&fault.layers()[..3]));
+    prove(first, &inscription.layers[0]);
+
+    for descriptor in &inscription.layers[1..] {
+        prove(stream.next().unwrap().unwrap(), descriptor);
+    }
+    assert!(stream.next().is_none());
+
+    assert_eq!(
+        fault.peak(),
+        3,
+        "the depth was not the bound on GETs at once"
+    );
+    assert_eq!(
+        fetched(&fault),
+        sorted(&fault.layers()),
+        "a layer was fetched twice",
+    );
+}
+
+/// The profile a read-ahead is handed, noting the thread of every layer
+/// opened against it: opening a layer asks the profile its name once.
+#[derive(Default)]
+struct Opening(Mutex<Vec<std::thread::ThreadId>>);
+
+impl Opening {
+    fn opened(&self) -> Vec<std::thread::ThreadId> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl Profile for Opening {
+    fn name(&self) -> &str {
+        self.0.lock().unwrap().push(std::thread::current().id());
+
+        PROFILE_NAME
+    }
+
+    fn version(&self) -> u64 {
+        ToyProfile.version()
+    }
+
+    fn kinds(&self) -> &[&str] {
+        &["notes", "index"]
+    }
+
+    fn layer_media_type(&self, kind: &str) -> Result<String, Error> {
+        ToyProfile.layer_media_type(kind)
+    }
+
+    fn tag_for_sequence(&self, sequence: u64) -> Result<String, Error> {
+        ToyProfile.tag_for_sequence(sequence)
+    }
+}
+
+/// A layer is opened when the caller takes it, on the caller's thread; until
+/// then a staged blob is a file.
+#[test]
+fn a_read_ahead_opens_a_layer_only_when_it_is_taken() {
+    let _serial = exclusive();
+
+    let (_fault, registry, inscription, moved) = published_layers("stelae/ahead-open", 4, None);
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+    let total: u64 = stele.manifest().layers.iter().map(|l| l.size as u64).sum();
+    let layers = inscription.layers.clone();
+    let opening = Opening::default();
+    let caller = std::thread::current().id();
+
+    let mut stream = stele.stream_layers(&index, &opening, layers, Limits::default(), 4);
+    let first = stream.next().unwrap().unwrap();
+
+    eventually("every blob to land", || moved.bytes() == total);
+    assert_eq!(opening.opened(), vec![caller], "a layer was opened untaken");
+
+    for descriptor in &inscription.layers[1..] {
+        prove(stream.next().unwrap().unwrap(), descriptor);
+    }
+    prove(first, &inscription.layers[0]);
+
+    assert_eq!(opening.opened(), vec![caller; inscription.layers.len()]);
+}
+
+/// Each take opens the layer it hands over and no other, however many staged
+/// layers behind it have finished.
+#[test]
+fn a_read_ahead_opens_only_the_layer_each_take_hands_over() {
+    let _serial = exclusive();
+
+    let (_fault, registry, inscription, moved) =
+        published_layers("stelae/ahead-open-each", 4, None);
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+    let total: u64 = stele.manifest().layers.iter().map(|l| l.size as u64).sum();
+    let layers = inscription.layers.clone();
+    let opening = Opening::default();
+    let caller = std::thread::current().id();
+
+    let mut stream = stele.stream_layers(&index, &opening, layers, Limits::default(), 4);
+
+    for (taken, descriptor) in inscription.layers.iter().enumerate() {
+        let reader = stream.next().unwrap().unwrap();
+
+        if taken == 0 {
+            // Landed is not yet finished: give the pulls time to hand their
+            // files back, so the next take finds them all staged.
+            eventually("every blob to land", || moved.bytes() == total);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        assert_eq!(
+            opening.opened(),
+            vec![caller; taken + 1],
+            "take {taken} opened a layer it did not hand over",
+        );
+        prove(reader, descriptor);
+    }
+}
+
+/// A layer that fails on every attempt is reported at its own turn, after
+/// every layer before it, and the stream ends there with nothing left running.
+#[test]
+fn a_read_ahead_reports_a_failed_layer_at_its_turn() {
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, moved) = published_layers("stelae/ahead-error", 5, None);
+    let blobs = fault.layers();
+
+    // The failing layer gives up well before the two in front of it land.
+    fault.delay(&blobs[..2], Duration::from_millis(200));
+    fault.fail_always(&blobs[2], Fault::Truncate);
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+    let layers = inscription.layers.clone();
+
+    let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), 8);
+
+    prove(stream.next().unwrap().unwrap(), &inscription.layers[0]);
+    prove(stream.next().unwrap().unwrap(), &inscription.layers[1]);
+
+    let failed = stream.next().unwrap().unwrap_err();
+    let Error::RetriesExhausted { attempts, .. } = &failed else {
+        panic!("not an exhausted read: {failed:?}");
+    };
+    assert_eq!(*attempts, DEFAULT_READ_ATTEMPTS);
+    assert!(failed.to_string().contains(&blobs[2]), "{failed}");
+    assert!(
+        stream.next().is_none(),
+        "a layer was handed over after the error"
+    );
+
+    let served = fault.served();
+    let gave_up = served.iter().rposition(|blob| *blob == blobs[2]).unwrap();
+    let first = served.iter().position(|blob| *blob == blobs[0]).unwrap();
+    assert!(
+        gave_up < first,
+        "the failure was not ready before its turn: {served:?}"
+    );
+
+    drop(stream);
+
+    let (gets, bytes) = (fault.arrived().len(), moved.bytes());
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(fault.arrived().len(), gets, "a pull was still fetching");
+    assert_eq!(moved.bytes(), bytes, "a pull was still writing");
+}
+
+/// A layer the manifest does not place is refused at its own turn on a
+/// read-ahead as well, and nothing named after it is fetched.
+#[test]
+fn a_read_ahead_refuses_an_unplaced_layer_at_its_turn() {
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, _) = published_layers("stelae/ahead-absent", 4, None);
+    let blobs = fault.layers();
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+
+    let mut absent = inscription.layers[0].clone();
+    absent.diff_id = Digest::from_bytes([0xab; 32]);
+    let layers = vec![
+        inscription.layers[0].clone(),
+        absent,
+        inscription.layers[1].clone(),
+        inscription.layers[2].clone(),
+    ];
+
+    let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), 8);
+
+    prove(stream.next().unwrap().unwrap(), &inscription.layers[0]);
+
+    // Time for any pull started past the refusal to reach the registry.
+    std::thread::sleep(Duration::from_millis(100));
+
+    assert!(matches!(
+        stream.next(),
+        Some(Err(Error::LayerNotFound { .. }))
+    ));
+    assert!(
+        stream.next().is_none(),
+        "a layer was handed over after the refusal"
+    );
+    assert_eq!(
+        fault.arrived(),
+        vec![blobs[0].clone()],
+        "a layer named after the refusal was fetched",
+    );
+}
+
+/// Dropping the stream partway cancels the pulls in flight and drops the staged
+/// ones: nothing is fetched or written after the drop returns, and the staging
+/// directory holds nothing.
+#[test]
+fn dropping_a_read_ahead_cancels_its_pulls() {
+    let _serial = exclusive();
+
+    let scratch = tempfile::tempdir().unwrap();
+    let staging = scratch.path().join("staging");
+    let (fault, registry, inscription, moved) =
+        published_layers("stelae/ahead-drop", 8, Some(staging.clone()));
+
+    let delay = Duration::from_millis(500);
+    fault.delay(&fault.layers(), delay);
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+    let layers = inscription.layers.clone();
+
+    let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), 4);
+
+    // Two taken: the third and fourth are staged, the fifth is still waiting
+    // on the registry.
+    for descriptor in &inscription.layers[..2] {
+        prove(stream.next().unwrap().unwrap(), descriptor);
+    }
+    eventually("the fifth pull to reach the registry", || {
+        fault.arrived().len() == 5
+    });
+    assert_eq!(fetched(&fault), sorted(&fault.layers()[..5]));
+
+    let dropping = Instant::now();
+    drop(stream);
+    assert!(
+        dropping.elapsed() < delay,
+        "the drop waited out a download instead of cancelling it",
+    );
+
+    let (gets, bytes) = (fault.arrived().len(), moved.bytes());
+
+    // Past the delay, so a pull that had not been cancelled would have landed.
+    std::thread::sleep(delay + Duration::from_millis(200));
+    assert_eq!(fault.arrived().len(), gets, "a GET started after the drop");
+    assert_eq!(moved.bytes(), bytes, "a pull wrote after the drop");
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+}
+
+/// Dropping the stream cancels a pull that is waiting out its retry backoff:
+/// the drop returns at once, and the pull never makes its next attempt.
+#[test]
+fn dropping_a_read_ahead_cancels_a_pull_waiting_to_retry() {
+    let _serial = exclusive();
+
+    let backoff = Duration::from_secs(1);
+    let fault = FaultRegistry::spawn();
+    let registry = faulty_waiting(&fault, "stelae/ahead-drop-retry", backoff);
+    let inscription = write_layers(&registry, 8);
+    let moved = Arc::new(Moved::default());
+    registry.observe(Observer::new(moved.clone()));
+
+    // The fifth layer's first transfer is cut off, so its pull is waiting to
+    // try again when the stream is dropped.
+    let blob = fault.layers()[4].clone();
+    fault.fail_next(&blob, &[Fault::Truncate]);
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+    let layers = inscription.layers.clone();
+
+    let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), 4);
+
+    for descriptor in &inscription.layers[..2] {
+        prove(stream.next().unwrap().unwrap(), descriptor);
+    }
+    eventually("the fifth pull to be cut off", || {
+        moved.retries().len() == 1
+    });
+
+    let dropping = Instant::now();
+    drop(stream);
+    assert!(
+        dropping.elapsed() < backoff / 5,
+        "the drop waited out a retry's backoff instead of cancelling it",
+    );
+
+    // Past the backoff, so a pull that had not been cancelled would have tried
+    // again by now.
+    std::thread::sleep(backoff + Duration::from_millis(200));
+    assert_eq!(fault.gets(&blob), 1, "the cancelled pull tried again");
+}
+
+/// A transfer cut off once inside a read-ahead is fetched again: exactly one
+/// retry, naming the blob it retries, and the stream completes.
+#[test]
+fn a_retry_inside_a_read_ahead_is_announced_once() {
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, moved) = published_layers("stelae/ahead-retry", 8, None);
+    let blob = fault.layers()[3].clone();
+
+    fault.fail_next(&blob, &[Fault::Truncate]);
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+    let layers = inscription.layers.clone();
+
+    let mut taken = 0;
+    for (reader, descriptor) in stele
+        .stream_layers(&index, &ToyProfile, layers, Limits::default(), 8)
+        .zip(&inscription.layers)
+    {
+        prove(reader.unwrap(), descriptor);
+        taken += 1;
+    }
+    assert_eq!(taken, inscription.layers.len());
+
+    let retries = moved.retries();
+    assert_eq!(retries.len(), 1, "{retries:?}");
+
+    let (attempt, remaining, reason) = &retries[0];
+    assert_eq!((*attempt, *remaining), (1, DEFAULT_READ_ATTEMPTS - 1));
+    assert!(reason.contains(&blob), "the retry names no blob: {reason}");
+    assert_eq!(fault.gets(&blob), 2);
+}
+
+/// At a depth of one or none a stream makes the requests a `stream_layer` loop
+/// makes, in the same order, and fetches nothing ahead of the caller.
+#[test]
+fn a_read_ahead_of_one_is_a_stream_layer_loop() {
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, _) = published_layers("stelae/ahead-serial", 4, None);
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+
+    for descriptor in &inscription.layers {
+        let reader = stele
+            .stream_layer(&index, &ToyProfile, descriptor, Limits::default())
+            .unwrap();
+        prove(reader, descriptor);
+    }
+
+    let looped = fault.arrived();
+    assert_eq!(looped, fault.layers());
+
+    for ahead in [0, 1] {
+        fault.forget();
+
+        let layers = inscription.layers.clone();
+        let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), ahead);
+
+        let first = stream.next().unwrap().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(fault.arrived().len(), 1, "depth {ahead} fetched ahead");
+        prove(first, &inscription.layers[0]);
+
+        for (reader, descriptor) in stream.zip(&inscription.layers[1..]) {
+            prove(reader.unwrap(), descriptor);
+        }
+
+        assert_eq!(fault.arrived(), looped, "depth {ahead} is not the loop");
+    }
+}
+
+/// At a depth of two, the smallest that reads ahead, one layer is fetched
+/// while the caller holds another, and no more.
+#[test]
+fn a_read_ahead_of_two_fetches_one_layer_ahead() {
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, _) = published_layers("stelae/ahead-two", 4, None);
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+    let layers = inscription.layers.clone();
+
+    let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), 2);
+
+    let first = stream.next().unwrap().unwrap();
+    eventually("the second pull to reach the registry", || {
+        fault.arrived().len() == 2
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        fetched(&fault),
+        sorted(&fault.layers()[..2]),
+        "depth 2 did not fetch exactly one layer ahead",
+    );
+    prove(first, &inscription.layers[0]);
+
+    for descriptor in &inscription.layers[1..] {
+        prove(stream.next().unwrap().unwrap(), descriptor);
+    }
+    assert!(
+        stream.next().is_none(),
+        "a layer past the last was handed over"
+    );
+}
+
+/// The wall clock the read-ahead buys: 200 small layers, each behind a 300 ms
+/// wait for its first byte (a registry redirect and an object store's first
+/// byte), streamed at depths 1, 4 and 8. Depth 8 takes at most a quarter of
+/// depth 1.
+///
+/// About ninety seconds, so it runs only when asked for:
+///
+/// ```text
+/// STELAE_MEASURE_READ_AHEAD=1 cargo test -p stelae --all-features --test oci \
+///     read_ahead_wall_clock -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "a measurement of about ninety seconds"]
+fn read_ahead_wall_clock() {
+    if std::env::var_os("STELAE_MEASURE_READ_AHEAD").is_none() {
+        eprintln!("read-ahead measurement skipped: STELAE_MEASURE_READ_AHEAD is unset");
+        return;
+    }
+
+    let _serial = exclusive();
+
+    let (fault, registry, inscription, _) = published_layers("stelae/ahead-wall", 200, None);
+    fault.delay(&fault.layers(), Duration::from_millis(300));
+
+    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let index = stele.blob_index().unwrap();
+
+    let walls: Vec<Duration> = [1, 4, 8]
+        .into_iter()
+        .map(|ahead| {
+            let layers = inscription.layers.clone();
+            let started = Instant::now();
+
+            for (reader, descriptor) in stele
+                .stream_layers(&index, &ToyProfile, layers, Limits::default(), ahead)
+                .zip(&inscription.layers)
+            {
+                prove(reader.unwrap(), descriptor);
+            }
+
+            let wall = started.elapsed();
+            println!(
+                "depth {ahead}: {wall:.2?} for {} layers",
+                inscription.layers.len()
+            );
+
+            wall
+        })
+        .collect();
+
+    assert!(
+        walls[2] * 4 <= walls[0],
+        "depth 8 took more than a quarter of depth 1: {walls:?}",
+    );
 }
