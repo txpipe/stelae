@@ -657,7 +657,10 @@ happens:
 Losing the batch directory is a different thing, and so is losing `/data`: see the
 recovery above. On an emptyDir, or a claim you deleted, the batch goes with the stores,
 and the run restores `latest` and replays what wasn't published. That costs time and
-loses nothing.
+loses nothing. A repository with no stele yet has no `latest` to restore, so a run
+without `--allow-genesis` fails: that is the recovery's empty case, which clears any
+store configured outside the storage path and runs with `--allow-genesis`
+(`allowGenesisFallback: true` on the chart).
 
 ## First publication
 
@@ -672,10 +675,13 @@ predecessor.
    about 250 GiB on mainnet.
 2. Delete every tag in the repository, `latest` first, so no earlier pin's
    stele is restored or chained onto.
-3. Clear any stores an earlier attempt left, then start the first run with
-   `--allow-genesis`. Initialization finds no
-   `latest`, opts into genesis and replays from block 0, publishing each
-   epoch boundary before it replays past it.
+3. Clear the storage path and any store configured outside it, since an
+   earlier attempt can leave stores and a batch there, then start the first
+   run with `--allow-genesis`. Initialization finds no `latest`, opts into
+   genesis and replays from block 0. A batch of one publishes each epoch
+   boundary before it replays past it. A larger batch publishes its
+   boundaries once it closes, so the repository trails replay by up to a
+   batch ([What a batch delays](#what-a-batch-delays)).
 4. Run every later invocation without `--allow-genesis`. Initialization then
    restores the published `latest` (or reuses the committed stores) and
    fails closed if it cannot, instead of silently replaying from genesis.

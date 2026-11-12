@@ -101,7 +101,12 @@ naming.
    earlier attempt left, because initialization resumes kept stores. A
    deleted `persistence.existingClaim` must be created again, empty, before
    step 3: until it exists the pod stays Pending (see the chart README's
-   [Data volume](../k8s/dolos-publisher/README.md#data-volume)).
+   [Data volume](../k8s/dolos-publisher/README.md#data-volume)). Delete only a
+   claim that holds nothing but the publisher's stores: point
+   `persistence.existingClaim` at a new, empty claim instead of deleting one
+   shared with other data. Check its volume's reclaim policy first, too: under
+   `Delete` the volume goes with the claim, and under `Retain` the volume and
+   its data stay until someone removes them.
 3. Install or upgrade with the candidate's image, the network's v2
    `dolosToml` with full history (no `[history]` window), its retained epochs in `stateEpochs`,
    `allowGenesisFallback: true` and a bumped `run`. From an emptyDir or a fresh
