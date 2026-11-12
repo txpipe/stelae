@@ -607,12 +607,12 @@ this one refuses until they're replaced. A release on an older pin still needs w
 [Source and dependency identity](#source-and-dependency-identity) says.
 
 Batching stays off until a command names a batch, because `--batch-epochs` stays 1 by
-default and the chart passes none of these. The upgrade itself still costs a deployment
-something, on a batch of one: on preprod a run takes about 49% longer than the last release
-before batches ([Choosing a window](#choosing-a-window); mainnet isn't measured), it spools
-index runs under `--scratch-dir`, tens of gigabytes on a mainnet first publish where the
-older pin spooled nothing, and it gains the refusal above. Size the claim and any deadline
-for that before upgrading.
+default and the chart passes none of these unless its `batch` values are set. The upgrade
+itself still costs a deployment something, on a batch of one: on preprod a run takes about
+49% longer than the last release before batches ([Choosing a window](#choosing-a-window);
+mainnet isn't measured), it spools index runs under `--scratch-dir`, tens of gigabytes on a
+mainnet first publish where the older pin spooled nothing, and it gains the refusal above.
+Size the claim and any deadline for that before upgrading.
 
 **Rollback.** The stores can stand ahead of `latest` while a batch is open, and an image
 from before batches can't read the journal that accounts for that. So drain first:

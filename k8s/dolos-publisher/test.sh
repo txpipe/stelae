@@ -259,3 +259,23 @@ for invalid in \
         exit 1
     fi
 done
+
+# A null override deletes its key: nulling one of a full set is a partial
+# set, and nulling a value that was never set changes nothing.
+printf '%s\n' 'batch:' '  epochs: 4' '  scratchMib: 2200' '  reserveMib: 175' >"$OUT/batch-full.yaml"
+for key in epochs scratchMib reserveMib; do
+    printf '%s\n' 'batch:' "  $key: null" >"$OUT/batch-null.yaml"
+    if helm template publisher "$CHART" --values "$VALUES" --values "$OUT/batch-full.yaml" \
+        --values "$OUT/batch-null.yaml" >"$OUT/invalid.yaml" 2>&1; then
+        echo "partial batch configuration accepted: $key nulled in a values file" >&2
+        exit 1
+    fi
+    if helm template publisher "$CHART" --values "$VALUES" \
+        --set batch.epochs=4,batch.scratchMib=2200,batch.reserveMib=175 \
+        --set "batch.$key=null" >"$OUT/invalid.yaml" 2>&1; then
+        echo "partial batch configuration accepted: $key nulled with --set" >&2
+        exit 1
+    fi
+done
+helm template publisher "$CHART" --values "$VALUES" --set batch.epochs=null >"$OUT/batch-null-default.yaml"
+cmp "$OUT/default.yaml" "$OUT/batch-null-default.yaml"

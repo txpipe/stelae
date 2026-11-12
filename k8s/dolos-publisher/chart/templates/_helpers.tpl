@@ -19,13 +19,18 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 
 {{/*
 The batch values when all three are set, nothing when none is, and a
-failed render for a partial set, which the publisher would refuse.
+failed render for a partial set, which the publisher would refuse. A null
+override deletes its key in Helm's merge, so a key counts only when present
+with a value.
 */}}
 {{- define "dolos-publisher.batch" -}}
 {{- $b := .Values.batch | default dict -}}
 {{- $set := list -}}
 {{- range $k := list "epochs" "scratchMib" "reserveMib" -}}
-{{- if not (kindIs "invalid" (get $b $k)) -}}{{- $set = append $set $k -}}{{- end -}}
+{{- if hasKey $b $k -}}
+{{- $v := index $b $k -}}
+{{- if not (or (kindIs "invalid" $v) (eq (toString $v) "")) -}}{{- $set = append $set $k -}}{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- if eq (len $set) 3 -}}
 {{ toYaml (pick $b "epochs" "scratchMib" "reserveMib") }}
