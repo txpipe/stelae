@@ -740,6 +740,7 @@ NO_PHASES = {"traversals": {}, "capture_seconds": 0, "stage_seconds": 0, "publis
 def fmt_gib(value):
     return f"{value / 1024 ** 3:.2f}"
 
+
 def command_summarize(args):
     """Tables over every observation, failed ones included, as Markdown."""
     observations = read_observations(args.root)
