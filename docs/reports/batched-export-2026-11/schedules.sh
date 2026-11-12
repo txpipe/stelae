@@ -18,11 +18,15 @@
 # ---- base ----
 # Replay to epoch 256 and seed a repository with its stele, under base/preprod. As run
 # these were the same two commands by hand: `loopback replay`, then `publish`.
-python3 "$ROOT/bin/measure.py" prepare --root "$ROOT" --corpus "$ROOT/corpus/preprod/immutable" --state-epochs "$ROOT/state-epochs" --loopback "$ROOT/loopback" --publisher "$ROOT/stelae-publisher-candidate" --base-epoch 256
+python3 "$ROOT/bin/measure.py" prepare --root "$ROOT" --corpus "$ROOT/corpus/preprod/immutable" --state-epochs "$ROOT/state-epochs" --loopback "$ROOT/loopback" --publisher "$ROOT/stelae-publisher-candidate" --base-epoch 256 || exit 1
 
 # ---- extend-base ----
 # A candidate batch takes the base to 276. Its stores and repository, less the chain
 # files and the spool, are what every run on base/preprod-276 clones.
+BASE="$ROOT/base/preprod-276"
+if [ -e "$BASE" ]; then
+  echo "extend-base: $BASE already exists" >&2; exit 1
+fi
 # A run the tool couldn't record exits 1.
 python3 "$ROOT/bin/measure.py" run --root "$ROOT/extend" --corpus "$ROOT/corpus/preprod/immutable" --state-epochs "$ROOT/state-epochs" --loopback "$ROOT/loopback" --workload base-256-to-276 --base "$ROOT/base/preprod" --until 276 --first-file 5041 --last-file 5450 --timeout 7000 --keep --arm "{\"name\":\"w20\",\"binary\":\"$ROOT/stelae-publisher-candidate\",\"flags\":[\"--batch-epochs\",\"20\",\"--batch-scratch-mib\",\"400000\",\"--batch-reserve-mib\",\"1024\"]}" || exit 1
 # A run that failed or timed out exits 0 with partial stores, which aren't a base. The
@@ -31,17 +35,14 @@ LAST=$(tail -1 "$ROOT/extend/observations.jsonl")
 if ! printf '%s' "$LAST" | grep -q '"succeeded": true'; then
   echo "extend-base: the last run didn't reach 276, so there is no base to move" >&2; exit 1
 fi
-EXTENDED="$ROOT/extend/runs/$(printf '%s' "$LAST" | python3 -c 'import json, sys; print(json.load(sys.stdin)["run"])')"
-BASE="$ROOT/base/preprod-276"
-if [ -e "$BASE" ]; then
-  echo "extend-base: $BASE already exists" >&2; exit 1
-fi
+EXTENDED="$ROOT/extend/runs/$(printf '%s' "$LAST" | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["run"])')"
 # Cloned beside it and renamed into place, so the base is whole or absent, and the run
 # it comes from stays as it was for another try.
 STAGED="$BASE.partial"
+CLONE=-c; [ "$(uname)" = Darwin ] || CLONE=--reflink=auto
 rm -rf "$STAGED" && mkdir -p "$STAGED/data" || exit 1
-cp -c -R "$EXTENDED/registry" "$STAGED/registry" || exit 1
-for part in archive cache state wal; do cp -c -R "$EXTENDED/data/$part" "$STAGED/data/" || exit 1; done
+cp "$CLONE" -R "$EXTENDED/registry" "$STAGED/registry" || exit 1
+for part in archive cache state wal; do cp "$CLONE" -R "$EXTENDED/data/$part" "$STAGED/data/" || exit 1; done
 mv "$STAGED" "$BASE" || exit 1
 
 # ---- genesis-parity ----

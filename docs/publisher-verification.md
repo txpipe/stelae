@@ -61,17 +61,17 @@ skipping a sequence and nothing written under one it reached:
 | Between a seal's immutable tag and `latest`, which the registry holds and never serves, so the rerun finds half a seal | `a_kill_between_a_seals_two_tags_converges` |
 | With `latest` written and its answer not yet sent, which uploads nothing again | `a_kill_before_a_seals_answer_converges_without_another_upload` |
 | Between two sequences, with the last journaled | `a_kill_between_two_sequences_converges` |
-| With the last `latest` written and its answer not yet sent, the batch still journaled, which leaves a rerun only the batch to clear | `a_kill_as_the_last_seal_lands_converges_without_another_upload` |
-
-A cleanup stopped part way is `a_cleanup_that_stopped_part_way_finishes` in
-`stelae-cardano/tests/batch.rs`: nothing outside the process can stop it between two
-of its file removals.
+| With the last `latest` written and its answer not yet sent, the batch still journaled, so the rerun reproduces the last sequence to compare it, journals it and clears the batch, uploading nothing again | `a_kill_as_the_last_seal_lands_converges_without_another_upload` |
 
 `uploads_the_registry_refuses_are_retried_to_the_same_repository` does the same
 for a registry answering 503 to every 25th upload, and checks the registry counted
 what it refused, and
 `an_uninterrupted_run_traverses_once_a_batch` counts traversals from the whole
 process's log, so one started on another thread can't hide.
+
+A cleanup stopped part way is `a_cleanup_that_stopped_part_way_finishes` in
+`stelae-cardano/tests/batch.rs`: nothing outside the process can stop it between two
+of its file removals.
 
 A kill during a block's replay is left out deliberately: Dolos commits a block's
 state before its archive entry, so that kill can leave stores the publisher has to

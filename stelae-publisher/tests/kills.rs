@@ -393,9 +393,10 @@ fn uploads_the_registry_refuses_are_retried_to_the_same_repository() {
 }
 
 /// The last seal lands and the process dies before it hears so, with the batch
-/// still journaled: the rerun finds the work done and has only the batch to
-/// clear. A cleanup stopped part way is `tests/batch.rs`'s, since nothing here
-/// can stop the process between two of its file removals.
+/// still journaled: the rerun reproduces the last sequence to compare it,
+/// journals it and clears the batch, uploading nothing again. A cleanup stopped
+/// part way is `tests/batch.rs`'s, since nothing here can stop the process
+/// between two of its file removals.
 #[test]
 fn a_kill_as_the_last_seal_lands_converges_without_another_upload() {
     let run = Run::new();
