@@ -8,6 +8,7 @@
 use std::{
     collections::BTreeMap,
     fs::File,
+    os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -30,6 +31,7 @@ const UNTIL: u64 = 6;
 const WINDOW: u64 = 3;
 const NAME: &str = "cardano/killed";
 const PATIENCE: Duration = Duration::from_secs(900);
+const SIGKILL: i32 = 9;
 
 static CHAIN: LazyLock<Chain> = LazyLock::new(|| Chain::delegating(UNTIL as usize + 2, &[]));
 
@@ -114,24 +116,40 @@ impl Run {
     }
 
     fn finishes(&self, child: &mut Child) {
-        let status = child.wait().unwrap();
+        let began = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            self.give_up_after_patience(child, began, "never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        };
         assert!(status.success(), "{status}: {}", self.log());
     }
 
-    /// Wait for `reached`, and kill the process then.
+    /// Wait for `reached`, and kill the process then. The kill has to be what
+    /// ends it: a process that finished first leaves a rerun nothing to do.
     fn kill_when(&self, child: &mut Child, reached: impl Fn() -> bool) {
         let began = Instant::now();
         while !reached() {
             if let Some(status) = child.try_wait().unwrap() {
-                // Too quick to catch, which leaves a rerun with nothing to do.
-                assert!(reached(), "exited {status} early: {}", self.log());
-                return;
+                panic!("exited {status} before the kill: {}", self.log());
             }
-            assert!(began.elapsed() < PATIENCE, "never reached: {}", self.log());
+            self.give_up_after_patience(child, began, "never reached");
             std::thread::sleep(Duration::from_millis(5));
         }
         child.kill().unwrap();
-        child.wait().unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(SIGKILL), "{status}: {}", self.log());
+    }
+
+    /// Past `PATIENCE`, kill the process and fail with its log.
+    fn give_up_after_patience(&self, child: &mut Child, began: Instant, what: &str) {
+        if began.elapsed() > PATIENCE {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what} in {PATIENCE:?}: {}", self.log());
+        }
     }
 
     /// Kill the process once the registry holds a request of its.
@@ -155,10 +173,27 @@ impl Run {
         for (tag, manifest) in expected {
             assert_eq!(&found[tag], manifest, "at {tag}: {}", self.log());
         }
+        // The registry takes a manifest whatever it names, so a seal over a
+        // blob that never landed shows only here.
+        let absent = self.loopback.absent_blobs(NAME);
+        assert!(absent.is_empty(), "named and never held: {absent:?}");
         let dir = batch::dir_in(self.storage());
         assert!(!dir.join("journal.json").exists(), "{}", self.log());
         assert!(!dir.join("staging").exists(), "{}", self.log());
         self.assert_every_write_kept_to_order();
+    }
+
+    /// As [`Self::rerun_converges`], uploading nothing that went up before it.
+    fn rerun_converges_without_another_upload(&self) {
+        let uploaded = self.loopback.accounting(NAME).uploads;
+        self.rerun_converges();
+        let accounting = self.loopback.accounting(NAME);
+        for (digest, (_, count)) in &uploaded {
+            assert_eq!(
+                accounting.uploads[digest].1, *count,
+                "{digest} went up again"
+            );
+        }
     }
 
     /// Through kills and reruns, `latest` only ever moved to the next sequence,
@@ -309,15 +344,7 @@ fn a_kill_before_a_seals_answer_converges_without_another_upload() {
     let mut child = run.spawn();
     run.kill_on_hold(&mut child);
     assert!(run.latest_is(2), "the seal was meant to land");
-    let uploaded = run.loopback.accounting(NAME).uploads;
-    run.rerun_converges();
-    let accounting = run.loopback.accounting(NAME);
-    for (digest, (_, count)) in &uploaded {
-        assert_eq!(
-            accounting.uploads[digest].1, *count,
-            "{digest} went up again"
-        );
-    }
+    run.rerun_converges_without_another_upload();
 }
 
 #[test]
@@ -365,10 +392,19 @@ fn uploads_the_registry_refuses_are_retried_to_the_same_repository() {
     );
 }
 
+/// The last seal lands and the process dies before it hears so, with the batch
+/// still journaled: the rerun finds the work done and has only the batch to
+/// clear. A cleanup stopped part way is `tests/batch.rs`'s, since nothing here
+/// can stop the process between two of its file removals.
 #[test]
-fn a_kill_after_the_last_seal_converges() {
+fn a_kill_as_the_last_seal_lands_converges_without_another_upload() {
     let run = Run::new();
+    run.loopback
+        .rule(from_the_nth(sets_latest, UNTIL, Verdict::HoldAnswer));
     let mut child = run.spawn();
-    run.kill_when(&mut child, || run.latest_is(UNTIL));
-    run.rerun_converges();
+    run.kill_on_hold(&mut child);
+    assert!(run.latest_is(UNTIL), "the last seal was meant to land");
+    let journal = batch::dir_in(run.storage()).join("journal.json");
+    assert!(journal.exists(), "the kill left nothing to recover");
+    run.rerun_converges_without_another_upload();
 }

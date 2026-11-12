@@ -48,9 +48,10 @@ manifest and blob, and what each took to upload:
 | A Byron main block sharing its boundary block's slot | `a_byron_boundary_holds_its_boundary_block_and_not_the_main_block_beside_it` |
 | A consumer restoring every publication, reproducing it from the restored stores and replaying on to the next | `a_consumer_restores_every_publication_of_a_batch_and_replays_on`, and for Byron `a_consumer_restores_a_byron_boundary_and_replays_the_main_block_beside_it` |
 
-`stelae-publisher/tests/kills.rs` runs the real binary, kills it with SIGKILL and
-reruns it, each time to the same bytes as a run nothing interrupted, with `latest`
-never skipping a sequence and nothing written under one it reached:
+`stelae-publisher/tests/kills.rs` runs the real binary, kills it with SIGKILL, which
+must be what ends it, and reruns it, each time to the same bytes as a run nothing
+interrupted, with every blob a manifest names in the repository, `latest` never
+skipping a sequence and nothing written under one it reached:
 
 | Killed | Test |
 | --- | --- |
@@ -60,7 +61,11 @@ never skipping a sequence and nothing written under one it reached:
 | Between a seal's immutable tag and `latest`, which the registry holds and never serves, so the rerun finds half a seal | `a_kill_between_a_seals_two_tags_converges` |
 | With `latest` written and its answer not yet sent, which uploads nothing again | `a_kill_before_a_seals_answer_converges_without_another_upload` |
 | Between two sequences, with the last journaled | `a_kill_between_two_sequences_converges` |
-| Right after the last seal, in or before cleanup | `a_kill_after_the_last_seal_converges` |
+| With the last `latest` written and its answer not yet sent, the batch still journaled, which leaves a rerun only the batch to clear | `a_kill_as_the_last_seal_lands_converges_without_another_upload` |
+
+A cleanup stopped part way is `a_cleanup_that_stopped_part_way_finishes` in
+`stelae-cardano/tests/batch.rs`: nothing outside the process can stop it between two
+of its file removals.
 
 `uploads_the_registry_refuses_are_retried_to_the_same_repository` does the same
 for a registry answering 503 to every 25th upload, and checks the registry counted
