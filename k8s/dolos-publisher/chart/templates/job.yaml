@@ -53,6 +53,14 @@ spec:
             {{- if .Values.allowGenesisFallback }}
             - --allow-genesis
             {{- end }}
+            {{- with include "dolos-publisher.batch" . | fromYaml }}
+            - --batch-epochs
+            - {{ .epochs | int64 | quote }}
+            - --batch-scratch-mib
+            - {{ .scratchMib | int64 | quote }}
+            - --batch-reserve-mib
+            - {{ .reserveMib | int64 | quote }}
+            {{- end }}
             {{- if .Values.directS3SecretName }}
             - --direct-s3-config
             - /run/direct-s3/direct-s3.json

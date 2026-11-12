@@ -106,3 +106,15 @@ resources: {}
 
 # Optional Secret containing direct-s3.json; uploads blobs directly into Zot storage.
 directS3SecretName: ""
+
+# Prepared batches: set all three or none. Unset, the run publishes one
+# boundary at a time. Set, a sequence appears in the repository only when its
+# batch closes, and /data must hold the batch on top of the stores. Both
+# sizes follow from the network; README.md has the sizing.
+batch:
+  # Boundaries in a batch, at least 2. Passed as --batch-epochs.
+  epochs: null
+  # MiB the batch may hold on disk. Passed as --batch-scratch-mib.
+  scratchMib: null
+  # MiB kept free per prepared boundary. Passed as --batch-reserve-mib.
+  reserveMib: null

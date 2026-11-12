@@ -143,11 +143,78 @@ adds another Job. To recover, delete the release's backfill Jobs with
 | `persistence.size` | Size of the claim the chart creates, with no default |
 | `persistence.storageClassName` | Class of the created claim; empty uses the cluster default |
 | `persistence.existingClaim` | Claim to mount instead of creating one |
+| `batch.epochs` | Boundaries in a prepared batch, at least 2; unset publishes one at a time |
+| `batch.scratchMib` | MiB a batch may hold on disk, with no default |
+| `batch.reserveMib` | MiB kept free per prepared boundary, with no default |
 
 [values.yaml](chart/values.yaml) also exposes transport, secret name, retry
 budget, termination grace period and placement. Initialization fails closed
 by default. `allowGenesisFallback: true` adds `--allow-genesis`; use it only
 for a deliberately verified first publication.
+
+## Batching
+
+By default the Job publishes one boundary at a time. Setting `batch.epochs`,
+`batch.scratchMib` and `batch.reserveMib` together passes `--batch-epochs`,
+`--batch-scratch-mib` and `--batch-reserve-mib`, so the run prepares several
+boundaries and publishes them in order. Set all three or none: a partial set
+fails the render, as the publisher would refuse it. Changing them changes the
+pod template, so bump `run`.
+
+**Sequences appear later.** A sequence reaches the repository only when its
+batch closes, so during a backfill `latest` trails the stores by up to a
+batch. Consumers restoring meanwhile get the last one published. At the tip a
+run publishes what the source offered without waiting for a full batch.
+
+**Sizing.** A batch lives on `/data`, under
+`<storage.path>/.stelae-batch/`, on top of the stores. For a window of `W`
+boundaries over a run of `N` epochs:
+
+```text
+batch.scratchMib        >=  W x (bundle + reserve)
+batch.reserveMib        >=  staged runs + replay growth + download, per boundary
+free space on /data     >=  W x (bundle + reserve) + one publication's check + transient + N x growth
+```
+
+On preprod at the measured height a bundle is about 0.42 GiB and the reserve
+about 158 to 175 MiB with the download on the same volume, so a window of 4
+needs a `scratchMib` of about 2.3 GiB and at least 4 GiB free beyond the
+stores and their growth over the run, with the stores growing about 0.1 GiB an
+epoch. That 4 GiB is a floor, measured on a lineage with no dump at a
+`concurrency` of 4: the default of 8 adds about 0.13 GiB, each dump the
+lineage holds adds its size from the `latest` manifest, and a run that held
+its window was seen to use 6.2 GiB. Size the persistent claim, or the
+emptyDir's `ephemeral-storage`, for that free space on top of the stores, with
+margin. A bundle follows the network's state,
+so measure a network not listed by reading `.stelae-batch/prepared` after the
+first capture. A budget that holds one boundary but is too small for the
+window does not fail: batches close
+early and pay their own traversals, which is worse than a smaller window. The
+measurements, the window to start from and the cost of each term are in
+[publisher.md](../../docs/publisher.md#prepared-batches).
+
+On a persistent claim, a run that fills `/data` stops on the room it lacks:
+make room and rerun, see
+[A volume that fills](../../docs/publisher.md#a-volume-that-fills). On an
+emptyDir it doesn't: the publisher reads the node's free space, not the pod's
+`ephemeral-storage` limit, so overrunning that limit evicts the pod and loses
+`/data`. The next pod restores the same `latest` and prepares the same batch,
+so an undersized limit repeats without progress until `backoffLimit`. There
+`scratchMib` and the `ephemeral-storage` size are the only bounds. A restart
+on a persistent claim goes on from the journaled batch, or refuses where the
+stores and journal disagree, as
+[What a restart does](../../docs/publisher.md#what-a-restart-does) lists. With
+an emptyDir, a pod restart loses the batch with the stores and restores from
+`latest`.
+
+While a persistent claim holds a pending batch, a run without the flags
+refuses and names the flags that publish it. The chart passes no
+`--until-epoch`, so a batch drains only when a Job runs to the tip and
+completes, after which its journal under `.stelae-batch/` is gone. Until then keep `image.tag` and the
+`batch` values the batch was prepared with: unset the values, upgrade the
+image or roll back to a chart without them only once the batch has drained, as
+[Upgrade and rollback](../../docs/publisher.md#upgrade-and-rollback)
+explains.
 
 ## Validation
 
@@ -158,7 +225,7 @@ helm template stelae-publisher-preprod k8s/dolos-publisher/chart \
 ```
 
 The checks cover direct invocation, the state epochs file and argument,
-both `/data` modes, genesis opt-in, TLS selection, missing or invalid configuration and
+both `/data` modes, batching all or none, genesis opt-in, TLS selection, missing or invalid configuration and
 accidental use of the legacy Dolos image.
 
 ## Upgrade and rollback
@@ -169,7 +236,9 @@ does not guarantee a single writer: stop the previous writer and wait for its
 pod to terminate before starting the next run. With an emptyDir the new Job
 restores from `latest`. With a persistent claim it resumes the kept stores,
 so delete the claim first when they no longer fit, and always for a
-rollback away from a suspect image (see [Data volume](#data-volume)).
+rollback away from a suspect image (see [Data volume](#data-volume)). While a
+batch is pending, change neither the image nor the `batch` values until a Job
+has drained it (see [Batching](#batching)).
 
 Rolling back to chart 0.3 drops the claim from the Job: 0.3 accepts the
 `persistence` block but mounts an emptyDir, so a full-history publisher
