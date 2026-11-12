@@ -109,13 +109,23 @@ w16 against w1, 3 pairs: 0.8%, -1.6%, -4.2%. Median -1.6%, so the 25% target is 
 |---|--:|--:|--:|--:|--:|--:|
 | w4-budget-1024 | 1 | 757 | 757 | 757 | 672 | 1.99 |
 
-### profile
+### profile, to epoch 280
 
 | Arm | Runs | Median wall s | Min | Max | Median CPU s | Peak RSS GiB |
 |---|--:|--:|--:|--:|--:|--:|
 | profile-old | 1 | 288 | 288 | 288 | 263 | 2.21 |
-| profile-w12 | 1 | 792 | 792 | 792 | 612 | 1.61 |
+
+### profile, to epoch 284
+
+| Arm | Runs | Median wall s | Min | Max | Median CPU s | Peak RSS GiB |
+|---|--:|--:|--:|--:|--:|--:|
 | profile-w8 | 1 | 1092 | 1092 | 1092 | 627 | 1.28 |
+
+### profile, to epoch 288
+
+| Arm | Runs | Median wall s | Min | Max | Median CPU s | Peak RSS GiB |
+|---|--:|--:|--:|--:|--:|--:|
+| profile-w12 | 1 | 792 | 792 | 792 | 612 | 1.61 |
 
 ### restored-by-the-old-consumer
 

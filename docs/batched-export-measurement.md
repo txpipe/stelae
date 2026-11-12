@@ -45,6 +45,10 @@ measure.py prepare --root ROOT --corpus IMMUTABLE --state-epochs EPOCHS \
   --loopback LOOPBACK --publisher PUBLISHER --base-epoch 256
 ```
 
+A replay that stops leaves its stores, so `prepare` records the epoch a replay finished
+at in `base/<network>/replayed-to` and refuses stores without that record, or with
+another epoch's: delete them and prepare again.
+
 Run the arms, with each arm once in each position across rounds. `--first-file` is two
 immutable files below the base's cursor and `--last-file` is a few past the boundary
 `--until` names, on the network's own numbering:
@@ -63,7 +67,8 @@ the log matches and reruns, or reruns each `--rerun-arm` in turn to try an upgra
 rollback. `--fail-every N` has the registry refuse every Nth upload. `--discard-above
 BYTES` has it keep only the size of larger blobs, which takes its writes off the volume
 being measured, and those blobs can't be restored. `--keep` leaves a run's stores and
-repository in place for `restore`.
+repository in place for `restore`. A run's id is the second it started and its arm, with
+a count after the arm when another run under the root already had that id.
 
 Then read them:
 
@@ -84,13 +89,16 @@ has the publisher digest the restored stores and compares the document byte for 
 
 To see where a publication waits, `tools/batched-export/sample-run.sh` samples a run's
 publisher with macOS `sample`, and `profile-summary.py` reads the shares from that. Sampling
-costs a run something, so give those runs their own workload.
+costs a run something, so give those runs their own workload. Given the tool's PID the
+sampler stops waiting when the tool ends, and without it once the run's row is written.
 
 ## What the numbers mean
 
-- **`succeeded`** means the last process exited 0 and the repository holds `epoch-<until>`. A
-  run out of chain files exits 0 short of that, and it doesn't count. `summarize` medians and
-  `compare` read only runs that succeeded.
+- **`succeeded`** means the last process exited 0, the repository holds `epoch-<until>`, and
+  a `--kill-on` the run asked for came (`kill_fired`). A run out of chain files exits 0 short
+  of that, and one whose pattern never matched measured no fault: neither counts. `summarize`
+  medians and `compare` read only runs that succeeded, and `summarize` keeps runs to
+  different epochs in separate tables. A rerun leg records its arm, binary hash and flags.
 - **Wall time** is the process's, from spawn to exit. Inputs are cloned before the
   clock starts.
 - **The OS cache** is neither controlled nor measured. Clones are separate files, so a run
@@ -99,8 +107,12 @@ costs a run something, so give those runs their own workload.
   the one figure kept, so read a comparison through arm order and spread.
 - **Replay, capture, stage and publish** are spans between log lines, so they're as
   good as the log's timestamps. On a batch of one, staging falls inside publishing.
-  The old exporter logs no traversal and walks its indexes beside its layers, so it
-  has no stage span and its traversal count reads "not logged".
+  Replay is what no span covers, so that staging counts once. A span a kill or stop cut
+  short ends at its process's last line and counts in `interrupted_seconds`, in no
+  phase, so a rerun can't close it. Rows from before `covered_seconds`, which the
+  report's are, give replay as the tool then did. The old exporter logs no traversal and
+  walks its indexes beside its layers, so it has no stage span and its traversal count
+  reads "not logged".
 - **Traversal counts** are every `index staging traversal started` line in the
   process's log, which `Staged::report()` also counts.
 - **High-water marks** are sampled once a second, so a shorter peak can be missed:

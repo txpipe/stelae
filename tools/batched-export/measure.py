@@ -178,25 +178,48 @@ def host_state(path):
     return state
 
 
-def phases(log_path):
+def phases(log_path, starts=()):
     """What the log shows of a run, in the seconds its timestamps allow.
 
     `capture`, `stage` and `publish` are spans between markers. `stage` sits
     inside `publish` on a batch of one, which stages as it publishes. Replay and
     the stores' opening and closing are what's left of the log's whole span. The
     old exporter logs no traversal and walks its indexes beside its layers.
+
+    `starts` are the byte offsets where each process's lines begin. A span a
+    process left open, killed or stopped, ends at its last line and counts as
+    `interrupted`, in no phase, so a rerun never closes it. `covered` is the time
+    any span covers, each second once.
     """
     traversals = {}
-    spans = {"capture": 0.0, "stage": 0.0, "publish": 0.0}
+    spans = {"capture": 0.0, "stage": 0.0, "publish": 0.0, "interrupted": 0.0}
     opened = {}
+    intervals = []
     first = last = None
     committed = []
+    later = sorted(offset for offset in starts if offset > 0)
+    position = 0
 
     def close(name, at):
         if name in opened:
-            spans[name] += at - opened.pop(name)
+            began = opened.pop(name)
+            spans[name] += at - began
+            intervals.append((began, at))
 
-    for line in Path(log_path).read_text(errors="replace").splitlines():
+    def interrupt():
+        if opened:
+            began = min(opened.values())
+            spans["interrupted"] += last - began
+            intervals.append((began, last))
+            opened.clear()
+
+    for raw in Path(log_path).read_bytes().splitlines(keepends=True):
+        if later and position >= later[0]:
+            while later and position >= later[0]:
+                later.pop(0)
+            interrupt()
+        position += len(raw)
+        line = raw.decode(errors="replace")
         stamp = TIMESTAMP.match(line)
         if not stamp:
             continue
@@ -220,11 +243,20 @@ def phases(log_path):
         found = COMMITTED.search(line)
         if found:
             committed.append((int(found.group(1)), at))
+    interrupt()
+    covered, reach = 0.0, None
+    for began, ended in sorted(intervals):
+        began = began if reach is None else max(began, reach)
+        if ended > began:
+            covered += ended - began
+            reach = ended
     return {
         "traversals": traversals,
         "capture_seconds": spans["capture"],
         "stage_seconds": spans["stage"],
         "publish_seconds": spans["publish"],
+        "interrupted_seconds": spans["interrupted"],
+        "covered_seconds": covered,
         "log_seconds": (last - first) if first is not None else None,
         "committed": committed,
     }
@@ -286,6 +318,8 @@ def run_once(command, log_path, data, legs, kill_on=None, timeout=None):
     `kill_on` is (pattern, nth). However this ends, the process is gone by the
     time it returns or raises, and a process that started has its leg.
     """
+    # Where this process's lines start, since every leg appends to one log.
+    log_offset = log_path.stat().st_size if log_path.exists() else 0
     sampler = Sampler(data)
     sampler.start()
     began = time.perf_counter()
@@ -325,6 +359,7 @@ def run_once(command, log_path, data, legs, kill_on=None, timeout=None):
             legs.append({
                 "exit": process.returncode,
                 "killed": killed,
+                "log_offset": log_offset,
                 "wall_seconds": wall,
                 "user_seconds": usage.ru_utime,
                 "system_seconds": usage.ru_stime,
@@ -362,11 +397,19 @@ def command_prepare(args):
     base = root / "base" / args.network
     config = base / "dolos.toml"
     base.mkdir(parents=True, exist_ok=True)
+    # Written once the replay succeeds: a replay that stopped leaves its stores too.
+    replayed = base / "replayed-to"
     if not (base / "data").exists():
         write_config(config, args.network, base / "data")
         subprocess.run(
             [args.loopback, "replay", str(config), str(args.corpus), str(args.base_epoch)],
             check=True,
+        )
+        replayed.write_text(f"{args.base_epoch}\n")
+    elif not replayed.is_file() or replayed.read_text().split() != [str(args.base_epoch)]:
+        raise SystemExit(
+            f"{base / 'data'} isn't a finished replay to epoch {args.base_epoch}, as "
+            f"{replayed} would say: delete it and prepare again"
         )
     seed = base / "registry"
     loopback = Loopback(args.loopback, seed)
@@ -406,7 +449,6 @@ def record(root, observation, name="observations.jsonl"):
 def measure(args, arm, run_dir, observation):
     """Fill in `observation` as far as the run gets."""
     root = Path(args.root)
-    run_dir.mkdir(parents=True)
     base = root / args.base
     data, registry = run_dir / "data", run_dir / "registry"
     observation["binary_sha256"] = sha256_of(arm["binary"])
@@ -442,13 +484,17 @@ def measure(args, arm, run_dir, observation):
             # The same arm again, or the arms named: an upgrade or a rollback.
             for rerun in [json.loads(a) for a in args.rerun_arm] or [arm]:
                 rerun_command = publisher_command(rerun, config, loopback, args)
+                identity = {"arm": rerun["name"], "binary_sha256": sha256_of(rerun["binary"]),
+                            "flags": rerun.get("flags", [])}
                 run_once(rerun_command, log, data, legs, None, args.timeout)
-                legs[-1]["arm"] = rerun["name"]
+                legs[-1].update(identity)
         accounting = loopback.accounting()
     finally:
-        if log.exists():
-            observation["phases"] = phases(log)
-        loopback.stop()
+        try:
+            if log.exists():
+                observation["phases"] = phases(log, [leg["log_offset"] for leg in legs])
+        finally:
+            loopback.stop()
     observation["uploaded_bytes"] = sum(s * c for s, c in accounting["uploads"].values())
     observation["received_bytes"] = accounting["received"]
     observation["blobs_uploaded"] = len(accounting["uploads"])
@@ -457,18 +503,42 @@ def measure(args, arm, run_dir, observation):
     )
     observation["tag_writes"] = len(accounting["tags"])
     observation["publications"] = publications(registry)
-    # A run that exhausts its chain files exits 0 short of what it was asked for.
+    # A run that exhausts its chain files exits 0 short of what it was asked for, and
+    # one whose planned kill never came measured no fault.
+    observation["kill_fired"] = legs[0]["killed"] == "planned" if args.kill_on else None
     observation["succeeded"] = (
         legs[-1]["exit"] == 0 and f"epoch-{args.until}" in observation["publications"]
+        and observation["kill_fired"] is not False
     )
+
+
+def claim_run(root, stamp, name):
+    """A run id and its directory, made here, which no run under `root` had before.
+
+    Ids have one-second resolution, so a second run of an arm in that second gets a
+    count after its name.
+    """
+    runs = root / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    count = 1
+    while True:
+        run_id = f"{stamp}-{name}" + (f"-{count}" if count > 1 else "")
+        count += 1
+        if (root / "evidence" / run_id).exists():
+            continue
+        try:
+            (runs / run_id).mkdir()
+        except FileExistsError:
+            continue
+        return run_id, runs / run_id
 
 
 def command_run(args):
     """One observation, appended whatever its outcome."""
     root = Path(args.root)
     arm = json.loads(args.arm)
-    run_id = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{arm['name']}"
-    run_dir = root / "runs" / run_id
+    stamp = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S}"
+    run_id, run_dir = f"{stamp}-{arm['name']}", None
     observation = {
         "run": run_id,
         "arm": arm["name"],
@@ -479,7 +549,7 @@ def command_run(args):
         "position_in_round": args.position,
         "fault": args.kill_on or (f"fail upload every {args.fail_every}" if args.fail_every else None),
         "until_epoch": args.until,
-        "started_utc": run_id.split("-")[0],
+        "started_utc": stamp,
         "clone_seconds": None,
         "busiest_at_start": [],
         "host_at_start": {},
@@ -492,10 +562,13 @@ def command_run(args):
         "blobs_uploaded_more_than_once": None,
         "tag_writes": None,
         "publications": {},
+        "kill_fired": None,
         "succeeded": False,
     }
     failure = None
     try:
+        run_id, run_dir = claim_run(root, stamp, arm["name"])
+        observation["run"] = run_id
         measure(args, arm, run_dir, observation)
     except (Exception, KeyboardInterrupt) as error:
         failure = error
@@ -507,6 +580,9 @@ def command_run(args):
     print(json.dumps({key: observation[key] for key in
                       ["run", "arm", "workload", "round", "succeeded", "wall_seconds_total",
                        "uploaded_bytes"]}), flush=True)
+    if run_dir is None:
+        print(f"{run_id}: {failure}. It has no run directory", file=sys.stderr, flush=True)
+        return 1
     try:
         keep_evidence(run_dir / "registry", root / "evidence" / run_id)
         if (run_dir / "publisher.log").exists():
@@ -664,7 +740,6 @@ NO_PHASES = {"traversals": {}, "capture_seconds": 0, "stage_seconds": 0, "publis
 def fmt_gib(value):
     return f"{value / 1024 ** 3:.2f}"
 
-
 def command_summarize(args):
     """Tables over every observation, failed ones included, as Markdown."""
     observations = read_observations(args.root)
@@ -688,10 +763,16 @@ def command_summarize(args):
         batch = max(l["batch_high_water"] for l in o["legs"])
         spool = max(l["high_water"]["spool"] for l in o["legs"])
         growth = max(l["high_water"]["stores"] - o["legs"][0]["stores_at_start"] for l in o["legs"])
-        stage_inside = t["stage_seconds"] if o["arm"] == "w1" else 0
         log = t["log_seconds"] or 0
-        replay = log - t["capture_seconds"] - t["publish_seconds"]
-        replay -= 0 if stage_inside else t["stage_seconds"]
+        if "covered_seconds" in t:
+            # What no span covers, so a batch of one's staging inside its
+            # publications counts once, whatever its arm is called.
+            replay = log - t["covered_seconds"]
+        else:
+            # Rows from before spans were merged: only their `w1` arm staged inside
+            # its publications.
+            replay = log - t["capture_seconds"] - t["publish_seconds"]
+            replay -= 0 if o["arm"] == "w1" else t["stage_seconds"]
         load = "" if leg["load_median"] is None else f"{leg['load_median']:.1f}"
         traversed = (f"{counts.get('tag', 0)}/{counts.get('exact', 0)}/{counts.get('entity', 0)}"
                      if counts else "not logged")
@@ -701,15 +782,20 @@ def command_summarize(args):
               f"{cpu:.0f} | {fmt_gib(rss)} | {fmt_gib(batch)} | {fmt_gib(spool)} | "
               f"{fmt_gib(growth)} | {fmt_gib(o['uploaded_bytes'] or 0)} | {traversed} | {load} |")
     print()
-    for workload in sorted({o["workload"] for o in observations}):
-        runs = [o for o in observations if o["workload"] == workload and o["succeeded"]
-                and not o["fault"]]
+    # Runs to different epochs publish different lengths, so they never share a median.
+    groups = {}
+    for o in observations:
+        if o["succeeded"] and not o["fault"]:
+            groups.setdefault((o["workload"], o["until_epoch"]), []).append(o)
+    targets = {}
+    for workload, until in groups:
+        targets[workload] = targets.get(workload, 0) + 1
+    for (workload, until), runs in sorted(groups.items()):
         by_arm = {}
         for run in runs:
             by_arm.setdefault(run["arm"], []).append(run)
-        if not by_arm:
-            continue
-        print(f"\n### {workload}\n")
+        heading = f"{workload}, to epoch {until}" if targets[workload] > 1 else workload
+        print(f"\n### {heading}\n")
         print("| Arm | Runs | Median wall s | Min | Max | Median CPU s | Peak RSS GiB |")
         print("|---|--:|--:|--:|--:|--:|--:|")
         for arm, arm_runs in sorted(by_arm.items()):

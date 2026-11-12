@@ -162,6 +162,11 @@ bytes more than it kept from 13 refusals, and uploaded the same bytes. That run 
 upgrade below shared the host with builds, at load 10 to 17 as they started, so their wall
 times aren't comparable with these.
 
+The tool that recorded these rows let a span run on across a kill. So the staging kill's
+row in [tables.md](tables.md) gives 42 s of staging, from the killed process's start to the
+rerun's end, where the rerun staged for 18 s. The rows stay as recorded, and the wall times
+above don't depend on spans.
+
 ## Upgrade and rollback
 
 | Case | Result |

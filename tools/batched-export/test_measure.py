@@ -62,14 +62,44 @@ sequence = sys.argv[sys.argv.index("--point") + 1].removeprefix("epoch-")
 config.with_name("restored").write_text(sequence)
 """
 
-# Digests what the consumer restored, as `<prefix><sequence>`.
+# Digests what the consumer restored, as `<prefix><sequence>`, and exits 4 unless it is
+# chained from the inscription of the sequence before, or from nothing for the first.
 DIGEST = """#!{python}
 import sys
 from pathlib import Path
 config = Path(sys.argv[sys.argv.index("--config") + 1])
 output = Path(sys.argv[sys.argv.index("--output") + 1])
-output.write_text({prefix!r} + config.with_name("restored").read_text())
+sequence = int(config.with_name("restored").read_text())
+chained = sys.argv[sys.argv.index("--chain-from") + 1] if "--chain-from" in sys.argv else None
+found = Path(chained).read_text() if chained else None
+if found != (None if sequence == 1 else "inscription-" + str(sequence - 1)):
+    sys.exit(4)
+output.write_text({prefix!r} + str(sequence))
 """
+
+# `replay` makes the storage path its config names, records the epoch asked for, and
+# exits 1 while `fails` exists. Anything else serves as the registry.
+REPLAYING_REGISTRY = """#!{python}
+import re, sys
+from pathlib import Path
+if sys.argv[1] == "replay":
+    storage = re.search(r'path = "(.*)"', Path(sys.argv[2]).read_text()).group(1)
+    Path(storage).mkdir(parents=True, exist_ok=True)
+    with open({calls!r}, "a") as calls:
+        calls.write(sys.argv[4] + "\\n")
+    sys.exit(1 if Path({fails!r}).exists() else 0)
+import http.server
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+print(server.server_address[1], flush=True)
+server.serve_forever()
+"""
+
+# Timestamped lines, as the publisher's log has them.
+def logged(seconds, text):
+    return f"2026-01-01T00:{seconds // 60:02}:{seconds % 60:02}.000Z INFO {text}"
 
 
 def gone(pid):
@@ -219,6 +249,33 @@ class Runs(Harness):
         self.assertTrue((kept / "data").is_dir(), "--keep lost the stores")
         self.assertTrue((kept / "registry").is_dir(), "--keep lost the repository")
 
+    def test_a_run_never_takes_an_id_another_run_had(self):
+        # Another run of this arm kept evidence under the id of this second, and of the
+        # next few in case the clock ticks over.
+        now = time.time()
+        taken = [self.root / "evidence" / f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime(now + s))}-same"
+                 for s in range(5)]
+        for evidence in taken:
+            evidence.mkdir(parents=True)
+        done = self.run_tool(self.publisher("same"))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        run = self.rows()[0]["run"]
+        self.assertTrue(run.endswith("-same-2"), run)
+        self.assertTrue((self.root / "evidence" / run / "epoch-1.manifest.json").is_file())
+        for evidence in taken:
+            self.assertEqual(list(evidence.iterdir()), [], f"{evidence.name} was written to")
+
+    def test_a_log_that_cannot_be_read_still_stops_the_registry(self):
+        # A registry left running holds the tool's stderr, so without the bound the
+        # wait for it never ends.
+        done = self.run_tool(self.publisher("unreadable", then=(
+            'log = run / "publisher.log"\nlog.unlink()\nlog.mkdir()\n'
+        )), timeout=60)
+        self.assertEqual(done.returncode, 1)
+        row = self.rows()[0]
+        self.assertIn("IsADirectoryError", row["error"])
+        self.assertTrue(gone(int(self.registry_pid.read_text())), "the registry outlived the run")
+
 
 class Rows(Harness):
     def test_a_row_that_cannot_be_appended_goes_to_stderr_and_keeps_the_run(self):
@@ -310,17 +367,54 @@ class Faults(Harness):
         marker = self.root / "second-ran"
         first = self.script("first", '#!/bin/sh\necho "reached the point" >&2\nexec sleep 600\n')
         second = self.publisher("second", then=f"Path({str(marker)!r}).write_text('ran')")
+        rerun = {"name": "second", "binary": str(second), "flags": ["--batch-epochs", "4"]}
         # The timeout bounds a rerun of the wrong arm, which would sleep.
         done = self.run_tool(first, "--kill-on", "reached the point", "--timeout", "30",
-                             "--rerun-arm", json.dumps({"name": "second", "binary": str(second)}))
+                             "--rerun-arm", json.dumps(rerun))
         self.assertEqual(done.returncode, 0, done.stderr)
         row = self.rows()[0]
         self.assertEqual(row["legs"][0]["killed"], "planned")
         self.assertEqual(row["legs"][0]["exit"], -9)
         self.assertEqual(row["legs"][1]["arm"], "second")
         self.assertEqual(row["legs"][1]["exit"], 0)
+        self.assertEqual(row["legs"][1]["binary_sha256"],
+                         hashlib.sha256(second.read_bytes()).hexdigest())
+        self.assertEqual(row["legs"][1]["flags"], ["--batch-epochs", "4"])
         self.assertTrue(marker.exists(), "the arm named never ran")
+        self.assertTrue(row["kill_fired"])
         self.assertTrue(row["succeeded"])
+
+    def test_a_kill_that_never_comes_is_no_fault_measured(self):
+        done = self.run_tool(self.publisher("untouched"), "--kill-on", "never logged")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        row = self.rows()[0]
+        self.assertEqual(len(row["legs"]), 1)
+        self.assertEqual(row["legs"][0]["exit"], 0)
+        self.assertFalse(row["kill_fired"])
+        self.assertFalse(row["succeeded"])
+        done = self.read_with("compare")
+        self.assertIn("0 tags", done.stdout)
+
+    def test_a_span_a_kill_cut_short_ends_with_its_process(self):
+        marker = self.root / "once"
+        first = [logged(0, 'index staging traversal started traversal="exact"'),
+                 logged(5, "reached the point")]
+        second = [logged(60, 'index staging traversal started traversal="exact"'),
+                  logged(62, "index staging finished")]
+        publisher = self.publisher("killed-staging", then=(
+            f"if not Path({str(marker)!r}).exists():\n"
+            f"    Path({str(marker)!r}).write_text('once')\n"
+            f"    print({chr(10).join(first)!r}, file=sys.stderr, flush=True)\n"
+            "    time.sleep(600)\n"
+            f"print({chr(10).join(second)!r}, file=sys.stderr, flush=True)\n"
+        ))
+        done = self.run_tool(publisher, "--kill-on", "reached the point")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        spans = self.rows()[0]["phases"]
+        self.assertEqual(spans["stage_seconds"], 2)
+        self.assertEqual(spans["interrupted_seconds"], 5)
+        self.assertEqual(spans["covered_seconds"], 7)
+        self.assertEqual(spans["traversals"], {"exact": 2})
 
     def test_a_planned_kill_with_no_arm_named_runs_the_same_arm_again(self):
         marker = self.root / "once"
@@ -484,6 +578,34 @@ class Summarize(Harness):
         self.assertIn("2 pairs: 10.0%, 30.0%. Median 20.0%, so the 25% target is NOT met.",
                       done.stdout)
 
+    def test_runs_to_different_epochs_never_share_a_median(self):
+        self.run_tool(self.publisher("shorter"))
+        self.run_tool(self.publisher("longer", {"epoch-1": "one", "epoch-2": "two"}),
+                      "--until", "2")
+        done = self.read_with("summarize")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        sections = done.stdout.split("\n### ")[1:]
+        self.assertEqual([section.splitlines()[0] for section in sections],
+                         ["test, to epoch 1", "test, to epoch 2"])
+        self.assertIn("| shorter |", sections[0])
+        self.assertNotIn("| longer |", sections[0])
+
+    def test_replay_is_what_no_span_covers_whatever_the_arm_is_called(self):
+        # A batch of one stages inside a publication, under a name other than `w1`.
+        lines = [logged(0, "opened"), logged(10, "publishing pending boundary sequence=1"),
+                 logged(12, 'index staging traversal started traversal="exact"'),
+                 logged(15, "index staging finished"),
+                 logged(20, "published pending boundary sequence=1"), logged(30, "done")]
+        self.run_tool(self.publisher("renamed", then=(
+            f"print({chr(10).join(lines)!r}, file=sys.stderr, flush=True)\n"
+        )))
+        done = self.read_with("summarize")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        row = next(line for line in done.stdout.splitlines() if "| renamed |" in line)
+        cells = [cell.strip() for cell in row.split("|")]
+        replay, capture, stage, publish = cells[7:11]
+        self.assertEqual((replay, capture, stage, publish), ("20", "0", "3", "10"))
+
     def test_every_kind_of_row_is_read(self):
         self.run_tool(self.publisher("ok"))
         self.run_tool(self.script("fails", "#!/bin/sh\nexit 3\n"))
@@ -542,6 +664,14 @@ class Restores(Harness):
         self.assertEqual(done.returncode, 1)
         self.assertEqual([line["reproduced"] for line in self.lines()], [False, False])
 
+    def test_a_consumer_that_restores_and_then_fails_is_not_reproduced(self):
+        self.consumer = self.script("consumer", CONSUMER.format(python=sys.executable)
+                                    + "sys.exit(2)\n")
+        done = self.restore()
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual([(line["restore_exit"], line["digest_exit"], line["reproduced"])
+                          for line in self.lines()], [(2, 0, False), (2, 0, False)])
+
     def test_a_consumer_that_fails_is_not_reproduced(self):
         self.consumer = self.script("consumer", "#!/bin/sh\nexit 2\n")
         done = self.restore()
@@ -569,6 +699,71 @@ class Restores(Harness):
                         "the only copy went")
 
 
+class Prepare(Harness):
+    def setUp(self):
+        super().setUp()
+        self.calls, self.fails = self.root / "replays", self.root / "replay-fails"
+        self.registry = self.script("replaying", REPLAYING_REGISTRY.format(
+            python=sys.executable, calls=str(self.calls), fails=str(self.fails)))
+        self.publisher = self.script("publishes", "#!/bin/sh\nexit 0\n")
+
+    def prepare(self, epoch):
+        return subprocess.run(
+            [sys.executable, str(TOOL), "prepare", "--root", str(self.root),
+             "--corpus", str(self.root / "corpus"),
+             "--state-epochs", str(self.root / "state-epochs"), "--loopback", str(self.registry),
+             "--publisher", str(self.publisher), "--base-epoch", str(epoch)],
+            capture_output=True, text=True, timeout=60,
+        )
+
+    def test_a_replay_that_stopped_is_not_taken_for_a_base(self):
+        self.fails.write_text("")
+        self.assertNotEqual(self.prepare(256).returncode, 0)
+        self.assertTrue((self.root / "base" / "preprod" / "data").is_dir())
+        self.fails.unlink()
+        done = self.prepare(256)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("isn't a finished replay to epoch 256", done.stderr)
+        self.assertEqual(self.calls.read_text().split(), ["256"])
+
+    def test_a_finished_replay_is_kept_for_its_own_epoch(self):
+        for epoch in [256, 256]:
+            done = self.prepare(epoch)
+            self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.calls.read_text().split(), ["256"])
+        done = self.prepare(300)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("isn't a finished replay to epoch 300", done.stderr)
+
+
+class Profiles(unittest.TestCase):
+    """What `profile-summary.py` makes of the samples it is given."""
+
+    def test_a_missing_sample_and_an_empty_one_leave_the_rest_read(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / "empty.txt").write_text("Call graph:\n    5 Thread_1\n")
+        (root / "real.txt").write_text(
+            "Call graph:\n"
+            "    10 stelae_driver::retry::bounded::h0123456789abcdef  (in stelae)\n"
+            "    + 4 stelae_driver::publish::PublishRecord::save  (in stelae)\n"
+            "Sort by top of stack, same collapsed (when >= 5):\n"
+            "        __fcntl  (in libsystem_kernel.dylib)        2\n"
+            "Binary Images:\n"
+        )
+        done = subprocess.run(
+            [sys.executable, "-I", str(Path(__file__).with_name("profile-summary.py")),
+             str(root / "missing.txt"), str(root / "empty.txt"), str(root / "real.txt")],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        summaries = [line for line in done.stdout.splitlines() if not line.startswith(" ")]
+        self.assertEqual(summaries[0], "missing: no sample, No such file or directory")
+        self.assertEqual(summaries[1], "empty: 0 samples of a publication, so no shares")
+        self.assertEqual(summaries[2], "real: 10 samples, save 40%, file sync 20%")
+
+
 class Sample(unittest.TestCase):
     """The sampler's waits end. Reaching `sample` itself takes macOS and 28 s."""
 
@@ -590,6 +785,17 @@ class Sample(unittest.TestCase):
         ended = subprocess.Popen(["true"])
         ended.wait()
         done = self.sample(str(ended.pid))
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("ended before publishing 5", done.stderr)
+
+    def test_a_kept_run_whose_row_is_written_ends_the_wait(self):
+        root = self.run_dir.parent / "root"
+        kept = root / "runs" / "20260101T000000-kept"
+        kept.mkdir(parents=True)
+        (kept / "publisher.log").write_text("nothing yet\n")
+        (root / "observations.jsonl").write_text(json.dumps({"run": kept.name}) + "\n")
+        done = subprocess.run(["bash", str(SAMPLER), str(kept), "5", str(self.output)],
+                              capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 1)
         self.assertIn("ended before publishing 5", done.stderr)
 
