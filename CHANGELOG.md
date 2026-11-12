@@ -2,18 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.6.0] - 2026-11-12
 
 ### 🚀 Features
 
-- `SteleReader::stream_layers` streams the layers a caller names, in that order, opening each `LayerReader` when it is taken. A registry `Stele` pulls up to `ahead` blobs ahead of the caller as tasks on the transport's runtime, and dropping the stream cancels them; other readers, and a depth of 0 or 1, read one layer at a time as `stream_layer` does. Each read retry's `Event::Retry` reason now starts with the blob or manifest it retries.
-- [**breaking**] Retry failed and truncated registry reads with a longer backoff: manifest, config and layer `GET`s get `Options::read_attempts` (default 6) with waits from `Options::read_delay` (2 s) doubling up to 60 s, also retry a body that fails mid-transfer, a blob short of its descriptor and a digest mismatch, and report exhaustion as `Error::RetriesExhausted`. That message and each `Event::Retry` reason spell out the failure's whole cause chain. Publish round trips keep `Options::attempts`.
+- [**breaking**] Prepare bounded batches across replay boundaries (#19)
+- [**breaking**] Publish prepared batches in order and recover safely (#20)
+- [**breaking**] Retry failed and truncated registry reads with a longer backoff (#23)
+- Stream layers in order, read ahead by the registry transport (#24)
+- Let the publisher chart set batching (#25)
+
+### 🔧 Continuous Integration
+
+- Move the macOS test job to macos-15 (#21)
+
+### 🧪 Testing
+
+- Prove batched publication's parity and measure its cost (#22)
 
 ## [0.5.2] - 2026-11-04
 
 ### 🚀 Features
 
 - Support opt-in direct S3 uploads to Zot blob storage (#18)
+
+### Release
+
+- V0.5.2
 
 ## [0.5.1] - 2026-11-03
 

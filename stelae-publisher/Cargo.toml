@@ -11,8 +11,8 @@ name = "stelae-publisher"
 path = "src/main.rs"
 
 [dependencies]
-stelae = { path = "../stelae", version = "=0.5.2", features = ["oci"] }
-stelae-cardano = { path = "../stelae-cardano", version = "=0.5.2" }
+stelae = { path = "../stelae", version = "=0.6.0", features = ["oci"] }
+stelae-cardano = { path = "../stelae-cardano", version = "=0.6.0" }
 
 clap = { version = "4.5.37", features = ["derive"] }
 # The parser Dolos reads a credentials file with, so every file Dolos takes
@@ -30,5 +30,5 @@ tracing-subscriber = "0.3.17"
 url = "2.5"
 
 [dev-dependencies]
-stelae-cardano = { path = "../stelae-cardano", version = "=0.5.2", features = ["testing"] }
+stelae-cardano = { path = "../stelae-cardano", version = "=0.6.0", features = ["testing"] }
 tempfile = "3.20.0"
