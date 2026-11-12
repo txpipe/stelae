@@ -221,3 +221,41 @@ if grep -Fq -- '--direct-s3-config' "$OUT/default.yaml"; then
     echo 'default publisher unexpectedly enables direct S3' >&2
     exit 1
 fi
+
+# Batching: all three flags or none, never a partial set the publisher refuses.
+if grep -Eq -- '--batch-(epochs|scratch-mib|reserve-mib)' "$OUT/default.yaml"; then
+    echo 'default publisher unexpectedly batches' >&2
+    exit 1
+fi
+helm lint "$CHART" --values "$VALUES" \
+    --set batch.epochs=4,batch.scratchMib=2200,batch.reserveMib=175
+helm template publisher "$CHART" --values "$VALUES" \
+    --set batch.epochs=4,batch.scratchMib=2200,batch.reserveMib=175 >"$OUT/batch.yaml"
+doc Job "$OUT/batch.yaml" | under args |
+    grep -A1 -Fx -- '            - --batch-epochs' | grep -Fx '            - "4"'
+doc Job "$OUT/batch.yaml" | under args |
+    grep -A1 -Fx -- '            - --batch-scratch-mib' | grep -Fx '            - "2200"'
+doc Job "$OUT/batch.yaml" | under args |
+    grep -A1 -Fx -- '            - --batch-reserve-mib' | grep -Fx '            - "175"'
+helm template publisher "$CHART" --values "$VALUES" \
+    --set-string batch.epochs=4,batch.scratchMib=2200,batch.reserveMib=175 >"$OUT/batch-string.yaml"
+cmp "$OUT/batch.yaml" "$OUT/batch-string.yaml"
+# A values file reads numbers as floats; a large size still renders as digits.
+printf '%s\n' 'batch:' '  epochs: 4' '  scratchMib: 1048576' '  reserveMib: 175' >"$OUT/batch-values.yaml"
+helm template publisher "$CHART" --values "$VALUES" --values "$OUT/batch-values.yaml" |
+    grep -A1 -Fx -- '            - --batch-scratch-mib' | grep -Fx '            - "1048576"'
+
+for invalid in \
+    batch.epochs=4 \
+    batch.epochs=4,batch.scratchMib=2200 \
+    batch.scratchMib=2200,batch.reserveMib=175 \
+    batch.reserveMib=175 \
+    batch.epochs=1,batch.scratchMib=2200,batch.reserveMib=175 \
+    batch.epochs=4,batch.scratchMib=0,batch.reserveMib=175 \
+    batch.epochs=4,batch.scratchMib=2200,batch.reserveMib=175,batch.reserve=1; do
+    if helm template publisher "$CHART" --values "$VALUES" \
+        --set "$invalid" >"$OUT/invalid.yaml" 2>&1; then
+        echo "invalid batch configuration accepted: $invalid" >&2
+        exit 1
+    fi
+done

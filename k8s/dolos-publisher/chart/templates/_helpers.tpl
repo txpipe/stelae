@@ -16,3 +16,20 @@ app.kubernetes.io/name: {{ .Chart.Name }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
+
+{{/*
+The batch values when all three are set, nothing when none is, and a
+failed render for a partial set, which the publisher would refuse.
+*/}}
+{{- define "dolos-publisher.batch" -}}
+{{- $b := .Values.batch | default dict -}}
+{{- $set := list -}}
+{{- range $k := list "epochs" "scratchMib" "reserveMib" -}}
+{{- if not (kindIs "invalid" (get $b $k)) -}}{{- $set = append $set $k -}}{{- end -}}
+{{- end -}}
+{{- if eq (len $set) 3 -}}
+{{ toYaml (pick $b "epochs" "scratchMib" "reserveMib") }}
+{{- else if $set -}}
+{{- fail (printf "batch.epochs, batch.scratchMib and batch.reserveMib go together; set all three or none (set: %s)" (join ", " $set)) -}}
+{{- end -}}
+{{- end -}}

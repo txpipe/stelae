@@ -326,7 +326,8 @@ A batch prepares several boundaries before it publishes any, so one index
 traversal serves them all. Replay may stand past the repository's latest stele
 only while every sequence in between is a complete bundle the journal names.
 `run` and `backfill` take the controls below. `publish` stays a batch of one. The
-chart passes none of them, so a deployment doesn't batch until its command says to.
+chart passes them only when its `batch` values are set, so a deployment doesn't batch
+until its values say to.
 
 | Control | Meaning |
 | --- | --- |
