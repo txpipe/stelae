@@ -15,7 +15,7 @@
 //! a certificate whose beacon covers `lastImmutable` verifies them by merkle
 //! proof.
 //!
-//! The certificate itself is deliberately *not* part of a snapshot.
+//! The certificate itself is deliberately *not* part of a Stelae snapshot.
 //! Certificates are produced on the aggregator's cadence, so two publishers at
 //! the same boundary would reference different ones and stop reproducing each
 //! other's inscription; the digest values, by contrast, are byte-stable
