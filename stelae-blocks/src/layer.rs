@@ -101,16 +101,17 @@ pub struct BlocksReader<R: Read> {
 impl<R: Read> BlocksReader<R> {
     /// Open the compressed blob `source` holds, as `descriptor` describes it.
     pub fn open(source: R, descriptor: &LayerDescriptor) -> Result<Self, Error> {
-        Self::from_layer(LayerReader::new(
-            source,
-            &BlocksProfile,
-            descriptor,
-            limits(),
-        )?)
+        let layer = LayerReader::new(source, &BlocksProfile, descriptor, limits())?;
+
+        Self::from_layer(layer, descriptor)
     }
 
-    /// Read a layer a transport has already opened.
-    pub fn from_layer(layer: LayerReader<R>) -> Result<Self, Error> {
+    /// Read a layer a transport has already opened against `descriptor`.
+    ///
+    /// The header's scope must be the descriptor's, read on the header's
+    /// network. That the network is the inscription's `position` is the
+    /// consumer's check: neither end of this reader sees the position.
+    pub fn from_layer(layer: LayerReader<R>, descriptor: &LayerDescriptor) -> Result<Self, Error> {
         let header = layer.header();
 
         if header.profile != PROFILE_NAME || header.kind != BLOCKS {
@@ -125,6 +126,17 @@ impl<R: Read> BlocksReader<R> {
         }
 
         let scope = EpochScope::read_header(header.scope.as_bytes())?;
+        let described = EpochScope::read_descriptor(scope.network_magic, &descriptor.scope)?;
+
+        if described != scope {
+            return Err(Error::Stelae(stelae::Error::LayerMismatch {
+                kind: BLOCKS.to_owned(),
+                reason: format!(
+                    "header scope {scope:?} disagrees with descriptor scope {}",
+                    descriptor.scope
+                ),
+            }));
+        }
 
         Ok(Self {
             layer,
@@ -157,9 +169,17 @@ impl<R: Read> BlocksReader<R> {
         Some(checked)
     }
 
-    /// Drain what is left and confirm the layer's digest, size and record
-    /// count. Refused if any block failed to read.
-    pub fn finish(self) -> Result<LayerDigests, Error> {
+    /// Read what is left through the same checks as iteration, then confirm
+    /// the layer's digest, size and record count. Refused if any block failed.
+    pub fn finish(mut self) -> Result<LayerDigests, Error> {
+        while !self.failed {
+            match self.next() {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(e),
+                None => break,
+            }
+        }
+
         if self.failed {
             return Err(Error::Stelae(stelae::Error::LayerMismatch {
                 kind: BLOCKS.to_owned(),

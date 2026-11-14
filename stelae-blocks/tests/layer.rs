@@ -6,7 +6,7 @@ use std::fs::File;
 use stelae::{
     dir::SnapshotDir,
     profile::{checked_layer_media_type, checked_tag_for_sequence, validate_profile_name},
-    Discarding, MediaType, Profile, RecordSink, SnapshotWriter,
+    Discarding, LayerSpec, MediaType, Profile, RecordSink, SnapshotWriter,
 };
 use stelae_blocks::{
     record, write_layer, BlockRecord, BlocksProfile, BlocksReader, EpochScope, Error, BLOCKS,
@@ -117,29 +117,103 @@ fn an_empty_epoch_is_a_layer_of_its_header_alone() {
     assert_eq!(written.descriptor.records, 1);
 }
 
-/// A layer some other writer produced with its blocks out of order is refused
-/// on read, and cannot then be confirmed.
-#[test]
-fn the_reader_refuses_a_layer_out_of_order() {
-    let dir = tempfile::tempdir().unwrap();
+/// A layer some other writer produced through a raw sink, skipping the
+/// profile's checks: the header scope from `header`, the descriptor scope from
+/// `descriptor`, the blocks as given. Returns the reader over it.
+fn raw_layer(
+    dir: &tempfile::TempDir,
+    header: EpochScope,
+    descriptor: EpochScope,
+    blocks: &[BlockRecord],
+) -> Result<BlocksReader<File>, Error> {
     let snapshot = SnapshotDir::create(dir.path().join("snapshot")).unwrap();
 
-    let spec = scope().layer_spec().unwrap();
+    let spec = LayerSpec::new(BLOCKS, header.header().unwrap(), descriptor.descriptor());
     let mut sink = snapshot
         .layer_sink(&BlocksProfile, &spec, COMPRESSION_LEVEL)
         .unwrap();
 
-    for block in fixture().into_iter().rev() {
-        sink.write_record(&record::encode(&block).unwrap()).unwrap();
+    for block in blocks {
+        sink.write_record(&record::encode(block).unwrap()).unwrap();
     }
 
     let written = sink.finish().unwrap();
     let blob = File::open(snapshot.blob_path(&written.digests.blob_digest)).unwrap();
-    let mut reader = BlocksReader::open(blob, &written.descriptor).unwrap();
+
+    BlocksReader::open(blob, &written.descriptor)
+}
+
+fn reversed() -> Vec<BlockRecord> {
+    fixture().into_iter().rev().collect()
+}
+
+/// A layer out of order is refused on read, and cannot then be confirmed.
+#[test]
+fn the_reader_refuses_a_layer_out_of_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut reader = raw_layer(&dir, scope(), scope(), &reversed()).unwrap();
 
     assert!(reader.next().unwrap().is_ok());
     let err = reader.next().unwrap().unwrap_err();
     assert!(matches!(err, Error::OutOfOrder(_)), "{err:?}");
     assert!(reader.next().is_none());
     assert!(reader.finish().is_err());
+}
+
+/// `finish` reads the blocks it was not handed through the same checks, so a
+/// layer out of order is refused however little of it was iterated.
+#[test]
+fn finish_refuses_a_layer_out_of_order_it_did_not_iterate() {
+    let dir = tempfile::tempdir().unwrap();
+    let reader = raw_layer(&dir, scope(), scope(), &reversed()).unwrap();
+    let err = reader.finish().unwrap_err();
+    assert!(matches!(err, Error::OutOfOrder(_)), "{err:?}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut reader = raw_layer(&dir, scope(), scope(), &reversed()).unwrap();
+    assert!(reader.next().unwrap().is_ok());
+    let err = reader.finish().unwrap_err();
+    assert!(matches!(err, Error::OutOfOrder(_)), "{err:?}");
+}
+
+/// In order but past the epoch's last slot: refused on read and on finish.
+#[test]
+fn the_reader_refuses_a_block_outside_the_epoch() {
+    let blocks = [
+        BlockRecord::new(259_200, [1; 32], vec![]),
+        BlockRecord::new(345_600, [2; 32], vec![]),
+    ];
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut reader = raw_layer(&dir, scope(), scope(), &blocks).unwrap();
+    assert!(reader.next().unwrap().is_ok());
+    let err = reader.next().unwrap().unwrap_err();
+    assert!(
+        matches!(err, Error::OutsideEpoch { slot: 345_600, .. }),
+        "{err:?}"
+    );
+    assert!(reader.finish().is_err());
+
+    let dir = tempfile::tempdir().unwrap();
+    let reader = raw_layer(&dir, scope(), scope(), &blocks).unwrap();
+    let err = reader.finish().unwrap_err();
+    assert!(matches!(err, Error::OutsideEpoch { .. }), "{err:?}");
+}
+
+/// A header and descriptor naming different epochs are refused at open.
+#[test]
+fn the_reader_refuses_a_header_scope_the_descriptor_does_not_name() {
+    let next = EpochScope::new(2, 4, 345_600, 431_999).unwrap();
+    let shifted = EpochScope::new(2, 3, 259_200, 345_600).unwrap();
+
+    for descriptor in [next, shifted] {
+        let dir = tempfile::tempdir().unwrap();
+        let err = raw_layer(&dir, scope(), descriptor, &fixture())
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, Error::Stelae(stelae::Error::LayerMismatch { .. })),
+            "{descriptor:?}: {err:?}"
+        );
+    }
 }

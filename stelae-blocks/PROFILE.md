@@ -68,7 +68,9 @@ digest of that file.
 
 Both slot bounds are inclusive and are the epoch's own first and last slot,
 not those of its first and last block. The descriptor leaves the network out:
-the inscription's `position` names it.
+the inscription's `position` names it. A reader refuses a layer whose header
+scope is not its descriptor's on the header's network; checking that network
+against `position` is the consumer's part.
 
 ### Records
 
@@ -84,7 +86,7 @@ the inscription's `position` names it.
 Records run in ascending slot. Blocks that share a slot keep the order the
 chain gave them: a Byron epoch boundary block shares its slot with the block
 after it. A reader refuses a slot that goes backwards or falls outside the
-scope.
+scope, and does not confirm a layer until every block has passed both checks.
 
 An epoch with no blocks is a layer holding its header record alone.
 
