@@ -1,0 +1,22 @@
+[package]
+name = "stelae-blocks"
+description = "The io.txpipe.cardano.blocks profile: one layer of raw Cardano blocks per epoch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "PROFILE.md"
+
+# A client-neutral profile: it depends on the protocol and the driver and on
+# no node implementation. `cargo tree -p stelae-blocks -e normal` must match
+# nothing `^(dolos|pallas)(-|$)`.
+[dependencies]
+stelae = { path = "../stelae", version = "=0.6.0" }
+stelae-driver = { path = "../stelae-driver", version = "=0.6.0" }
+
+minicbor = { version = "0.26", features = ["std"] }
+serde_json = "1.0.122"
+thiserror = "2.0.12"
+
+[dev-dependencies]
+tempfile = "3.20.0"
