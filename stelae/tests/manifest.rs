@@ -226,8 +226,7 @@ fn a_manifest_reads_back_from_its_bytes() {
     assert_eq!(read, manifest);
     assert!(read_manifest(&read, &inscription).is_ok());
 
-    // Every optional field the specification defines, so none is dropped on
-    // the way in.
+    // Every optional field the types carry, so none is dropped on the way in.
     let mut full = manifest.clone();
     full.annotations = Some(BTreeMap::from([("m".to_owned(), "n".to_owned())]));
     full.config.urls = Some(vec!["https://mirror.invalid/blob".to_owned()]);
