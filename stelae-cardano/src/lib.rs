@@ -39,13 +39,18 @@ mod dependency_identity {
     /// name, so it has to be the revision every Dolos package resolves to.
     #[test]
     fn dolos_revision_is_the_locked_dolos_revision() {
-        const SOURCE: &str = "git+https://github.com/txpipe/dolos?rev=";
+        const SOURCE: &str = "source = \"git+https://github.com/txpipe/dolos";
 
+        // Every Dolos git source, however it is requested, by the commit it
+        // resolved to: the fragment after `#`.
         let lock = include_str!("../../Cargo.lock");
         let revisions: Vec<&str> = lock
             .lines()
-            .filter_map(|line| line.split_once(SOURCE))
-            .map(|(_, rest)| rest.split('#').next().unwrap())
+            .filter(|line| line.starts_with(SOURCE))
+            .map(|line| {
+                let (_, resolved) = line.rsplit_once('#').expect("a resolved git source");
+                resolved.trim_end_matches('"')
+            })
             .collect();
 
         assert!(!revisions.is_empty());
