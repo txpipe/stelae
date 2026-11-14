@@ -359,6 +359,30 @@ mod tests {
         );
     }
 
+    /// The space preflight counts both fjall stores' journals, in bytes.
+    #[test]
+    fn a_restore_counts_both_fjall_journals() {
+        use dolos::adapters::{ArchiveStoreBackend, StateStoreBackend};
+
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = crate::RootConfig::new(dolos_core::config::ChainConfig::known("preview"));
+        config.storage.path = storage.path().to_path_buf();
+
+        let archive = dolos::storage::open_archive_store(&config).unwrap();
+        let state = dolos::storage::open_state_store(&config).unwrap();
+
+        let (StateStoreBackend::Fjall(fjall_state), ArchiveStoreBackend::Fjall(fjall_archive)) =
+            (&state, &archive)
+        else {
+            panic!("the default configuration opens fjall stores");
+        };
+
+        let expected =
+            (fjall_state.tuning().journal_mb + fjall_archive.tuning().journal_mb) * 1024 * 1024;
+        assert!(expected > 0);
+        assert_eq!(journals(&archive, &state), expected);
+    }
+
     #[test]
     fn marker_roundtrip_preserves_the_storage_contract() {
         let dir = tempfile::tempdir().unwrap();

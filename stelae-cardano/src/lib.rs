@@ -35,6 +35,25 @@ pub const DOLOS_REVISION: &str = "a95ecdebe8666ddde29578d7a734af5ce8f16375";
 mod dependency_identity {
     use super::*;
 
+    /// `DOLOS_REVISION` is what published inscriptions and batch records
+    /// name, so it has to be the revision every Dolos package resolves to.
+    #[test]
+    fn dolos_revision_is_the_locked_dolos_revision() {
+        const SOURCE: &str = "git+https://github.com/txpipe/dolos?rev=";
+
+        let lock = include_str!("../../Cargo.lock");
+        let revisions: Vec<&str> = lock
+            .lines()
+            .filter_map(|line| line.split_once(SOURCE))
+            .map(|(_, rest)| rest.split('#').next().unwrap())
+            .collect();
+
+        assert!(!revisions.is_empty());
+        for revision in revisions {
+            assert_eq!(revision, DOLOS_REVISION);
+        }
+    }
+
     fn accepts_host_profile<P: stelae_driver::DriverProfile>() {}
 
     #[test]
