@@ -13,8 +13,8 @@ use serde_json::json;
 use stelae::{
     inscription::LayerDescriptor,
     manifest::{
-        build_manifest, manifest_bytes, read_manifest, DIFF_ID_ANNOTATION, KIND_ANNOTATION,
-        SCOPE_ANNOTATION,
+        build_manifest, manifest_bytes, read_manifest, Manifest, DIFF_ID_ANNOTATION,
+        KIND_ANNOTATION, SCOPE_ANNOTATION,
     },
     Compression, Digest, Error, HistoryEntry, Inscription, LayerDigests, Profile, WrittenLayer,
 };
@@ -200,6 +200,31 @@ fn a_manifest_yields_the_identity_to_blob_map() {
     assert_eq!(blobs.blob_for(&digest_of(0xaa)), Some(digest_of(0xa1)));
     assert_eq!(blobs.blob_for(&digest_of(0xbb)), Some(digest_of(0xb1)));
     assert_eq!(blobs.blob_for(&digest_of(0xcc)), None);
+}
+
+/// A manifest read back from its own bytes is the manifest that was built, and
+/// fields the specification may add are ignored rather than refused, so a
+/// transport that parses the document itself reads what a registry serves.
+#[test]
+fn a_manifest_reads_back_from_its_bytes() {
+    let (inscription, layers) = fixture();
+    let (manifest, _) = build_manifest(&inscription, &layers).unwrap();
+    let body = manifest_bytes(&manifest).unwrap();
+
+    let read: Manifest = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(read, manifest);
+    assert_eq!(manifest_bytes(&read).unwrap(), body);
+
+    let mut extended: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    extended["futureField"] = json!(true);
+    extended["config"]["futureField"] = json!(1);
+    extended["layers"][0]["futureField"] = json!("x");
+
+    let read: Manifest = serde_json::from_value(extended).unwrap();
+
+    assert_eq!(read, manifest);
+    assert!(read_manifest(&read, &inscription).is_ok());
 }
 
 /// The annotations Dolos ADR-004 asks for, checked as content rather than as
