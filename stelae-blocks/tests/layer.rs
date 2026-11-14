@@ -226,8 +226,9 @@ fn the_reader_refuses_a_header_scope_the_descriptor_does_not_name() {
     let next = EpochScope::new(2, 4, 345_600, 431_999).unwrap();
     let shifted = EpochScope::new(2, 3, 259_200, 345_600).unwrap();
     let late_start = EpochScope::new(2, 3, 259_201, 345_599).unwrap();
+    let other_epoch = EpochScope::new(2, 4, 259_200, 345_599).unwrap();
 
-    for descriptor in [next, shifted, late_start] {
+    for descriptor in [next, shifted, late_start, other_epoch] {
         let dir = tempfile::tempdir().unwrap();
         let err = raw_layer(&dir, scope(), descriptor, &fixture())
             .err()
@@ -245,7 +246,9 @@ fn the_reader_refuses_a_descriptor_scope_it_cannot_read() {
     let mut extra = scope().descriptor();
     extra["shard"] = 0.into();
 
-    for descriptor in [serde_json::json!({}), extra] {
+    let not_a_slot = serde_json::json!({"epoch": 3, "startSlot": "x", "endSlot": 345_599});
+
+    for descriptor in [serde_json::json!({}), extra, not_a_slot] {
         let dir = tempfile::tempdir().unwrap();
         let records = blocks_as_records(&fixture());
         let err = raw_records(&dir, scope(), descriptor.clone(), &records)
