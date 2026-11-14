@@ -26,13 +26,38 @@ pub use dolos_snapshot::{
 };
 
 /// The Dolos revision this publisher reads its configuration and stores with:
-/// the boundary preparation facade (txpipe/dolos PR #1564). The v2 profile was
-/// frozen earlier, at e39a38a3 (PR #1548).
-pub const DOLOS_REVISION: &str = "bf66dcc66cd65228539c8401e291807e947c61ec";
+/// the build of fjall from the txpipe fork (txpipe/dolos PR #1599), over the
+/// boundary preparation facade of PR #1564. The v2 profile was frozen earlier,
+/// at e39a38a3 (PR #1548).
+pub const DOLOS_REVISION: &str = "a95ecdebe8666ddde29578d7a734af5ce8f16375";
 
 #[cfg(test)]
 mod dependency_identity {
     use super::*;
+
+    /// `DOLOS_REVISION` is what published inscriptions and batch records
+    /// name, so it has to be the revision every Dolos package resolves to.
+    #[test]
+    fn dolos_revision_is_the_locked_dolos_revision() {
+        const SOURCE: &str = "source = \"git+https://github.com/txpipe/dolos";
+
+        // Every Dolos git source, however it is requested, by the commit it
+        // resolved to: the fragment after `#`.
+        let lock = include_str!("../../Cargo.lock");
+        let revisions: Vec<&str> = lock
+            .lines()
+            .filter(|line| line.starts_with(SOURCE))
+            .map(|line| {
+                let (_, resolved) = line.rsplit_once('#').expect("a resolved git source");
+                resolved.trim_end_matches('"')
+            })
+            .collect();
+
+        assert!(!revisions.is_empty());
+        for revision in revisions {
+            assert_eq!(revision, DOLOS_REVISION);
+        }
+    }
 
     fn accepts_host_profile<P: stelae_driver::DriverProfile>() {}
 

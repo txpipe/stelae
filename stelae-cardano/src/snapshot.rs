@@ -53,11 +53,13 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    // This variant and the next box the profile's error, which is large enough
+    // to trip `result_large_err` on every result carrying this one.
     #[error("{what}")]
     Profile {
         what: String,
         #[source]
-        source: dolos_snapshot::Error,
+        source: Box<dolos_snapshot::Error>,
     },
 
     /// The check ran and the stele failed it.
@@ -65,7 +67,7 @@ pub enum Error {
     Mismatch {
         what: String,
         #[source]
-        source: dolos_snapshot::Error,
+        source: Box<dolos_snapshot::Error>,
     },
 
     #[error("{} holds one stele, sequence {sequence}, and not {point}", path.display())]
@@ -85,7 +87,10 @@ impl Error {
 
     fn profile(what: impl Into<String>) -> impl FnOnce(dolos_snapshot::Error) -> Self {
         let what = what.into();
-        move |source| Self::Profile { what, source }
+        move |source| Self::Profile {
+            what,
+            source: Box::new(source),
+        }
     }
 
     /// A verification failure, classified by whether it is the stele's.
@@ -99,7 +104,9 @@ impl Error {
     ) -> impl FnOnce(dolos_snapshot::Error) -> Self {
         let what = what.into();
         move |source| {
-            if wrong(&source) {
+            let wrong = wrong(&source);
+            let source = Box::new(source);
+            if wrong {
                 Self::Mismatch { what, source }
             } else {
                 Self::Profile { what, source }
