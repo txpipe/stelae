@@ -1382,8 +1382,8 @@ dependencies = [
  "minicbor 0.26.5",
  "serde",
  "serde_json",
- "stelae",
- "stelae-driver",
+ "stelae 0.5.2",
+ "stelae-driver 0.5.2",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
@@ -4768,6 +4768,29 @@ checksum = "5c0e04424e733e69714ca1bbb9204c1a57f09f5493439520f9f68c132ad25eec"
 
 [[package]]
 name = "stelae"
+version = "0.5.2"
+source = "git+https://github.com/txpipe/stelae?rev=cdcf27134f574b522bb454ff5ee9f6a2adf0e353#cdcf27134f574b522bb454ff5ee9f6a2adf0e353"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "hex",
+ "http",
+ "minicbor 0.26.5",
+ "object_store",
+ "oci-client",
+ "reqwest",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "zstd",
+]
+
+[[package]]
+name = "stelae"
 version = "0.6.0"
 dependencies = [
  "bytes",
@@ -4808,14 +4831,28 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "stelae",
+ "stelae 0.5.2",
  "stelae-cardano",
- "stelae-driver",
+ "stelae-driver 0.5.2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "toml 0.8.23",
+ "tracing",
+]
+
+[[package]]
+name = "stelae-driver"
+version = "0.5.2"
+source = "git+https://github.com/txpipe/stelae?rev=cdcf27134f574b522bb454ff5ee9f6a2adf0e353#cdcf27134f574b522bb454ff5ee9f6a2adf0e353"
+dependencies = [
+ "fs4",
+ "minicbor 0.26.5",
+ "serde",
+ "serde_json",
+ "stelae 0.5.2",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -4827,7 +4864,7 @@ dependencies = [
  "minicbor 0.26.5",
  "serde",
  "serde_json",
- "stelae",
+ "stelae 0.6.0",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
@@ -4843,7 +4880,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "stelae",
+ "stelae 0.5.2",
  "stelae-cardano",
  "tempfile",
  "tokio",

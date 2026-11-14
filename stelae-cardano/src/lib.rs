@@ -59,15 +59,17 @@ mod dependency_identity {
         }
     }
 
+    // The host's `stelae` and `stelae-driver` must be the ones the Dolos profile
+    // was built against, or these would not compile.
     fn accepts_host_profile<P: stelae_driver::DriverProfile>() {}
 
     #[test]
-    fn dolos_profile_implements_the_workspace_driver_trait() {
+    fn dolos_profile_implements_the_host_driver_trait() {
         accepts_host_profile::<dolos_snapshot::DolosProfile>();
     }
 
     #[test]
-    fn facade_registry_types_are_the_protocol_types_used_by_this_workspace() {
+    fn facade_registry_types_are_the_protocol_types_used_by_this_host() {
         fn accepts_repository(_: &stelae::oci::Repository) {}
         let repository: Repository = "oci://example.invalid/cardano/preview".parse().unwrap();
         accepts_repository(&repository);

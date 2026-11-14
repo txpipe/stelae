@@ -50,14 +50,14 @@ contains no publisher command, backfill loop or publisher policy module. The
 root `dolos` package is imported with default features disabled, so its
 service features are absent from the publisher graph.
 
-The pinned profile depends on Stelae at `55d5270`, the snapshot envelope
-rename ([PR 17](https://github.com/txpipe/stelae/pull/17)), versioned `0.5.0`.
-The workspace patch for `https://github.com/txpipe/stelae` resolves those
-dependencies back to the workspace `stelae` and `stelae-driver` packages, so
-the profile and the publisher share one set of protocol types instead of two
-of the same version. A Dolos pin whose Stelae reference carries a different
-protocol from this workspace needs that skew resolved before it is pinned; the
-patch would otherwise hide it.
+The pinned profile depends on Stelae at `cdcf271`, the main commit after
+v0.5.2 that streams a restore's layers in order
+([PR 24](https://github.com/txpipe/stelae/pull/24)). The host (`stelae-cardano`
+and `stelae-publisher`) takes `stelae` and `stelae-driver` by git at that same
+revision, so the profile and the publisher share one set of protocol types.
+The workspace `stelae` and `stelae-driver` are built and tested from their
+paths and may move ahead of it; the host follows them only when the Dolos pin
+moves to a Dolos built against the newer revision.
 
 Steles cut against an earlier pin are not part of this lineage: the frozen
 profile renamed its payload media types and reset every schema revision to

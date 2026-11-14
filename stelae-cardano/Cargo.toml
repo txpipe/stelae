@@ -7,8 +7,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-stelae = { path = "../stelae", version = "=0.6.0", features = ["oci"] }
-stelae-driver = { path = "../stelae-driver", version = "=0.6.0", features = ["oci"] }
+# The Stelae revision the Dolos commit below pins (crates/snapshot/Cargo.toml),
+# never the workspace crates or a tag: any other source would make the
+# profile's protocol types distinct from these.
+stelae = { git = "https://github.com/txpipe/stelae", rev = "cdcf27134f574b522bb454ff5ee9f6a2adf0e353", features = ["oci"] }
+stelae-driver = { git = "https://github.com/txpipe/stelae", rev = "cdcf27134f574b522bb454ff5ee9f6a2adf0e353", features = ["oci"] }
 
 # The Dolos commit that builds fjall from the txpipe fork (txpipe/dolos PR
 # #1599). Boundary preparation and staged export came earlier (PR #1564), and
