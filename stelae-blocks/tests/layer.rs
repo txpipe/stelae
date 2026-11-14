@@ -6,7 +6,7 @@ use std::fs::File;
 use stelae::{
     dir::SnapshotDir,
     profile::{checked_layer_media_type, checked_tag_for_sequence, validate_profile_name},
-    Discarding, LayerSpec, MediaType, Profile, RecordSink, SnapshotWriter,
+    CanonicalCbor, Discarding, LayerSpec, MediaType, Profile, RecordSink, SnapshotWriter,
 };
 use stelae_blocks::{
     record, write_layer, BlockRecord, BlocksProfile, BlocksReader, EpochScope, Error, BLOCKS,
@@ -126,15 +126,34 @@ fn raw_layer(
     descriptor: EpochScope,
     blocks: &[BlockRecord],
 ) -> Result<BlocksReader<File>, Error> {
+    raw_records(
+        dir,
+        header,
+        descriptor.descriptor(),
+        &blocks_as_records(blocks),
+    )
+}
+
+fn blocks_as_records(blocks: &[BlockRecord]) -> Vec<CanonicalCbor> {
+    blocks.iter().map(|b| record::encode(b).unwrap()).collect()
+}
+
+/// As `raw_layer`, with the descriptor scope and the records taken verbatim.
+fn raw_records(
+    dir: &tempfile::TempDir,
+    header: EpochScope,
+    descriptor: serde_json::Value,
+    records: &[CanonicalCbor],
+) -> Result<BlocksReader<File>, Error> {
     let snapshot = SnapshotDir::create(dir.path().join("snapshot")).unwrap();
 
-    let spec = LayerSpec::new(BLOCKS, header.header().unwrap(), descriptor.descriptor());
+    let spec = LayerSpec::new(BLOCKS, header.header().unwrap(), descriptor);
     let mut sink = snapshot
         .layer_sink(&BlocksProfile, &spec, COMPRESSION_LEVEL)
         .unwrap();
 
-    for block in blocks {
-        sink.write_record(&record::encode(block).unwrap()).unwrap();
+    for record in records {
+        sink.write_record(record).unwrap();
     }
 
     let written = sink.finish().unwrap();
@@ -200,13 +219,15 @@ fn the_reader_refuses_a_block_outside_the_epoch() {
     assert!(matches!(err, Error::OutsideEpoch { .. }), "{err:?}");
 }
 
-/// A header and descriptor naming different epochs are refused at open.
+/// A header and descriptor that disagree on the epoch or on either bound are
+/// refused at open.
 #[test]
 fn the_reader_refuses_a_header_scope_the_descriptor_does_not_name() {
     let next = EpochScope::new(2, 4, 345_600, 431_999).unwrap();
     let shifted = EpochScope::new(2, 3, 259_200, 345_600).unwrap();
+    let late_start = EpochScope::new(2, 3, 259_201, 345_599).unwrap();
 
-    for descriptor in [next, shifted] {
+    for descriptor in [next, shifted, late_start] {
         let dir = tempfile::tempdir().unwrap();
         let err = raw_layer(&dir, scope(), descriptor, &fixture())
             .err()
@@ -214,6 +235,58 @@ fn the_reader_refuses_a_header_scope_the_descriptor_does_not_name() {
         assert!(
             matches!(err, Error::Stelae(stelae::Error::LayerMismatch { .. })),
             "{descriptor:?}: {err:?}"
+        );
+    }
+}
+
+/// A descriptor scope that is not the profile's shape is refused at open.
+#[test]
+fn the_reader_refuses_a_descriptor_scope_it_cannot_read() {
+    let mut extra = scope().descriptor();
+    extra["shard"] = 0.into();
+
+    for descriptor in [serde_json::json!({}), extra] {
+        let dir = tempfile::tempdir().unwrap();
+        let records = blocks_as_records(&fixture());
+        let err = raw_records(&dir, scope(), descriptor.clone(), &records)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, Error::MalformedScope(_)),
+            "{descriptor}: {err:?}"
+        );
+    }
+}
+
+/// A record that is canonical CBOR but not a block is refused on read and on
+/// finish, however little of the layer was iterated.
+#[test]
+fn the_reader_refuses_a_record_that_is_not_a_block() {
+    let not_a_block = stelae::frame::encode(|e| {
+        e.array(2)?.u64(259_260)?.bytes(&[0; 32])?;
+        Ok(())
+    })
+    .unwrap();
+    let mut records = blocks_as_records(&fixture()[..1]);
+    records.push(not_a_block);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut reader = raw_records(&dir, scope(), scope().descriptor(), &records).unwrap();
+    assert!(reader.next().unwrap().is_ok());
+    let err = reader.next().unwrap().unwrap_err();
+    assert!(matches!(err, Error::MalformedRecord(_)), "{err:?}");
+    assert!(reader.finish().is_err());
+
+    for iterated in [0, 1] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = raw_records(&dir, scope(), scope().descriptor(), &records).unwrap();
+        for _ in 0..iterated {
+            assert!(reader.next().unwrap().is_ok());
+        }
+        let err = reader.finish().unwrap_err();
+        assert!(
+            matches!(err, Error::MalformedRecord(_)),
+            "{iterated}: {err:?}"
         );
     }
 }
