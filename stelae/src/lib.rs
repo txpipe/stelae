@@ -38,6 +38,9 @@
 //! - [`progress`] — the one seam a publish and a restore report through while
 //!   they run: an observer a caller passes in, callbacks only, silent by
 //!   default.
+//! - [`manifest`] — the OCI image manifest a snapshot is published under: its
+//!   types, its canonical bytes, and the identity→blob map read off it, for
+//!   every transport that holds one.
 //! - [`dir`] — a minimal on-disk snapshot: the first implementation of that
 //!   seam, and the one a snapshot is inspectable by hand through.
 //! - [`oci`] — (feature `oci`) an OCI registry as the other implementation:
@@ -58,6 +61,7 @@ pub mod dir;
 pub mod frame;
 pub mod inscription;
 pub mod layer;
+pub mod manifest;
 #[cfg(feature = "oci")]
 pub mod oci;
 pub mod plan;
@@ -120,7 +124,7 @@ pub const MOVING_TAG: &str = "latest";
 /// ("~1,700 manifest descriptors, well under the 4 MiB manifest guidance"). A
 /// snapshot that exceeds it is refused before the push rather than after a
 /// registry answers `413`, because the failure is a property of the document
-/// and the same everywhere. See [`oci`].
+/// and the same everywhere. See [`manifest::manifest_bytes`].
 pub const MANIFEST_SIZE_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Largest integer RFC 8785 (via ECMAScript number serialization) renders
