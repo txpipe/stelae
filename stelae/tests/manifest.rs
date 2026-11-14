@@ -225,6 +225,19 @@ fn a_manifest_reads_back_from_its_bytes() {
 
     assert_eq!(read, manifest);
     assert!(read_manifest(&read, &inscription).is_ok());
+
+    // Every optional field the specification defines, so none is dropped on
+    // the way in.
+    let mut full = manifest.clone();
+    full.annotations = Some(BTreeMap::from([("m".to_owned(), "n".to_owned())]));
+    full.config.urls = Some(vec!["https://mirror.invalid/blob".to_owned()]);
+    full.config.annotations = Some(BTreeMap::from([("k".to_owned(), "v".to_owned())]));
+    full.config.artifact_type = Some("application/vnd.example.thing.v1".to_owned());
+    full.subject = Some(full.config.clone());
+
+    let read: Manifest = serde_json::from_slice(&manifest_bytes(&full).unwrap()).unwrap();
+
+    assert_eq!(read, full);
 }
 
 /// The annotations Dolos ADR-004 asks for, checked as content rather than as
