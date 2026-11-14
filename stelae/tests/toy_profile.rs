@@ -1,4 +1,5 @@
-//! The boundary proof: a stele of a profile the protocol knows nothing about.
+//! The boundary proof: a snapshot of a profile the protocol knows nothing
+//! about.
 //!
 //! `dev.example.toy` publishes chapters of notes. It has no chain, no epochs,
 //! no blocks, no ledger — nothing Cardano-shaped and nothing Dolos-shaped. If
@@ -8,18 +9,18 @@
 //!
 //! What it demonstrates, end to end:
 //!
-//! 1. A stele is written to a directory and read back, records intact.
+//! 1. A snapshot is written to a directory and read back, records intact.
 //! 2. Two independent write runs produce the same inscription digest.
 //! 3. Every vendor-owned string in the artifact came from the profile; the core
 //!    composed none of them.
 //! 4. `position`, `parameters` and `scope` survive as arbitrary shapes — the
 //!    core canonicalizes and hashes them without ever typing them.
-//! 5. A stele of a *different* profile, or a profile major version above the
+//! 5. A snapshot of a *different* profile, or a profile major version above the
 //!    one implemented, is refused cleanly.
 //! 6. Both write paths — a layer handed over whole, and a layer streamed into a
 //!    sink — produce the same artifact, and this profile publishes one of each.
-//! 7. A stele carrying a layer kind this build does not define is *readable* —
-//!    the layer is reported and skipped — and not publishable on top of.
+//! 7. A snapshot carrying a layer kind this build does not define is *readable*
+//!    — the layer is reported and skipped — and not publishable on top of.
 
 use std::{collections::BTreeSet, io::Write as _};
 
@@ -27,10 +28,10 @@ use serde_json::json;
 
 use stelae::{
     digest::read_blob,
-    dir::{BlobIndex, LayerSpec, SteleDir, WrittenLayer},
+    dir::{BlobIndex, LayerSpec, SnapshotDir, WrittenLayer},
     frame::{encode, CanonicalCbor, Limits},
     Compression, Discarding, Error, Inscription, LayerDescriptor, LayerReader, LayerWriter,
-    Profile, RecordSink, SteleReader, SteleWriter,
+    Profile, RecordSink, SnapshotReader, SnapshotWriter,
 };
 
 const PROFILE_NAME: &str = "dev.example.toy";
@@ -147,11 +148,11 @@ fn index_scopes() -> (CanonicalCbor, serde_json::Value) {
 /// about them is allowed to differ, because a layer that restores through one
 /// and not the other is a determinism bug in the format itself.
 fn read_both_ways(
-    stele: &SteleDir,
+    snapshot: &SnapshotDir,
     index: &BlobIndex,
     descriptor: &LayerDescriptor,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    let buffered = stele.read_layer(index, &ToyProfile, descriptor);
+    let buffered = snapshot.read_layer(index, &ToyProfile, descriptor);
 
     // A window far below one record, so the streaming path is exercised at its
     // refill boundaries rather than swallowing the layer in one read.
@@ -161,7 +162,7 @@ fn read_both_ways(
     };
 
     let streamed = (|| {
-        let mut reader = stele.stream_layer(index, &ToyProfile, descriptor, limits)?;
+        let mut reader = snapshot.stream_layer(index, &ToyProfile, descriptor, limits)?;
 
         let mut records = Vec::new();
         while let Some(record) = reader.next_record() {
@@ -201,20 +202,20 @@ fn read_both_ways(
     }
 }
 
-/// Write a complete stele of the toy profile into `root`.
+/// Write a complete snapshot of the toy profile into `root`.
 ///
 /// This is the publisher side of the protocol in miniature: frame the profile's
 /// records into layers, collect the descriptors the layers yield, and put them
-/// in an inscription whose digest is the stele's identity.
-fn write_stele(root: &std::path::Path) -> (Inscription, stelae::Digest) {
-    let stele = SteleDir::create(root).unwrap();
+/// in an inscription whose digest is the snapshot's identity.
+fn write_snapshot(root: &std::path::Path) -> (Inscription, stelae::Digest) {
+    let snapshot = SnapshotDir::create(root).unwrap();
 
     let (notes_header_scope, notes_scope) = notes_scopes();
     let (index_header_scope, index_scope) = index_scopes();
 
     let notes: Vec<CanonicalCbor> = NOTES.iter().map(note_record).collect();
 
-    let written_notes = stele
+    let written_notes = snapshot
         .write_layer(
             &ToyProfile,
             &LayerSpec::new("notes", notes_header_scope, notes_scope),
@@ -225,14 +226,14 @@ fn write_stele(root: &std::path::Path) -> (Inscription, stelae::Digest) {
 
     // The index layer is streamed into a sink instead, so this profile — which
     // the protocol knows nothing about — exercises both write paths in the same
-    // stele. The records are never collected: a profile publishing at Dolos
+    // snapshot. The records are never collected: a profile publishing at Dolos
     // sizes cannot hold a layer, and the shape it needs has to work for a
     // three-note chapter too. That the goldens below do not move is the proof
     // that the two paths produce one artifact.
     let mut sorted: Vec<&Note> = NOTES.iter().collect();
     sorted.sort_by_key(|n| n.title);
 
-    let mut index_sink = stele
+    let mut index_sink = snapshot
         .layer_sink(
             &ToyProfile,
             &LayerSpec::new("index", index_header_scope, index_scope),
@@ -270,34 +271,34 @@ fn write_stele(root: &std::path::Path) -> (Inscription, stelae::Digest) {
 
     inscription.layers = vec![written_notes.descriptor, written_index.descriptor];
 
-    let digest = stele.seal(&ToyProfile, &inscription).unwrap();
+    let digest = snapshot.seal(&ToyProfile, &inscription).unwrap();
 
     (inscription, digest)
 }
 
 #[test]
-fn writes_a_stele_and_reads_it_back() {
+fn writes_a_snapshot_and_reads_it_back() {
     let temp = tempfile::tempdir().unwrap();
-    let (written, digest) = write_stele(temp.path());
+    let (written, digest) = write_snapshot(temp.path());
 
     // On-disk shape: one canonical document plus content-addressed blobs.
     assert!(temp.path().join("inscription.json").is_file());
     let blobs = temp.path().join("blobs").join("sha256");
     assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), 2);
 
-    let stele = SteleDir::open(temp.path()).unwrap();
-    let read = stele.read_inscription().unwrap();
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
+    let read = snapshot.read_inscription().unwrap();
 
     assert_eq!(read, written);
     assert_eq!(read.digest().unwrap(), digest);
     read.check_profile(&ToyProfile).unwrap();
 
     // The layers come back through the same identity the inscription pins.
-    let index = stele.blob_index().unwrap();
+    let index = snapshot.blob_index().unwrap();
     assert_eq!(index.len(), 2);
 
     let notes_descriptor = read.layers_of_kind("notes").next().unwrap();
-    let layer = stele
+    let layer = snapshot
         .read_layer(&index, &ToyProfile, notes_descriptor)
         .unwrap();
 
@@ -322,7 +323,7 @@ fn writes_a_stele_and_reads_it_back() {
 
     // The second layer reads back the same way.
     let index_descriptor = read.layers_of_kind("index").next().unwrap();
-    let index_layer = stele
+    let index_layer = snapshot
         .read_layer(&index, &ToyProfile, index_descriptor)
         .unwrap();
     assert_eq!(index_layer.header().kind, "index");
@@ -330,7 +331,7 @@ fn writes_a_stele_and_reads_it_back() {
 
     // And both layers read back identically without ever being held.
     for descriptor in &read.layers {
-        read_both_ways(&stele, &index, descriptor).unwrap();
+        read_both_ways(&snapshot, &index, descriptor).unwrap();
     }
 }
 
@@ -340,14 +341,14 @@ fn writes_a_stele_and_reads_it_back() {
 #[test]
 fn a_layer_streams_back_record_for_record() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
-    let stele = SteleDir::open(temp.path()).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
+    let index = snapshot.blob_index().unwrap();
 
     let notes_descriptor = inscription.layers_of_kind("notes").next().unwrap();
 
-    let mut reader = stele
+    let mut reader = snapshot
         .stream_layer(
             &index,
             &ToyProfile,
@@ -386,10 +387,10 @@ fn a_layer_streams_back_record_for_record() {
 #[test]
 fn a_directory_streams_layers_as_stream_layer_reads_them() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
-    let stele = SteleDir::open(temp.path()).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
+    let index = snapshot.blob_index().unwrap();
 
     let read = |mut reader: LayerReader<std::fs::File>| {
         let header = reader.header().clone();
@@ -408,7 +409,7 @@ fn a_directory_streams_layers_as_stream_layer_reads_them() {
         .iter()
         .map(|descriptor| {
             read(
-                stele
+                snapshot
                     .stream_layer(&index, &ToyProfile, descriptor, Limits::default())
                     .unwrap(),
             )
@@ -416,7 +417,7 @@ fn a_directory_streams_layers_as_stream_layer_reads_them() {
         .collect();
 
     for ahead in [0, 1, 8] {
-        let streamed: Vec<_> = stele
+        let streamed: Vec<_> = snapshot
             .stream_layers(&index, &ToyProfile, named.clone(), Limits::default(), ahead)
             .map(|reader| read(reader.unwrap()))
             .collect();
@@ -427,7 +428,7 @@ fn a_directory_streams_layers_as_stream_layer_reads_them() {
     let mut absent = inscription.layers[0].clone();
     absent.diff_id = stelae::Digest::from_bytes([0xab; 32]);
 
-    let mut stream = stele.stream_layers(
+    let mut stream = snapshot.stream_layers(
         &index,
         &ToyProfile,
         vec![
@@ -457,14 +458,14 @@ fn a_directory_streams_layers_as_stream_layer_reads_them() {
 #[test]
 fn finish_confirms_the_layer_whether_or_not_the_records_were_read() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
-    let stele = SteleDir::open(temp.path()).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
+    let index = snapshot.blob_index().unwrap();
     let descriptor = &inscription.layers[0];
 
     // Not a single content record consumed.
-    let untouched = stele
+    let untouched = snapshot
         .stream_layer(&index, &ToyProfile, descriptor, Limits::default())
         .unwrap()
         .finish()
@@ -473,7 +474,7 @@ fn finish_confirms_the_layer_whether_or_not_the_records_were_read() {
     assert_eq!(untouched.diff_id, descriptor.diff_id);
 
     // One record consumed, then finished. Same verdict, same digests.
-    let mut reader = stele
+    let mut reader = snapshot
         .stream_layer(&index, &ToyProfile, descriptor, Limits::default())
         .unwrap();
     reader.next_record().unwrap().unwrap();
@@ -488,8 +489,8 @@ fn two_independent_writes_produce_the_same_inscription_digest() {
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
 
-    let (left, left_digest) = write_stele(first.path());
-    let (right, right_digest) = write_stele(second.path());
+    let (left, left_digest) = write_snapshot(first.path());
+    let (right, right_digest) = write_snapshot(second.path());
 
     assert_eq!(left, right);
     assert_eq!(left_digest, right_digest);
@@ -502,13 +503,13 @@ fn two_independent_writes_produce_the_same_inscription_digest() {
     );
 
     for descriptor in &left.layers {
-        let left_blob = SteleDir::open(first.path())
+        let left_blob = SnapshotDir::open(first.path())
             .unwrap()
             .blob_index()
             .unwrap()
             .blob_for(&descriptor.diff_id)
             .unwrap();
-        let right_blob = SteleDir::open(second.path())
+        let right_blob = SnapshotDir::open(second.path())
             .unwrap()
             .blob_index()
             .unwrap()
@@ -524,13 +525,15 @@ fn two_independent_writes_produce_the_same_inscription_digest() {
 #[test]
 fn layers_round_trip_byte_identically() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
-    let stele = SteleDir::open(temp.path()).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
+    let index = snapshot.blob_index().unwrap();
 
     for descriptor in &inscription.layers {
-        let layer = stele.read_layer(&index, &ToyProfile, descriptor).unwrap();
+        let layer = snapshot
+            .read_layer(&index, &ToyProfile, descriptor)
+            .unwrap();
 
         // Re-frame the records that came back and compare the whole sequence.
         // The header is re-encoded from its parsed form, so a field that did not
@@ -571,18 +574,18 @@ fn both_write_paths_produce_the_same_layer() {
     let buffered_dir = tempfile::tempdir().unwrap();
     let streamed_dir = tempfile::tempdir().unwrap();
 
-    let buffered_stele = SteleDir::create(buffered_dir.path()).unwrap();
-    let streamed_stele = SteleDir::create(streamed_dir.path()).unwrap();
+    let buffered_snapshot = SnapshotDir::create(buffered_dir.path()).unwrap();
+    let streamed_snapshot = SnapshotDir::create(streamed_dir.path()).unwrap();
 
     let (header_scope, scope) = notes_scopes();
     let spec = LayerSpec::new("notes", header_scope, scope);
     let records: Vec<CanonicalCbor> = NOTES.iter().map(note_record).collect();
 
-    let buffered = buffered_stele
+    let buffered = buffered_snapshot
         .write_layer(&ToyProfile, &spec, COMPRESSION_LEVEL, &records)
         .unwrap();
 
-    let mut sink = streamed_stele
+    let mut sink = streamed_snapshot
         .layer_sink(&ToyProfile, &spec, COMPRESSION_LEVEL)
         .unwrap();
 
@@ -604,16 +607,16 @@ fn both_write_paths_produce_the_same_layer() {
 
     // Same blob digest means the same file name; the bytes under it are the
     // same too, which is what an OCI registry would be asked to deduplicate.
-    let blob = |stele: &SteleDir, written: &WrittenLayer| {
-        std::fs::read(stele.blob_path(&written.digests.blob_digest)).unwrap()
+    let blob = |snapshot: &SnapshotDir, written: &WrittenLayer| {
+        std::fs::read(snapshot.blob_path(&written.digests.blob_digest)).unwrap()
     };
 
     assert_eq!(
-        blob(&buffered_stele, &buffered),
-        blob(&streamed_stele, &streamed)
+        blob(&buffered_snapshot, &buffered),
+        blob(&streamed_snapshot, &streamed)
     );
 
-    // And one layer in each stele, with no staging file beside it.
+    // And one layer in each snapshot, with no staging file beside it.
     for root in [buffered_dir.path(), streamed_dir.path()] {
         let blobs = root.join("blobs");
         assert_eq!(
@@ -643,18 +646,18 @@ fn both_write_paths_produce_the_same_layer() {
 #[test]
 fn a_blob_that_already_exists_is_deduplicated() {
     let temp = tempfile::tempdir().unwrap();
-    let stele = SteleDir::create(temp.path()).unwrap();
+    let snapshot = SnapshotDir::create(temp.path()).unwrap();
     let blobs = temp.path().join("blobs");
 
     let (header_scope, scope) = notes_scopes();
     let spec = LayerSpec::new("notes", header_scope, scope);
     let records: Vec<CanonicalCbor> = NOTES.iter().map(note_record).collect();
 
-    // Byte-identical writes: same records, same header scope, same stele. The
+    // Byte-identical writes: same records, same header scope, same snapshot. The
     // header scope matters — it is inside the layer, so two shards of one kind
     // that differ only there are different blobs and never meet here.
     let write = || {
-        let mut sink = stele
+        let mut sink = snapshot
             .layer_sink(&ToyProfile, &spec, COMPRESSION_LEVEL)
             .unwrap();
 
@@ -666,7 +669,7 @@ fn a_blob_that_already_exists_is_deduplicated() {
     };
 
     let first = write();
-    let blob = stele.blob_path(&first.digests.blob_digest);
+    let blob = snapshot.blob_path(&first.digests.blob_digest);
     assert!(blob.is_file());
 
     let mark = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
@@ -703,12 +706,12 @@ fn a_blob_that_already_exists_is_deduplicated() {
 
     // The layer the second writer describes reads back, through both readers,
     // out of the blob the first writer published.
-    let index = stele.blob_index().unwrap();
+    let index = snapshot.blob_index().unwrap();
     assert_eq!(index.len(), 1);
 
     let expected: Vec<Vec<u8>> = records.iter().map(|r| r.as_bytes().to_vec()).collect();
     assert_eq!(
-        read_both_ways(&stele, &index, &second.descriptor).unwrap(),
+        read_both_ways(&snapshot, &index, &second.descriptor).unwrap(),
         expected
     );
 }
@@ -718,7 +721,7 @@ fn a_blob_that_already_exists_is_deduplicated() {
 /// The Dolos profile shards its state into sixteen layers and cannot walk the
 /// store sixteen times, so it walks once and routes each record to the shard it
 /// belongs in. That works only if a sink is an ordinary independent value: no
-/// borrow of the stele it will land in, no shared staging name, no ordering
+/// borrow of the snapshot it will land in, no shared staging name, no ordering
 /// between them. Here the records interleave across all sixteen and every layer
 /// still reads back — through both readers — exactly what was routed to it.
 #[test]
@@ -727,7 +730,7 @@ fn sixteen_sinks_are_written_in_one_pass() {
     const RECORDS: u64 = 8 * SHARDS;
 
     let temp = tempfile::tempdir().unwrap();
-    let stele = SteleDir::create(temp.path()).unwrap();
+    let snapshot = SnapshotDir::create(temp.path()).unwrap();
     let blobs = temp.path().join("blobs");
 
     let mut sinks: Vec<_> = (0..SHARDS)
@@ -738,7 +741,7 @@ fn sixteen_sinks_are_written_in_one_pass() {
             })
             .unwrap();
 
-            stele
+            snapshot
                 .layer_sink(
                     &ToyProfile,
                     &LayerSpec::new("notes", header_scope, json!({"shard": shard})),
@@ -768,7 +771,7 @@ fn sixteen_sinks_are_written_in_one_pass() {
         std::fs::read_dir(&blobs).unwrap().count() as u64,
         SHARDS + 1
     );
-    assert!(stele.blob_index().unwrap().is_empty());
+    assert!(snapshot.blob_index().unwrap().is_empty());
 
     let written: Vec<WrittenLayer> = sinks
         .into_iter()
@@ -786,11 +789,11 @@ fn sixteen_sinks_are_written_in_one_pass() {
         "only sha256/"
     );
 
-    let index = stele.blob_index().unwrap();
+    let index = snapshot.blob_index().unwrap();
     assert_eq!(index.len() as u64, SHARDS);
 
     for (shard, written) in written.iter().enumerate() {
-        let records = read_both_ways(&stele, &index, &written.descriptor).unwrap();
+        let records = read_both_ways(&snapshot, &index, &written.descriptor).unwrap();
         assert_eq!(records, routed[shard], "shard {shard}");
         assert_eq!(
             written.descriptor.records,
@@ -811,13 +814,13 @@ fn sixteen_sinks_are_written_in_one_pass() {
 #[test]
 fn a_sink_dropped_without_finishing_leaves_nothing() {
     let temp = tempfile::tempdir().unwrap();
-    let stele = SteleDir::create(temp.path()).unwrap();
+    let snapshot = SnapshotDir::create(temp.path()).unwrap();
     let blobs = temp.path().join("blobs");
 
     let (header_scope, scope) = notes_scopes();
 
     {
-        let mut sink = stele
+        let mut sink = snapshot
             .layer_sink(
                 &ToyProfile,
                 &LayerSpec::new("notes", header_scope, scope),
@@ -837,7 +840,7 @@ fn a_sink_dropped_without_finishing_leaves_nothing() {
             .collect();
 
         assert_eq!(staged.len(), 1, "{staged:?}");
-        assert!(stele.blob_index().unwrap().is_empty());
+        assert!(snapshot.blob_index().unwrap().is_empty());
     }
 
     // Dropped: nothing staged, nothing published.
@@ -847,19 +850,19 @@ fn a_sink_dropped_without_finishing_leaves_nothing() {
         "only sha256/"
     );
     assert_eq!(std::fs::read_dir(blobs.join("sha256")).unwrap().count(), 0);
-    assert!(stele.blob_index().unwrap().is_empty());
+    assert!(snapshot.blob_index().unwrap().is_empty());
 }
 
 /// Unknown #4: nothing vendor-owned in the artifact was composed by the core.
 ///
-/// Every media type and tag in the stele is character-for-character what
+/// Every media type and tag in the snapshot is character-for-character what
 /// `ToyProfile` returned. There is no fallback, no default and no template in
 /// `stelae` that could have produced them — remove the profile and the strings
 /// have no other source.
 #[test]
 fn the_core_composes_no_vendor_owned_string() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
     assert_eq!(inscription.profile.name, ToyProfile.name());
 
@@ -889,7 +892,7 @@ fn the_core_composes_no_vendor_owned_string() {
 #[test]
 fn opaque_fields_are_carried_not_interpreted() {
     let temp = tempfile::tempdir().unwrap();
-    let stele = SteleDir::create(temp.path()).unwrap();
+    let snapshot = SnapshotDir::create(temp.path()).unwrap();
 
     let alien = json!({
         "shelf": ["east", "west"],
@@ -904,7 +907,7 @@ fn opaque_fields_are_carried_not_interpreted() {
     })
     .unwrap();
 
-    let written = stele
+    let written = snapshot
         .write_layer(
             &ToyProfile,
             &LayerSpec::new("notes", header_scope.clone(), alien.clone()),
@@ -924,9 +927,9 @@ fn opaque_fields_are_carried_not_interpreted() {
         },
     );
     inscription.layers = vec![written.descriptor];
-    stele.seal(&ToyProfile, &inscription).unwrap();
+    snapshot.seal(&ToyProfile, &inscription).unwrap();
 
-    let read = SteleDir::open(temp.path())
+    let read = SnapshotDir::open(temp.path())
         .unwrap()
         .read_inscription()
         .unwrap();
@@ -935,16 +938,19 @@ fn opaque_fields_are_carried_not_interpreted() {
     assert_eq!(read.parameters, alien);
     assert_eq!(read.layers[0].scope, alien);
 
-    let index = SteleDir::open(temp.path()).unwrap().blob_index().unwrap();
-    let layer = SteleDir::open(temp.path())
+    let index = SnapshotDir::open(temp.path())
+        .unwrap()
+        .blob_index()
+        .unwrap();
+    let layer = SnapshotDir::open(temp.path())
         .unwrap()
         .read_layer(&index, &ToyProfile, &read.layers[0])
         .unwrap();
     assert_eq!(layer.header().scope, header_scope);
 }
 
-/// A client fails closed on a stele it cannot read, rather than restoring part
-/// of it.
+/// A client fails closed on a snapshot it cannot read, rather than restoring
+/// part of it.
 #[test]
 fn a_foreign_profile_is_refused() {
     struct Other;
@@ -968,7 +974,7 @@ fn a_foreign_profile_is_refused() {
     }
 
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
     let err = inscription.check_profile(&Other).unwrap_err();
     assert!(matches!(err, Error::UnknownProfile { .. }), "{err:?}");
@@ -992,12 +998,12 @@ fn a_foreign_profile_is_refused() {
     assert!(matches!(err, Error::UnknownLayerKind { .. }), "{err:?}");
 }
 
-/// A stele written with the retired `.stele.` infix is refused, on both the
+/// A snapshot written with the retired `.stele.` infix is refused, on both the
 /// read and the publish side, with an error naming `.stelae.`.
 #[test]
 fn a_retired_infix_layer_is_refused() {
     let temp = tempfile::tempdir().unwrap();
-    let (mut inscription, _) = write_stele(temp.path());
+    let (mut inscription, _) = write_snapshot(temp.path());
 
     for layer in &mut inscription.layers {
         layer.media_type = layer.media_type.replace(".stelae.", ".stele.");
@@ -1013,19 +1019,19 @@ fn a_retired_infix_layer_is_refused() {
     assert!(names_stelae(&err), "{err:?}");
 }
 
-/// Tampering is caught on both halves of a stele: the document, whose bytes are
-/// its digest, and the blobs, whose names are their digests.
+/// Tampering is caught on both halves of a snapshot: the document, whose bytes
+/// are its digest, and the blobs, whose names are their digests.
 #[test]
 fn tampering_is_caught_on_read() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
     // Re-indenting the inscription leaves the content intact but changes the
     // bytes a verifier would hash.
     let pretty = serde_json::to_vec_pretty(&inscription).unwrap();
     std::fs::write(temp.path().join("inscription.json"), &pretty).unwrap();
 
-    let err = SteleDir::open(temp.path())
+    let err = SnapshotDir::open(temp.path())
         .unwrap()
         .read_inscription()
         .unwrap_err();
@@ -1033,15 +1039,15 @@ fn tampering_is_caught_on_read() {
 
     // A blob whose content no longer matches its name is corruption.
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
-    let stele = SteleDir::open(temp.path()).unwrap();
-    let blob = stele
+    let (inscription, _) = write_snapshot(temp.path());
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
+    let blob = snapshot
         .blob_index()
         .unwrap()
         .blob_for(&inscription.layers[0].diff_id)
         .unwrap();
 
-    let path = stele.blob_path(&blob);
+    let path = snapshot.blob_path(&blob);
     let mut bytes = std::fs::read(&path).unwrap();
     let middle = bytes.len() / 2;
     bytes[middle] ^= 0xff;
@@ -1051,32 +1057,32 @@ fn tampering_is_caught_on_read() {
     // states the map without opening a blob, so the corruption surfaces on the
     // read of the layer itself — against the identity the inscription pins,
     // which is the stronger claim of the two.
-    let index = stele.blob_index().unwrap();
+    let index = snapshot.blob_index().unwrap();
     assert_eq!(index.blob_for(&inscription.layers[0].diff_id), Some(blob));
-    assert!(stele
+    assert!(snapshot
         .read_layer(&index, &ToyProfile, &inscription.layers[0])
         .is_err());
 
     // The scan does look, and refuses before a descriptor is consulted at all.
     std::fs::remove_file(temp.path().join(stelae::dir::BLOB_INDEX_FILE)).unwrap();
     assert!(
-        stele.blob_index().is_err(),
+        snapshot.blob_index().is_err(),
         "a blob that disagrees with its name must not index"
     );
 }
 
 /// A layer whose bytes do not decompress is refused as that layer, on both
 /// read paths, and a blob that could not be read keeps the reader's own error:
-/// the one is the stele's defect, the other a disk's.
+/// the one is the snapshot's defect, the other a disk's.
 #[test]
 fn a_blob_that_does_not_decompress_is_refused_as_its_layer() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
-    let stele = SteleDir::open(temp.path()).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
+    let index = snapshot.blob_index().unwrap();
     let descriptor = &inscription.layers[0];
-    let path = stele.blob_path(&index.blob_for(&descriptor.diff_id).unwrap());
+    let path = snapshot.blob_path(&index.blob_for(&descriptor.diff_id).unwrap());
     let bytes = std::fs::read(&path).unwrap();
 
     let read = |source: &mut dyn std::io::Read| {
@@ -1103,7 +1109,7 @@ fn a_blob_that_does_not_decompress_is_refused_as_its_layer() {
 
         // In place, where the buffered reader sees the same bytes.
         std::fs::write(&path, blob).unwrap();
-        let err = read_both_ways(&stele, &index, descriptor).unwrap_err();
+        let err = read_both_ways(&snapshot, &index, descriptor).unwrap_err();
         assert!(refused_as_its_layer(&err), "{err:?}");
     }
 
@@ -1193,18 +1199,18 @@ fn a_blob_that_does_not_decompress_is_refused_as_its_layer() {
 #[test]
 fn a_blob_that_cannot_be_read_keeps_the_readers_error() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
-    let stele = SteleDir::open(temp.path()).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
+    let index = snapshot.blob_index().unwrap();
     let descriptor = &inscription.layers[0];
-    let path = stele.blob_path(&index.blob_for(&descriptor.diff_id).unwrap());
+    let path = snapshot.blob_path(&index.blob_for(&descriptor.diff_id).unwrap());
 
     // A directory opens, and its first read fails.
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
 
-    let err = stele
+    let err = snapshot
         .read_layer(&index, &ToyProfile, descriptor)
         .unwrap_err();
     assert!(
@@ -1218,7 +1224,7 @@ fn a_blob_that_cannot_be_read_keeps_the_readers_error() {
 #[test]
 fn the_scan_passes_over_a_blob_that_is_not_a_layer() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
     let junk = b"not a zstd frame";
     std::fs::write(
@@ -1230,8 +1236,8 @@ fn the_scan_passes_over_a_blob_that_is_not_a_layer() {
     )
     .unwrap();
 
-    let stele = SteleDir::open(temp.path()).unwrap();
-    let scanned = without_sidecar(temp.path(), || stele.blob_index().unwrap());
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
+    let scanned = without_sidecar(temp.path(), || snapshot.blob_index().unwrap());
 
     assert_eq!(scanned.len(), inscription.layers.len());
 }
@@ -1240,7 +1246,7 @@ fn the_scan_passes_over_a_blob_that_is_not_a_layer() {
 #[test]
 fn a_sealed_directory_states_its_blob_map() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
     let sidecar = temp.path().join(stelae::dir::BLOB_INDEX_FILE);
     assert!(
@@ -1248,9 +1254,9 @@ fn a_sealed_directory_states_its_blob_map() {
         "a seal writes the map beside the document"
     );
 
-    let stele = SteleDir::open(temp.path()).unwrap();
-    let stated = stele.blob_index().unwrap();
-    let scanned = without_sidecar(temp.path(), || stele.blob_index().unwrap());
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
+    let stated = snapshot.blob_index().unwrap();
+    let scanned = without_sidecar(temp.path(), || snapshot.blob_index().unwrap());
 
     assert_eq!(stated.len(), scanned.len());
 
@@ -1275,17 +1281,17 @@ fn a_sealed_directory_states_its_blob_map() {
 #[test]
 fn the_sidecar_is_read_instead_of_the_blobs() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
-    let stele = SteleDir::open(temp.path()).unwrap();
-    let before = stele.blob_index().unwrap();
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
+    let before = snapshot.blob_index().unwrap();
 
     for descriptor in &inscription.layers {
         let blob = before.blob_for(&descriptor.diff_id).unwrap();
-        std::fs::write(stele.blob_path(&blob), b"").unwrap();
+        std::fs::write(snapshot.blob_path(&blob), b"").unwrap();
     }
 
-    let after = stele.blob_index().unwrap();
+    let after = snapshot.blob_index().unwrap();
 
     for descriptor in &inscription.layers {
         assert_eq!(
@@ -1296,7 +1302,7 @@ fn the_sidecar_is_read_instead_of_the_blobs() {
         );
     }
 
-    let err = without_sidecar(temp.path(), || stele.blob_index().unwrap_err());
+    let err = without_sidecar(temp.path(), || snapshot.blob_index().unwrap_err());
     assert!(matches!(err, Error::DigestMismatch { .. }), "{err:?}");
 }
 
@@ -1308,34 +1314,34 @@ fn the_sidecar_is_read_instead_of_the_blobs() {
 #[test]
 fn a_corrupt_sidecar_is_not_an_absent_one() {
     let temp = tempfile::tempdir().unwrap();
-    write_stele(temp.path());
+    write_snapshot(temp.path());
 
-    let stele = SteleDir::open(temp.path()).unwrap();
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
     let sidecar = temp.path().join(stelae::dir::BLOB_INDEX_FILE);
 
     std::fs::write(&sidecar, br#"{"layers": [{"diffId": "#).unwrap();
-    let err = stele.blob_index().unwrap_err();
+    let err = snapshot.blob_index().unwrap_err();
     assert!(matches!(err, Error::Json(_)), "{err:?}");
 
     std::fs::remove_file(&sidecar).unwrap();
-    stele.blob_index().unwrap();
+    snapshot.blob_index().unwrap();
 }
 
-/// A stele whose layers this writer did not all produce gets no sidecar.
+/// A snapshot whose layers this writer did not all produce gets no sidecar.
 ///
 /// The file's meaning is that it is complete: a reader that finds one stops
-/// looking at blobs, so a map missing an entry would read as a stele missing a
-/// layer rather than as a sidecar missing a line. No map is the honest answer,
-/// and the scan behind it was always correct.
+/// looking at blobs, so a map missing an entry would read as a snapshot missing
+/// a layer rather than as a sidecar missing a line. No map is the honest
+/// answer, and the scan behind it was always correct.
 #[test]
 fn an_incomplete_map_is_not_written() {
     let temp = tempfile::tempdir().unwrap();
-    let stele = SteleDir::create(temp.path()).unwrap();
+    let snapshot = SnapshotDir::create(temp.path()).unwrap();
 
     let (header_scope, scope) = notes_scopes();
     let notes: Vec<CanonicalCbor> = NOTES.iter().map(note_record).collect();
 
-    let written = stele
+    let written = snapshot
         .write_layer(
             &ToyProfile,
             &LayerSpec::new("notes", header_scope, scope),
@@ -1351,12 +1357,15 @@ fn an_incomplete_map_is_not_written() {
     let mut inscription = bulk_inscription();
     inscription.layers = vec![written.descriptor, absent];
 
-    stele.seal(&ToyProfile, &inscription).unwrap();
+    snapshot.seal(&ToyProfile, &inscription).unwrap();
 
     assert!(!temp.path().join(stelae::dir::BLOB_INDEX_FILE).exists());
 
     // And the scan still places the layer that is there.
-    let index = SteleDir::open(temp.path()).unwrap().blob_index().unwrap();
+    let index = SnapshotDir::open(temp.path())
+        .unwrap()
+        .blob_index()
+        .unwrap();
     assert!(index.blob_for(&inscription.layers[0].diff_id).is_some());
 }
 
@@ -1370,7 +1379,7 @@ fn an_incomplete_map_is_not_written() {
 #[test]
 fn a_seal_that_fails_leaves_no_stale_map() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
     let sidecar = temp.path().join(stelae::dir::BLOB_INDEX_FILE);
     assert!(
@@ -1379,14 +1388,14 @@ fn a_seal_that_fails_leaves_no_stale_map() {
     );
 
     // Opened while the inscription is still readable, since that is what a
-    // reseal of a published stele would have done.
-    let stele = SteleDir::open(temp.path()).unwrap();
+    // reseal of a published snapshot would have done.
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
 
     let path = temp.path().join(stelae::dir::INSCRIPTION_FILE);
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
 
-    stele.seal(&ToyProfile, &inscription).unwrap_err();
+    snapshot.seal(&ToyProfile, &inscription).unwrap_err();
 
     assert!(
         !sidecar.exists(),
@@ -1396,7 +1405,7 @@ fn a_seal_that_fails_leaves_no_stale_map() {
 
 /// The saving, measured rather than asserted.
 ///
-/// One stele read both ways, and the numbers go to stdout — `cargo test -p
+/// One snapshot read both ways, and the numbers go to stdout — `cargo test -p
 /// stelae the_scan_the_sidecar_removes -- --nocapture`. What they say depends
 /// on the machine; what this test *checks* does not, so the timings are printed
 /// and the agreement between the two maps is asserted.
@@ -1407,17 +1416,17 @@ fn the_scan_the_sidecar_removes() {
     const BODY: usize = 16 * 1024;
 
     let temp = tempfile::tempdir().unwrap();
-    let inscription = bulk_stele(temp.path(), LAYERS, RECORDS, BODY);
+    let inscription = bulk_snapshot(temp.path(), LAYERS, RECORDS, BODY);
 
-    let stele = SteleDir::open(temp.path()).unwrap();
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
 
     let start = std::time::Instant::now();
-    let stated = stele.blob_index().unwrap();
+    let stated = snapshot.blob_index().unwrap();
     let by_sidecar = start.elapsed();
 
     let (scanned, by_scan) = without_sidecar(temp.path(), || {
         let start = std::time::Instant::now();
-        let scanned = stele.blob_index().unwrap();
+        let scanned = snapshot.blob_index().unwrap();
         (scanned, start.elapsed())
     });
 
@@ -1441,7 +1450,7 @@ fn the_scan_the_sidecar_removes() {
         .iter()
         .map(|layer| {
             let blob = stated.blob_for(&layer.diff_id).unwrap();
-            std::fs::metadata(stele.blob_path(&blob)).unwrap().len()
+            std::fs::metadata(snapshot.blob_path(&blob)).unwrap().len()
         })
         .sum();
 
@@ -1453,12 +1462,12 @@ fn the_scan_the_sidecar_removes() {
     );
 }
 
-/// Run `read` against the same stele with [`stelae::dir::BLOB_INDEX_FILE`]
+/// Run `read` against the same snapshot with [`stelae::dir::BLOB_INDEX_FILE`]
 /// moved out of the way, then put it back.
 ///
-/// Renamed rather than deleted so that one stele answers both ways in one test:
-/// what is being compared is two readers over identical bytes, and rebuilding
-/// the stele in between would compare two steles instead.
+/// Renamed rather than deleted so that one snapshot answers both ways in one
+/// test: what is being compared is two readers over identical bytes, and
+/// rebuilding the snapshot in between would compare two snapshots instead.
 fn without_sidecar<T>(root: &std::path::Path, read: impl FnOnce() -> T) -> T {
     let sidecar = root.join(stelae::dir::BLOB_INDEX_FILE);
     let aside = root.join("blobs.json.aside");
@@ -1484,14 +1493,14 @@ fn bulk_inscription() -> Inscription {
     )
 }
 
-/// A stele of `layers` note layers, each `records` records of `body`
+/// A snapshot of `layers` note layers, each `records` records of `body`
 /// incompressible bytes.
 ///
 /// Incompressible on purpose: the scan's cost is a decompression pass, and junk
 /// that zstd folds to nothing would measure the compressor rather than the
 /// pass.
-fn bulk_stele(root: &std::path::Path, layers: u64, records: u64, body: usize) -> Inscription {
-    let stele = SteleDir::create(root).unwrap();
+fn bulk_snapshot(root: &std::path::Path, layers: u64, records: u64, body: usize) -> Inscription {
+    let snapshot = SnapshotDir::create(root).unwrap();
 
     let mut seed = 0x2545_f491_4f6c_dd1du64;
     let mut next = move || {
@@ -1510,7 +1519,7 @@ fn bulk_stele(root: &std::path::Path, layers: u64, records: u64, body: usize) ->
         })
         .unwrap();
 
-        let mut sink = stele
+        let mut sink = snapshot
             .layer_sink(
                 &ToyProfile,
                 &LayerSpec::new(
@@ -1545,7 +1554,7 @@ fn bulk_stele(root: &std::path::Path, layers: u64, records: u64, body: usize) ->
     let mut inscription = bulk_inscription();
     inscription.layers = descriptors;
 
-    stele.seal(&ToyProfile, &inscription).unwrap();
+    snapshot.seal(&ToyProfile, &inscription).unwrap();
 
     inscription
 }
@@ -1555,29 +1564,29 @@ fn bulk_stele(root: &std::path::Path, layers: u64, records: u64, body: usize) ->
 #[test]
 fn a_descriptor_that_disagrees_with_its_layer_is_refused() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
-    let stele = SteleDir::open(temp.path()).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
+    let index = snapshot.blob_index().unwrap();
 
     let mut wrong_size = inscription.layers[0].clone();
     wrong_size.uncompressed_size += 1;
-    let err = read_both_ways(&stele, &index, &wrong_size).unwrap_err();
+    let err = read_both_ways(&snapshot, &index, &wrong_size).unwrap_err();
     assert!(matches!(err, Error::LayerMismatch { .. }), "{err:?}");
 
     let mut wrong_count = inscription.layers[0].clone();
     wrong_count.records += 1;
-    let err = read_both_ways(&stele, &index, &wrong_count).unwrap_err();
+    let err = read_both_ways(&snapshot, &index, &wrong_count).unwrap_err();
     assert!(matches!(err, Error::LayerMismatch { .. }), "{err:?}");
 
     let mut wrong_kind = inscription.layers[0].clone();
     wrong_kind.kind = "index".to_owned();
-    let err = read_both_ways(&stele, &index, &wrong_kind).unwrap_err();
+    let err = read_both_ways(&snapshot, &index, &wrong_kind).unwrap_err();
     assert!(matches!(err, Error::LayerMismatch { .. }), "{err:?}");
 
     let mut absent = inscription.layers[0].clone();
     absent.diff_id = stelae::Digest::from_bytes([0xab; 32]);
-    let err = read_both_ways(&stele, &index, &absent).unwrap_err();
+    let err = read_both_ways(&snapshot, &index, &absent).unwrap_err();
     assert!(matches!(err, Error::LayerNotFound { .. }), "{err:?}");
 
     // A descriptor claiming *less* than the layer holds is refused during
@@ -1586,7 +1595,7 @@ fn a_descriptor_that_disagrees_with_its_layer_is_refused() {
     // the end just to be told so.
     let mut too_small = inscription.layers[0].clone();
     too_small.uncompressed_size -= 1;
-    let err = read_both_ways(&stele, &index, &too_small).unwrap_err();
+    let err = read_both_ways(&snapshot, &index, &too_small).unwrap_err();
     assert!(matches!(err, Error::DecompressedTooLarge { .. }), "{err:?}");
 }
 
@@ -1601,21 +1610,21 @@ fn a_descriptor_that_disagrees_with_its_layer_is_refused() {
 #[test]
 fn a_malformed_record_is_reported_not_counted() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
-    let stele = SteleDir::open(temp.path()).unwrap();
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
     let descriptor = inscription.layers[0].clone();
 
     // Take the layer's bytes back out and append the head of a CBOR text string
     // that never arrives — a byte the framing must refuse.
-    let blob_digest = stele
+    let blob_digest = snapshot
         .blob_index()
         .unwrap()
         .blob_for(&descriptor.diff_id)
         .unwrap();
 
     let (mut content, _) = read_blob(
-        std::fs::File::open(stele.blob_path(&blob_digest)).unwrap(),
+        std::fs::File::open(snapshot.blob_path(&blob_digest)).unwrap(),
         descriptor.uncompressed_size,
     )
     .unwrap();
@@ -1627,7 +1636,7 @@ fn a_malformed_record_is_reported_not_counted() {
     let mut writer = LayerWriter::new(Vec::new(), COMPRESSION_LEVEL).unwrap();
     writer.write_all(&content).unwrap();
     let (blob, digests) = writer.finish().unwrap();
-    std::fs::write(stele.blob_path(&digests.blob_digest), &blob).unwrap();
+    std::fs::write(snapshot.blob_path(&digests.blob_digest), &blob).unwrap();
 
     let corrupt = LayerDescriptor {
         diff_id: digests.diff_id,
@@ -1638,8 +1647,8 @@ fn a_malformed_record_is_reported_not_counted() {
 
     // Placed by hand and named in no inscription, so the sealed map does not
     // carry it; the scan, which knows only what is on disk, does.
-    let index = without_sidecar(temp.path(), || stele.blob_index().unwrap());
-    let err = read_both_ways(&stele, &index, &corrupt).unwrap_err();
+    let index = without_sidecar(temp.path(), || snapshot.blob_index().unwrap());
+    let err = read_both_ways(&snapshot, &index, &corrupt).unwrap_err();
 
     assert!(matches!(err, Error::TruncatedCbor { .. }), "{err:?}");
 
@@ -1649,7 +1658,7 @@ fn a_malformed_record_is_reported_not_counted() {
     // and size the descriptor claims both hold. Only the record count and the
     // reader's own memory of having failed stand between a corrupt layer and an
     // `Ok`.
-    let mut reader = stele
+    let mut reader = snapshot
         .stream_layer(&index, &ToyProfile, &corrupt, Limits::default())
         .unwrap();
 
@@ -1670,7 +1679,7 @@ fn a_malformed_record_is_reported_not_counted() {
 #[test]
 fn a_layer_media_type_that_is_not_the_profiles_is_refused() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, _) = write_stele(temp.path());
+    let (inscription, _) = write_snapshot(temp.path());
 
     let with_media_type = |media_type: &str| {
         let mut tampered = inscription.clone();
@@ -1728,10 +1737,10 @@ fn a_profile_cannot_claim_the_protocols_namespace() {
     }
 
     let temp = tempfile::tempdir().unwrap();
-    let stele = SteleDir::create(temp.path()).unwrap();
+    let snapshot = SnapshotDir::create(temp.path()).unwrap();
 
     let (header_scope, scope) = notes_scopes();
-    let err = stele
+    let err = snapshot
         .write_layer(
             &Squatter,
             &LayerSpec::new("notes", header_scope, scope),
@@ -1767,7 +1776,7 @@ fn a_profile_cannot_claim_the_protocols_namespace() {
 #[test]
 fn golden_digests_pin_the_encoding() {
     let temp = tempfile::tempdir().unwrap();
-    let (inscription, digest) = write_stele(temp.path());
+    let (inscription, digest) = write_snapshot(temp.path());
 
     assert_eq!(
         digest.to_string(),
@@ -1837,7 +1846,7 @@ fn golden_digests_pin_the_encoding() {
 #[test]
 fn a_discarding_writer_reproduces_what_a_directory_stores() {
     let temp = tempfile::tempdir().unwrap();
-    let (stored, stored_digest) = write_stele(temp.path());
+    let (stored, stored_digest) = write_snapshot(temp.path());
 
     let (notes_header_scope, notes_scope) = notes_scopes();
     let (index_header_scope, index_scope) = index_scopes();
@@ -1870,7 +1879,7 @@ fn a_discarding_writer_reproduces_what_a_directory_stores() {
 
     let reproduced_index = index_sink.finish().unwrap();
 
-    // The stored stele's own blob digests, recovered the way a directory has
+    // The stored snapshot's own blob digests, recovered the way a directory has
     // to: by hashing the files it holds. Nothing in an inscription carries
     // them, which is the point — they are transport, and a reproduction that
     // agreed on identity while disagreeing on the compressed bytes would still
@@ -1915,7 +1924,7 @@ fn a_discarding_writer_reproduces_what_a_directory_stores() {
         );
     }
 
-    // And the identity, over a document assembled exactly as `write_stele`
+    // And the identity, over a document assembled exactly as `write_snapshot`
     // assembles it.
     let mut inscription = Inscription::new(
         &ToyProfile,
@@ -1939,7 +1948,7 @@ fn a_discarding_writer_reproduces_what_a_directory_stores() {
         stored_digest,
     );
 
-    // Nothing was written anywhere on the way: the only stele on disk is the
+    // Nothing was written anywhere on the way: the only snapshot on disk is the
     // one the directory wrote, and it has exactly its own two blobs.
     assert_eq!(stored_blobs.len(), 2);
 }
@@ -1975,16 +1984,16 @@ impl Profile for FutureToyProfile {
     }
 }
 
-/// Write the toy stele, then have the newer publisher add its `covers` layer
+/// Write the toy snapshot, then have the newer publisher add its `covers` layer
 /// and re-seal.
 ///
 /// Through the ordinary writer and the ordinary seal, so what the assertions
-/// read back is a stele somebody could have published — not an inscription with
-/// a descriptor pasted into it, which would prove nothing about the layer being
-/// real.
+/// read back is a snapshot somebody could have published — not an inscription
+/// with a descriptor pasted into it, which would prove nothing about the layer
+/// being real.
 fn published_ahead(root: &std::path::Path, scope: serde_json::Value) -> Inscription {
-    let (mut inscription, _) = write_stele(root);
-    let stele = SteleDir::open(root).unwrap();
+    let (mut inscription, _) = write_snapshot(root);
+    let snapshot = SnapshotDir::open(root).unwrap();
 
     let header = encode(|e| {
         e.map(1)?.str("chapter")?.u64(3)?;
@@ -1998,7 +2007,7 @@ fn published_ahead(root: &std::path::Path, scope: serde_json::Value) -> Inscript
     })
     .unwrap();
 
-    let written = stele
+    let written = snapshot
         .write_layer(
             &FutureToyProfile,
             &LayerSpec::new("covers", header, scope),
@@ -2008,7 +2017,7 @@ fn published_ahead(root: &std::path::Path, scope: serde_json::Value) -> Inscript
         .unwrap();
 
     inscription.layers.push(written.descriptor);
-    stele.seal(&FutureToyProfile, &inscription).unwrap();
+    snapshot.seal(&FutureToyProfile, &inscription).unwrap();
 
     inscription
 }
@@ -2016,7 +2025,7 @@ fn published_ahead(root: &std::path::Path, scope: serde_json::Value) -> Inscript
 /// The blast radius of an additive kind, in one test.
 ///
 /// A profile that gains a kind publishes it as a new media type on a new layer.
-/// If an older reader refused the whole stele over it, every additive change
+/// If an older reader refused the whole snapshot over it, every additive change
 /// would brick every deployed reader; so the reader takes the document, keeps
 /// the layers it models, and *reports* the one it does not. The publish side
 /// keeps the old rule, because a publisher attests every layer it lists.
@@ -2049,19 +2058,21 @@ fn an_unknown_layer_kind_is_skippable_at_read_and_refused_at_publish() {
 
     // Skipping is about consumption and nothing else: the layers the old reader
     // does model are still reachable through the identities the inscription
-    // pins, and the skipped one is still a layer of the stele.
-    let stele = SteleDir::open(temp.path()).unwrap();
-    let index = stele.blob_index().unwrap();
+    // pins, and the skipped one is still a layer of the snapshot.
+    let snapshot = SnapshotDir::open(temp.path()).unwrap();
+    let index = snapshot.blob_index().unwrap();
     assert_eq!(index.len(), 3);
 
     for kind in ["notes", "index"] {
         let descriptor = ahead.layers_of_kind(kind).next().unwrap();
-        stele.read_layer(&index, &ToyProfile, descriptor).unwrap();
+        snapshot
+            .read_layer(&index, &ToyProfile, descriptor)
+            .unwrap();
     }
 }
 
 /// `required: true` in a layer's scope is a publisher telling older readers
-/// that this layer is not optional: refuse the stele rather than restore a
+/// that this layer is not optional: refuse the snapshot rather than restore a
 /// partial one.
 ///
 /// The protocol never reads the flag — a scope is profile-owned and opaque — so
@@ -2085,7 +2096,7 @@ fn a_required_unknown_layer_is_the_profiles_own_refusal() {
     let skipped = plan(&published_ahead(optional.path(), json!({"chapter": 3}))).unwrap();
     assert_eq!(skipped, vec!["covers".to_owned()]);
 
-    // The same stele, the same reader, one flag apart.
+    // The same snapshot, the same reader, one flag apart.
     let required = tempfile::tempdir().unwrap();
     let refusal = plan(&published_ahead(
         required.path(),
@@ -2098,8 +2109,8 @@ fn a_required_unknown_layer_is_the_profiles_own_refusal() {
 
     // `required` is a scope field like any other to the protocol: it neither
     // makes the layer known nor stops the document being read.
-    let stele = SteleDir::open(required.path()).unwrap();
-    stele
+    let snapshot = SnapshotDir::open(required.path()).unwrap();
+    snapshot
         .read_inscription()
         .unwrap()
         .check_profile(&ToyProfile)

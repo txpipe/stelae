@@ -515,11 +515,12 @@ impl<W: Write> SeqWriter<W> {
     ///
     /// Its *size* is checked, and that check is the writer's whole reason for
     /// knowing a ceiling. A record past it is refused here rather than written
-    /// and discovered by whoever tries to read the layer back: a stele whose
-    /// records no reader will accept is not a stele, and the publisher is the
-    /// only party positioned to say so while the fix is still cheap. Reported
-    /// in the record's offset within the layer, the same coordinate
-    /// [`RecordReader`] fails in, so the two ends name the same byte.
+    /// and discovered by whoever tries to read the layer back: a snapshot whose
+    /// records no reader will accept is not a snapshot, and the publisher is
+    /// the only party positioned to say so while the fix is still cheap.
+    /// Reported in the record's offset within the layer, the same
+    /// coordinate [`RecordReader`] fails in, so the two ends name the same
+    /// byte.
     pub fn write_record(&mut self, record: &CanonicalCbor) -> Result<(), Error> {
         let bytes = record.as_bytes();
 
@@ -1270,10 +1271,11 @@ mod tests {
 
     /// The writer refuses what the reader would refuse, at the same ceiling.
     ///
-    /// Regression for a stele that published cleanly and restored nowhere: the
-    /// reader held records to 16 MiB, nothing held the writer to anything, and
-    /// a profile with a 24 MiB record produced 928 layers, a valid manifest and
-    /// an artifact whose first oversized record ended every restore of it.
+    /// Regression for a snapshot that published cleanly and restored nowhere:
+    /// the reader held records to 16 MiB, nothing held the writer to
+    /// anything, and a profile with a 24 MiB record produced 928 layers, a
+    /// valid manifest and an artifact whose first oversized record ended
+    /// every restore of it.
     #[test]
     fn writer_refuses_a_record_past_its_ceiling() {
         let big = encode(|e| {

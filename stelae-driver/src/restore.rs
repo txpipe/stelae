@@ -9,7 +9,7 @@
 //!
 //! The checkpoint's rule is [`stelae::plan::Resume`]'s — a layer is done when
 //! its `diffId` is recorded, which is a fact about bytes and not about the
-//! stele they were published in. *Which* layers may be skipped at all is the
+//! snapshot they were published in. *Which* layers may be skipped at all is the
 //! profile's half of the split, and stays with it: this type is only ever
 //! asked about the layers a profile chose to ask about.
 
@@ -37,7 +37,7 @@ use crate::Error;
 /// There is deliberately no `Default`: the read limits are the publishing
 /// profile's ceilings, not the protocol's defaults — a restore that read under
 /// a tighter limit than the publisher wrote under would refuse that profile's
-/// own steles — so the profile supplies its budget.
+/// own snapshots — so the profile supplies its budget.
 #[derive(Debug, Clone, Copy)]
 pub struct Budget {
     /// Per-record and window bounds on the layer read itself.
@@ -48,7 +48,7 @@ pub struct Budget {
     pub commit_bytes: usize,
 }
 
-/// What a restore is about to do, once the stele has been read.
+/// What a restore is about to do, once the snapshot has been read.
 ///
 /// Returned alongside the profile's plan so a caller can report the
 /// *remaining* download rather than the original one — the whole point of the
@@ -64,7 +64,7 @@ pub struct Outlook {
 /// Where a restore records what it has finished, and what it inherits.
 ///
 /// One value rather than three arguments, because the three are one idea: the
-/// file, the set of layers it says are done, and the identity of the stele
+/// file, the set of layers it says are done, and the identity of the snapshot
 /// being restored into it.
 pub struct Checkpoint {
     path: PathBuf,
@@ -73,7 +73,7 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    /// Open the checkpoint at `path` for restoring the stele `identity`.
+    /// Open the checkpoint at `path` for restoring the snapshot `identity`.
     ///
     /// The path is the caller's: the driver never derives where a node keeps
     /// its progress file. `resume` gates whether anything on disk is
@@ -96,7 +96,7 @@ impl Checkpoint {
 
         // The new identity, the old completions. The completions are what the
         // resume rule is about — content, not the document that described it —
-        // and the digest is what tells a later reader which stele a
+        // and the digest is what tells a later reader which snapshot a
         // half-finished restore was aimed at.
         let progress = RestoreProgress {
             inscription_digest: identity,

@@ -39,11 +39,11 @@ pub trait DriverProfile: stelae::Profile {
     /// history.
     ///
     /// Kind classification like [`DriverProfile::epoch_kinds`], and asked for
-    /// one reason: the staging arithmetic sizes the two halves of a stele
+    /// one reason: the staging arithmetic sizes the two halves of a snapshot
     /// differently. A tip is rewritten whole by every publish, so all of it is
     /// staged together and every such layer sums; anything else is staged a few
     /// at a time and only the largest few count. [`is_inheritable`] cannot
-    /// stand in for this — it answers a different question, and a stele has
+    /// stand in for this — it answers a different question, and a snapshot has
     /// layers that are neither inheritable nor tip.
     ///
     /// [`is_inheritable`]: DriverProfile::is_inheritable
@@ -60,11 +60,11 @@ pub trait DriverProfile: stelae::Profile {
     /// Refuse a predecessor that describes a different dataset than the one
     /// being published.
     ///
-    /// `previous` is the stele being chained to; `position` is the document the
-    /// new stele will carry. Both halves are the profile's own shape, so what
-    /// "the same dataset" means is the profile's to decide — the driver only
-    /// knows that a repository holding two of them is a fault, and refuses
-    /// before anything is built.
+    /// `previous` is the snapshot being chained to; `position` is the document
+    /// the new snapshot will carry. Both halves are the profile's own
+    /// shape, so what "the same dataset" means is the profile's to decide —
+    /// the driver only knows that a repository holding two of them is a
+    /// fault, and refuses before anything is built.
     fn check_same_dataset(
         &self,
         previous: &Inscription,

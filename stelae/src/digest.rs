@@ -616,8 +616,8 @@ mod tests {
     }
 
     /// The blob digest and the compressed size cover the whole file, which is
-    /// what lets a stele directory detect tampering by comparing a blob's name
-    /// with its content.
+    /// what lets a snapshot directory detect tampering by comparing a blob's
+    /// name with its content.
     #[test]
     fn blob_digest_covers_every_byte() {
         let content = sample_sequence();

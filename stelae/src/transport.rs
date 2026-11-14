@@ -1,19 +1,20 @@
-//! The seam a stele is written through and read back from.
+//! The seam a snapshot is written through and read back from.
 //!
-//! Until this module existed there was exactly one way to hold a stele — a
-//! directory ([`crate::dir::SteleDir`]) — and a profile that wanted to publish
-//! one named that type in its signatures. That is the wrong dependency:
-//! *where* a stele lives is transport, and a profile has no opinion about it.
+//! Until this module existed there was exactly one way to hold a snapshot — a
+//! directory ([`crate::dir::SnapshotDir`]) — and a profile that wanted to
+//! publish one named that type in its signatures. That is the wrong dependency:
+//! *where* a snapshot lives is transport, and a profile has no opinion about
+//! it.
 //!
 //! What a profile actually uses is two small halves:
 //!
-//! - the **write** half ([`SteleWriter`]) opens a one-record-at-a-time sink for
-//!   a [`LayerSpec`] and, when every layer is written, accepts the finished
+//! - the **write** half ([`SnapshotWriter`]) opens a one-record-at-a-time sink
+//!   for a [`LayerSpec`] and, when every layer is written, accepts the finished
 //!   inscription;
-//! - the **read** half ([`SteleReader`]) reads an inscription, hands over the
-//!   identity→blob map, and streams a layer named by a [`LayerDescriptor`]
-//!   under [`Limits`] — or, through [`SteleReader::stream_layers`], the layers
-//!   a caller names, one after another in the order it named them.
+//! - the **read** half ([`SnapshotReader`]) reads an inscription, hands over
+//!   the identity→blob map, and streams a layer named by a [`LayerDescriptor`]
+//!   under [`Limits`] — or, through [`SnapshotReader::stream_layers`], the
+//!   layers a caller names, one after another in the order it named them.
 //!
 //! Both are exactly what a directory already did, so the directory keeps
 //! working unchanged and a registry lands beside it.
@@ -21,12 +22,13 @@
 //! ## An ordered read, fetched ahead by the transport that can
 //!
 //! A restore drains its layers one at a time and knows the whole list before
-//! the first. [`SteleReader::stream_layers`] takes that list and a depth, and
-//! hands the layers back in list order, each [`LayerReader`] opened when the
-//! caller takes it. What happens before that is the transport's: a directory's
-//! blobs are already local, so the default reads one layer at a time; a
-//! registry ([`crate::oci::Stele`]) downloads up to the depth ahead of the
-//! caller on its own runtime, so the network wait overlaps the caller's work.
+//! the first. [`SnapshotReader::stream_layers`] takes that list and a depth,
+//! and hands the layers back in list order, each [`LayerReader`] opened when
+//! the caller takes it. What happens before that is the transport's: a
+//! directory's blobs are already local, so the default reads one layer at a
+//! time; a registry ([`crate::oci::Snapshot`]) downloads up to the depth ahead
+//! of the caller on its own runtime, so the network wait overlaps the caller's
+//! work.
 //!
 //! ## `BlobIndex` is the concept that generalizes
 //!
@@ -38,16 +40,16 @@
 //!
 //! - a registry has a manifest, and reads the map straight off it;
 //! - a directory has one too, now: [`crate::dir::BLOB_INDEX_FILE`], written
-//!   beside the inscription by the seal that closed the stele. Before it
-//!   existed — and for any stele published before it did —
-//!   [`crate::dir::SteleDir::blob_index`] rebuilds the map by decompressing
-//!   every blob, a full verification pass over the stele paid before the
+//!   beside the inscription by the seal that closed the snapshot. Before it
+//!   existed — and for any snapshot published before it did —
+//!   [`crate::dir::SnapshotDir::blob_index`] rebuilds the map by decompressing
+//!   every blob, a full verification pass over the snapshot paid before the
 //!   restore reads any of it.
 //!
 //! Same type, same meaning, one file read versus one HTTP GET — and, for the
-//! steles that predate the sidecar, the scan. Keeping [`BlobIndex`] rather than
-//! parameterizing the reader on "how to find a blob" is what let a directory
-//! close that gap without a reader anywhere learning a new shape.
+//! snapshots that predate the sidecar, the scan. Keeping [`BlobIndex`] rather
+//! than parameterizing the reader on "how to find a blob" is what let a
+//! directory close that gap without a reader anywhere learning a new shape.
 //!
 //! ## A third implementation that stores nothing
 //!
@@ -55,8 +57,8 @@
 //! framed, hashed and compressed exactly as a publish would, and the bytes go
 //! to [`std::io::sink`] instead of to a file or a registry. What comes back is
 //! the identity — a [`WrittenLayer`] per layer and the inscription's digest
-//! from [`SteleWriter::seal`] — which is the whole of what a reproduction needs
-//! and none of what it would have to store.
+//! from [`SnapshotWriter::seal`] — which is the whole of what a reproduction
+//! needs and none of what it would have to store.
 //!
 //! ## What the seam deliberately does not carry
 //!
@@ -109,8 +111,8 @@ impl LayerSpec {
 /// transport facts that do not belong there.
 ///
 /// Serializable so that a host can *hold one across a process*. Nothing in the
-/// protocol reads such a file — it is not a stele and never becomes one — but a
-/// publisher that wants to carry a layer it already uploaded into a later
+/// protocol reads such a file — it is not a snapshot and never becomes one —
+/// but a publisher that wants to carry a layer it already uploaded into a later
 /// attempt has to write down what the transport told it, and writing down a
 /// half of the pair is what makes a descriptor and a blob able to disagree. See
 /// [`crate::oci::Registry::adopt_carried`].
@@ -124,7 +126,7 @@ pub struct WrittenLayer {
 /// Map from a layer's identity (`diffId`) to the blob that holds it.
 ///
 /// In a registry this comes from the manifest. In a directory it is recovered
-/// by [`crate::dir::SteleDir::blob_index`], which is the same map at a much
+/// by [`crate::dir::SnapshotDir::blob_index`], which is the same map at a much
 /// higher price — see the module documentation.
 #[derive(Debug, Clone, Default)]
 pub struct BlobIndex(std::collections::BTreeMap<Digest, Digest>);
@@ -195,13 +197,13 @@ pub trait RecordSink {
     fn finish(self) -> Result<WrittenLayer, Error>;
 }
 
-/// The write half of a stele.
+/// The write half of a snapshot.
 ///
-/// Two operations, in this order: open a sink per layer, then seal the stele
+/// Two operations, in this order: open a sink per layer, then seal the snapshot
 /// with the inscription that describes them. Everything vendor-owned — the
 /// media type of a layer, the tag a sequence publishes under — is asked of the
 /// [`Profile`] and validated against the naming rules, never composed here.
-pub trait SteleWriter {
+pub trait SnapshotWriter {
     type Sink: RecordSink;
 
     /// Open a layer and stream records into it.
@@ -210,7 +212,7 @@ pub trait SteleWriter {
     /// naming rules before anything is created, so a profile that claims a name
     /// it does not own is refused before it can publish under it.
     ///
-    /// A sink owns everything it needs rather than borrowing the stele, so a
+    /// A sink owns everything it needs rather than borrowing the snapshot, so a
     /// producer can hold many open at once and route each record to one of
     /// them. That is the shape the Dolos profile's sixteen state shards need:
     /// one pass over the store, sixteen layers being written.
@@ -221,27 +223,29 @@ pub trait SteleWriter {
         level: i32,
     ) -> Result<Self::Sink, Error>;
 
-    /// Accept the finished inscription and make the stele readable.
+    /// Accept the finished inscription and make the snapshot readable.
     ///
     /// The last thing a publish does, and the reason it is one call rather than
     /// a write followed by a flush: for a registry this is where the config
     /// blob, the manifest and both tags land, in the one order that never
-    /// leaves a reader following the moving tag pointed at a stele whose blobs
-    /// are still uploading.
+    /// leaves a reader following the moving tag pointed at a snapshot whose
+    /// blobs are still uploading.
     ///
     /// `profile` is unused by a transport that does not name things — a
     /// directory has no tags — and load-bearing for one that does.
     ///
-    /// Returns the stele's identity: the sha256 of the canonical inscription.
+    /// Returns the snapshot's identity: the sha256 of the canonical
+    /// inscription.
     fn seal(&self, profile: &dyn Profile, inscription: &Inscription) -> Result<Digest, Error>;
 
     /// Frame, compress and store one layer a caller already holds.
     ///
-    /// A convenience over [`SteleWriter::layer_sink`] and nothing more, so the
-    /// buffered and streaming write paths cannot drift apart the way two
-    /// implementations would. It is the right call for a layer that fits in
-    /// memory — every record has to be materialized somewhere that outlives the
-    /// call, which is exactly what a sink exists to avoid at profile sizes.
+    /// A convenience over [`SnapshotWriter::layer_sink`] and nothing more, so
+    /// the buffered and streaming write paths cannot drift apart the way
+    /// two implementations would. It is the right call for a layer that
+    /// fits in memory — every record has to be materialized somewhere that
+    /// outlives the call, which is exactly what a sink exists to avoid at
+    /// profile sizes.
     fn write_layer<'a, I>(
         &self,
         profile: &dyn Profile,
@@ -262,7 +266,7 @@ pub trait SteleWriter {
         sink.finish()
     }
 
-    /// Attest a layer this stele already carries under a second descriptor.
+    /// Attest a layer this snapshot already carries under a second descriptor.
     ///
     /// One blob, two names. A profile may need the same byte string described
     /// twice — the Dolos profile's retained state dump at the epoch it is cut
@@ -295,12 +299,13 @@ pub trait SteleWriter {
     /// attached.
     ///
     /// **The default body does nothing, and that is the point.** A transport
-    /// that has no bytes of its own to report — [`crate::dir::SteleDir`] writes
-    /// straight to files a caller can watch, [`Discarding`] moves nothing —
-    /// implements nothing and loses nothing; only [`crate::oci::Registry`],
-    /// whose uploads are the hours a publisher waits through, overrides it. A
-    /// method every implementor must answer would be a tax on every future
-    /// transport for a capability most of them do not have.
+    /// that has no bytes of its own to report — [`crate::dir::SnapshotDir`]
+    /// writes straight to files a caller can watch, [`Discarding`] moves
+    /// nothing — implements nothing and loses nothing; only
+    /// [`crate::oci::Registry`], whose uploads are the hours a publisher
+    /// waits through, overrides it. A method every implementor must answer
+    /// would be a tax on every future transport for a capability most of
+    /// them do not have.
     ///
     /// The profile driver is what calls this — it is handed the observer as an
     /// argument and passes it on — so a caller wires one observer once and both
@@ -308,7 +313,7 @@ pub trait SteleWriter {
     fn observe(&self, _observer: Observer) {}
 }
 
-/// The second descriptor [`SteleWriter::carry_again`] hands back.
+/// The second descriptor [`SnapshotWriter::carry_again`] hands back.
 ///
 /// Shared rather than written twice, so an overriding transport and the
 /// default cannot drift about which fields a re-attested layer keeps.
@@ -322,8 +327,8 @@ pub fn again(written: &WrittenLayer, scope: serde_json::Value) -> WrittenLayer {
     }
 }
 
-/// Open a layer: everything every [`SteleWriter::layer_sink`] does before its
-/// own sink struct exists.
+/// Open a layer: everything every [`SnapshotWriter::layer_sink`] does before
+/// its own sink struct exists.
 ///
 /// The media type is resolved through the profile and validated against the
 /// naming rules, the framing is wrapped at the profile's record ceiling, and
@@ -359,7 +364,7 @@ where
     Ok((sequence, media_type))
 }
 
-/// A stele that computes its identity and stores nothing.
+/// A snapshot that computes its identity and stores nothing.
 ///
 /// The write half of the seam with the storing taken out. Every field of a
 /// [`WrittenLayer`] is a function of the record stream — [`RecordSink::finish`]
@@ -370,9 +375,9 @@ where
 /// `inscription.json`: the sha256 of the canonical document.
 ///
 /// That is the whole of `stelae-publisher digest`. A verifier reproduces a
-/// published stele's layers from its own stores and compares descriptors,
-/// without provisioning the disk the stele would occupy — hundreds of gigabytes
-/// on mainnet — and without touching a registry.
+/// published snapshot's layers from its own stores and compares descriptors,
+/// without provisioning the disk the snapshot would occupy — hundreds of
+/// gigabytes on mainnet — and without touching a registry.
 ///
 /// ## It compresses
 ///
@@ -392,9 +397,9 @@ where
 ///
 /// ## What it cannot answer
 ///
-/// Nothing that needs bytes back. There is no [`SteleReader`] half here and
-/// there cannot be one: a stele that stored nothing has nothing to stream, and
-/// a caller wanting both halves wants a real transport.
+/// Nothing that needs bytes back. There is no [`SnapshotReader`] half here and
+/// there cannot be one: a snapshot that stored nothing has nothing to stream,
+/// and a caller wanting both halves wants a real transport.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Discarding;
 
@@ -452,7 +457,7 @@ impl RecordSink for DiscardingSink {
     }
 }
 
-impl SteleWriter for Discarding {
+impl SnapshotWriter for Discarding {
     type Sink = DiscardingSink;
 
     /// Open a layer that goes nowhere.
@@ -477,7 +482,7 @@ impl SteleWriter for Discarding {
         })
     }
 
-    /// Return the stele's identity without writing it down.
+    /// Return the snapshot's identity without writing it down.
     ///
     /// [`Inscription::digest`] canonicalizes, which validates — so a document
     /// that could not be sealed into a directory is refused here too, and a
@@ -488,15 +493,15 @@ impl SteleWriter for Discarding {
     }
 }
 
-/// The read half of a stele.
+/// The read half of a snapshot.
 ///
 /// Three operations, in this order: read the inscription, obtain the
 /// identity→blob map, then stream the layers the inscription describes. A
 /// caller checks the profile between the first and the third — the protocol
 /// cannot, because it does not know which profile the caller implements — and
-/// that check is what makes an unreadable stele a clean refusal rather than a
-/// partial restore.
-pub trait SteleReader {
+/// that check is what makes an unreadable snapshot a clean refusal rather than
+/// a partial restore.
+pub trait SnapshotReader {
     /// The byte source a layer is read out of. A file for both transports
     /// today, because a registry stages a pulled blob rather than decompressing
     /// off the socket.
@@ -510,7 +515,7 @@ pub trait SteleReader {
     /// repaired.
     fn read_inscription(&self) -> Result<Inscription, Error>;
 
-    /// The `diffId` → blob map for this stele.
+    /// The `diffId` → blob map for this snapshot.
     fn blob_index(&self) -> Result<BlobIndex, Error>;
 
     /// How many compressed bytes fetching this layer moves, if the transport
@@ -571,15 +576,16 @@ pub trait SteleReader {
     /// Report what this transport moves to `observer`, for as long as it is
     /// attached.
     ///
-    /// The read half of [`SteleWriter::observe`], with the same default and the
-    /// same reason for it. It matters more here than there: a registry reader
-    /// pulls a whole blob to scratch before it yields its first record, so a
-    /// restore that reported only what the profile driver sees would be silent
-    /// for the download — and on a restore the download *is* the work.
+    /// The read half of [`SnapshotWriter::observe`], with the same default and
+    /// the same reason for it. It matters more here than there: a registry
+    /// reader pulls a whole blob to scratch before it yields its first
+    /// record, so a restore that reported only what the profile driver sees
+    /// would be silent for the download — and on a restore the download
+    /// *is* the work.
     fn observe(&self, _observer: Observer) {}
 }
 
-/// The layers [`SteleReader::stream_layers`] hands back, in the order they
+/// The layers [`SnapshotReader::stream_layers`] hands back, in the order they
 /// were named.
 ///
 /// An iterator of one reader per layer, which stops after the first error
@@ -593,7 +599,7 @@ pub struct LayerStream<'s, B: std::io::Read> {
 impl<'s, B: std::io::Read> LayerStream<'s, B> {
     /// A stream over `layers`, ended at its first error.
     ///
-    /// For a transport overriding [`SteleReader::stream_layers`]; whatever
+    /// For a transport overriding [`SnapshotReader::stream_layers`]; whatever
     /// `layers` holds is dropped with the stream.
     pub fn new(layers: impl Iterator<Item = Result<LayerReader<B>, Error>> + 's) -> Self {
         Self {
@@ -602,9 +608,9 @@ impl<'s, B: std::io::Read> LayerStream<'s, B> {
         }
     }
 
-    /// One [`SteleReader::stream_layer`] call per layer, made when the caller
-    /// asks for that layer: the default stream, and the one an override falls
-    /// back to when it has nothing to fetch ahead.
+    /// One [`SnapshotReader::stream_layer`] call per layer, made when the
+    /// caller asks for that layer: the default stream, and the one an
+    /// override falls back to when it has nothing to fetch ahead.
     pub fn serial<R>(
         reader: &'s R,
         index: &'s BlobIndex,
@@ -613,7 +619,7 @@ impl<'s, B: std::io::Read> LayerStream<'s, B> {
         limits: Limits,
     ) -> Self
     where
-        R: SteleReader<Blob = B> + ?Sized,
+        R: SnapshotReader<Blob = B> + ?Sized,
     {
         Self::new(Serial {
             reader,
@@ -651,7 +657,7 @@ struct Serial<'s, R: ?Sized> {
     limits: Limits,
 }
 
-impl<R: SteleReader + ?Sized> Iterator for Serial<'_, R> {
+impl<R: SnapshotReader + ?Sized> Iterator for Serial<'_, R> {
     type Item = Result<LayerReader<R::Blob>, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {

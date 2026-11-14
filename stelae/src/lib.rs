@@ -2,8 +2,8 @@
 //!
 //! A deterministic, content-addressed snapshot protocol.
 //!
-//! A *stele* is one published artifact set at one sequence point: an
-//! **inscription** (the canonical-JSON document whose sha256 is the stele's
+//! A *snapshot* is one published artifact set at one sequence point: an
+//! **inscription** (the canonical-JSON document whose sha256 is the snapshot's
 //! identity) plus its **layers** (content-addressed blobs of deterministic CBOR
 //! records). Independent publishers that hold the same source data reproduce
 //! the same inscription digest byte-for-byte, which is what makes k-of-n
@@ -29,17 +29,17 @@
 //!   its digest, and the `history` attestation invariant.
 //! - [`profile`] — the [`Profile`] trait plus the protocol's media-type,
 //!   profile name and tag naming rules.
-//! - [`transport`] — the seam a stele is written through and read back from:
+//! - [`transport`] — the seam a snapshot is written through and read back from:
 //!   the two halves a profile uses, the `diffId`→blob map both transports
-//!   answer differently, and the discarding writer that computes a stele's
+//!   answer differently, and the discarding writer that computes a snapshot's
 //!   identity without storing it.
 //! - [`plan`] — what a restore has already done and what it has left to fetch:
 //!   the progress file, the resume rule, and remaining-bytes accounting.
 //! - [`progress`] — the one seam a publish and a restore report through while
 //!   they run: an observer a caller passes in, callbacks only, silent by
 //!   default.
-//! - [`dir`] — a minimal on-disk stele: the first implementation of that seam,
-//!   and the one a stele is inspectable by hand through.
+//! - [`dir`] — a minimal on-disk snapshot: the first implementation of that
+//!   seam, and the one a snapshot is inspectable by hand through.
 //! - [`oci`] — (feature `oci`) an OCI registry as the other implementation:
 //!   push with blob-skip, pull by manifest.
 //!
@@ -75,8 +75,8 @@ pub use plan::{Remaining, RestoreProgress, Resume};
 pub use profile::{MediaType, Profile};
 pub use progress::{Event, Observer, Outcome, Progress};
 pub use transport::{
-    BlobIndex, Discarding, DiscardingSink, LayerSpec, LayerStream, RecordSink, SteleReader,
-    SteleWriter, WrittenLayer,
+    BlobIndex, Discarding, DiscardingSink, LayerSpec, LayerStream, RecordSink, SnapshotReader,
+    SnapshotWriter, WrittenLayer,
 };
 
 /// Artifact type of a Stelae snapshot's manifest. Generic tooling discovers
@@ -112,13 +112,13 @@ pub const LAYER_FORMAT_VERSION: u64 = 1;
 /// per-sequence tags.
 pub const MOVING_TAG: &str = "latest";
 
-/// Ceiling on the size of a stele's OCI manifest.
+/// Ceiling on the size of a snapshot's OCI manifest.
 ///
 /// Not a spec limit — the OCI distribution specification sets none — but the
 /// figure registries converge on, and the one Dolos ADR-004 sized the format
 /// against
 /// ("~1,700 manifest descriptors, well under the 4 MiB manifest guidance"). A
-/// stele that exceeds it is refused before the push rather than after a
+/// snapshot that exceeds it is refused before the push rather than after a
 /// registry answers `413`, because the failure is a property of the document
 /// and the same everywhere. See [`oci`].
 pub const MANIFEST_SIZE_LIMIT: usize = 4 * 1024 * 1024;
@@ -212,11 +212,11 @@ pub enum Error {
 
     /// A publish held to one predecessor, reading another under the moving tag.
     ///
-    /// Raised before anything is uploaded, so nothing attests a stele the
+    /// Raised before anything is uploaded, so nothing attests a snapshot the
     /// caller never checked and nothing starts the history over.
     #[cfg(feature = "oci")]
     #[error(
-        "this publish follows {expected:?}, and the repository's latest stele is {found:?}: \
+        "this publish follows {expected:?}, and the repository's latest snapshot is {found:?}: \
          another writer moved it"
     )]
     PredecessorMoved {
@@ -236,7 +236,7 @@ pub enum Error {
     /// from being one epoch out, and an operator reading the message should not
     /// have to subtract.
     #[error(
-        "this repository's latest stele is sequence {latest} and this publish is sequence \
+        "this repository's latest snapshot is sequence {latest} and this publish is sequence \
          {publishing}: {reason}"
     )]
     HistoryBreak {
@@ -273,7 +273,7 @@ pub enum Error {
         actual: String,
     },
 
-    #[error("layer {kind:?} ({diff_id}) is not present in this stele")]
+    #[error("layer {kind:?} ({diff_id}) is not present in this snapshot")]
     LayerNotFound { kind: String, diff_id: String },
 
     #[error("layer {kind:?} disagrees with its descriptor: {reason}")]
@@ -290,7 +290,7 @@ pub enum Error {
 
     /// The manifest and the inscription describe different sets of layers.
     ///
-    /// They are two views of one stele — the inscription holds identity, the
+    /// They are two views of one snapshot — the inscription holds identity, the
     /// manifest holds transport — and the whole reason a registry can hand over
     /// a `diffId`→blob map for free is that the two agree. A disagreement is a
     /// refusal, in either direction: a layer the document describes and the
@@ -301,7 +301,7 @@ pub enum Error {
 
     /// A manifest past [`MANIFEST_SIZE_LIMIT`].
     #[error(
-        "the manifest for this stele is {size} bytes, past the {MANIFEST_SIZE_LIMIT}-byte ceiling \
+        "the manifest for this snapshot is {size} bytes, past the {MANIFEST_SIZE_LIMIT}-byte ceiling \
          registries converge on; it describes {layers} layer(s)"
     )]
     ManifestTooLarge { size: usize, layers: usize },
@@ -309,12 +309,13 @@ pub enum Error {
     /// A layer a publisher asked to carry forward, whose blob the repository no
     /// longer holds.
     ///
-    /// Distinct from [`Error::LayerNotFound`], which is about a stele that does
-    /// not describe a layer. This one is the opposite shape: a stele describes
-    /// it, and the bytes are gone — a descriptor pointing at a blob a registry
-    /// has reclaimed. Publishing it would produce a well-formed stele nobody
-    /// can restore, so it is refused where it is discovered rather than where
-    /// it would eventually be noticed.
+    /// Distinct from [`Error::LayerNotFound`], which is about a snapshot that
+    /// does not describe a layer. This one is the opposite shape: a
+    /// snapshot describes it, and the bytes are gone — a descriptor
+    /// pointing at a blob a registry has reclaimed. Publishing it would
+    /// produce a well-formed snapshot nobody can restore, so it is refused
+    /// where it is discovered rather than where it would eventually be
+    /// noticed.
     #[cfg(feature = "oci")]
     #[error(
         "layer {kind:?} ({diff_id}) cannot be carried forward: this repository no longer holds \

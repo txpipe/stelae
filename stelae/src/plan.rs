@@ -1,6 +1,6 @@
 //! What a restore has already done, and what it has left to fetch.
 //!
-//! A restore of a stele at profile sizes is hours of download and ingestion,
+//! A restore of a snapshot at profile sizes is hours of download and ingestion,
 //! and the interruptions it has to survive are the ordinary ones: a reboot, a
 //! dropped connection, a ctrl-C. Without something on disk saying what landed,
 //! the only answer is "start again". This module is that something, plus the
@@ -12,7 +12,7 @@
 //! whole rule, and it is a consequence of what a `diffId` *is*: sha256 over the
 //! layer's uncompressed bytes. A match means the same bytes, so a layer
 //! completed under an *older* inscription is still the layer this restore would
-//! fetch — the stele it was published in has nothing to do with it.
+//! fetch — the snapshot it was published in has nothing to do with it.
 //!
 //! [`Resume`] therefore exposes exactly one question, [`Resume::is_done`], and
 //! it takes a `Digest` and nothing else. There is deliberately no way to ask it
@@ -30,10 +30,9 @@
 //! survives.
 //!
 //! The file's **name and location** are the profile's too. Dolos ADR-004
-//! spells them
-//! `<storage.path>/.snapshot-restore.json` for the Dolos profile, and
-//! "snapshot" is that profile's word for a stele rather than the protocol's —
-//! so every entry point here takes a path a caller chose.
+//! spells them `<storage.path>/.snapshot-restore.json` for the Dolos profile,
+//! a name the protocol does not fix, so every entry point here takes a path a
+//! caller chose.
 //!
 //! ## What this module is not
 //!
@@ -57,19 +56,19 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{inscription::LayerDescriptor, transport::BlobIndex, Digest, Error, SteleReader};
+use crate::{inscription::LayerDescriptor, transport::BlobIndex, Digest, Error, SnapshotReader};
 
 /// A restore's progress, as it survives the process making it.
 ///
 /// Exactly what Dolos ADR-004 asks the file to record: the inscription digest,
 /// and the `diffId`s of the layers that are done. The digest is not what
 /// decides a resume — see the module documentation — but it is what lets an
-/// operator, or a later diagnostic, tell which stele a half-finished restore
+/// operator, or a later diagnostic, tell which snapshot a half-finished restore
 /// was aimed at.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreProgress {
-    /// The stele this restore is reading, by identity.
+    /// The snapshot this restore is reading, by identity.
     pub inscription_digest: Digest,
 
     /// The layers whose records are committed, by identity.
@@ -204,8 +203,8 @@ impl Resume {
     ///
     /// Takes the completed set whatever inscription it was recorded under. That
     /// is the resume rule, not an oversight: an epoch layer is named by its
-    /// content, so a newer stele describing the same layer describes the same
-    /// bytes.
+    /// content, so a newer snapshot describing the same layer describes the
+    /// same bytes.
     pub fn from_progress(progress: Option<&RestoreProgress>) -> Self {
         match progress {
             Some(progress) => progress.resume(),
@@ -234,7 +233,7 @@ impl Resume {
 /// Compressed bytes, because that is what a download costs and what a time
 /// estimate divides by a rate. The inscription carries only *uncompressed*
 /// sizes — identity does not depend on a compressor — so these come from the
-/// transport, through [`SteleReader::compressed_size`].
+/// transport, through [`SnapshotReader::compressed_size`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Remaining {
     /// Layers still to fetch.
@@ -265,7 +264,7 @@ pub struct Remaining {
 }
 
 impl Remaining {
-    /// Sum what `layers` will cost to fetch from `stele`.
+    /// Sum what `layers` will cost to fetch from `snapshot`.
     ///
     /// The caller has already decided *which* layers those are — dropped what a
     /// resume says is done, and what its own selection never wanted. That split
@@ -276,9 +275,9 @@ impl Remaining {
     /// One pass answers both questions a caller has about these bytes: what
     /// they cost to move, and — through [`Remaining::largest_compressed`] —
     /// what has to fit on disk while one of them is being moved.
-    pub fn of<'a, R, I>(stele: &R, index: &BlobIndex, layers: I) -> Result<Self, Error>
+    pub fn of<'a, R, I>(snapshot: &R, index: &BlobIndex, layers: I) -> Result<Self, Error>
     where
-        R: SteleReader,
+        R: SnapshotReader,
         I: IntoIterator<Item = &'a LayerDescriptor>,
     {
         let mut remaining = Self::default();
@@ -286,7 +285,7 @@ impl Remaining {
         for descriptor in layers {
             remaining.layers += 1;
 
-            match stele.compressed_size(index, descriptor)? {
+            match snapshot.compressed_size(index, descriptor)? {
                 Some(bytes) => {
                     remaining.compressed_bytes += bytes;
                     remaining.largest_compressed = remaining.largest_compressed.max(Some(bytes));
@@ -378,7 +377,7 @@ mod tests {
         assert!(!resume.is_done(&digest(2)));
         assert_eq!(resume.len(), 1);
 
-        // The same set, now consulted while restoring a different stele. The
+        // The same set, now consulted while restoring a different snapshot. The
         // digest the file records is not an input to the question, which is the
         // whole of the rule.
         let newer = RestoreProgress {

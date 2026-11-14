@@ -1,4 +1,4 @@
-//! A stele on a local filesystem.
+//! A snapshot on a local filesystem.
 //!
 //! ```text
 //! <root>/
@@ -6,15 +6,15 @@
 //!   blobs/sha256/<hex>        one compressed layer per file
 //! ```
 //!
-//! This is the smallest complete stele: enough to write one, read it back and
-//! verify it end to end without a registry. It exists for two reasons.
+//! This is the smallest complete snapshot: enough to write one, read it back
+//! and verify it end to end without a registry. It exists for two reasons.
 //!
 //! It is the **seam** OCI transport slots into. Blob paths are the OCI image
 //! layout's (`blobs/<algorithm>/<encoded>`, named by the digest of the stored
 //! bytes), so adding `oci-layout` and `index.json` later puts files *beside*
 //! these rather than moving them.
 //!
-//! And it makes a stele **inspectable by hand** from the first commit of the
+//! And it makes a snapshot **inspectable by hand** from the first commit of the
 //! format — `zstd -d < blobs/sha256/<hex> | cbor2diag` prints the records,
 //! which is worth a great deal while a spec is young.
 //!
@@ -26,22 +26,23 @@
 //!
 //! An inscription lists `diffId`s — identity — and deliberately not compressed
 //! digests, which are transport and live in the OCI manifest. With no map from
-//! a layer descriptor to the file holding it, [`SteleDir::blob_index`] has to
-//! rebuild one by scanning: every blob decompressed once, in full, before the
-//! restore goes on to read them all again. A directory restore therefore
-//! decompressed the whole stele twice.
+//! a layer descriptor to the file holding it, [`SnapshotDir::blob_index`] has
+//! to rebuild one by scanning: every blob decompressed once, in full, before
+//! the restore goes on to read them all again. A directory restore therefore
+//! decompressed the whole snapshot twice.
 //!
-//! So [`SteleWriter::seal`] writes the map down beside the inscription —
+//! So [`SnapshotWriter::seal`] writes the map down beside the inscription —
 //! [`BLOB_INDEX_FILE`], `diffId` → blob digest, which is the one thing a
 //! registry's manifest supplies that this layout did not. A directory that
 //! carries it is a degenerate registry: the map is read, no blob is opened, and
 //! each blob is decompressed exactly once — by the restore that wanted it.
 //!
 //! The sidecar is **transport and never identity**. Nothing signs it, nothing
-//! hashes it into the stele's digest, and both halves of every entry are
-//! recoverable from the blobs themselves — which is exactly why a stele without
-//! one still reads, by the scan that was the only way before it. Absence is the
-//! older format; a file that does not parse is a fault and not an absence.
+//! hashes it into the snapshot's digest, and both halves of every entry are
+//! recoverable from the blobs themselves — which is exactly why a snapshot
+//! without one still reads, by the scan that was the only way before it.
+//! Absence is the older format; a file that does not parse is a fault and not
+//! an absence.
 //!
 //! ## Where the seam moved to
 //!
@@ -68,17 +69,17 @@ use crate::{
     inscription::LayerDescriptor,
     layer::{check_header, check_identity, check_record_count, LayerReader},
     profile::Profile,
-    transport::{open_layer, RecordSink, SteleReader, SteleWriter},
+    transport::{open_layer, RecordSink, SnapshotReader, SnapshotWriter},
     Digest, Error, Inscription,
 };
 
-/// File name of the inscription at the root of a stele directory.
+/// File name of the inscription at the root of a snapshot directory.
 pub const INSCRIPTION_FILE: &str = "inscription.json";
 
 /// Directory holding content-addressed blobs, in OCI image-layout shape.
 pub const BLOBS_DIR: &str = "blobs";
 
-/// File name of the `diffId` → blob digest map at the root of a stele
+/// File name of the `diffId` → blob digest map at the root of a snapshot
 /// directory: what this layout has instead of a registry's manifest.
 pub const BLOB_INDEX_FILE: &str = "blobs.json";
 
@@ -126,7 +127,7 @@ impl Layer {
     }
 }
 
-/// A layer of a stele directory being written, one record at a time.
+/// A layer of a snapshot directory being written, one record at a time.
 ///
 /// The directory's implementation of [`RecordSink`], and the mirror of
 /// [`LayerReader`] on the write side. Nothing is buffered: records are framed,
@@ -135,16 +136,16 @@ impl Layer {
 /// one record, whatever the profile is publishing.
 ///
 /// A sink owns its staging file rather than borrowing the directory, so several
-/// can be open at once; the counter in [`SteleDir::layer_sink`] keeps their
+/// can be open at once; the counter in [`SnapshotDir::layer_sink`] keeps their
 /// staging names apart.
 ///
 /// ## Nothing exists until `finish`
 ///
 /// A layer's name is the digest of its own compressed bytes, so it cannot be
 /// known before the last record is written. Until then the layer is a staging
-/// file, invisible to [`SteleDir::blob_index`], and a sink dropped without
+/// file, invisible to [`SnapshotDir::blob_index`], and a sink dropped without
 /// [`RecordSink::finish`] takes it with it — an export that fails halfway
-/// leaves no partial layer behind. Only `finish` puts a blob in the stele.
+/// leaves no partial layer behind. Only `finish` puts a blob in the snapshot.
 pub struct LayerSink {
     /// Declared before `staging` on purpose: fields drop in declaration order,
     /// so the file handle is closed before the file it names is unlinked. On
@@ -174,9 +175,9 @@ impl RecordSink for LayerSink {
     /// digest and hand back the descriptor to put in the inscription.
     ///
     /// The rename is what publishes the layer, and it is the last thing that
-    /// happens. A failure anywhere in here leaves the stele exactly as it was:
-    /// the staging file is removed on the way out, the same as for a sink that
-    /// was simply dropped.
+    /// happens. A failure anywhere in here leaves the snapshot exactly as it
+    /// was: the staging file is removed on the way out, the same as for a
+    /// sink that was simply dropped.
     ///
     /// ## A blob that is already there is a success, not a rename
     ///
@@ -186,22 +187,23 @@ impl RecordSink for LayerSink {
     /// a file with its own contents: hundreds of megabytes of I/O for a mainnet
     /// state shard, and on Windows a failure. Every reader here opens a blob
     /// with a plain [`fs::File::open`], without `FILE_SHARE_DELETE`, so
-    /// replacing a blob that a concurrent [`SteleReader::stream_layer`] holds
-    /// open is a sharing violation there and silently fine on Unix. So the blob
-    /// on disk is kept, the staging file goes the way an abandoned one does,
-    /// and the caller gets exactly the [`WrittenLayer`] it would have got had
-    /// it been first: `descriptor` and `digests` are computed from the record
-    /// stream, never from the rename.
+    /// replacing a blob that a concurrent [`SnapshotReader::stream_layer`]
+    /// holds open is a sharing violation there and silently fine on Unix.
+    /// So the blob on disk is kept, the staging file goes the way an
+    /// abandoned one does, and the caller gets exactly the [`WrittenLayer`]
+    /// it would have got had it been first: `descriptor` and `digests` are
+    /// computed from the record stream, never from the rename.
     ///
     /// The existing blob is **trusted on its name, not re-read**. This writer
     /// computed that digest itself, out of the bytes it had just written, a
     /// microsecond earlier, and re-reading a file that may be gigabytes to
     /// confirm what content addressing already asserts would put a second full
     /// pass on the write path. That is a deliberate divergence from the
-    /// neighbour: [`SteleDir::blob_index`] re-digests every blob it finds, at a
-    /// cost its own documentation calls out. It is a fixture scanner rebuilding
-    /// a map with no manifest to lean on and no knowledge of who wrote what,
-    /// which is not the position of a writer holding its own digest.
+    /// neighbour: [`SnapshotDir::blob_index`] re-digests every blob it finds,
+    /// at a cost its own documentation calls out. It is a fixture scanner
+    /// rebuilding a map with no manifest to lean on and no knowledge of who
+    /// wrote what, which is not the position of a writer holding its own
+    /// digest.
     ///
     /// The window between the test and the rename is a TOCTOU, and an unguarded
     /// one on purpose: the path *is* the digest, so the only racer that can
@@ -261,10 +263,10 @@ impl RecordSink for LayerSink {
 /// Removing it is a `Drop` rather than a step in [`LayerSink::finish`] because
 /// the case that matters is the one nobody writes code for: a producer that
 /// hits an error mid-layer and returns. Nothing *reads* an abandoned staging
-/// file — it sits beside `sha256/` and [`SteleDir::blob_index`] only considers
-/// digest-named entries inside it — but a mainnet state shard is hundreds of
-/// megabytes, and a failed export leaving sixteen of them on the disk is its
-/// own incident.
+/// file — it sits beside `sha256/` and [`SnapshotDir::blob_index`] only
+/// considers digest-named entries inside it — but a mainnet state shard is
+/// hundreds of megabytes, and a failed export leaving sixteen of them on the
+/// disk is its own incident.
 struct Staging {
     path: PathBuf,
     published: bool,
@@ -299,7 +301,7 @@ impl Drop for Staging {
 
 /// Where a blob of `digest` lives under `root`, per the OCI image layout.
 ///
-/// One definition, used both to write a layer and to find it again — a stele
+/// One definition, used both to write a layer and to find it again — a snapshot
 /// whose writer and reader disagreed about the path would be unreadable by
 /// itself and perfectly readable by nobody.
 fn blob_path(root: &Path, digest: &Digest) -> PathBuf {
@@ -323,7 +325,7 @@ fn blob_path(root: &Path, digest: &Digest) -> PathBuf {
 ///    a future OCI layout's manifest and config blobs beside these.
 ///
 /// Costs one raw pass plus one decompressing pass per blob, over the whole
-/// stele, before the restore has read a record. That is what the sidecar
+/// snapshot, before the restore has read a record. That is what the sidecar
 /// removes; see the module documentation.
 fn scan_blobs(root: &Path) -> Result<BlobIndex, Error> {
     let mut index = BTreeMap::new();
@@ -386,7 +388,7 @@ type Written = Arc<Mutex<BTreeMap<Digest, Digest>>>;
 /// A poisoned lock means a layer panicked mid-write. What is behind it is a map
 /// of pairs each written in one `insert`, so it is still coherent, and the
 /// failed layer is reported by the `?` that carried its error out — refusing to
-/// look would turn one failed layer into a stele that cannot be sealed.
+/// look would turn one failed layer into a snapshot that cannot be sealed.
 fn lock(written: &Written) -> std::sync::MutexGuard<'_, BTreeMap<Digest, Digest>> {
     written
         .lock()
@@ -414,19 +416,19 @@ struct BlobIndexFile {
     layers: Vec<BlobRef>,
 }
 
-/// A stele directory.
-pub struct SteleDir {
+/// A snapshot directory.
+pub struct SnapshotDir {
     root: PathBuf,
     /// The pairs this directory's own [`LayerSink`]s produced, kept so
-    /// [`SteleWriter::seal`] can write [`BLOB_INDEX_FILE`] out of them.
+    /// [`SnapshotWriter::seal`] can write [`BLOB_INDEX_FILE`] out of them.
     ///
     /// Empty on a directory that is only being read, which costs nothing: a
     /// reader never seals.
     written: Written,
 }
 
-impl SteleDir {
-    /// Create the directory skeleton, failing if a stele is already there.
+impl SnapshotDir {
+    /// Create the directory skeleton, failing if a snapshot is already there.
     pub fn create(root: impl Into<PathBuf>) -> Result<Self, Error> {
         let root = root.into();
 
@@ -445,7 +447,7 @@ impl SteleDir {
         })
     }
 
-    /// Open an existing stele directory.
+    /// Open an existing snapshot directory.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, Error> {
         let root = root.into();
 
@@ -484,27 +486,27 @@ impl SteleDir {
     ///
     /// That condition is the file's whole meaning. A reader that finds one uses
     /// it *instead of* looking at the blobs, so a map missing an entry does not
-    /// read as an incomplete index — it reads as a stele missing a layer. A
+    /// read as an incomplete index — it reads as a snapshot missing a layer. A
     /// directory whose blobs came from somewhere this writer never saw gets no
     /// sidecar and keeps the scan it always had, which is the same fallback a
-    /// stele published before this file existed relies on.
+    /// snapshot published before this file existed relies on.
     ///
     /// One `diffId` may carry several descriptors — a retained state dump and
     /// the tip shard it was cut from are one blob under two scopes — so the map
     /// is keyed by identity and the file lists each blob once.
     ///
-    /// Declining leaves the stele with no sidecar, which [`SteleWriter::seal`]
-    /// has already seen to: a directory sealed a second time through a second
-    /// handle — the first handle's layers already on disk and unknown to this
-    /// one — would otherwise keep a map that is complete for a document nobody
-    /// publishes any more.
+    /// Declining leaves the snapshot with no sidecar, which
+    /// [`SnapshotWriter::seal`] has already seen to: a directory sealed a
+    /// second time through a second handle — the first handle's layers
+    /// already on disk and unknown to this one — would otherwise keep a map
+    /// that is complete for a document nobody publishes any more.
     ///
     /// Written through a staging file and renamed, so the name never exists
     /// over half a document: the reader's rule is that a file which is there
     /// parses, and the only way to keep that promise across a crash is to
     /// publish the name atomically. A failure to write it fails the seal — the
-    /// inscription is already down, and a stele whose sidecar quietly did not
-    /// land is one that quietly costs every later restore the scan.
+    /// inscription is already down, and a snapshot whose sidecar quietly did
+    /// not land is one that quietly costs every later restore the scan.
     fn write_blob_index(&self, inscription: &Inscription) -> Result<(), Error> {
         let mut layers = BTreeMap::new();
 
@@ -549,13 +551,13 @@ impl SteleDir {
         }
     }
 
-    /// Read the sidecar, or `None` if this stele does not carry one.
+    /// Read the sidecar, or `None` if this snapshot does not carry one.
     ///
     /// Absence and corruption are deliberately not the same answer. Absence is
     /// the format before [`BLOB_INDEX_FILE`] existed, and the scan reads those
-    /// steles correctly; a file that is there and does not parse is a fault in
-    /// something that wrote it, and falling back to the scan would restore
-    /// successfully while hiding it.
+    /// snapshots correctly; a file that is there and does not parse is a fault
+    /// in something that wrote it, and falling back to the scan would
+    /// restore successfully while hiding it.
     fn read_blob_index(&self) -> Result<Option<BlobIndex>, Error> {
         let (_, path) = self.blob_index_paths();
 
@@ -577,7 +579,7 @@ impl SteleDir {
     }
 }
 
-impl SteleWriter for SteleDir {
+impl SnapshotWriter for SnapshotDir {
     type Sink = LayerSink;
 
     /// Open a layer and stream records into it.
@@ -627,13 +629,13 @@ impl SteleWriter for SteleDir {
     }
 
     /// Write the inscription in canonical form and return its digest — the
-    /// stele's identity.
+    /// snapshot's identity.
     ///
     /// A directory names nothing, so the profile goes unused here: there are no
     /// tags to render and the file has one name the layout fixes.
     ///
     /// The sidecar lands after it, and in that order on purpose: the
-    /// inscription is the stele and the sidecar is an index over it, so a
+    /// inscription is the snapshot and the sidecar is an index over it, so a
     /// directory is never one without being the other first.
     ///
     /// Any sidecar already there is dropped before the inscription it indexes
@@ -642,7 +644,7 @@ impl SteleWriter for SteleDir {
     /// the other way round, a seal interrupted between the two writes would
     /// leave the previous document's map over the new inscription — and a
     /// reader that finds a map stops looking at blobs, so it would place layers
-    /// this stele no longer holds and report the ones it does as missing.
+    /// this snapshot no longer holds and report the ones it does as missing.
     fn seal(&self, _profile: &dyn Profile, inscription: &Inscription) -> Result<Digest, Error> {
         let canonical = inscription.canonicalize()?;
 
@@ -658,7 +660,7 @@ impl SteleWriter for SteleDir {
     }
 }
 
-impl SteleReader for SteleDir {
+impl SnapshotReader for SnapshotDir {
     type Blob = fs::File;
 
     /// Read and verify the inscription.
@@ -678,18 +680,19 @@ impl SteleReader for SteleDir {
         Ok(inscription)
     }
 
-    /// The `diffId` → blob map: read off [`BLOB_INDEX_FILE`] if this stele
+    /// The `diffId` → blob map: read off [`BLOB_INDEX_FILE`] if this snapshot
     /// carries one, and otherwise rebuilt by [`scan_blobs`].
     ///
     /// The sidecar is the whole difference between a restore that decompresses
-    /// this stele once and one that decompresses it twice, so it is preferred
-    /// wherever it exists — which, for anything [`SteleWriter::seal`] wrote, is
-    /// everywhere. What the scan checked on the way past is not lost, only
-    /// moved: a layer's identity, size and record count are proven by
-    /// [`LayerReader::finish`] as the restore reads it, against the descriptor
-    /// the signed inscription carries. What a directory stops paying for is
-    /// verifying blobs *nobody asked for*, which is exactly the position a
-    /// registry has always been in.
+    /// this snapshot once and one that decompresses it twice, so it is
+    /// preferred wherever it exists — which, for anything
+    /// [`SnapshotWriter::seal`] wrote, is everywhere. What the scan checked
+    /// on the way past is not lost, only moved: a layer's identity, size
+    /// and record count are proven by [`LayerReader::finish`] as the
+    /// restore reads it, against the descriptor the signed inscription
+    /// carries. What a directory stops paying for is verifying blobs
+    /// *nobody asked for*, which is exactly the position a registry has
+    /// always been in.
     fn blob_index(&self) -> Result<BlobIndex, Error> {
         match self.read_blob_index()? {
             Some(index) => Ok(index),
@@ -702,12 +705,12 @@ impl SteleReader for SteleDir {
     /// One `stat`, and deliberately not a read: the compressed size is the
     /// length of the file the blob is stored in, and a directory needs no
     /// manifest to learn it. This is *not* the double-read a directory pays for
-    /// [`SteleDir::blob_index`] — nothing is opened and nothing is
+    /// [`SnapshotDir::blob_index`] — nothing is opened and nothing is
     /// decompressed.
     ///
     /// A layer the index does not place is `None` rather than an error, because
     /// the caller asking this is estimating a download and not performing one.
-    /// The refusal belongs to [`SteleDir::stream_layer`], which is where the
+    /// The refusal belongs to [`SnapshotDir::stream_layer`], which is where the
     /// missing layer actually stops something.
     fn compressed_size(
         &self,
@@ -727,9 +730,9 @@ impl SteleReader for SteleDir {
 
     /// Stream one layer's records without holding it.
     ///
-    /// The same verification as [`SteleDir::read_layer`] — the checks are one
-    /// implementation, called from both — but spread across the read: the
-    /// header on construction, the decompression ceiling as the stream
+    /// The same verification as [`SnapshotDir::read_layer`] — the checks are
+    /// one implementation, called from both — but spread across the read:
+    /// the header on construction, the decompression ceiling as the stream
     /// advances, and the identity digest, size and record count in
     /// [`LayerReader::finish`]. Records are therefore consumable *before* the
     /// layer is proven; see the [`crate::layer`] module documentation for the
@@ -750,7 +753,7 @@ impl SteleReader for SteleDir {
     }
 }
 
-impl SteleDir {
+impl SnapshotDir {
     /// Locate the blob holding a layer, or say which layer is missing.
     fn blob_of(&self, index: &BlobIndex, descriptor: &LayerDescriptor) -> Result<PathBuf, Error> {
         let blob_digest =
@@ -767,7 +770,7 @@ impl SteleDir {
     /// Open the blob holding a layer.
     ///
     /// A map that places the layer and a file that is not there are one
-    /// condition — the layer is not in this stele — and they report as one
+    /// condition — the layer is not in this snapshot — and they report as one
     /// [`Error::LayerNotFound`]. The two used to be indistinguishable because
     /// the map was *built* by reading the directory, so a missing file was a
     /// missing entry; a map stated by [`BLOB_INDEX_FILE`] can place a layer the
@@ -799,7 +802,7 @@ impl SteleDir {
     /// The layer is held whole, which is what makes this a fixture: the
     /// descriptor's `uncompressedSize` is allocated outright, and on a Dolos
     /// state shard that is 402 MB. Callers that only need to walk the records
-    /// want [`SteleDir::stream_layer`], which checks exactly the same claims
+    /// want [`SnapshotDir::stream_layer`], which checks exactly the same claims
     /// out of a bounded window.
     pub fn read_layer(
         &self,

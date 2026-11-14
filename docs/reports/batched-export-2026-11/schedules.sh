@@ -16,7 +16,7 @@
 : "${ROOT:?set ROOT}" "${OLD_DOLOS:?set OLD_DOLOS}"
 
 # ---- base ----
-# Replay to epoch 256 and seed a repository with its stele, under base/preprod. As run
+# Replay to epoch 256 and seed a repository with its snapshot, under base/preprod. As run
 # these were the same two commands by hand: `loopback replay`, then `publish`.
 python3 "$ROOT/bin/measure.py" prepare --root "$ROOT" --corpus "$ROOT/corpus/preprod/immutable" --state-epochs "$ROOT/state-epochs" --loopback "$ROOT/loopback" --publisher "$ROOT/stelae-publisher-candidate" --base-epoch 256 || exit 1
 
@@ -66,7 +66,7 @@ python3 "$M" restore --root "$R" --run "$RUN" "${sequences[@]}" --consumer "$OLD
 # ---- rounds ----
 # Paired complete-pipeline runs: three rounds of three arms with each arm once in
 # each position, then one run of each other window, all over the same 24 epochs
-# (276 to 300, the last a retained dump) from clones of the same stores and stele.
+# (276 to 300, the last a retained dump) from clones of the same stores and snapshot.
 R="$ROOT"
 M="$R/bin/measure.py"
 C="$R/stelae-publisher-candidate"; O="$R/stelae-publisher-old"

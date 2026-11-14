@@ -23,11 +23,11 @@ may grow within a version, and only as that section describes.
 
 ## Overview
 
-A **stele** (*stele*: a standing inscribed slab) is one published artifact set
-at one sequence point: a set of compressed **layers** plus an **inscription**
-— a canonical JSON document listing the uncompressed digest of every layer
-along with the profile, sequence and position that identify what the snapshot
-is *of*. The protocol owns framing, the signable document, transport,
+A Stelae **snapshot** is one published artifact set at one sequence point: a
+set of compressed **layers** plus an **inscription** — a canonical JSON
+document listing the uncompressed digest of every layer along with the
+profile, sequence and position that identify what the snapshot is *of*. The
+protocol owns framing, the signable document, transport,
 attestation and restore planning; a **profile** owns layer kinds, record
 shapes, position, parameters, tag rendering and store semantics.
 
@@ -51,7 +51,7 @@ than a feature of this protocol. The referrers API gives detached signatures
 a standard, tooling-compatible home. And registry infrastructure — auth, CDN
 distribution, garbage collection, mirroring — is commodity, so the protocol
 specifies none of it. Any OCI Distribution v1.1 registry is a valid home for
-a stele repository.
+a snapshot repository.
 
 ## Profiles, naming and media types
 
@@ -81,7 +81,7 @@ Normative rules for coexistence:
    the layer and reports the skip, and only a `required: true` in that
    layer's `scope` turns the skip back into a refusal naming the kind and the
    scope. The publish side keeps the strict rule in both cases — a publisher
-   that cannot build a kind must not chain onto a stele carrying it, since
+   that cannot build a kind must not chain onto a snapshot carrying it, since
    the alternatives are dropping the layer from the repository silently or
    attesting bytes it never read. `required` lives in the profile-owned
    `scope` and not in an OCI annotation, so it is signed planning input
@@ -143,7 +143,7 @@ depends on it.
 
 ## The inscription
 
-The inscription is the canonical, signable document of a stele: the OCI
+The inscription is the canonical, signable document of a snapshot: the OCI
 config blob, canonical JSON per RFC 8785 (JCS). Generic keys plus three
 profile-owned opaque objects — `position`, `parameters` and each layer's
 `scope`:
@@ -181,7 +181,7 @@ profile-owned opaque objects — `position`, `parameters` and each layer's
 `history` embeds the digest of every previously published inscription, so the
 latest signed inscription transitively attests the entire publication history
 (~80 bytes per sequence — negligible for a config blob). This makes
-attestation outlive blob retention: a stele whose blobs have long been
+attestation outlive blob retention: a snapshot whose blobs have long been
 garbage-collected can still be verified by anyone holding a copy, because the
 copy carries its own inscription — check that inscription's digest against
 the `history` of the latest signed one, then the layers against its diffIds.
@@ -191,7 +191,7 @@ Retention is the publisher's policy, not the protocol's: a publisher keeps a
 trailing window of immutable tags, untagged blobs are the registry's garbage
 collector's to reclaim, and blobs still referenced by later manifests
 survive on their own. `history` is what makes that policy safe — trust
-evidence for a reclaimed stele survives in every later inscription.
+evidence for a reclaimed snapshot survives in every later inscription.
 
 **History invariant:** `history` contains exactly one entry per published
 sequence, contiguous from the dataset's first published sequence (pinned
@@ -224,7 +224,7 @@ direct restore.
 
 ### The manifest
 
-A stele in a registry is one OCI image manifest, and its shape is closed: a
+A snapshot in a registry is one OCI image manifest, and its shape is closed: a
 conforming publisher writes exactly the fields below, and a conforming client
 refuses anything else.
 
@@ -257,7 +257,7 @@ TxPipe owns:
 hands over for free. A directory has no manifest to carry it, so a publish
 writes the same map to a `blobs.json` sidecar beside `inscription.json`; it
 is transport and not identity — unsigned, outside the inscription digest, and
-fully recoverable from the blobs — so a stele without one still restores, by
+fully recoverable from the blobs — so a snapshot without one still restores, by
 decompressing every blob to rebuild it. A client that does not read it cannot
 fetch a layer; it is the one annotation a reader must understand. The other
 two exist so a human or a generic registry tool can see what a blob covers
@@ -265,7 +265,7 @@ without fetching the config blob, and a client may ignore them.
 
 ### Manifest–inscription agreement
 
-The manifest and the inscription are two views of one stele — the inscription
+The manifest and the inscription are two views of one snapshot — the inscription
 holds identity, the manifest holds transport — and a disagreement between
 them, in either direction, is a refusal, never a preference.
 
@@ -278,7 +278,7 @@ A client refuses a manifest — before any blob is fetched — when:
 
 - `artifactType` is missing. This fails closed by choice: a registry that
   strips the OCI 1.1 discovery field has published something a client cannot
-  recognize as a stele, and reading it anyway would make the discovery
+  recognize as a snapshot, and reading it anyway would make the discovery
   contract advisory.
 - `artifactType` is present and is not `application/vnd.stelae.snapshot.v1`.
   The envelope identifier releases before v2 wrote is one such value: it has
@@ -331,7 +331,7 @@ own accounting lives in its half of the spec).
 
 ## Restore planning
 
-A client reads a stele in a fixed order, refusing early: resolve the tag to
+A client reads a snapshot in a fixed order, refusing early: resolve the tag to
 a manifest and refuse any manifest–inscription disagreement (above, before
 any blob is fetched); verify the inscription's digest, `schema`, profile
 name and major version, and signatures; plan; then fetch, verifying each
@@ -343,13 +343,13 @@ profile-side by necessity (a layer's `scope` is opaque, so only the profile
 can read a window out of one), and store writes are the host's.
 
 - No layer kind is mandatory for consumers: the inscription declares what the
-  stele contains, and the client selects which layers to fetch and which data
+  snapshot contains, and the client selects which layers to fetch and which data
   to source elsewhere. A kind the client does not implement is skipped and
   reported, per rule 3 above.
 - The progress file (`stelae::plan::RestoreProgress`) records the inscription
   digest and the diffIds of completed layers, at a path the host chooses. Its
   resume rule is content-based: a layer is done when its `diffId` is
-  recorded, which is a fact about bytes and not about the stele they were
+  recorded, which is a fact about bytes and not about the snapshot they were
   published in. *Which* layers may be skipped on resume at all is the
   profile's decision.
 - Remaining-transfer accounting (`stelae::plan::Remaining`) is derived from

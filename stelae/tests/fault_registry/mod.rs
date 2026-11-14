@@ -1,9 +1,9 @@
 //! An in-process OCI registry that can break the transfers it serves.
 //!
 //! Enough of the distribution API for a [`stelae::oci::Registry`] to publish a
-//! stele and pull it back over plaintext HTTP — monolithic blob uploads, blob
-//! `HEAD`/`GET`, manifest `PUT`/`GET` — plus scripted faults on the reads: a
-//! body cut off partway, a body that is honestly short, or a status code, and
+//! snapshot and pull it back over plaintext HTTP — monolithic blob uploads,
+//! blob `HEAD`/`GET`, manifest `PUT`/`GET` — plus scripted faults on the reads:
+//! a body cut off partway, a body that is honestly short, or a status code, and
 //! a wait before a layer blob's first byte. No container, so the read-retry
 //! and read-ahead tests run under plain `cargo test`.
 //!

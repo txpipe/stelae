@@ -43,9 +43,9 @@ use serde_json::json;
 use stats_alloc::{Region, StatsAlloc, INSTRUMENTED_SYSTEM};
 
 use stelae::{
-    dir::{LayerSpec, SteleDir},
+    dir::{LayerSpec, SnapshotDir},
     frame::{encode, CanonicalCbor, Limits, RecordReader, SeqWriter},
-    Compression, Error, Inscription, Profile, RecordSink, SteleReader, SteleWriter,
+    Compression, Error, Inscription, Profile, RecordSink, SnapshotReader, SnapshotWriter,
 };
 
 #[global_allocator]
@@ -223,11 +223,11 @@ fn streaming_a_layer_does_not_scale_with_its_size() {
     let _serial = exclusive();
 
     let temp = tempfile::tempdir().unwrap();
-    let stele = SteleDir::create(temp.path()).unwrap();
+    let snapshot = SnapshotDir::create(temp.path()).unwrap();
 
     let records: Vec<CanonicalCbor> = (0..RECORDS).map(bulk_record).collect();
 
-    let written = stele
+    let written = snapshot
         .write_layer(
             &BulkProfile,
             &LayerSpec::new("bulk", scope(), json!({})),
@@ -247,7 +247,7 @@ fn streaming_a_layer_does_not_scale_with_its_size() {
         },
     );
     inscription.layers = vec![written.descriptor.clone()];
-    stele.seal(&BulkProfile, &inscription).unwrap();
+    snapshot.seal(&BulkProfile, &inscription).unwrap();
 
     let descriptor = &inscription.layers[0];
     assert!(
@@ -256,13 +256,13 @@ fn streaming_a_layer_does_not_scale_with_its_size() {
     );
 
     // Everything before the region is setup: building the index is a scan of
-    // the stele, and what it costs is not what is under test.
+    // the snapshot, and what it costs is not what is under test.
     drop(records);
-    let index = stele.blob_index().unwrap();
+    let index = snapshot.blob_index().unwrap();
 
     let region = Region::new(GLOBAL);
 
-    let mut reader = stele
+    let mut reader = snapshot
         .stream_layer(&index, &BulkProfile, descriptor, Limits::default())
         .unwrap();
 
@@ -290,7 +290,9 @@ fn streaming_a_layer_does_not_scale_with_its_size() {
     // size for it. If that ever stops being true the budget above has stopped
     // measuring the difference between the two paths.
     let region = Region::new(GLOBAL);
-    let layer = stele.read_layer(&index, &BulkProfile, descriptor).unwrap();
+    let layer = snapshot
+        .read_layer(&index, &BulkProfile, descriptor)
+        .unwrap();
     let buffered = region.change().bytes_allocated;
 
     assert_eq!(layer.as_bytes().len() as u64, descriptor.uncompressed_size);
@@ -313,7 +315,7 @@ fn streaming_a_layer_does_not_scale_with_its_size() {
 ///
 /// Both paths write the same layer here, so the comparison is between two ways
 /// of producing one artifact and not between two artifacts. They go into
-/// separate steles: the blob is named by its own digest, so writing it twice
+/// separate snapshots: the blob is named by its own digest, so writing it twice
 /// into one directory would be a rename onto a file that is already there.
 #[test]
 fn writing_a_layer_through_a_sink_does_not_scale_with_its_size() {
@@ -322,8 +324,8 @@ fn writing_a_layer_through_a_sink_does_not_scale_with_its_size() {
     let streamed_dir = tempfile::tempdir().unwrap();
     let buffered_dir = tempfile::tempdir().unwrap();
 
-    let streamed_stele = SteleDir::create(streamed_dir.path()).unwrap();
-    let buffered_stele = SteleDir::create(buffered_dir.path()).unwrap();
+    let streamed_snapshot = SnapshotDir::create(streamed_dir.path()).unwrap();
+    let buffered_snapshot = SnapshotDir::create(buffered_dir.path()).unwrap();
 
     let spec = LayerSpec::new("bulk", scope(), json!({}));
 
@@ -332,7 +334,7 @@ fn writing_a_layer_through_a_sink_does_not_scale_with_its_size() {
     // plus whatever the protocol is holding on its behalf.
     let region = Region::new(GLOBAL);
 
-    let mut sink = streamed_stele
+    let mut sink = streamed_snapshot
         .layer_sink(&BulkProfile, &spec, COMPRESSION_LEVEL)
         .unwrap();
 
@@ -353,7 +355,7 @@ fn writing_a_layer_through_a_sink_does_not_scale_with_its_size() {
     let region = Region::new(GLOBAL);
 
     let records: Vec<CanonicalCbor> = (0..RECORDS).map(bulk_record).collect();
-    let buffered = buffered_stele
+    let buffered = buffered_snapshot
         .write_layer(&BulkProfile, &spec, COMPRESSION_LEVEL, &records)
         .unwrap();
 
