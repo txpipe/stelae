@@ -38,12 +38,12 @@
 //! operation returns — that is what the seal's join buys — and nothing about
 //! the order in between is promised.
 //!
-//! The transports answer through [`SteleWriter::observe`] and
-//! [`SteleReader::observe`], which have default no-op bodies: reporting is
+//! The transports answer through [`SnapshotWriter::observe`] and
+//! [`SnapshotReader::observe`], which have default no-op bodies: reporting is
 //! something a transport *may* do, not a tax every implementation pays.
 //!
-//! [`SteleWriter::observe`]: crate::SteleWriter::observe
-//! [`SteleReader::observe`]: crate::SteleReader::observe
+//! [`SnapshotWriter::observe`]: crate::SnapshotWriter::observe
+//! [`SnapshotReader::observe`]: crate::SnapshotReader::observe
 //!
 //! ## Rendering is nobody's business here
 //!
@@ -135,7 +135,8 @@ pub enum Outcome {
     /// interrupted restore had committed before it died.
     Skipped,
 
-    /// Adopted whole from the stele before it, and never read out of a store.
+    /// Adopted whole from the snapshot before it, and never read out of a
+    /// store.
     Inherited,
 }
 

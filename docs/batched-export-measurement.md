@@ -38,7 +38,7 @@ git archive <last-release-tag> | tar -x -C <scratch>/old-src   # and build it th
 Choose a root on the volume being measured, with room for a clone of the stores and
 of the repository per run. Copy an immutable directory there, because a run deletes
 what it consumes and so reads clones of these files. Then replay to a base epoch and
-seed its stele, once:
+seed its snapshot, once:
 
 ```sh
 measure.py prepare --root ROOT --corpus IMMUTABLE --state-epochs EPOCHS \

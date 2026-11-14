@@ -3,14 +3,14 @@
 A deterministic, content-addressed snapshot protocol for large reproducible
 datasets, distributed through OCI registries.
 
-A *stele* is a snapshot: a set of compressed layers plus an **inscription** —
+A Stelae *snapshot* is a set of compressed layers plus an **inscription**:
 a canonical (RFC 8785) JSON document listing the uncompressed digest of every
 layer along with the profile, sequence and position that identify what the
 snapshot is *of*. Determinism is anchored on the inscription's sha256:
 independent parties that hold the same data produce byte-identical
 inscriptions, whatever compressed their blobs. The payload is opaque to the
 protocol — a **profile** names the layer kinds, scopes and parameters, so any
-project shipping large reproducible datasets can put its steles beside anyone
+project shipping large reproducible datasets can put its snapshots beside anyone
 else's in the same registry without colliding or forking the spec.
 
 The protocol was designed for [Dolos](https://github.com/txpipe/dolos), the
@@ -27,7 +27,7 @@ producer and consumer; it carries no Cardano assumption.
 | [`stelae-publisher`](stelae-publisher/) | The `stelae-publisher` executable and its operator-facing commands. |
 
 Publisher commands (`initialize`, `publish`, `backfill`, `run`, and `digest`,
-`verify` and `inspect` for reading and reproducing published steles),
+`verify` and `inspect` for reading and reproducing published snapshots),
 configuration precedence and persisted-state contracts are documented in
 [docs/publisher.md](docs/publisher.md). Reproducible image inputs,
 release provenance and a fresh lineage's first publication on the chart are in

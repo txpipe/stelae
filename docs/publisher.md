@@ -59,10 +59,10 @@ The workspace `stelae` and `stelae-driver` are built and tested from their
 paths and may move ahead of it; the host follows them only when the Dolos pin
 moves to a Dolos built against the newer revision.
 
-Steles cut against an earlier pin are not part of this lineage: the frozen
+Snapshots cut against an earlier pin are not part of this lineage: the frozen
 profile renamed its payload media types and reset every schema revision to
 1, and restoring or
-chaining onto an older stele is unsupported. A repository that holds one
+chaining onto an older snapshot is unsupported. A repository that holds one
 starts over (see [First publication](#first-publication)).
 
 The lockfile is committed. These commands verify the intended graph:
@@ -116,7 +116,7 @@ The retained epochs are echoed into every inscription's parameters as signed
 input (decision 0026), so they are validated (ascending, no repeats, no epoch
 0) before any store opens. A command that touches no registry (`publish
 --output-dir`, `initialize --source file://…`, `digest`, `verify` or
-`inspect` of a `file://` stele) reads no registry credentials. A token and user together, or a password with no
+`inspect` of a `file://` snapshot) reads no registry credentials. A token and user together, or a password with no
 user, fail through the shared profile credential policy. CLI command names
 belong to this executable; profile names, media types, tags and repository
 identities remain the existing wire values.
@@ -126,7 +126,7 @@ identities remain the existing wire values.
 Publish the committed stores once to a directory:
 
 ```sh
-stelae-publisher --config dolos.toml publish --output-dir ./stele \
+stelae-publisher --config dolos.toml publish --output-dir ./snapshot \
   --state-epochs-file state-epochs
 ```
 
@@ -159,7 +159,7 @@ stores are cleared. `--allow-genesis` is the only genesis fallback and is for
 a deliberately verified first publication. `initialize`, `publish`, and
 `backfill` are also available independently.
 
-### Reading and reproducing steles
+### Reading and reproducing snapshots
 
 `digest`, `verify` and `inspect` replace Dolos's former `snapshot` commands
 over the same profile entry points. `--repo` takes `oci://HOST/PATH` or
@@ -172,13 +172,13 @@ the identity reported; `--chain-from FILE` extends a predecessor's history:
 
 ```sh
 stelae-publisher --config dolos.toml digest \
-  --state-epochs-file state-epochs > stele.json
+  --state-epochs-file state-epochs > snapshot.json
 ```
 
-Check a published stele's digests, every layer streamed against both of its
+Check a published snapshot's digests, every layer streamed against both of its
 digests; `--reproduce` also rebuilds every layer from the committed stores and
 requires a byte-identical inscription, taking `--epochs`, `--producers` and
-the `--state-epochs-file` the stele was published with:
+the `--state-epochs-file` the snapshot was published with:
 
 ```sh
 stelae-publisher --config dolos.toml verify \
@@ -186,7 +186,7 @@ stelae-publisher --config dolos.toml verify \
   --reproduce --state-epochs-file state-epochs
 ```
 
-Print a stele's table of contents without pulling a layer. A directory stele
+Print a snapshot's table of contents without pulling a layer. A directory snapshot
 published before `blobs.json` existed reports its compressed sizes as unknown
 rather than reading every blob to find them:
 
@@ -207,15 +207,15 @@ progress and logs on stderr. `inspect --format json` is the canonical
 inscription verbatim, what `digest --chain-from` takes; `digest` writes the
 inscription in either format; `verify --format json` is one report object.
 They exit 0 on success, 1 on an error, 2 on a usage error and 3 when `verify`
-refused the stele: a document or layer whose bytes, digests, names or
+refused the snapshot: a document or layer whose bytes, digests, names or
 encoding disagree, including a blob a registry serves under another digest
 or past its descriptor's size and a blob that does not decompress,
 an inscription of another profile or schema, a broken history, or, under
-`--reproduce`, a stele of another network or sequence than the stores or a
+`--reproduce`, a snapshot of another network or sequence than the stores or a
 reproduction that differs. A check that could not run, because the registry,
 the disk, the credentials, the configuration or the local stores failed,
 exits 1, including a record the local stores hold out of order or malformed
-under `--reproduce`, as does a `--point` a directory stele does not hold and
+under `--reproduce`, as does a `--point` a directory snapshot does not hold and
 any refusal by `inspect` or `digest`.
 
 OCI operations run synchronously on the process thread. Mithril calls have a
@@ -262,8 +262,8 @@ The backfill state machine preserves these rules from the accepted Dolos host:
 Dolos commits a replayed block's state before its archive entry, and an import
 keeps no WAL, so a kill or a full volume between the two leaves the state cursor
 past blocks the archive never got. Replaying on closes the difference with those
-blocks missing: the stele cut from there restores without complaint, and every
-later stele inherits the hole. So `run` and `backfill` compare the cursor with the
+blocks missing: the snapshot cut from there restores without complaint, and every
+later snapshot inherits the hole. So `run` and `backfill` compare the cursor with the
 archive's tip before replaying or publishing anything, on a batch of one and a
 larger batch alike, and refuse while the tip is behind. An archive ahead of the
 cursor passes. Replay writes the same blocks again, which heals it only up to the
@@ -272,7 +272,7 @@ cursor, until the stores are replaced.
 
 The refusal repeats until the stores are replaced, and nothing repairs imported
 stores: clear the storage path and any store configured outside it, then restore
-the stores from the repository's latest stele. A repository with no stele has
+the stores from the repository's latest snapshot. A repository with no snapshot has
 nothing to restore, so clear them the same way and run with `--allow-genesis`.
 Stores a node synced differ: they keep a WAL, so a Dolos restart catches the archive
 up, and their documented route, `publish` and `digest`, doesn't meet this check.
@@ -288,7 +288,7 @@ the two compare equal. It also compares slots, so a Byron main block lost beside
 its boundary block at one slot passes. The chart reruns a failed publisher by itself
 (`restartPolicy: OnFailure`, `backoffLimit`) in the same pod, so `/data` survives
 that rerun on an emptyDir as well as on a claim, and nobody read the stop first:
-steles from a publisher rerun in place before this check are unchecked by it.
+snapshots from a publisher rerun in place before this check are unchecked by it.
 
 ### A volume that fills
 
@@ -324,12 +324,12 @@ Three cases read differently:
   repository already holds that boundary. A held boundary isn't checked, so a run over
   one gets no such refusal, and a clean run doesn't show that no gap was crossed. Clear
   the storage path and any store configured outside it, then restore from the
-  repository's latest stele.
+  repository's latest snapshot.
 
 ## Prepared batches
 
 A batch prepares several boundaries before it publishes any, so one index
-traversal serves them all. Replay may stand past the repository's latest stele
+traversal serves them all. Replay may stand past the repository's latest snapshot
 only while every sequence in between is a complete bundle the journal names.
 `run` and `backfill` take the controls below. `publish` stays a batch of one. The
 chart passes them only when its `batch` values are set, so a deployment doesn't batch
@@ -387,7 +387,7 @@ files, the stores at their highest stood 0.86 GiB up over 4 epochs, 1.06 over 16
 up to about 1 GiB, whatever the window.
 
 Each publication also checks first that its volume can stage what it stages at once, and
-refuses a shortfall. That is every state layer of the latest stele, retained dumps included,
+refuses a shortfall. That is every state layer of the latest snapshot, retained dumps included,
 and its largest other layers, as many as `--concurrency`. At this height, on a lineage with
 no dump yet, it takes 0.65 GiB at `--concurrency 4`, which these runs used, and 0.79 at the
 default of 8. At epoch 300, with one dump, it takes 1.04 and 1.17. A lineage from genesis
@@ -465,7 +465,7 @@ on what the source offered and publishes it, so a window only delays a backfill.
    move again until the last commit, so that view stays frozen.
 8. **Commit each sequence in order.** Read what the repository holds, and hold it
    to the journal. Publish through the existing transport, chained to the real
-   predecessor. Journal the stele, then release its bundle and any payload no later
+   predecessor. Journal the snapshot, then release its bundle and any payload no later
    bundle shares.
 9. **Clean up** after the last commit: the staged runs, then the bundles, then the
    journal. A crash at any point only repeats this. Pruning resumes here, and replay
@@ -490,7 +490,7 @@ during a backfill costs one smaller batch, and one more index traversal for the 
 
 ### Progress
 
-Each journal write logs and reports the frontiers: `published`, the stele the next
+Each journal write logs and reports the frontiers: `published`, the snapshot the next
 publication follows, which moves with each commit; `prepared`, the last journaled
 sequence;
 `staged`, where the runs were staged from; `replay`, the slot the stores reached;
@@ -506,7 +506,7 @@ and `horizon`, the oldest slot the archive has to keep for the batch.
 | behind the journal's replay frontier | refuses: the stores were rebuilt or rolled back |
 
 These refuse too, and none is repaired automatically: a repository whose latest
-stele is not the one the batch follows, a journal or bundle that is missing or
+snapshot is not the one the batch follows, a journal or bundle that is missing or
 damaged, and another repository, network, store contract, retained list or Dolos
 revision than the batch was prepared from. A batch of one and a repository
 `publish` refuse to run past a pending batch, and the refusal names the flags that
@@ -519,7 +519,7 @@ from the sequence the journal names:
 
 | The repository holds | The run |
 | --- | --- |
-| the stele the journal says comes before this sequence, and nothing under this sequence | publishes it |
+| the snapshot the journal says comes before this sequence, and nothing under this sequence | publishes it |
 | this sequence under its immutable tag only: a seal that stopped half way | reproduces it, compares identities and seals again |
 | this sequence as `latest`: an upload whose answer was lost | reproduces it, compares identities, journals it and doesn't upload it again |
 | this sequence as `latest` with another identity | refuses, and overwrites nothing: another writer published it, or these stores aren't what the batch was prepared from. The recovery below applies |
@@ -572,14 +572,14 @@ partial publication includes the sequences this batch already committed. A resto
 changes nothing over stores that are still there, and deleting the batch alone
 leaves stores past the repository, which refuse, so clear them first:
 
-- **It holds a stele.** Clear the storage path and any store configured outside it,
-  which deletes the batch with them. Then restore the stores from its latest stele
+- **It holds a snapshot.** Clear the storage path and any store configured outside it,
+  which deletes the batch with them. Then restore the stores from its latest snapshot
   with `initialize`, or `run`, which starts with it, to replay those sequences.
 - **It is empty.** There is nothing to restore: clear them the same way and run with
   `--allow-genesis`.
 
 A store configured outside the storage path survives clearing that path and reads as
-existing stores afterwards. `--allow-genesis` then keeps it, and a first stele starts
+existing stores afterwards. `--allow-genesis` then keeps it, and a first snapshot starts
 past what the batch held with nothing to refuse it.
 
 A download window left from the lost replay can't continue a restored one. With
@@ -590,8 +590,8 @@ needs downloads again.
 A batch over an empty repository records where it began in
 `<storage.path>/.stelae-batch-began.json`, outside the batch. A history can't start
 past that sequence while the repository is empty, on a batch of one or a repository
-`publish` as well, because a stele there would leave out sequences only the batch
-held. The record means nothing once the repository holds a stele. Delete it only
+`publish` as well, because a snapshot there would leave out sequences only the batch
+held. The record means nothing once the repository holds a snapshot. Delete it only
 to start a history past those sequences on purpose.
 
 Cancelling keeps all of it: a shutdown signal neither publishes nor manufactures
@@ -625,22 +625,22 @@ from before batches can't read the journal that accounts for that. So drain firs
 run the image that prepared the batch with `--until-epoch` set to the last prepared
 sequence, which exits there with the journal gone, then roll back. After that nothing is
 different from any other rollback. The exception is rolling back from an image you suspect
-of a bad export: don't drain it, because that seals more steles from it, and clear the
+of a bad export: don't drain it, because that seals more snapshots from it, and clear the
 stores and restore instead, and the batch goes with them
 ([the chart's data volume](../k8s/dolos-publisher/README.md#data-volume)).
 
 If a rollback reaches a pending batch anyway, the repository and the stores decide what
 happens:
 
-- **The stores are two or more sequences past the repository's latest stele.** The older
+- **The stores are two or more sequences past the repository's latest snapshot.** The older
   image refuses, after its retries, saying the node is sequences ahead of the latest
-  stele and a publish would leave a gap. It publishes nothing, and the batch is untouched.
+  snapshot and a publish would leave a gap. It publishes nothing, and the batch is untouched.
   Go back to the image that prepared it and the batch finishes, to the same bytes. This
   ran over real preprod, at three sequences ahead.
 - **The stores are one sequence past it, and past that boundary.** A batch stands here while
   it holds its first boundary and replays toward its second, and so does a batch that closed on
   `end-of-source` past that boundary and stopped during its last sequence. The older image
-  fails on every retry, saying to restore that epoch's stele. It publishes nothing and the
+  fails on every retry, saying to restore that epoch's snapshot. It publishes nothing and the
   batch is untouched, so clear nothing: go back to the image that prepared it, and the batch
   goes on. Like the next case, this comes from reading both releases and hasn't been run.
 - **The stores are one sequence past it, on that boundary.** A batch stopped during its last
@@ -654,7 +654,7 @@ happens:
   every sequence the batch held is gone from that lineage for good: a batch stopped at
   its third boundary and continued by the last release published `epoch-3` onward,
   with no `epoch-1` or `epoch-2`. Past a boundary it fails on every retry instead, asking
-  for a stele of that epoch to restore, and there isn't one. It publishes nothing and the
+  for a snapshot of that epoch to restore, and there isn't one. It publishes nothing and the
   batch is untouched, so go back to the image that prepared it, and the batch finishes: this
   comes from reading both releases. Don't roll back over a first batch. If the older image has
   published, stop the writer, delete the tags, clear the storage path and any store configured
@@ -664,7 +664,7 @@ happens:
 Losing the batch directory is a different thing, and so is losing `/data`: see the
 recovery above. On an emptyDir, or a claim you deleted, the batch goes with the stores,
 and the run restores `latest` and replays what wasn't published. That costs time and
-loses nothing. A repository with no stele yet has no `latest` to restore, so a run
+loses nothing. A repository with no snapshot yet has no `latest` to restore, so a run
 without `--allow-genesis` fails: that is the recovery's empty case, which clears any
 store configured outside the storage path and runs with `--allow-genesis`
 (`allowGenesisFallback: true` on the chart).
@@ -673,7 +673,7 @@ store configured outside the storage path and runs with `--allow-genesis`
 
 A fresh lineage starts from an empty repository and replays from genesis.
 Every inscription after the first names its predecessor and carries its
-history forward, so the first stele is the only one published without a
+history forward, so the first snapshot is the only one published without a
 predecessor.
 
 1. Stop every other writer to the repository and wait for it to exit.
@@ -681,7 +681,7 @@ predecessor.
    [Configuration](#configuration)); its stores grow with the chain, to
    about 250 GiB on mainnet.
 2. Delete every tag in the repository, `latest` first, so no earlier pin's
-   stele is restored or chained onto.
+   snapshot is restored or chained onto.
 3. Clear the storage path and any store configured outside it, since an
    earlier attempt can leave stores and a batch there, then start the first
    run with `--allow-genesis`. Initialization finds no `latest`, opts into

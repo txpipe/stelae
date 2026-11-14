@@ -2,11 +2,11 @@
 //!
 //! [`stelae`] is the protocol: framing, canonicalization, digests and the
 //! naming rules. A *profile* — `dolos-snapshot` is this workspace's one — says
-//! what a stele contains. Between them sits the work every publisher and every
-//! restorer does whatever it is moving: sizing a volume before a run starts,
-//! counting layers and records for whoever is watching, reading where a node
-//! stands against a repository's newest stele, keying a layer by its kind and
-//! scope.
+//! what a snapshot contains. Between them sits the work every publisher and
+//! every restorer does whatever it is moving: sizing a volume before a run
+//! starts, counting layers and records for whoever is watching, reading where a
+//! node stands against a repository's newest snapshot, keying a layer by its
+//! kind and scope.
 //!
 //! None of that is protocol and none of it is profile, so it lives here rather
 //! than in either. No type here is a node's or a profile's — the boundary this
@@ -29,7 +29,7 @@
 //!   the `oci` feature because that is where a repository lives.
 //! - [`retry`] — the bounded patience a run spends on an external that fails in
 //!   bursts.
-//! - [`Standing`] — where a node stands against a repository's latest stele.
+//! - [`Standing`] — where a node stands against a repository's latest snapshot.
 //! - [`scope_key`] — the pair that identifies one layer.
 
 pub mod digests;
@@ -84,13 +84,13 @@ pub enum Error {
     /// numbers and composes no sentence about what they name — so a profile
     /// that spells the refusal itself keeps the message it always had, the way
     /// every other shared refusal here does.
-    #[error("this stele describes dataset {found}, but this node is configured for {expected}")]
+    #[error("this snapshot describes dataset {found}, but this node is configured for {expected}")]
     DatasetMismatch { expected: u64, found: u64 },
 
     /// A publish that would not extend the repository's chain. Raised by
     /// [`stelae::inscription::history_for`] and carried here unchanged.
     #[error(
-        "this repository's latest stele is sequence {latest} and this publish is sequence \
+        "this repository's latest snapshot is sequence {latest} and this publish is sequence \
          {publishing}: {reason}"
     )]
     HistoryBreak {
@@ -149,11 +149,11 @@ impl Error {
     }
 }
 
-/// Where a node stands relative to the newest stele already published.
+/// Where a node stands relative to the newest snapshot already published.
 ///
 /// The comparison a publisher on a timer needs *before* anything is built, and
 /// both halves of it are already in hand: the sequence a repository's latest
-/// stele carries, and the sequence the node's cursor derived. Without it the
+/// snapshot carries, and the sequence the node's cursor derived. Without it the
 /// ordinary case — nothing has closed since last time — arrives as the
 /// [`Error::HistoryBreak`] refusal a skipped sequence does, and a job on a
 /// timer cannot tell the two apart.
@@ -162,12 +162,12 @@ impl Error {
 /// the cases can be checked without one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standing {
-    /// Nothing has been published; this stele would start the chain.
+    /// Nothing has been published; this snapshot would start the chain.
     Empty,
     /// The published chain has already reached this node. Not an error: a
     /// publisher whose node has not entered a new epoch has nothing to do.
     UpToDate { latest: u64 },
-    /// The chain ends exactly one sequence back; this stele extends it.
+    /// The chain ends exactly one sequence back; this snapshot extends it.
     Next { latest: u64 },
     /// The node is further ahead than one sequence, so a publish would leave a
     /// gap. `distance` is how far — the number the refusal reports alongside
@@ -177,7 +177,7 @@ pub enum Standing {
 }
 
 impl Standing {
-    /// Read a node at `sequence` against a repository whose latest stele is
+    /// Read a node at `sequence` against a repository whose latest snapshot is
     /// `latest`.
     pub fn read(latest: Option<u64>, sequence: u64) -> Self {
         let Some(latest) = latest else {

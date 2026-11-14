@@ -1,8 +1,8 @@
 //! The chained-publish lifecycle against a repository.
 //!
 //! Everything a publisher does once it is standing in front of a *repository*
-//! rather than a transport: what the new stele says about the ones already in
-//! it, and what it may take from them. Generic over
+//! rather than a transport: what the new snapshot says about the ones already
+//! in it, and what it may take from them. Generic over
 //! [`DriverProfile`][crate::DriverProfile] throughout — every document that
 //! crosses this module is composed by a profile and only compared here.
 //!
@@ -27,9 +27,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use stelae::{
     inscription::{Compression, HistoryEntry, Inscription, LayerDescriptor},
-    oci::{Auth, Options, Registry, Repository, Stele, DEFAULT_CONCURRENCY},
+    oci::{Auth, Options, Registry, Repository, Snapshot, DEFAULT_CONCURRENCY},
     transport::WrittenLayer,
-    Digest, SteleReader as _,
+    Digest, SnapshotReader as _,
 };
 
 use crate::{scope_key, DriverProfile, Error, Predecessor, Standing};
@@ -151,9 +151,9 @@ pub struct Publishing<'a> {
     /// the record over.
     pub rebuild: bool,
 
-    /// What the caller already holds this publish to follow: a stele, or inside
-    /// it `None` for an empty repository. Outer `None` follows whatever is
-    /// there.
+    /// What the caller already holds this publish to follow: a snapshot, or
+    /// inside it `None` for an empty repository. Outer `None` follows
+    /// whatever is there.
     pub follows: Option<Option<(u64, Digest)>>,
 }
 
@@ -169,7 +169,7 @@ impl<'a> Publishing<'a> {
     }
 
     /// The same publish, refused before anything is uploaded unless the
-    /// repository's latest stele is `predecessor`.
+    /// repository's latest snapshot is `predecessor`.
     pub fn following(self, predecessor: Option<(u64, Digest)>) -> Self {
         Self {
             follows: Some(predecessor),
@@ -273,7 +273,7 @@ impl Origin {
 
 /// The epoch layers an interrupted publish got as far as uploading.
 ///
-/// Written after each layer's upload succeeds and deleted once the stele is
+/// Written after each layer's upload succeeds and deleted once the snapshot is
 /// sealed, so a record that exists describes a publish that did not finish. See
 /// the module documentation for what it is and — more to the point — what it is
 /// not.
@@ -438,7 +438,7 @@ pub fn standing(
 ) -> Result<Standing, Error> {
     let latest = registry
         .latest(profile)?
-        .map(|stele| stele.read_inscription())
+        .map(|snapshot| snapshot.read_inscription())
         .transpose()?;
 
     if let Some(previous) = &latest {
@@ -457,15 +457,15 @@ pub fn standing(
 /// The publish this one follows, in a repository — which may be itself.
 ///
 /// Holds the history it hands to the new inscription and the two tables of
-/// layers it is willing to let the new stele carry forward rather than build,
-/// both keyed by the pair that decides it: the layer's kind and the canonical
-/// encoding of its profile-owned scope.
+/// layers it is willing to let the new snapshot carry forward rather than
+/// build, both keyed by the pair that decides it: the layer's kind and the
+/// canonical encoding of its profile-owned scope.
 ///
 /// The tables answer the same question from different standing. `inheritable`
-/// is the *predecessor's manifest* — a stele the repository serves, so a layer
-/// missing from it is a fault. `resumable` is *this publish's own record* of an
-/// attempt that died before it could write a manifest — a note, so a layer
-/// missing from the registry is only a rebuild. The manifest is consulted
+/// is the *predecessor's manifest* — a snapshot the repository serves, so a
+/// layer missing from it is a fault. `resumable` is *this publish's own record*
+/// of an attempt that died before it could write a manifest — a note, so a
+/// layer missing from the registry is only a rebuild. The manifest is consulted
 /// first, because a repository that states it holds a layer needs no note to
 /// say so.
 pub struct Chained<'a> {
@@ -473,7 +473,7 @@ pub struct Chained<'a> {
     /// Held rather than threaded, because [`Predecessor::landed`] is asked by
     /// the export's producer pool and has nowhere to take one from.
     profile: &'a (dyn DriverProfile + Sync),
-    source: Option<&'a Stele>,
+    source: Option<&'a Snapshot>,
     predecessor: Option<(u64, Digest)>,
     history: Vec<HistoryEntry>,
     inheritable: BTreeMap<(String, String), LayerDescriptor>,
@@ -505,13 +505,13 @@ impl<'a> Chained<'a> {
     /// The publish `sequence` follows in `publishing`'s repository.
     ///
     /// Every input is a part rather than a plan: the sequence being published,
-    /// the `position` document the new stele will carry — read only by the
+    /// the `position` document the new snapshot will carry — read only by the
     /// profile, through [`DriverProfile::check_same_dataset`] — and the
     /// [`Origin`] the profile records under.
     pub fn new(
         profile: &'a (dyn DriverProfile + Sync),
         publishing: Publishing<'a>,
-        latest: Option<&'a Stele>,
+        latest: Option<&'a Snapshot>,
         sequence: u64,
         position: &serde_json::Value,
         origin: Origin,
@@ -523,7 +523,9 @@ impl<'a> Chained<'a> {
             follows,
         } = publishing;
 
-        let inscription = latest.map(|stele| stele.read_inscription()).transpose()?;
+        let inscription = latest
+            .map(|snapshot| snapshot.read_inscription())
+            .transpose()?;
 
         let predecessor = inscription
             .as_ref()
@@ -531,10 +533,10 @@ impl<'a> Chained<'a> {
             .transpose()?;
 
         // Ahead of every other check on this read, so a moved tag is told as
-        // that and not as whatever the other writer's stele fails.
+        // that and not as whatever the other writer's snapshot fails.
         if let Some(expected) = follows.filter(|expected| *expected != predecessor) {
-            let named = |stele: Option<(u64, Digest)>| {
-                stele.map(|(sequence, identity)| (sequence, identity.to_string()))
+            let named = |snapshot: Option<(u64, Digest)>| {
+                snapshot.map(|(sequence, identity)| (sequence, identity.to_string()))
             };
             return Err(stelae::Error::PredecessorMoved {
                 expected: named(expected),
@@ -601,7 +603,7 @@ impl<'a> Chained<'a> {
         })
     }
 
-    /// The stele this one chains to, if the repository holds one.
+    /// The snapshot this one chains to, if the repository holds one.
     pub fn predecessor(&self) -> Option<(u64, Digest)> {
         self.predecessor
     }
@@ -613,8 +615,9 @@ impl<'a> Chained<'a> {
 
     /// Delete the resumption record.
     ///
-    /// Called once the stele is sealed and never before it: before the seal it
-    /// would be a record that outlived neither the run nor its usefulness.
+    /// Called once the snapshot is sealed and never before it: before the seal
+    /// it would be a record that outlived neither the run nor its
+    /// usefulness.
     pub fn forget_record(&self) -> Result<(), Error> {
         match &self.record {
             Some(record) => PublishRecord::remove(&record.path),
@@ -726,7 +729,8 @@ impl Predecessor for Chained<'_> {
     }
 }
 
-/// The layers a new stele may inherit from `previous`, keyed by kind and scope.
+/// The layers a new snapshot may inherit from `previous`, keyed by kind and
+/// scope.
 ///
 /// [`DriverProfile::is_inheritable`] decides, and it decides on the scope as
 /// well as the kind. A state *tip* shard is out: it changes every publish, and
@@ -736,7 +740,7 @@ impl Predecessor for Chained<'_> {
 /// `digests` has no source in this slice.
 ///
 /// Two layers of one kind claiming one scope, described differently in any
-/// respect, is a refusal rather than a first-wins: it means the stele being
+/// respect, is a refusal rather than a first-wins: it means the snapshot being
 /// chained to describes the same window twice and disagrees with itself about
 /// what is in it, and inheriting either answer would publish that disagreement
 /// forward. "In any respect" and not "with different identities", because
@@ -762,9 +766,9 @@ pub fn inheritable_layers(
             // The whole descriptor, not the identity alone. `records` and
             // `uncompressed_size` are functions of the bytes `diff_id` names,
             // so two descriptors sharing an identity and disagreeing about
-            // either are a stele contradicting itself just as surely as two
+            // either are a snapshot contradicting itself just as surely as two
             // identities would be — and `adopt_layer` carries
-            // `uncompressed_size` forward into a stele that never reads the
+            // `uncompressed_size` forward into a snapshot that never reads the
             // bytes that would settle it.
             if existing != layer {
                 // Spelled out rather than named by identity alone: the two can
@@ -800,12 +804,13 @@ pub fn inheritable_layers(
 
 /// What a publish holds staged on disk at its peak.
 ///
-/// Not the size of the stele: a publish never has the whole document on disk at
-/// once. What it does have at once is a *tip* pass — the profile's export keeps
-/// one state kind's shard sinks open across a single walk of its namespace —
-/// plus whatever other layers are in flight beside it. Summing *every* state
-/// layer rather than the widest kind's is deliberately conservative: the peak
-/// it prices is the pre-split one, an upper bound on any per-kind pass.
+/// Not the size of the snapshot: a publish never has the whole document on disk
+/// at once. What it does have at once is a *tip* pass — the profile's export
+/// keeps one state kind's shard sinks open across a single walk of its
+/// namespace — plus whatever other layers are in flight beside it. Summing
+/// *every* state layer rather than the widest kind's is deliberately
+/// conservative: the peak it prices is the pre-split one, an upper bound on any
+/// per-kind pass.
 ///
 /// Which layers are the tip is [`DriverProfile::is_state_kind`]'s answer and
 /// not one this crate could reach: it is the one place the arithmetic has to
@@ -823,8 +828,8 @@ pub struct StagingPeak {
     /// Every state layer, summed — the conservative reading above.
     pub state_bytes: u64,
     /// The non-state layers that can be staged at once, largest first: as many
-    /// as the transport uploads concurrently, or all of them where the stele
-    /// has fewer than that. Empty on a stele that is all state, and on a
+    /// as the transport uploads concurrently, or all of them where the snapshot
+    /// has fewer than that. Empty on a snapshot that is all state, and on a
     /// [`StagingPeak::default`] nothing was measured into.
     pub concurrent_other_bytes: Vec<u64>,
     /// Layers the predecessor's manifest stated no size for. Non-zero makes
@@ -853,7 +858,7 @@ impl StagingPeak {
     }
 }
 
-/// Size the staging peak of the next publish from the stele before it.
+/// Size the staging peak of the next publish from the snapshot before it.
 ///
 /// A proxy, and deliberately so: the numbers are the *predecessor's* layers,
 /// not this publish's, because this publish's layers do not exist until it
@@ -895,7 +900,7 @@ pub fn staging_peak(
         }
     }
 
-    // The largest as many as the transport stages at once, and no more: a stele
+    // The largest as many as the transport stages at once, and no more: a snapshot
     // with fewer non-state layers than the transport has permits cannot put
     // more of them on disk than it has.
     others.sort_unstable_by(|a, b| b.cmp(a));
@@ -945,7 +950,7 @@ fn staging_need(peak: Option<StagingPeak>, scratch_dir: &Path) -> crate::preflig
         return crate::preflight::Need::unsized_because(
             STAGING,
             scratch_dir,
-            "this repository holds no stele to size the staging from",
+            "this repository holds no snapshot to size the staging from",
         );
     };
 

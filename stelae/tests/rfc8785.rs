@@ -1,6 +1,6 @@
 //! RFC 8785 (JSON Canonicalization Scheme) conformance.
 //!
-//! The inscription digest is the identity of a stele: independent publishers
+//! The inscription digest is the identity of a snapshot: independent publishers
 //! reproduce it, signatures cover it, and `history` chains it. All of that
 //! rests on canonicalization being *the same function* everywhere — so the JCS
 //! implementation is not an implementation detail to be assumed correct, it is

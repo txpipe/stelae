@@ -10,15 +10,16 @@ use crate::Error;
 
 /// The publish this one follows.
 ///
-/// Two questions, one concept: what a new inscription attests about the steles
-/// before it, and which of their layers it may carry forward rather than build
-/// again. Both are answers only the previous publish has, and holding them
-/// together is what lets a publisher rebuild everything while still chaining —
-/// the `--rebuild` case, which suppresses [`Predecessor::adopt`] and leaves
-/// [`Predecessor::history`] exactly as it was.
+/// Two questions, one concept: what a new inscription attests about the
+/// snapshots before it, and which of their layers it may carry forward rather
+/// than build again. Both are answers only the previous publish has, and
+/// holding them together is what lets a publisher rebuild everything while
+/// still chaining — the `--rebuild` case, which suppresses
+/// [`Predecessor::adopt`] and leaves [`Predecessor::history`] exactly as it
+/// was.
 ///
 /// The publish this one follows can be **this publish, interrupted**, which is
-/// what [`Predecessor::landed`] is for: a stele that never got sealed left
+/// what [`Predecessor::landed`] is for: a snapshot that never got sealed left
 /// layers behind that a restart may carry forward on exactly the terms a
 /// predecessor's do. Nothing here decides where that is written down — that is
 /// the implementor's, as `adopt` already is.
@@ -107,7 +108,7 @@ pub trait Predecessor: Sync {
     }
 }
 
-/// The first stele of a repository: no history, nothing to inherit.
+/// The first snapshot of a repository: no history, nothing to inherit.
 ///
 /// The protocol permits an empty history at any sequence, so this is not only
 /// the very first publish — it is every publish into a directory, which has no

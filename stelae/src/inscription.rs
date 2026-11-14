@@ -1,8 +1,8 @@
-//! The inscription: a stele's canonical, signable document.
+//! The inscription: a snapshot's canonical, signable document.
 //!
-//! The inscription is the OCI config blob of a stele and the anchor of the
+//! The inscription is the OCI config blob of a snapshot and the anchor of the
 //! whole protocol. Its sha256, taken over its RFC 8785 canonical JSON encoding,
-//! is the stele's identity: what independent publishers reproduce, what
+//! is the snapshot's identity: what independent publishers reproduce, what
 //! signatures cover, and what `history` chains together so the newest signed
 //! inscription transitively attests every earlier one.
 //!
@@ -32,7 +32,7 @@ use crate::{
     Digest, Error, MAX_SAFE_INTEGER, SCHEMA_VERSION,
 };
 
-/// The profile a stele belongs to.
+/// The profile a snapshot belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProfileRef {
@@ -60,7 +60,7 @@ pub struct HistoryEntry {
     pub inscription_digest: Digest,
 }
 
-/// One layer of a stele, as the inscription describes it.
+/// One layer of a snapshot, as the inscription describes it.
 ///
 /// Note what is absent: the compressed digest and the compressed size. Those
 /// are transport facts and live in the OCI manifest. The inscription carries
@@ -84,7 +84,7 @@ pub struct LayerDescriptor {
     pub scope: serde_json::Value,
 }
 
-/// The canonical, signable document of a stele.
+/// The canonical, signable document of a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Inscription {
@@ -95,7 +95,7 @@ pub struct Inscription {
     /// The protocol's monotonic ordering key. A profile decides what it counts
     /// (the Dolos profile sets it to the Cardano epoch).
     pub sequence: u64,
-    /// Profile-owned, opaque: where in its source domain this stele stands.
+    /// Profile-owned, opaque: where in its source domain this snapshot stands.
     pub position: serde_json::Value,
     /// Profile-owned, opaque: the parameters a reader needs to interpret the
     /// layers.
@@ -143,7 +143,7 @@ impl Inscription {
         canonical_json(&value)
     }
 
-    /// The stele's identity: sha256 of [`Inscription::canonicalize`].
+    /// The snapshot's identity: sha256 of [`Inscription::canonicalize`].
     pub fn digest(&self) -> Result<Digest, Error> {
         Ok(Digest::compute(self.canonicalize()?))
     }
@@ -164,7 +164,7 @@ impl Inscription {
     /// itself leaves undefined and `serde_json` resolves last-wins. That is not
     /// a hole in practice: canonicalizing the result yields different bytes
     /// from the input, so any check that compares an inscription against its
-    /// digest — which is every use of one — refuses it. `SteleDir` makes the
+    /// digest — which is every use of one — refuses it. `SnapshotDir` makes the
     /// comparison explicit.
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let value: serde_json::Value = serde_json::from_slice(bytes)?;
@@ -256,10 +256,11 @@ impl Inscription {
     ///
     /// The client half of an additive change. A profile that gains a kind
     /// publishes it as a new media type on a new layer, and an older reader
-    /// cannot store what it does not model — but refusing the whole stele over
-    /// it would make every additive change break every deployed reader. So the
-    /// protocol reports the layers rather than refusing them, and the profile
-    /// decides during planning what skipping each one costs.
+    /// cannot store what it does not model — but refusing the whole snapshot
+    /// over it would make every additive change break every deployed
+    /// reader. So the protocol reports the layers rather than refusing
+    /// them, and the profile decides during planning what skipping each one
+    /// costs.
     ///
     /// **Nothing here reads a scope.** Whether a layer is one a reader may skip
     /// is a profile question, answered from the profile-owned `scope` the
@@ -278,9 +279,10 @@ impl Inscription {
     /// What a publisher checks, and the asymmetry is the point: a reader
     /// consumes the layers it understands, while a publisher *attests* every
     /// layer it lists — its inscription is the document independent parties
-    /// reproduce and, later, sign. Chaining onto a stele carrying a kind this
-    /// binary cannot build means either dropping that layer from the new stele
-    /// or attesting bytes it never read, and both are worse than stopping.
+    /// reproduce and, later, sign. Chaining onto a snapshot carrying a kind
+    /// this binary cannot build means either dropping that layer from the
+    /// new snapshot or attesting bytes it never read, and both are worse
+    /// than stopping.
     pub fn check_profile_strict(&self, profile: &dyn Profile) -> Result<(), Error> {
         self.check_profile(profile)?;
 
@@ -350,12 +352,12 @@ impl Inscription {
     /// first published sequence is a deployment parameter pinned alongside the
     /// repository — so the invariant checked here is the part that is
     /// universal: no gaps, no duplicates, no reordering, and nothing
-    /// missing between the last entry and this stele.
+    /// missing between the last entry and this snapshot.
     fn validate_history(&self) -> Result<(), Error> {
         for (index, entry) in self.history.iter().enumerate() {
             if entry.sequence >= self.sequence {
                 return Err(Error::HistoryInvariant(format!(
-                    "entry {index} has sequence {} which is not below this stele's sequence {}",
+                    "entry {index} has sequence {} which is not below this snapshot's sequence {}",
                     entry.sequence, self.sequence
                 )));
             }
@@ -393,7 +395,7 @@ impl Inscription {
         if let Some(last) = self.history.last() {
             if last.sequence + 1 != self.sequence {
                 return Err(Error::HistoryInvariant(format!(
-                    "history ends at sequence {} but this stele is sequence {}",
+                    "history ends at sequence {} but this snapshot is sequence {}",
                     last.sequence, self.sequence
                 )));
             }
@@ -403,7 +405,7 @@ impl Inscription {
     }
 }
 
-/// The history a stele at `sequence` carries when it follows `previous`.
+/// The history a snapshot at `sequence` carries when it follows `previous`.
 ///
 /// The constructive half of the invariant [`Inscription::validate`] checks: one
 /// builds the chain, the other refuses a document whose chain is broken.
@@ -411,11 +413,11 @@ impl Inscription {
 /// The three legal readings of what came before, and the one refusal:
 ///
 /// - **nothing there** — an empty history, which the protocol permits at any
-///   sequence. The first stele of a repository carries no history, and so does
-///   a publisher deliberately starting a new one at sequence 500;
-/// - **the stele before this one** — the old history plus an entry naming it.
-///   Contiguous by construction, so the protocol's invariant passes rather than
-///   being relied upon;
+///   sequence. The first snapshot of a repository carries no history, and so
+///   does a publisher deliberately starting a new one at sequence 500;
+/// - **the snapshot before this one** — the old history plus an entry naming
+///   it. Contiguous by construction, so the protocol's invariant passes rather
+///   than being relied upon;
 /// - **anything else** — refused, naming both sequences and, for a gap, the
 ///   distance between them. A gap means a publisher skipped sequences, an equal
 ///   sequence means it is republishing one, and a higher one means the
@@ -450,13 +452,13 @@ pub fn history_for(
             return Ok(history);
         }
         _ if latest >= sequence => {
-            "this stele is at or behind the repository's latest; a republish would restart the \
+            "this snapshot is at or behind the repository's latest; a republish would restart the \
              chain rather than extend it"
                 .to_owned()
         }
         _ => format!(
             "this node is {} sequences ahead, and a publish must follow the repository's latest \
-             stele: this one would leave a gap no later stele could close",
+             snapshot: this one would leave a gap no later snapshot could close",
             sequence - latest,
         ),
     };
@@ -615,7 +617,7 @@ mod tests {
         }
     }
 
-    /// The first stele of a repository carries no history, at any sequence.
+    /// The first snapshot of a repository carries no history, at any sequence.
     #[test]
     fn an_empty_repository_starts_a_history() {
         assert!(history_for(None, 0).unwrap().is_empty());
@@ -631,7 +633,7 @@ mod tests {
         assert_eq!(
             history.iter().map(|e| e.sequence).collect::<Vec<_>>(),
             vec![1, 2, 3],
-            "the old history plus an entry naming the stele it came from"
+            "the old history plus an entry naming the snapshot it came from"
         );
 
         assert_eq!(history[2].inscription_digest, previous.digest().unwrap());
@@ -882,7 +884,7 @@ mod tests {
     fn history_accepts_a_contiguous_ascending_chain() {
         sample().validate().unwrap();
 
-        // The first stele of a repository carries no history.
+        // The first snapshot of a repository carries no history.
         let mut first = sample();
         first.sequence = 0;
         first.history.clear();

@@ -1,4 +1,4 @@
-//! A stele in a registry, and the delta transfer that is the reason for it.
+//! A snapshot in a registry, and the delta transfer that is the reason for it.
 //!
 //! Two kinds of test live here and they have opposite requirements, which is
 //! why they share a file rather than a run:
@@ -10,9 +10,9 @@
 //!   CI, under `--all-features`, like any other test.
 //! - everything marked `#[ignore]` needs a **registry**, and spawns one:
 //!   `docker run` of an OCI Distribution server, torn down on the way out. They
-//!   are the ones that prove a stele survives the round trip, that the second
-//!   push moves only what the registry lacks, and that neither direction holds
-//!   a layer.
+//!   are the ones that prove a snapshot survives the round trip, that the
+//!   second push moves only what the registry lacks, and that neither direction
+//!   holds a layer.
 //!
 //! Run the second kind with:
 //!
@@ -28,7 +28,7 @@
 //!
 //! Every registry this suite spawns is behind htpasswd, and every transport it
 //! opens carries the pair. That is not incidental hardening: the registry this
-//! transport is aimed at authenticates every request — access to a stele
+//! transport is aimed at authenticates every request — access to a snapshot
 //! repository is free and identity-less, and still credentialed — so a suite
 //! that only ever spoke to an anonymous server would prove the round trip
 //! against a server unlike the one it runs against.
@@ -76,9 +76,10 @@
 //! run leaves its namespace to the deployment's own garbage collection.
 //!
 //! `STELAE_TEST_REGISTRY_PULL_USER` / `_PULL_PASSWORD` optionally name a
-//! second pair, narrower by contract: expected to read a stele and be refused
-//! a write, which is what [`the_read_only_pair_pulls_and_cannot_push`] proves.
-//! The htpasswd fixture knows one pair, so that proof asks for a deployment.
+//! second pair, narrower by contract: expected to read a snapshot and be
+//! refused a write, which is what [`the_read_only_pair_pulls_and_cannot_push`]
+//! proves. The htpasswd fixture knows one pair, so that proof asks for a
+//! deployment.
 
 #![cfg(feature = "oci")]
 
@@ -97,7 +98,7 @@ use serde_json::json;
 use stats_alloc::{StatsAlloc, INSTRUMENTED_SYSTEM};
 
 use stelae::{
-    dir::SteleDir,
+    dir::SnapshotDir,
     frame::{encode, CanonicalCbor, Limits},
     inscription::LayerDescriptor,
     oci::{
@@ -107,7 +108,7 @@ use stelae::{
     },
     progress::{Event, Observer, Progress},
     Compression, Digest, Error, HistoryEntry, Inscription, LayerDigests, LayerReader, LayerSpec,
-    Profile, RecordSink, SteleReader, SteleWriter, WrittenLayer,
+    Profile, RecordSink, SnapshotReader, SnapshotWriter, WrittenLayer,
 };
 
 mod fault_registry;
@@ -440,7 +441,7 @@ fn a_manifest_that_disagrees_with_the_inscription_is_refused() {
 /// The envelope is checked before anything inside it is trusted, and a missing
 /// `artifactType` fails closed.
 #[test]
-fn a_manifest_that_is_not_a_steles_is_refused() {
+fn a_manifest_that_is_not_a_snapshots_own_is_refused() {
     let (inscription, layers) = fixture();
     let (manifest, _) = build_manifest(&inscription, &layers).unwrap();
 
@@ -483,13 +484,13 @@ fn a_manifest_that_is_not_a_steles_is_refused() {
 ///
 /// A descriptor and its three annotations run to roughly 350 bytes, so a
 /// manifest reaches the ceiling somewhere around twelve thousand layers —
-/// nearly seven times a mainnet stele's ~1,816 (Dolos ADR-004's ~600 epochs ×
-/// three per-epoch kinds, plus sixteen state shards). Nothing is expected to
+/// nearly seven times a mainnet snapshot's ~1,816 (Dolos ADR-004's ~600 epochs
+/// × three per-epoch kinds, plus sixteen state shards). Nothing is expected to
 /// meet it. The point is that when something does, the refusal names the
 /// document and the layer count instead of arriving as a registry's `413`.
 #[test]
 fn a_manifest_past_the_size_ceiling_is_refused() {
-    /// Layers of a mainnet stele, by Dolos ADR-004's own sizing.
+    /// Layers of a mainnet snapshot, by Dolos ADR-004's own sizing.
     const MAINNET: usize = 600 * 3 + 16;
     /// Comfortably past the ceiling: nothing here depends on where exactly it
     /// falls, only that it is far above anything a profile would publish.
@@ -533,7 +534,7 @@ fn a_manifest_past_the_size_ceiling_is_refused() {
         "{err:?}"
     );
 
-    // A mainnet-sized stele passes it with room to spare, which is the claim
+    // A mainnet-sized snapshot passes it with room to spare, which is the claim
     // Dolos ADR-004 sized the format against.
     let body = manifest_bytes(&build(MAINNET)).unwrap();
 
@@ -830,8 +831,8 @@ impl Fixture {
     /// request, which is the wrong thing to conclude about a registry.
     ///
     /// So the probe is the client under test asking a repository nothing has
-    /// ever been written to for its latest stele. `Ok(None)` is the answer only
-    /// a registry that read the request can give — and under TLS it is
+    /// ever been written to for its latest snapshot. `Ok(None)` is the answer
+    /// only a registry that read the request can give — and under TLS it is
     /// reachable only through a handshake that verified, which makes the same
     /// call the readiness probe and the first assertion.
     fn wait_until_ready(&self) {
@@ -1106,36 +1107,39 @@ impl Drop for Fixture {
     }
 }
 
-/// Write a small stele of the toy profile through any transport.
+/// Write a small snapshot of the toy profile through any transport.
 ///
 /// One layer handed over whole and one streamed into a sink, so both write
 /// paths are exercised against whatever this is pointed at. `chapter` decides
-/// what goes in the index layer, which is how the delta test makes two steles
-/// that share a blob and differ in one.
-fn write_stele<W: SteleWriter>(stele: &W, chapter: u64) -> Inscription {
-    write_stele_fallibly(stele, chapter).unwrap()
+/// what goes in the index layer, which is how the delta test makes two
+/// snapshots that share a blob and differ in one.
+fn write_snapshot<W: SnapshotWriter>(snapshot: &W, chapter: u64) -> Inscription {
+    write_snapshot_fallibly(snapshot, chapter).unwrap()
 }
 
 /// The same publish, with every refusal handed back rather than unwrapped.
 ///
 /// For the tests whose subject *is* a refusal. Split out rather than made the
-/// only spelling because the twenty callers that expect a stele would each
+/// only spelling because the twenty callers that expect a snapshot would each
 /// grow an `.unwrap()` that says nothing, and the one that does not would stop
 /// standing out.
-fn write_stele_fallibly<W: SteleWriter>(stele: &W, chapter: u64) -> Result<Inscription, Error> {
+fn write_snapshot_fallibly<W: SnapshotWriter>(
+    snapshot: &W,
+    chapter: u64,
+) -> Result<Inscription, Error> {
     let (notes_header, notes_scope) = notes_scope(3);
     let (index_header, index_scope) = index_scope(chapter);
 
     let notes: Vec<CanonicalCbor> = (1..=3).map(note_record).collect();
 
-    let written_notes = stele.write_layer(
+    let written_notes = snapshot.write_layer(
         &ToyProfile,
         &LayerSpec::new("notes", notes_header, notes_scope),
         COMPRESSION_LEVEL,
         &notes,
     )?;
 
-    let mut sink = stele.layer_sink(
+    let mut sink = snapshot.layer_sink(
         &ToyProfile,
         &LayerSpec::new("index", index_header, index_scope),
         COMPRESSION_LEVEL,
@@ -1160,20 +1164,20 @@ fn write_stele_fallibly<W: SteleWriter>(stele: &W, chapter: u64) -> Result<Inscr
 
     inscription.layers = vec![written_notes.descriptor, written_index.descriptor];
 
-    stele.seal(&ToyProfile, &inscription)?;
+    snapshot.seal(&ToyProfile, &inscription)?;
 
     Ok(inscription)
 }
 
 /// Every record of every layer, read back through the streaming reader.
-fn records_of<R: SteleReader>(stele: &R, inscription: &Inscription) -> Vec<Vec<Vec<u8>>> {
-    let index = stele.blob_index().unwrap();
+fn records_of<R: SnapshotReader>(snapshot: &R, inscription: &Inscription) -> Vec<Vec<Vec<u8>>> {
+    let index = snapshot.blob_index().unwrap();
 
     inscription
         .layers
         .iter()
         .map(|descriptor| {
-            let mut reader = stele
+            let mut reader = snapshot
                 .stream_layer(&index, &ToyProfile, descriptor, Limits::default())
                 .unwrap();
 
@@ -1193,37 +1197,37 @@ fn records_of<R: SteleReader>(stele: &R, inscription: &Inscription) -> Vec<Vec<V
         .collect()
 }
 
-/// Done criterion 1: a stele pushed to a registry and pulled back is the same
-/// stele.
+/// Done criterion 1: a snapshot pushed to a registry and pulled back is the
+/// same snapshot.
 ///
 /// "The same" is checked against a directory rather than against itself: the
-/// same records go into a `SteleDir` and into the registry, and the two are
+/// same records go into a `SnapshotDir` and into the registry, and the two are
 /// compared on the inscription digest, on the identity of every layer, on the
 /// compressed blob digest — the byte string the registry stores against the
 /// byte string the directory names its file by — and on the records that come
 /// back out.
 #[test]
 #[ignore = "spawns a registry"]
-fn a_stele_survives_the_round_trip() {
+fn a_snapshot_survives_the_round_trip() {
     let _serial = exclusive();
 
     let fixture = Fixture::spawn();
     let registry = fixture.registry("stelae/roundtrip");
 
     let temp = tempfile::tempdir().unwrap();
-    let directory = SteleDir::create(temp.path()).unwrap();
+    let directory = SnapshotDir::create(temp.path()).unwrap();
 
-    let published = write_stele(&registry, 3);
-    let on_disk = write_stele(&directory, 3);
+    let published = write_snapshot(&registry, 3);
+    let on_disk = write_snapshot(&directory, 3);
 
-    assert_eq!(published, on_disk, "one stele, two transports");
+    assert_eq!(published, on_disk, "one snapshot, two transports");
     println!(
         "identity: {} ({} layers)",
         published.digest().unwrap(),
         published.layers.len()
     );
 
-    // Both tags resolve, and to the same stele.
+    // Both tags resolve, and to the same snapshot.
     let latest = registry.pull_latest(&ToyProfile).unwrap();
     let by_sequence = registry
         .pull_sequence(&ToyProfile, published.sequence)
@@ -1266,7 +1270,7 @@ fn a_stele_survives_the_round_trip() {
         latest.total_compressed_size(),
     );
 
-    // The whole-stele figure is the per-layer one summed, which is what makes
+    // The whole-snapshot figure is the per-layer one summed, which is what makes
     // the per-layer answer usable for a restore's remaining-download estimate:
     // a subset of the layers weighs a subset of the bytes, on the same scale.
     let index = latest.blob_index().unwrap();
@@ -1278,13 +1282,13 @@ fn a_stele_survives_the_round_trip() {
             latest
                 .compressed_size(&index, layer)
                 .unwrap()
-                .expect("a pulled stele states every layer's compressed size")
+                .expect("a pulled snapshot states every layer's compressed size")
         })
         .sum();
 
     assert_eq!(summed, latest.total_compressed_size());
 
-    // A stele of another profile is refused before a layer is fetched.
+    // A snapshot of another profile is refused before a layer is fetched.
     struct Other;
     impl Profile for Other {
         fn name(&self) -> &str {
@@ -1318,7 +1322,7 @@ fn the_registry_holds_a_snapshot_envelope() {
     let fixture = Fixture::spawn();
     let registry = fixture.registry("stelae/envelope");
 
-    let published = write_stele(&registry, 3);
+    let published = write_snapshot(&registry, 3);
 
     let raw: serde_json::Value =
         serde_json::from_slice(&fixture.manifest_raw("stelae/envelope", "latest")).unwrap();
@@ -1342,7 +1346,7 @@ fn the_retired_envelope_is_refused_off_the_registry() {
     let fixture = Fixture::spawn();
     let registry = fixture.registry("stelae/retired");
 
-    let published = write_stele(&registry, 3);
+    let published = write_snapshot(&registry, 3);
     let valid = registry
         .pull_latest(&ToyProfile)
         .unwrap()
@@ -1381,10 +1385,11 @@ fn the_retired_envelope_is_refused_off_the_registry() {
 /// Done criterion 2: the second push moves only what the registry lacks, and
 /// the transport says so in a number.
 ///
-/// The two steles share their `notes` layer byte for byte — same records, same
-/// scope, so the same `diffId` and, at a pinned compression level, the same
-/// blob — and differ in their `index` layer. What the registry has to receive
-/// is therefore exactly one blob, and what it must be spared is exactly one.
+/// The two snapshots share their `notes` layer byte for byte — same records,
+/// same scope, so the same `diffId` and, at a pinned compression level, the
+/// same blob — and differ in their `index` layer. What the registry has to
+/// receive is therefore exactly one blob, and what it must be spared is exactly
+/// one.
 #[test]
 #[ignore = "spawns a registry"]
 fn a_second_push_uploads_only_what_is_missing() {
@@ -1393,7 +1398,7 @@ fn a_second_push_uploads_only_what_is_missing() {
     let fixture = Fixture::spawn();
     let registry = fixture.registry("stelae/delta");
 
-    let first = write_stele(&registry, 3);
+    let first = write_snapshot(&registry, 3);
     let first_transfer = registry.take_transfer();
 
     println!("first push:  {first_transfer:?}");
@@ -1403,7 +1408,7 @@ fn a_second_push_uploads_only_what_is_missing() {
     assert!(first_transfer.bytes_uploaded > 0);
     assert_eq!(first_transfer.bytes_skipped, 0);
 
-    let second = write_stele(&registry, 4);
+    let second = write_snapshot(&registry, 4);
     let second_transfer = registry.take_transfer();
 
     println!("second push: {second_transfer:?}");
@@ -1418,17 +1423,17 @@ fn a_second_push_uploads_only_what_is_missing() {
     );
     assert!(second_transfer.bytes_skipped > 0);
 
-    // The skip is not a lie: both steles pull back whole, and the layer that
+    // The skip is not a lie: both snapshots pull back whole, and the layer that
     // was skipped is the one the first push put there.
     let notes = &first.layers[0];
     assert_eq!(notes.diff_id, second.layers[0].diff_id);
 
     for sequence in [first.sequence, second.sequence] {
-        let stele = registry.pull_sequence(&ToyProfile, sequence).unwrap();
-        let inscription = stele.read_inscription().unwrap();
+        let snapshot = registry.pull_sequence(&ToyProfile, sequence).unwrap();
+        let inscription = snapshot.read_inscription().unwrap();
 
         assert_eq!(inscription.sequence, sequence);
-        records_of(&stele, &inscription);
+        records_of(&snapshot, &inscription);
     }
 
     // And `latest` followed the second one.
@@ -1666,11 +1671,11 @@ fn neither_direction_holds_a_layer() {
     let sampler = Peak::start();
     let started = std::time::Instant::now();
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let read = stele.read_inscription().unwrap();
-    let blobs = stele.blob_index().unwrap();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let read = snapshot.read_inscription().unwrap();
+    let blobs = snapshot.blob_index().unwrap();
 
-    let mut reader = stele
+    let mut reader = snapshot
         .stream_layer(&blobs, &ToyProfile, &read.layers[0], Limits::default())
         .unwrap();
 
@@ -1735,10 +1740,10 @@ impl Chunks {
 /// A layer that fits goes up in one request; one that does not still streams;
 /// and neither is a different layer for it.
 ///
-/// The second half is the one decision 0026 rests on. A stele carries its
+/// The second half is the one decision 0026 rests on. A snapshot carries its
 /// predecessor's layers forward by identity, so a layer republished through a
 /// different transport path has to *be* the same layer — same `diffId` over the
-/// same uncompressed bytes, same blob under the same digest — or every stele
+/// same uncompressed bytes, same blob under the same digest — or every snapshot
 /// after this change would carry nothing forward and every publish would be a
 /// full upload.
 ///
@@ -1859,15 +1864,15 @@ fn a_layer_under_the_threshold_goes_up_in_one_request() {
         "the deltas do not add up to what was published: {seen:?}",
     );
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let read = stele.read_inscription().unwrap();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let read = snapshot.read_inscription().unwrap();
 
     assert_eq!(read, inscription, "the inscription came back different");
 
-    let blobs = stele.blob_index().unwrap();
+    let blobs = snapshot.blob_index().unwrap();
 
     for (described, written) in read.layers.iter().zip([&small, &bulk]) {
-        let mut reader = stele
+        let mut reader = snapshot
             .stream_layer(&blobs, &ToyProfile, described, Limits::default())
             .unwrap();
 
@@ -2026,27 +2031,27 @@ fn a_layer_that_is_not_the_one_described_is_refused() {
     let fixture = Fixture::spawn();
     let registry = fixture.registry("stelae/tamper");
 
-    let inscription = write_stele(&registry, 3);
+    let inscription = write_snapshot(&registry, 3);
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let blobs = stele.blob_index().unwrap();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let blobs = snapshot.blob_index().unwrap();
 
     // The notes layer's blob, under the index layer's descriptor: a real blob,
     // correctly named, holding the wrong layer.
     let mut swapped = inscription.layers[1].clone();
     swapped.diff_id = inscription.layers[0].diff_id;
 
-    let err = stele
+    let err = snapshot
         .stream_layer(&blobs, &ToyProfile, &swapped, Limits::default())
         .unwrap_err();
 
     assert!(matches!(err, Error::LayerMismatch { .. }), "{err:?}");
 
-    // And a descriptor naming a layer the stele does not carry.
+    // And a descriptor naming a layer the snapshot does not carry.
     let mut absent = inscription.layers[0].clone();
     absent.diff_id = digest_of(0xee);
 
-    let err = stele
+    let err = snapshot
         .stream_layer(&blobs, &ToyProfile, &absent, Limits::default())
         .unwrap_err();
 
@@ -2056,10 +2061,10 @@ fn a_layer_that_is_not_the_one_described_is_refused() {
 /// The identity check at the end of a layer, reached.
 ///
 /// A `diffId` annotation lives in the manifest, outside the inscription, so
-/// nothing about a stele's *identity* covers it — which makes a manifest that
-/// points a descriptor at the wrong blob the tamper this format has to survive
-/// on its own. Point it at a blob of another kind and the header record settles
-/// it immediately, which is what
+/// nothing about a snapshot's *identity* covers it — which makes a manifest
+/// that points a descriptor at the wrong blob the tamper this format has to
+/// survive on its own. Point it at a blob of another kind and the header record
+/// settles it immediately, which is what
 /// [`a_layer_that_is_not_the_one_described_is_refused`] shows. Point it at a
 /// blob of its own kind and the header has nothing to say: only the hash of
 /// every byte, once the layer ends, can tell the two apart.
@@ -2109,16 +2114,16 @@ fn a_same_kind_blob_is_refused_when_the_layer_ends() {
     inscription.layers = vec![short.descriptor.clone(), long.descriptor.clone()];
     registry.seal(&ToyProfile, &inscription).unwrap();
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
 
     // The long layer's identity, pointed at the short layer's blob. The short
     // one is the target on purpose: reading it stays inside the size the long
     // descriptor claims, so the meter cannot refuse this before the digest
     // does, and it is the digest that is under test.
-    let mut tampered = stele.blob_index().unwrap();
+    let mut tampered = snapshot.blob_index().unwrap();
     tampered.insert(long.descriptor.diff_id, short.digests.blob_digest);
 
-    let mut reader = stele
+    let mut reader = snapshot
         .stream_layer(&tampered, &ToyProfile, &long.descriptor, Limits::default())
         .unwrap();
 
@@ -2162,10 +2167,10 @@ fn staging_stays_in_the_scratch_directory_and_leaves_nothing() {
     let scratch = tempfile::tempdir().unwrap();
     let registry = fixture.registry_staging_in("stelae/scratch", Some(scratch.path().to_owned()));
 
-    let inscription = write_stele(&registry, 3);
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
+    let inscription = write_snapshot(&registry, 3);
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
 
-    records_of(&stele, &inscription);
+    records_of(&snapshot, &inscription);
 
     let left: Vec<_> = std::fs::read_dir(scratch.path())
         .unwrap()
@@ -2245,19 +2250,19 @@ fn a_staging_directory_that_cannot_be_used_names_itself() {
 
     names_it(&err);
 
-    // Down: the same directory, against a stele that is really there. Published
+    // Down: the same directory, against a snapshot that is really there. Published
     // through a staging directory that works, so what fails below is the pull.
     let staged = tempfile::tempdir().unwrap();
-    let published = write_stele(
+    let published = write_snapshot(
         &fixture.registry_staging_in("stelae/occupied", Some(staged.path().to_owned())),
         3,
     );
 
     let reader = fixture.registry_staging_in("stelae/occupied", Some(occupied.clone()));
-    let stele = reader.pull_latest(&ToyProfile).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = reader.pull_latest(&ToyProfile).unwrap();
+    let index = snapshot.blob_index().unwrap();
 
-    let err = stele
+    let err = snapshot
         .stream_layer(&index, &ToyProfile, &published.layers[0], Limits::default())
         .expect_err("staged a pulled blob in a regular file");
 
@@ -2281,15 +2286,15 @@ fn latest_is_absent_until_something_is_published() {
 
     assert!(
         registry.latest(&ToyProfile).unwrap().is_none(),
-        "an empty repository holds no stele, and that is not an error"
+        "an empty repository holds no snapshot, and that is not an error"
     );
 
-    let published = write_stele(&registry, 3);
+    let published = write_snapshot(&registry, 3);
 
     let found = registry
         .latest(&ToyProfile)
         .unwrap()
-        .expect("the repository holds a stele now");
+        .expect("the repository holds a snapshot now");
 
     assert_eq!(found.read_inscription().unwrap(), published);
 
@@ -2352,13 +2357,13 @@ fn credentials_are_required() {
     }
 }
 
-/// The published read-only pair reads a stele whole and cannot write one.
+/// The published read-only pair reads a snapshot whole and cannot write one.
 ///
 /// The deployment this suite points at hands consumers a pull-only pair —
 /// free, identity-less, and still credentialed — and its access policy rests
 /// on the registry enforcing that narrowness: a pull-only pair that could
 /// push would make the published credential a write credential. So both
-/// halves run against the real enforcement: a stele published under the full
+/// halves run against the real enforcement: a snapshot published under the full
 /// pair pulls back whole under the narrow one, and the same narrow pair is
 /// refused an upload.
 ///
@@ -2379,23 +2384,23 @@ fn the_read_only_pair_pulls_and_cannot_push() {
         return;
     };
 
-    let published = write_stele(&fixture.registry("stelae/read-only"), 3);
+    let published = write_snapshot(&fixture.registry("stelae/read-only"), 3);
 
     let reading = fixture.registry_as("stelae/read-only", None, pull);
-    let stele = reading.pull_latest(&ToyProfile).unwrap();
-    let inscription = stele.read_inscription().unwrap();
+    let snapshot = reading.pull_latest(&ToyProfile).unwrap();
+    let inscription = snapshot.read_inscription().unwrap();
 
     assert_eq!(inscription, published);
-    records_of(&stele, &inscription);
+    records_of(&snapshot, &inscription);
 
     // Through the seal, because that is where an upload's refusal is now
     // reported: `finish` closes the layer and hands the round trips to the
     // pool, so the credential is not asked about them until they are joined.
-    // The claim is unchanged — this pair cannot put a stele in this
+    // The claim is unchanged — this pair cannot put a snapshot in this
     // repository — and the seal is the honest place to make it, since a
     // publish that seals is a publish that happened.
-    let refused = write_stele_fallibly(&reading, 4)
-        .expect_err("a pull-only pair was allowed to publish a stele");
+    let refused = write_snapshot_fallibly(&reading, 4)
+        .expect_err("a pull-only pair was allowed to publish a snapshot");
 
     println!("write through the pull-only pair: {refused}");
 }
@@ -2403,7 +2408,7 @@ fn the_read_only_pair_pulls_and_cannot_push() {
 /// Carrying a layer forward costs nothing and asks nothing.
 ///
 /// The default, and the reason the publish path stopped getting slower with
-/// every epoch behind it: `source` is a stele this transport pulled, its
+/// every epoch behind it: `source` is a snapshot this transport pulled, its
 /// manifest is live under a tag, and a registry may not reclaim a blob in that
 /// position. So the layer is carried on the manifest's word — no round trip,
 /// no bytes — and only the counters move.
@@ -2415,15 +2420,15 @@ fn a_layer_is_carried_forward_on_the_manifest_that_names_it() {
     let fixture = Fixture::spawn();
 
     let source = fixture.registry("stelae/source");
-    let published = write_stele(&source, 3);
-    let stele = source.latest(&ToyProfile).unwrap().unwrap();
+    let published = write_snapshot(&source, 3);
+    let snapshot = source.latest(&ToyProfile).unwrap().unwrap();
 
     // Reset first, so what is read back is this call's cost and not the two
-    // layers `write_stele` pushed through the same transport.
+    // layers `write_snapshot` pushed through the same transport.
     source.take_transfer();
 
     source
-        .adopt_layer(&stele, published.layers[0].clone())
+        .adopt_layer(&snapshot, published.layers[0].clone())
         .unwrap();
 
     let transfer = source.take_transfer();
@@ -2438,7 +2443,7 @@ fn a_layer_is_carried_forward_on_the_manifest_that_names_it() {
 ///
 /// This is the guarantee `verify_adopted` exists for, and the failure it
 /// prevents is invisible without it: a manifest pointing at a reclaimed blob is
-/// a perfectly well-formed stele that nobody can restore. What has moved is
+/// a perfectly well-formed snapshot that nobody can restore. What has moved is
 /// *when* the refusal is reported — the `HEAD` runs concurrently with the rest
 /// of the publish and is joined at the seal — and what has not moved is that
 /// the refusal comes before anything is tagged.
@@ -2459,8 +2464,8 @@ fn a_verified_carry_refuses_a_blob_the_repository_does_not_hold() {
     let fixture = Fixture::spawn();
 
     let source = fixture.registry("stelae/source");
-    let published = write_stele(&source, 3);
-    let stele = source.latest(&ToyProfile).unwrap().unwrap();
+    let published = write_snapshot(&source, 3);
+    let snapshot = source.latest(&ToyProfile).unwrap().unwrap();
 
     let somewhere_else = Fixture::spawn();
     let elsewhere = somewhere_else.verifying("stelae/source");
@@ -2469,7 +2474,7 @@ fn a_verified_carry_refuses_a_blob_the_repository_does_not_hold() {
     // caller holds is a fact about bytes rather than a promise about a
     // registry.
     elsewhere
-        .adopt_layer(&stele, published.layers[0].clone())
+        .adopt_layer(&snapshot, published.layers[0].clone())
         .unwrap();
 
     // The seal is where the promise is collected, and it is refused.
@@ -2481,7 +2486,7 @@ fn a_verified_carry_refuses_a_blob_the_repository_does_not_hold() {
     assert!(matches!(err, Error::BlobMissing { .. }), "{err:?}");
 
     // And nothing was published: the moving tag in a repository that never had
-    // a stele still resolves to nothing.
+    // a snapshot still resolves to nothing.
     assert!(
         elsewhere.latest(&ToyProfile).unwrap().is_none(),
         "a refused seal tagged a manifest anyway",
@@ -2504,11 +2509,11 @@ fn a_verified_carry_refuses_a_blob_the_repository_does_not_hold() {
 /// [`a_verified_carry_refuses_a_blob_the_repository_does_not_hold`] documents
 /// at more length, so on that registry the second publish skips what the first
 /// one uploaded. What is asserted instead is the property that holds on either
-/// kind and is the one worth having: every layer and every byte the stele
+/// kind and is the one worth having: every layer and every byte the snapshot
 /// describes is accounted for, whichever way the registry answered.
 #[test]
 #[ignore = "spawns a registry"]
-fn concurrency_changes_the_cost_of_a_publish_and_not_the_stele() {
+fn concurrency_changes_the_cost_of_a_publish_and_not_the_snapshot() {
     let _serial = exclusive();
 
     let fixture = Fixture::spawn();
@@ -2516,8 +2521,8 @@ fn concurrency_changes_the_cost_of_a_publish_and_not_the_stele() {
     let serial = fixture.registry_at("stelae/serial", 1);
     let concurrent = fixture.registry_at("stelae/concurrent", 8);
 
-    let one = write_stele(&serial, 5);
-    let other = write_stele(&concurrent, 5);
+    let one = write_snapshot(&serial, 5);
+    let other = write_snapshot(&concurrent, 5);
 
     assert_eq!(one, other, "the inscriptions differ");
     assert_eq!(
@@ -2566,23 +2571,23 @@ fn concurrency_changes_the_cost_of_a_publish_and_not_the_stele() {
     records_of(&from_concurrent, &inscription);
 }
 
-/// A publish abandoned while its layers are still in flight leaves the stele
+/// A publish abandoned while its layers are still in flight leaves the snapshot
 /// before it standing.
 ///
 /// The concurrent path's version of the ordering argument, and the reason the
 /// join is at the seal rather than anywhere later: layers go up in parallel,
 /// but nothing is tagged until all of them are up, so a publisher that dies in
 /// the middle — here, a transport dropped without a seal — leaves untagged
-/// blobs the registry reclaims and a moving tag still pointing at a stele that
-/// restores.
+/// blobs the registry reclaims and a moving tag still pointing at a snapshot
+/// that restores.
 #[test]
 #[ignore = "spawns a registry"]
-fn a_publish_dropped_mid_flight_leaves_the_previous_stele_standing() {
+fn a_publish_dropped_mid_flight_leaves_the_previous_snapshot_standing() {
     let _serial = exclusive();
 
     let fixture = Fixture::spawn();
 
-    let standing = write_stele(&fixture.registry("stelae/abandoned"), 3);
+    let standing = write_snapshot(&fixture.registry("stelae/abandoned"), 3);
 
     {
         let abandoning = fixture.registry_at("stelae/abandoned", 8);
@@ -2606,9 +2611,9 @@ fn a_publish_dropped_mid_flight_leaves_the_previous_stele_standing() {
     }
 
     let reopened = fixture.registry("stelae/abandoned");
-    let stele = reopened.pull_latest(&ToyProfile).unwrap();
+    let snapshot = reopened.pull_latest(&ToyProfile).unwrap();
 
-    assert_eq!(stele.read_inscription().unwrap(), standing);
+    assert_eq!(snapshot.read_inscription().unwrap(), standing);
 }
 
 /// A deferred upload's failure is the seal's failure, and it stays the seal's
@@ -2706,7 +2711,7 @@ fn a_deferred_upload_that_fails_fails_every_seal() {
     println!("the seal collected the deferred failure: {refused}");
 
     // And it is remembered: nothing is outstanding any more, so a transport
-    // that only asked what was in flight would seal this stele over a blob that
+    // that only asked what was in flight would seal this snapshot over a blob that
     // never landed.
     let again = registry
         .seal(&ToyProfile, &inscription)
@@ -2800,17 +2805,17 @@ fn direct_s3_blobs_are_readable_through_zot() {
     let registry = fixture.open("direct-s3", None, fixture.credentials(), |o| {
         o.direct_s3 = Some(Box::new(config))
     });
-    let inscription = write_stele(&registry, 3);
+    let inscription = write_snapshot(&registry, 3);
     let latest = registry.pull_latest(&ToyProfile).unwrap();
     assert_eq!(latest.read_inscription().unwrap(), inscription);
     let directory = tempfile::tempdir().unwrap();
-    let disk = SteleDir::create(directory.path()).unwrap();
-    let expected = write_stele(&disk, 3);
+    let disk = SnapshotDir::create(directory.path()).unwrap();
+    let expected = write_snapshot(&disk, 3);
     assert_eq!(
         records_of(&latest, &inscription),
         records_of(&disk, &expected)
     );
-    let again = write_stele(&registry, 3);
+    let again = write_snapshot(&registry, 3);
     assert_eq!(again, inscription);
 }
 
@@ -2839,8 +2844,8 @@ fn faulty_waiting(
     .unwrap()
 }
 
-/// A stele published to a fresh fault registry, and the transport that did it,
-/// watched for retries.
+/// A snapshot published to a fresh fault registry, and the transport that did
+/// it, watched for retries.
 fn published(repository: &str) -> (FaultRegistry, Registry, Inscription, Arc<Retries>) {
     published_waiting(repository, std::time::Duration::from_millis(1))
 }
@@ -2852,7 +2857,7 @@ fn published_waiting(
 ) -> (FaultRegistry, Registry, Inscription, Arc<Retries>) {
     let fault = FaultRegistry::spawn();
     let registry = faulty_waiting(&fault, repository, read_delay);
-    let inscription = write_stele(&registry, 3);
+    let inscription = write_snapshot(&registry, 3);
 
     let retries = Arc::new(Retries::default());
     registry.observe(Observer::new(retries.clone()));
@@ -2862,10 +2867,10 @@ fn published_waiting(
 
 /// The first layer's stream, or the error that ended its download.
 fn first_layer(registry: &Registry, inscription: &Inscription) -> Result<(), Error> {
-    let stele = registry.pull_latest(&ToyProfile)?;
-    let index = stele.blob_index()?;
+    let snapshot = registry.pull_latest(&ToyProfile)?;
+    let index = snapshot.blob_index()?;
 
-    stele
+    snapshot
         .stream_layer(
             &index,
             &ToyProfile,
@@ -2886,14 +2891,14 @@ fn a_layer_reset_mid_transfer_is_fetched_again() {
 
     fault.fail_next(&layer, &[Fault::Truncate]);
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let expected = records_of(&stele, &inscription);
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let expected = records_of(&snapshot, &inscription);
 
     assert_eq!(retries.seen(), vec![(1, DEFAULT_READ_ATTEMPTS - 1)]);
     assert_eq!(fault.gets(&layer), 2, "the retry was not a new request");
 
-    // And what came back is the stele, not the stele plus a broken prefix.
-    assert_eq!(records_of(&stele, &inscription), expected);
+    // And what came back is the snapshot, not the snapshot plus a broken prefix.
+    assert_eq!(records_of(&snapshot, &inscription), expected);
 }
 
 /// The first read wait the transport was opened with is the one a retry
@@ -3001,7 +3006,7 @@ fn a_blob_that_always_fails_exhausts_the_read_budget() {
         "every attempt but the last was announced",
     );
 
-    // A transfer that kept breaking is not a stele that was wrong.
+    // A transfer that kept breaking is not a snapshot that was wrong.
     assert!(!failed.is_blob_refusal());
 }
 
@@ -3044,7 +3049,7 @@ fn a_publish_round_trip_keeps_its_attempt_count() {
 
     fault.fail_heads(500);
 
-    write_stele_fallibly(&registry, 3).expect_err("published past a registry answering 500");
+    write_snapshot_fallibly(&registry, 3).expect_err("published past a registry answering 500");
 
     let heads = fault.heads();
     assert!(!heads.is_empty(), "the publish made no existence check");
@@ -3068,15 +3073,15 @@ fn a_publish_round_trip_keeps_its_attempt_count() {
 // Reading layers ahead of the caller
 // ---------------------------------------------------------------------------
 
-/// `count` notes layers, each its own blob, published as one stele: more
+/// `count` notes layers, each its own blob, published as one snapshot: more
 /// layers than a read-ahead's depth.
-fn write_layers<W: SteleWriter>(stele: &W, count: u64) -> Inscription {
+fn write_layers<W: SnapshotWriter>(snapshot: &W, count: u64) -> Inscription {
     let layers = (0..count)
         .map(|chapter| {
             let (header, scope) = notes_scope(chapter);
             let records: Vec<CanonicalCbor> = (0..=chapter).map(note_record).collect();
 
-            stele
+            snapshot
                 .write_layer(
                     &ToyProfile,
                     &LayerSpec::new("notes", header, scope),
@@ -3100,7 +3105,7 @@ fn write_layers<W: SteleWriter>(stele: &W, count: u64) -> Inscription {
     );
 
     inscription.layers = layers;
-    stele.seal(&ToyProfile, &inscription).unwrap();
+    snapshot.seal(&ToyProfile, &inscription).unwrap();
 
     inscription
 }
@@ -3160,7 +3165,7 @@ fn faulty_in(fault: &FaultRegistry, repository: &str, scratch_dir: Option<PathBu
     .unwrap()
 }
 
-/// A stele of `count` layers on a fresh fault registry, the transport that
+/// A snapshot of `count` layers on a fresh fault registry, the transport that
 /// published it watched from then on.
 fn published_layers(
     repository: &str,
@@ -3226,12 +3231,12 @@ fn a_read_ahead_hands_layers_back_in_order() {
         fault.delay(std::slice::from_ref(blob), delay);
     }
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let index = snapshot.blob_index().unwrap();
     let layers = inscription.layers.clone();
 
     let mut taken = 0;
-    for (reader, descriptor) in stele
+    for (reader, descriptor) in snapshot
         .stream_layers(&index, &ToyProfile, layers, Limits::default(), 8)
         .zip(&inscription.layers)
     {
@@ -3260,11 +3265,11 @@ fn a_read_ahead_is_bounded_by_its_depth() {
     let (fault, registry, inscription, _) = published_layers("stelae/ahead-bound", 8, None);
     fault.delay(&fault.layers(), Duration::from_millis(50));
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let index = snapshot.blob_index().unwrap();
     let layers = inscription.layers.clone();
 
-    let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), 3);
+    let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 3);
 
     // Holding the first layer, the two behind it land and are staged, and
     // nothing past them starts.
@@ -3333,14 +3338,19 @@ fn a_read_ahead_opens_a_layer_only_when_it_is_taken() {
 
     let (_fault, registry, inscription, moved) = published_layers("stelae/ahead-open", 4, None);
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let index = stele.blob_index().unwrap();
-    let total: u64 = stele.manifest().layers.iter().map(|l| l.size as u64).sum();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let index = snapshot.blob_index().unwrap();
+    let total: u64 = snapshot
+        .manifest()
+        .layers
+        .iter()
+        .map(|l| l.size as u64)
+        .sum();
     let layers = inscription.layers.clone();
     let opening = Opening::default();
     let caller = std::thread::current().id();
 
-    let mut stream = stele.stream_layers(&index, &opening, layers, Limits::default(), 4);
+    let mut stream = snapshot.stream_layers(&index, &opening, layers, Limits::default(), 4);
     let first = stream.next().unwrap().unwrap();
 
     eventually("every blob to land", || moved.bytes() == total);
@@ -3363,14 +3373,19 @@ fn a_read_ahead_opens_only_the_layer_each_take_hands_over() {
     let (_fault, registry, inscription, moved) =
         published_layers("stelae/ahead-open-each", 4, None);
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let index = stele.blob_index().unwrap();
-    let total: u64 = stele.manifest().layers.iter().map(|l| l.size as u64).sum();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let index = snapshot.blob_index().unwrap();
+    let total: u64 = snapshot
+        .manifest()
+        .layers
+        .iter()
+        .map(|l| l.size as u64)
+        .sum();
     let layers = inscription.layers.clone();
     let opening = Opening::default();
     let caller = std::thread::current().id();
 
-    let mut stream = stele.stream_layers(&index, &opening, layers, Limits::default(), 4);
+    let mut stream = snapshot.stream_layers(&index, &opening, layers, Limits::default(), 4);
 
     for (taken, descriptor) in inscription.layers.iter().enumerate() {
         let reader = stream.next().unwrap().unwrap();
@@ -3404,11 +3419,11 @@ fn a_read_ahead_reports_a_failed_layer_at_its_turn() {
     fault.delay(&blobs[..2], Duration::from_millis(200));
     fault.fail_always(&blobs[2], Fault::Truncate);
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let index = snapshot.blob_index().unwrap();
     let layers = inscription.layers.clone();
 
-    let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), 8);
+    let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 8);
 
     prove(stream.next().unwrap().unwrap(), &inscription.layers[0]);
     prove(stream.next().unwrap().unwrap(), &inscription.layers[1]);
@@ -3449,8 +3464,8 @@ fn a_read_ahead_refuses_an_unplaced_layer_at_its_turn() {
     let (fault, registry, inscription, _) = published_layers("stelae/ahead-absent", 4, None);
     let blobs = fault.layers();
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let index = snapshot.blob_index().unwrap();
 
     let mut absent = inscription.layers[0].clone();
     absent.diff_id = Digest::from_bytes([0xab; 32]);
@@ -3461,7 +3476,7 @@ fn a_read_ahead_refuses_an_unplaced_layer_at_its_turn() {
         inscription.layers[2].clone(),
     ];
 
-    let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), 8);
+    let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 8);
 
     prove(stream.next().unwrap().unwrap(), &inscription.layers[0]);
 
@@ -3498,11 +3513,11 @@ fn dropping_a_read_ahead_cancels_its_pulls() {
     let delay = Duration::from_millis(500);
     fault.delay(&fault.layers(), delay);
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let index = snapshot.blob_index().unwrap();
     let layers = inscription.layers.clone();
 
-    let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), 4);
+    let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 4);
 
     // Two taken: the third and fourth are staged, the fifth is still waiting
     // on the registry.
@@ -3548,11 +3563,11 @@ fn dropping_a_read_ahead_cancels_a_pull_waiting_to_retry() {
     let blob = fault.layers()[4].clone();
     fault.fail_next(&blob, &[Fault::Truncate]);
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let index = snapshot.blob_index().unwrap();
     let layers = inscription.layers.clone();
 
-    let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), 4);
+    let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 4);
 
     for descriptor in &inscription.layers[..2] {
         prove(stream.next().unwrap().unwrap(), descriptor);
@@ -3585,12 +3600,12 @@ fn a_retry_inside_a_read_ahead_is_announced_once() {
 
     fault.fail_next(&blob, &[Fault::Truncate]);
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let index = snapshot.blob_index().unwrap();
     let layers = inscription.layers.clone();
 
     let mut taken = 0;
-    for (reader, descriptor) in stele
+    for (reader, descriptor) in snapshot
         .stream_layers(&index, &ToyProfile, layers, Limits::default(), 8)
         .zip(&inscription.layers)
     {
@@ -3616,11 +3631,11 @@ fn a_read_ahead_of_one_is_a_stream_layer_loop() {
 
     let (fault, registry, inscription, _) = published_layers("stelae/ahead-serial", 4, None);
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let index = snapshot.blob_index().unwrap();
 
     for descriptor in &inscription.layers {
-        let reader = stele
+        let reader = snapshot
             .stream_layer(&index, &ToyProfile, descriptor, Limits::default())
             .unwrap();
         prove(reader, descriptor);
@@ -3633,7 +3648,8 @@ fn a_read_ahead_of_one_is_a_stream_layer_loop() {
         fault.forget();
 
         let layers = inscription.layers.clone();
-        let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), ahead);
+        let mut stream =
+            snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), ahead);
 
         let first = stream.next().unwrap().unwrap();
         std::thread::sleep(Duration::from_millis(100));
@@ -3656,11 +3672,11 @@ fn a_read_ahead_of_two_fetches_one_layer_ahead() {
 
     let (fault, registry, inscription, _) = published_layers("stelae/ahead-two", 4, None);
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let index = snapshot.blob_index().unwrap();
     let layers = inscription.layers.clone();
 
-    let mut stream = stele.stream_layers(&index, &ToyProfile, layers, Limits::default(), 2);
+    let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 2);
 
     let first = stream.next().unwrap().unwrap();
     eventually("the second pull to reach the registry", || {
@@ -3707,8 +3723,8 @@ fn read_ahead_wall_clock() {
     let (fault, registry, inscription, _) = published_layers("stelae/ahead-wall", 200, None);
     fault.delay(&fault.layers(), Duration::from_millis(300));
 
-    let stele = registry.pull_latest(&ToyProfile).unwrap();
-    let index = stele.blob_index().unwrap();
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let index = snapshot.blob_index().unwrap();
 
     let walls: Vec<Duration> = [1, 4, 8]
         .into_iter()
@@ -3716,7 +3732,7 @@ fn read_ahead_wall_clock() {
             let layers = inscription.layers.clone();
             let started = Instant::now();
 
-            for (reader, descriptor) in stele
+            for (reader, descriptor) in snapshot
                 .stream_layers(&index, &ToyProfile, layers, Limits::default(), ahead)
                 .zip(&inscription.layers)
             {

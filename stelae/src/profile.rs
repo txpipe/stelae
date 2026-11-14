@@ -1,9 +1,10 @@
 //! The profile extension point and the naming rules that keep profiles apart.
 //!
-//! A [`Profile`] is a vendor's definition of what a stele of theirs contains:
-//! which layer kinds exist, what a record looks like, what goes in `position`,
-//! `parameters` and `scope`, and how a sequence renders as a tag. Dolos ships
-//! the first one (`io.txpipe.dolos.cardano`); nothing in this crate knows that.
+//! A [`Profile`] is a vendor's definition of what a snapshot of theirs
+//! contains: which layer kinds exist, what a record looks like, what goes in
+//! `position`, `parameters` and `scope`, and how a sequence renders as a tag.
+//! Dolos ships the first one (`io.txpipe.dolos.cardano`); nothing in this crate
+//! knows that.
 //!
 //! ## Where the boundary runs
 //!
@@ -56,11 +57,11 @@ pub trait Profile {
     /// the shape but never composes the string.
     fn layer_media_type(&self, kind: &str) -> Result<String, Error>;
 
-    /// The immutable tag under which a stele at `sequence` is published.
+    /// The immutable tag under which a snapshot at `sequence` is published.
     fn tag_for_sequence(&self, sequence: u64) -> Result<String, Error>;
 
-    /// The moving tag pointing at the most recent stele. Profiles may override
-    /// the spelling; the protocol only requires that one exists.
+    /// The moving tag pointing at the most recent snapshot. Profiles may
+    /// override the spelling; the protocol only requires that one exists.
     fn moving_tag(&self) -> &str {
         MOVING_TAG
     }
@@ -70,9 +71,10 @@ pub trait Profile {
     /// One number, asked of one party, and it bounds **both** ends: what a
     /// publisher is allowed to write and what a reader will accept. That is the
     /// point of putting it here rather than letting each end carry a constant.
-    /// A writer with the looser of two ceilings publishes a stele that restores
-    /// nowhere, and it publishes it *successfully* — the failure surfaces on
-    /// whoever tries to read it back, which is the party least able to fix it.
+    /// A writer with the looser of two ceilings publishes a snapshot that
+    /// restores nowhere, and it publishes it *successfully* — the failure
+    /// surfaces on whoever tries to read it back, which is the party least
+    /// able to fix it.
     ///
     /// The default is [`DEFAULT_MAX_RECORD`]. A profile whose records genuinely
     /// exceed it raises this deliberately and says why, which is the

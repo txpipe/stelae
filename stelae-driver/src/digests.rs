@@ -1,4 +1,4 @@
-//! The `digests` layer: sha256 of every Cardano immutable-DB file the stele
+//! The `digests` layer: sha256 of every Cardano immutable-DB file the snapshot
 //! covers.
 //!
 //! `[immutable_number, chunk: bytes(32), primary: bytes(32), secondary:
@@ -8,18 +8,18 @@
 //!
 //! Nothing here is written to a store. The layer exists so that block data
 //! obtained from *somewhere else* — a Mithril aggregator, a mirror, a relay
-//! replay — can be checked against the stele's signed inscription before it is
-//! imported. It is also the enabler for a future Mithril-sourced restore mode,
-//! which is why the digests are exactly Mithril Cardano DB v2's merkle leaves:
-//! sha256 over the raw `.chunk`/`.primary`/`.secondary` file bytes, so a
-//! certificate whose beacon covers `lastImmutable` verifies them by merkle
+//! replay — can be checked against the snapshot's signed inscription before it
+//! is imported. It is also the enabler for a future Mithril-sourced restore
+//! mode, which is why the digests are exactly Mithril Cardano DB v2's merkle
+//! leaves: sha256 over the raw `.chunk`/`.primary`/`.secondary` file bytes, so
+//! a certificate whose beacon covers `lastImmutable` verifies them by merkle
 //! proof.
 //!
-//! The certificate itself is deliberately *not* part of a stele. Certificates
-//! are produced on the aggregator's cadence, so two publishers at the same
-//! boundary would reference different ones and stop reproducing each other's
-//! inscription; the digest values, by contrast, are byte-stable properties of
-//! the chain.
+//! The certificate itself is deliberately *not* part of a snapshot.
+//! Certificates are produced on the aggregator's cadence, so two publishers at
+//! the same boundary would reference different ones and stop reproducing each
+//! other's inscription; the digest values, by contrast, are byte-stable
+//! properties of the chain.
 //!
 //! The layer is optional — a network without a Mithril aggregator simply has no
 //! `digests` layer, and the inscription says so.
@@ -43,7 +43,7 @@ pub const DIGESTS: &str = "digests";
 ///
 /// Uses [`stelae::Digest`] rather than a fourth thirty-two-byte newtype: these
 /// are sha256 over bytes, which is what that type is, and it already prints and
-/// parses in the `sha256:…` form the rest of a stele uses.
+/// parses in the `sha256:…` form the rest of a snapshot uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImmutableDigests {
     pub immutable_number: u64,

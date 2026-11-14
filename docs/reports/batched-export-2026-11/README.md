@@ -204,7 +204,7 @@ an epoch on these runs, about 2.2 GiB over 24 epochs, and 112 from 256 to 276, w
 chain files. The 0.86 GiB is about 0.68 above growth less the slice, so about 0.7 GiB is
 transient.
 
-A publication's own check of its staging sums every state layer of the latest stele, retained
+A publication's own check of its staging sums every state layer of the latest snapshot, retained
 dumps included, and its largest other layers, as many as `--concurrency`. Read off the
 manifests, `epoch-286` takes 0.65 GiB at these runs' `--concurrency 4` and 0.79 at the default
 of 8, and `epoch-300`, with one dump, takes 1.04 and 1.17. This base carries no dump before

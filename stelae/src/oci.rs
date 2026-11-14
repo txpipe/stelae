@@ -1,4 +1,4 @@
-//! A stele in an OCI registry.
+//! A snapshot in an OCI registry.
 //!
 //! This is the transport the format was designed for. Registries are
 //! content-addressed, so a push asks whether each blob is already there and
@@ -8,12 +8,12 @@
 //!
 //! It is the second implementation of [`crate::transport`] and adds no
 //! vocabulary of its own: a registry is another place a
-//! [`crate::dir::SteleDir`] could have been, and a profile driving one writes
-//! the same code.
+//! [`crate::dir::SnapshotDir`] could have been, and a profile driving one
+//! writes the same code.
 //!
-//! ## Two documents, one stele
+//! ## Two documents, one snapshot
 //!
-//! A stele in a registry is an OCI image manifest whose config blob is the
+//! A snapshot in a registry is an OCI image manifest whose config blob is the
 //! inscription:
 //!
 //! ```text
@@ -33,8 +33,8 @@
 //! [`crate::dir::BLOB_INDEX_FILE`] — or, lacking one, reconstruct by brute
 //! force what a manifest states.
 //!
-//! Because they are two views of one stele, **a disagreement between them is a
-//! refusal**, in either direction: a layer the inscription describes and the
+//! Because they are two views of one snapshot, **a disagreement between them is
+//! a refusal**, in either direction: a layer the inscription describes and the
 //! manifest does not carry cannot be fetched, and a layer the manifest carries
 //! and the inscription does not describe is a blob nothing attests. Positional
 //! correspondence is checked as well as the `diffId` annotations, so the
@@ -48,15 +48,16 @@
 //! it. A pulled layer is streamed to a temporary file and read back
 //! synchronously.
 //!
-//! Neither direction ever holds a whole stele. The staging files are unlinked
-//! at creation, so an abandoned push or a failed pull leaves nothing behind and
-//! needs no cleanup path of its own.
+//! Neither direction ever holds a whole snapshot. The staging files are
+//! unlinked at creation, so an abandoned push or a failed pull leaves nothing
+//! behind and needs no cleanup path of its own.
 //!
 //! On the way down the bound is the read-ahead depth.
-//! [`SteleReader::stream_layer`] pulls one blob. [`SteleReader::stream_layers`]
-//! on a [`Stele`] keeps at most `ahead` blobs downloading or staged that the
-//! caller has not taken yet, beside the readers the caller holds, and dropping
-//! the stream cancels those pulls and drops their files.
+//! [`SnapshotReader::stream_layer`] pulls one blob.
+//! [`SnapshotReader::stream_layers`] on a [`Snapshot`] keeps at most `ahead`
+//! blobs downloading or staged that the caller has not taken yet, beside the
+//! readers the caller holds, and dropping the stream cancels those pulls and
+//! drops their files.
 //!
 //! What the *upload* holds is decided by [`Options::monolithic_max`]. Above it,
 //! a layer is streamed and one [`UPLOAD_CHUNK`] is resident at a time. At or
@@ -92,8 +93,8 @@
 //! in-flight list, the permits — is behind its own lock, and `block_on` from
 //! many non-runtime threads is exactly what a runtime is for.
 //!
-//! Reads have tasks of their own. A [`Stele`] streaming layers through
-//! [`SteleReader::stream_layers`] spawns each pull (download, blob digest
+//! Reads have tasks of their own. A [`Snapshot`] streaming layers through
+//! [`SnapshotReader::stream_layers`] spawns each pull (download, blob digest
 //! check, staging, read retry) onto the same runtime, at most `ahead` of them,
 //! and the caller's thread only waits for the next one in order and opens its
 //! reader. A read retry there waits without holding its worker, as an upload's
@@ -102,14 +103,14 @@
 //!
 //! ## Why the publish path is concurrent, and where it joins again
 //!
-//! A publish is not one transfer; it is a few hundred small ones. A stele's
+//! A publish is not one transfer; it is a few hundred small ones. A snapshot's
 //! layers are cut at record-type and epoch granularity, so a mainnet publish
 //! moves tens of new blobs of half a megabyte each and carries hundreds of
 //! older ones forward — and every one of those, new or carried, costs at least
 //! one round trip to a registry that may be an ocean away. Run in sequence, the
 //! path spends nearly all of its wall clock waiting on a socket with the CPU
 //! and the link both idle, and the carried-forward half makes it *worse every
-//! epoch*: the stele gains layers, so the publish gains round trips, so the
+//! epoch*: the snapshot gains layers, so the publish gains round trips, so the
 //! cycle time grows linearly with the history behind it.
 //!
 //! Nothing about that is a bandwidth problem, so the answer is not bigger
@@ -126,12 +127,13 @@
 //!
 //! > **A manifest must never name a blob the registry has not committed.**
 //!
-//! So [`SteleWriter::seal`] is the join. Every deferred round trip is awaited
-//! there — before the manifest is built, before the config blob goes up, before
-//! either tag is written — and the first failure among them fails the seal, in
-//! the state a failed seal has always left behind: layers unspent, nothing
-//! tagged, and the caller free to seal again. A publish that dies mid-flight
-//! leaves untagged blobs the registry reclaims, exactly as a serial one did.
+//! So [`SnapshotWriter::seal`] is the join. Every deferred round trip is
+//! awaited there — before the manifest is built, before the config blob goes
+//! up, before either tag is written — and the first failure among them fails
+//! the seal, in the state a failed seal has always left behind: layers unspent,
+//! nothing tagged, and the caller free to seal again. A publish that dies
+//! mid-flight leaves untagged blobs the registry reclaims, exactly as a serial
+//! one did.
 //!
 //! The bound is a permit taken *before* the staged layer is handed over rather
 //! than inside the task, so it is also what keeps the scratch directory from
@@ -177,7 +179,7 @@
 //! upload that half-happened and an upload that fully happened both converge on
 //! the same blob when it is sent again; a `HEAD` and a manifest `GET` are
 //! reads; and the manifest `PUT` writes bytes that are a pure function of the
-//! stele. The one thing a retry needs and the serial path did not is the
+//! snapshot. The one thing a retry needs and the serial path did not is the
 //! staging file back at its first byte, which is why it is rewound per attempt
 //! rather than consumed once.
 //!
@@ -287,7 +289,7 @@ use crate::{
     profile::{checked_tag_for_sequence, validate_tag, Profile},
     progress::{Event, Observer},
     transport::{
-        open_layer, BlobIndex, LayerSpec, LayerStream, RecordSink, SteleReader, SteleWriter,
+        open_layer, BlobIndex, LayerSpec, LayerStream, RecordSink, SnapshotReader, SnapshotWriter,
         WrittenLayer,
     },
     Digest, Error, ARTIFACT_TYPE, INSCRIPTION_MEDIA_TYPE, MANIFEST_SIZE_LIMIT,
@@ -357,9 +359,9 @@ impl Auth {
 /// The three annotation keys below are the specification's: SPEC.md's "OCI
 /// layout" section names them, reverse-DNS under
 /// `stelae.store`, a domain TxPipe owns. They are transport metadata and sit
-/// outside the inscription, so they are outside a stele's identity — but only
-/// two of them are informational. [`DIFF_ID_ANNOTATION`] is normative, because
-/// it is load-bearing on the way back: it *is* the identity→blob map a
+/// outside the inscription, so they are outside a snapshot's identity — but
+/// only two of them are informational. [`DIFF_ID_ANNOTATION`] is normative,
+/// because it is load-bearing on the way back: it *is* the identity→blob map a
 /// directory has to rebuild by decompressing everything. The golden freezes
 /// all three.
 pub const KIND_ANNOTATION: &str = "store.stelae.layer.kind";
@@ -440,7 +442,7 @@ pub const DEFAULT_UPLOAD_MEMORY: u64 = 1024 * 1024 * 1024;
 /// publisher that believes it is transferring a delta can check.
 ///
 /// Counts layer blobs only. The config blob — the inscription — is small, is
-/// different for every stele by construction, and would only blur the number
+/// different for every snapshot by construction, and would only blur the number
 /// that matters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Transfer {
@@ -449,7 +451,7 @@ pub struct Transfer {
     /// Layer blobs the registry already had, and that were not.
     pub layers_skipped: u64,
     /// Layer blobs that were never built, because [`Registry::adopt_layer`]
-    /// took them from a stele already in this repository — or because
+    /// took them from a snapshot already in this repository — or because
     /// [`Registry::adopt_carried`] took them from an earlier attempt of this
     /// same publish.
     ///
@@ -472,7 +474,7 @@ pub struct Transfer {
 ///
 /// Eight, and the number is a floor on the registry's side of the trade rather
 /// than a ceiling on this one's: the round trips are latency, not bandwidth, so
-/// the transport would happily run more, and what stops it is that a stele's
+/// the transport would happily run more, and what stops it is that a snapshot's
 /// blobs go to *one* repository behind one origin. A publisher that opens
 /// thirty-two upload sessions at once against a registry sized for a container
 /// image is a publisher that finds the registry's limits rather than its own.
@@ -565,7 +567,7 @@ pub struct Options {
     /// Off, and that is the plain reading of the distribution specification
     /// rather than an optimism: a blob referenced by a manifest under a live
     /// tag is not garbage, and a registry that reclaims one has broken the
-    /// contract that makes *the stele the manifest came from* restorable —
+    /// contract that makes *the snapshot the manifest came from* restorable —
     /// which the `HEAD` would not have saved either. Paying a round trip per
     /// carried layer to re-establish that is what made the publish path's cost
     /// grow with the history behind it, for a check whose failure means the
@@ -666,9 +668,9 @@ impl Default for Options {
 /// Three things are refused, and the third is the one a hand-written splitter
 /// gets wrong:
 ///
-/// - **A tag or a digest.** `oci://…/dolos:v1` names a stele, and which stele
-///   is not part of naming the repository — a profile renders the tags, and a
-///   caller that wants a particular one says so separately.
+/// - **A tag or a digest.** `oci://…/dolos:v1` names a snapshot, and which
+///   snapshot is not part of naming the repository — a profile renders the
+///   tags, and a caller that wants a particular one says so separately.
 /// - **An empty host or path**, so the two halves a client needs both exist.
 /// - **A host the distribution grammar would have inferred rather than read.**
 ///   [`Reference`]'s own parser applies registry defaults: a first component
@@ -724,7 +726,7 @@ impl std::str::FromStr for Repository {
         // A host may carry a port, so only the path is asked about a reference.
         if repository.contains(':') || repository.contains('@') {
             return Err(bad(
-                "it names a tag or a digest, and which stele to read is not part of naming \
+                "it names a tag or a digest, and which snapshot to read is not part of naming \
                  the repository",
             ));
         }
@@ -767,12 +769,12 @@ impl std::fmt::Display for Repository {
 /// for exactly this.
 pub const SCHEME: &str = "oci://";
 
-/// A stele repository in an OCI registry.
+/// A snapshot repository in an OCI registry.
 ///
-/// Implements [`SteleWriter`], so a profile publishes into it exactly as it
+/// Implements [`SnapshotWriter`], so a profile publishes into it exactly as it
 /// would into a directory. Reading is [`Registry::pull`], which resolves a tag
-/// into a [`Stele`] — the read handle, and the thing that implements
-/// [`SteleReader`].
+/// into a [`Snapshot`] — the read handle, and the thing that implements
+/// [`SnapshotReader`].
 ///
 /// See the module documentation before calling any of this from async code.
 pub struct Registry {
@@ -808,15 +810,15 @@ struct Shared {
     /// `resident`, below.
     permits: Arc<tokio::sync::Semaphore>,
     /// The deferred layer round trips, waiting to be joined by
-    /// [`SteleWriter::seal`].
+    /// [`SnapshotWriter::seal`].
     ///
     /// Not in [`PushState`], for the reason `state` is not in `Shared`: the
     /// tasks reach the state and must never reach the handles that own them.
     inflight: Mutex<Vec<tokio::task::JoinHandle<Result<(), Error>>>>,
     /// Who is watching this connection, in either direction.
     ///
-    /// Beside the push state rather than inside it, because a [`Stele`] shares
-    /// this value and only ever reads: attaching an observer to the
+    /// Beside the push state rather than inside it, because a [`Snapshot`]
+    /// shares this value and only ever reads: attaching an observer to the
     /// [`Registry`] is what makes the pull it resolves report too, which is the
     /// property a restore depends on — the reader is created inside the driver
     /// and there is no other moment to wire it.
@@ -860,7 +862,8 @@ struct Shared {
 
 #[derive(Default)]
 struct PushState {
-    /// Layers finished since the last [`SteleWriter::seal`], in finish order.
+    /// Layers finished since the last [`SnapshotWriter::seal`], in finish
+    /// order.
     pending: Vec<WrittenLayer>,
     transfer: Transfer,
     /// The first deferred round trip that failed, rendered.
@@ -1054,17 +1057,17 @@ impl Registry {
     /// **What has *finished*.** Layer round trips are deferred and joined at
     /// the seal, so a publish still in flight is a publish still counting, and
     /// the moment these numbers are the whole story is after
-    /// [`SteleWriter::seal`] returns. Asked earlier they are a progress
-    /// reading; asked there they are the cost of the stele. A caller that wants
-    /// the second one does not have to do anything to get it — a publish ends
-    /// at a seal — and this does not block to manufacture it, because a
-    /// counter that waited for the network would be a strange thing for a
-    /// progress renderer to call.
+    /// [`SnapshotWriter::seal`] returns. Asked earlier they are a progress
+    /// reading; asked there they are the cost of the snapshot. A caller that
+    /// wants the second one does not have to do anything to get it — a
+    /// publish ends at a seal — and this does not block to manufacture it,
+    /// because a counter that waited for the network would be a strange
+    /// thing for a progress renderer to call.
     pub fn transfer(&self) -> Transfer {
         self.shared.locked().transfer
     }
 
-    /// The same numbers, and reset — so a publisher pushing several steles
+    /// The same numbers, and reset — so a publisher pushing several snapshots
     /// through one transport reads each one's cost rather than a running total.
     ///
     /// Read it after the seal, for the reason [`Registry::transfer`] gives, and
@@ -1076,7 +1079,7 @@ impl Registry {
         std::mem::take(&mut self.shared.locked().transfer)
     }
 
-    /// Resolve `tag` into a readable stele.
+    /// Resolve `tag` into a readable snapshot.
     ///
     /// The order is the specification, and every step is what makes the next
     /// one safe:
@@ -1089,12 +1092,12 @@ impl Registry {
     ///    held against each other, and it is what stops a manifest from
     ///    pointing at a document nobody signed;
     /// 4. [`Inscription::check_profile`] — **before any layer is fetched**, so
-    ///    a stele of another profile costs one small GET and not a partial
+    ///    a snapshot of another profile costs one small GET and not a partial
     ///    restore. The read-side check, deliberately: a pull serves a reader,
     ///    and a caller that is about to *publish* on top of what it pulled owes
     ///    the stricter [`Inscription::check_profile_strict`] of its own;
     /// 5. manifest ↔ inscription cross-check, which yields the [`BlobIndex`].
-    pub fn pull(&self, profile: &dyn Profile, tag: &str) -> Result<Stele, Error> {
+    pub fn pull(&self, profile: &dyn Profile, tag: &str) -> Result<Snapshot, Error> {
         validate_tag(tag)?;
 
         let reference = self.shared.tagged(tag);
@@ -1133,7 +1136,7 @@ impl Registry {
 
         let blobs = read_manifest(&manifest, &inscription)?;
 
-        Ok(Stele {
+        Ok(Snapshot {
             shared: Arc::clone(&self.shared),
             reference,
             manifest,
@@ -1143,22 +1146,23 @@ impl Registry {
     }
 
     /// Resolve the immutable tag `profile` renders for `sequence`.
-    pub fn pull_sequence(&self, profile: &dyn Profile, sequence: u64) -> Result<Stele, Error> {
+    pub fn pull_sequence(&self, profile: &dyn Profile, sequence: u64) -> Result<Snapshot, Error> {
         let tag = checked_tag_for_sequence(profile, sequence)?;
         self.pull(profile, &tag)
     }
 
-    /// Resolve the profile's moving tag — the most recent stele.
-    pub fn pull_latest(&self, profile: &dyn Profile) -> Result<Stele, Error> {
+    /// Resolve the profile's moving tag — the most recent snapshot.
+    pub fn pull_latest(&self, profile: &dyn Profile) -> Result<Snapshot, Error> {
         let tag = profile.moving_tag().to_owned();
         self.pull(profile, &tag)
     }
 
-    /// The most recent stele, or `None` if this repository has never held one.
+    /// The most recent snapshot, or `None` if this repository has never held
+    /// one.
     ///
     /// The whole value of this over [`Registry::pull_latest`] is the
     /// distinction it draws, and the distinction is load-bearing rather than
-    /// convenient. A publisher chains each stele to the one before it, so
+    /// convenient. A publisher chains each snapshot to the one before it, so
     /// "there is nothing to chain to" starts a history and *anything else*
     /// must not: a timeout, a 500 or an expired token read as absence would
     /// silently restart the chain, which is the exact outcome an inscription's
@@ -1169,53 +1173,55 @@ impl Registry {
     /// ways depending on which layer of the client noticed it. Matching them
     /// here rather than at a caller is the point: this is the only module in
     /// the crate that has any business naming an `oci_client` error type.
-    pub fn latest(&self, profile: &dyn Profile) -> Result<Option<Stele>, Error> {
+    pub fn latest(&self, profile: &dyn Profile) -> Result<Option<Snapshot>, Error> {
         match self.pull_latest(profile) {
-            Ok(stele) => Ok(Some(stele)),
+            Ok(snapshot) => Ok(Some(snapshot)),
             Err(Error::Registry(e)) if is_absent(&e) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    /// Carry a layer this repository already holds into the stele being
+    /// Carry a layer this repository already holds into the snapshot being
     /// written, without building it.
     ///
     /// This is the operation a content-addressed registry makes possible and a
     /// directory does not: the caller has established — by whatever rule its
     /// profile owns — that a layer it *would* write is the layer a previous
-    /// stele already published, so the bytes need neither be produced nor sent,
-    /// and the new manifest simply points at the blob the old one pointed at.
+    /// snapshot already published, so the bytes need neither be produced nor
+    /// sent, and the new manifest simply points at the blob the old one
+    /// pointed at.
     ///
-    /// **The new stele attests a layer it did not reproduce.** That is the
+    /// **The new snapshot attests a layer it did not reproduce.** That is the
     /// trade, and it is the caller's to make: nothing here can check that the
     /// descriptor describes those bytes, because checking would mean reading
     /// them, which is the cost being avoided.
     ///
     /// ## What is not checked, and why that is the default
     ///
-    /// `source` is a stele this transport *pulled*: its manifest is live in
+    /// `source` is a snapshot this transport *pulled*: its manifest is live in
     /// this repository under a tag, and it names this blob. A registry is not
     /// permitted to reclaim a blob in that position, and one that does has
-    /// already broken the stele the descriptor came from — a `HEAD` here would
-    /// find the damage a publish too late and could not have prevented it.
+    /// already broken the snapshot the descriptor came from — a `HEAD` here
+    /// would find the damage a publish too late and could not have
+    /// prevented it.
     ///
     /// Re-establishing it per carried layer per publish is what made this path
-    /// cost a round trip for every layer of history behind the stele, and made
-    /// each publish slower than the one before it for a reason that had nothing
-    /// to do with what it was publishing. So it is not paid by default.
-    /// [`Options::verify_adopted`] restores the proof for an operator who wants
-    /// it, and pays for it concurrently rather than in sequence: the `HEAD`
-    /// still lands before the manifest names the blob, which is the only
-    /// ordering that was ever load-bearing.
+    /// cost a round trip for every layer of history behind the snapshot, and
+    /// made each publish slower than the one before it for a reason that
+    /// had nothing to do with what it was publishing. So it is not paid by
+    /// default. [`Options::verify_adopted`] restores the proof for an
+    /// operator who wants it, and pays for it concurrently rather than in
+    /// sequence: the `HEAD` still lands before the manifest names the blob,
+    /// which is the only ordering that was ever load-bearing.
     ///
     /// The caller names the layer by its `descriptor` — identity, out of an
-    /// inscription — and the stele it came from. The blob digest and the
-    /// compressed size are read off *that stele's manifest*, by exactly the
-    /// lookup [`SteleReader::stream_layer`] uses, rather than passed in beside
-    /// the descriptor: they are transport facts, they belong to the manifest,
-    /// and a caller assembling the pair by hand is a caller that can mismatch
-    /// them.
-    pub fn adopt_layer(&self, source: &Stele, descriptor: LayerDescriptor) -> Result<(), Error> {
+    /// inscription — and the snapshot it came from. The blob digest and the
+    /// compressed size are read off *that snapshot's manifest*, by exactly the
+    /// lookup [`SnapshotReader::stream_layer`] uses, rather than passed in
+    /// beside the descriptor: they are transport facts, they belong to the
+    /// manifest, and a caller assembling the pair by hand is a caller that
+    /// can mismatch them.
+    pub fn adopt_layer(&self, source: &Snapshot, descriptor: LayerDescriptor) -> Result<(), Error> {
         let missing = || Error::LayerNotFound {
             kind: descriptor.kind.clone(),
             diff_id: descriptor.diff_id.to_string(),
@@ -1237,7 +1243,7 @@ impl Registry {
         // Refused rather than clamped. A descriptor's size is an `i64` and a
         // negative one is a manifest saying something impossible; clamping it
         // to zero would carry that zero into the new manifest, where it becomes
-        // the ceiling a later reader holds the download to — so the stele would
+        // the ceiling a later reader holds the download to — so the snapshot would
         // publish looking well-formed and refuse to restore. Every other
         // malformed-manifest shape here is a refusal, and this is one too.
         let compressed_size = u64::try_from(oci.size).map_err(|_| {
@@ -1258,7 +1264,7 @@ impl Registry {
         };
 
         // A manifest naming a blob the registry no longer has is a refusal and
-        // not a miss: the stele that named it is published, and something has
+        // not a miss: the snapshot that named it is published, and something has
         // reclaimed underneath it. See [`Registry::adopt_carried`] for the case
         // where the same absence is merely a rebuild — and `Options` for why
         // this transport does not go looking for it by default.
@@ -1280,15 +1286,15 @@ impl Registry {
     ///
     /// [`Registry::adopt_layer`] with the lookup already done — for a caller
     /// holding a [`WrittenLayer`] this transport produced earlier rather than a
-    /// stele to read one out of. The pair is still not assembled by hand: it is
-    /// the measurement [`RecordSink::finish`] returned when the blob went up,
-    /// carried across whatever interruption the caller survived.
+    /// snapshot to read one out of. The pair is still not assembled by hand: it
+    /// is the measurement [`RecordSink::finish`] returned when the blob
+    /// went up, carried across whatever interruption the caller survived.
     ///
     /// **The blob check is a verdict, not an assertion.** `Ok(false)` means the
     /// registry does not hold it and nothing was carried, which is a caller's
     /// cue to build the layer after all. That is the difference from
     /// [`Registry::adopt_layer`], where the same answer is an error: a
-    /// published manifest that names a reclaimed blob is a stele nobody can
+    /// published manifest that names a reclaimed blob is a snapshot nobody can
     /// restore, while a caller's own note that has gone stale costs a rebuild
     /// and nothing else.
     ///
@@ -1310,7 +1316,7 @@ impl Registry {
 
     /// The layer this transport is carrying for the next seal under `diff_id`.
     ///
-    /// What [`SteleWriter::seal`] would put in the manifest, asked for one
+    /// What [`SnapshotWriter::seal`] would put in the manifest, asked for one
     /// layer at a time — so a caller recording what it has finished records
     /// the transport's own measurement rather than a reconstruction of it.
     /// `None` once the layers have been spent by a seal, and for a `diffId`
@@ -1365,7 +1371,7 @@ impl Error {
     /// one its descriptor names: bytes that hash to another digest, or more of
     /// them than the descriptor claims.
     ///
-    /// A refusal of the stele, where everything else [`Error::Registry`]
+    /// A refusal of the snapshot, where everything else [`Error::Registry`]
     /// carries is a registry or a disk that could not answer.
     pub fn is_blob_refusal(&self) -> bool {
         use oci_client::errors::{DigestError, OciDistributionError as E};
@@ -2224,7 +2230,7 @@ impl Shared {
     /// Fetch a layer blob into a temporary file, ready to be read back.
     ///
     /// A future built out of clones, for the reason [`Shared::state`] gives,
-    /// so one pull serves both read paths: [`SteleReader::stream_layer`]
+    /// so one pull serves both read paths: [`SnapshotReader::stream_layer`]
     /// drives it with `block_on`, and a read-ahead spawns it as a task.
     ///
     /// `pull_blob` verifies the blob digest as the bytes go past, which is the
@@ -2303,7 +2309,7 @@ fn emptied(staged: &File) -> Result<File, Error> {
     Ok(again)
 }
 
-impl SteleWriter for Registry {
+impl SnapshotWriter for Registry {
     type Sink = RegistrySink;
 
     fn layer_sink(
@@ -2323,8 +2329,8 @@ impl SteleWriter for Registry {
         })
     }
 
-    /// Put the second descriptor in the list [`SteleWriter::seal`] builds the
-    /// manifest from.
+    /// Put the second descriptor in the list [`SnapshotWriter::seal`] builds
+    /// the manifest from.
     ///
     /// The override the default's documentation asks for: this transport pairs
     /// every layer the inscription describes against a layer it wrote, and a
@@ -2370,7 +2376,7 @@ impl SteleWriter for Registry {
         Ok(again)
     }
 
-    /// Publish the manifest, and with it the stele.
+    /// Publish the manifest, and with it the snapshot.
     ///
     /// The order is the whole of the safety argument:
     ///
@@ -2386,13 +2392,13 @@ impl SteleWriter for Registry {
     /// Step 1 is the serialization point the concurrency is arranged around:
     /// the manifest is built *after* it, so no document this transport writes
     /// can name a blob the registry has not committed. Step 4 is last so that a
-    /// reader following `latest` never resolves to a stele whose blobs are
+    /// reader following `latest` never resolves to a snapshot whose blobs are
     /// still uploading. A push that dies in the middle leaves untagged blobs
     /// the registry will reclaim, and a `latest` that still points at the
-    /// previous stele — which is a stele, and restores.
+    /// previous snapshot — which is a snapshot, and restores.
     ///
     /// **A seal that succeeds consumes the layers finished since the last
-    /// one.** One transport can therefore publish several steles in turn —
+    /// one.** One transport can therefore publish several snapshots in turn —
     /// which is what a publisher chaining a `history` does — and a second seal
     /// of the same inscription is refused rather than republishing a manifest
     /// over layers that are no longer accounted for.
@@ -2400,8 +2406,8 @@ impl SteleWriter for Registry {
     /// **A seal that fails consumes nothing.** Every fallible step runs before
     /// the layers are taken, so a registry that answers a manifest push with a
     /// 500 leaves a transport the caller can seal again — the blobs are
-    /// already up, and re-exporting a stele to recover from a transient error
-    /// is not a price this owes anyone.
+    /// already up, and re-exporting a snapshot to recover from a transient
+    /// error is not a price this owes anyone.
     ///
     /// **A seal that fails at step 1 is the exception, and it is permanent.** A
     /// layer that did not reach the repository cannot be sent again from here:
@@ -2455,7 +2461,7 @@ impl SteleWriter for Registry {
     /// Report every blob this connection uploads.
     ///
     /// One of the two implementations that override the default — the other is
-    /// [`Stele`], and it shares this connection's state, so an observer
+    /// [`Snapshot`], and it shares this connection's state, so an observer
     /// attached here is also attached to whatever this registry pulls.
     fn observe(&self, observer: Observer) {
         self.shared.watch(observer);
@@ -2511,7 +2517,7 @@ impl RecordSink for RegistrySink {
     /// fact about bytes this sink already has, and nothing the registry says
     /// can change it. The upload — and the `HEAD` that may make it
     /// unnecessary — runs concurrently with whatever the caller does next, and
-    /// is joined by [`SteleWriter::seal`] before the manifest can name it.
+    /// is joined by [`SnapshotWriter::seal`] before the manifest can name it.
     ///
     /// So an error here is a failure to *close the layer*; a failure to move it
     /// surfaces at the seal. That is a change in when a registry's refusal is
@@ -2559,14 +2565,14 @@ impl RecordSink for RegistrySink {
     }
 }
 
-/// A stele pulled from a registry, and the read handle over it.
+/// A snapshot pulled from a registry, and the read handle over it.
 ///
 /// Everything cheap has already happened by the time this exists: the manifest
 /// and the inscription are in hand, verified against each other, and the
 /// `diffId`→blob map came off the manifest rather than out of a scan. What is
 /// left is the layers, and those are fetched one at a time as
-/// [`SteleReader::stream_layer`] is called.
-pub struct Stele {
+/// [`SnapshotReader::stream_layer`] is called.
+pub struct Snapshot {
     shared: Arc<Shared>,
     reference: Reference,
     manifest: OciImageManifest,
@@ -2575,9 +2581,9 @@ pub struct Stele {
 }
 
 /// What was resolved, and nothing about the connection that resolved it.
-impl std::fmt::Debug for Stele {
+impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Stele")
+        f.debug_struct("Snapshot")
             .field("reference", &self.reference.whole())
             .field("sequence", &self.inscription.sequence)
             .field("layers", &self.manifest.layers.len())
@@ -2585,18 +2591,19 @@ impl std::fmt::Debug for Stele {
     }
 }
 
-impl Stele {
-    /// The OCI manifest this stele was read from.
+impl Snapshot {
+    /// The OCI manifest this snapshot was read from.
     pub fn manifest(&self) -> &OciImageManifest {
         &self.manifest
     }
 
     /// Compressed bytes across every layer, as the manifest reports them.
     ///
-    /// The whole-stele case of [`SteleReader::compressed_size`], for a caller
-    /// that wants the total without walking the inscription — a publisher
-    /// reporting what a repository holds, above all. A restore wants the
-    /// per-layer figure, because what it is going to fetch is a subset.
+    /// The whole-snapshot case of [`SnapshotReader::compressed_size`], for a
+    /// caller that wants the total without walking the inscription — a
+    /// publisher reporting what a repository holds, above all. A restore
+    /// wants the per-layer figure, because what it is going to fetch is a
+    /// subset.
     pub fn total_compressed_size(&self) -> u64 {
         self.manifest
             .layers
@@ -2621,7 +2628,7 @@ impl Stele {
             .find(|layer| layer.digest == blob)
     }
 
-    /// [`Stele::layer_of`] for a read, where a layer the manifest does not
+    /// [`Snapshot::layer_of`] for a read, where a layer the manifest does not
     /// place is a refusal.
     fn placed(
         &self,
@@ -2636,7 +2643,7 @@ impl Stele {
     }
 }
 
-impl SteleReader for Stele {
+impl SnapshotReader for Snapshot {
     type Blob = File;
 
     fn read_inscription(&self) -> Result<Inscription, Error> {
@@ -2651,7 +2658,7 @@ impl SteleReader for Stele {
     ///
     /// Free, and the reason a registry restore can report a correct total
     /// before it fetches anything: the manifest is already in hand by the time
-    /// a [`Stele`] exists. A negative size — a manifest claiming something
+    /// a [`Snapshot`] exists. A negative size — a manifest claiming something
     /// impossible — reads as `None` rather than as a number, so it widens the
     /// estimate's stated uncertainty instead of shrinking its total.
     fn compressed_size(
@@ -2686,8 +2693,8 @@ impl SteleReader for Stele {
     /// Pull up to `ahead` layers ahead of the caller, on the transport's
     /// runtime.
     ///
-    /// Each pull is the one [`SteleReader::stream_layer`] makes, spawned as a
-    /// task rather than driven on the caller's thread, and each reader is
+    /// Each pull is the one [`SnapshotReader::stream_layer`] makes, spawned as
+    /// a task rather than driven on the caller's thread, and each reader is
     /// opened on the caller's thread when it is taken. At a depth of `0` or `1`
     /// this is [`LayerStream::serial`], request for request.
     fn stream_layers<'s>(
@@ -2703,7 +2710,7 @@ impl SteleReader for Stele {
         }
 
         LayerStream::new(ReadAhead {
-            stele: self,
+            snapshot: self,
             index,
             profile,
             limits,
@@ -2715,10 +2722,10 @@ impl SteleReader for Stele {
 
     /// Report every blob this connection pulls.
     ///
-    /// A restore resolves its [`Stele`] inside the driver, so this is the
+    /// A restore resolves its [`Snapshot`] inside the driver, so this is the
     /// spelling a caller reaches when it holds the reader; attaching to the
-    /// [`Registry`] the stele came from does the same thing, because both write
-    /// the same connection state.
+    /// [`Registry`] the snapshot came from does the same thing, because both
+    /// write the same connection state.
     fn observe(&self, observer: Observer) {
         self.shared.watch(observer);
     }
@@ -2727,13 +2734,13 @@ impl SteleReader for Stele {
 /// A layer pull running as a task, its staged file the task's output.
 type Pull = tokio::task::JoinHandle<Result<File, Error>>;
 
-/// [`Stele::stream_layers`] past a depth of one.
+/// [`Snapshot::stream_layers`] past a depth of one.
 ///
 /// Pulls start in list order, and never more than `ahead` are untaken. The
 /// caller's thread waits for the front one and opens its reader, so a staged
 /// blob is a file and nothing else until it is taken.
 struct ReadAhead<'s> {
-    stele: &'s Stele,
+    snapshot: &'s Snapshot,
     index: &'s BlobIndex,
     profile: &'s dyn Profile,
     limits: Limits,
@@ -2749,17 +2756,17 @@ struct ReadAhead<'s> {
 impl ReadAhead<'_> {
     /// Start pulls in list order until `ahead` layers are untaken.
     fn fill(&mut self) {
-        let shared = &self.stele.shared;
+        let shared = &self.snapshot.shared;
 
         while self.pulls.len() < self.ahead {
             let Some(descriptor) = self.waiting.next() else {
                 return;
             };
 
-            let pull = self.stele.placed(self.index, &descriptor).map(|oci| {
+            let pull = self.snapshot.placed(self.index, &descriptor).map(|oci| {
                 shared
                     .runtime
-                    .spawn(shared.pull_layer(&self.stele.reference, oci))
+                    .spawn(shared.pull_layer(&self.snapshot.reference, oci))
             });
 
             // Nothing after a refusal is handed over, so nothing after it is
@@ -2786,7 +2793,7 @@ impl ReadAhead<'_> {
             pull.abort();
         }
 
-        self.stele.shared.runtime.block_on(async {
+        self.snapshot.shared.runtime.block_on(async {
             for pull in pulls {
                 let _ = pull.await;
             }
@@ -2798,12 +2805,12 @@ impl ReadAhead<'_> {
     /// A panicking task is re-raised here, as [`Shared::join_layers`] does: a
     /// panic in a download is a bug in this module, not a registry refusal.
     fn join(&self, pull: Pull) -> Result<File, Error> {
-        match self.stele.shared.runtime.block_on(pull) {
+        match self.snapshot.shared.runtime.block_on(pull) {
             Ok(staged) => staged,
             Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
             // Only `cancel` aborts a pull, and it never hands one back; this
             // arm is the runtime shutting down, which cannot happen while the
-            // stele holds it.
+            // snapshot holds it.
             Err(join) => Err(std::io::Error::other(join).into()),
         }
     }
@@ -2836,7 +2843,7 @@ impl Drop for ReadAhead<'_> {
     }
 }
 
-/// Build the manifest for a stele whose layers are already written.
+/// Build the manifest for a snapshot whose layers are already written.
 ///
 /// Returns it together with the canonical inscription bytes, so the config
 /// descriptor and the blob that is pushed under it cannot be computed from two
@@ -2934,12 +2941,12 @@ fn layer_descriptor(
 /// has one answer to "what are the bytes of this JSON document" rather than two
 /// that agree until they do not.
 ///
-/// The ceiling is [`MANIFEST_SIZE_LIMIT`]. What it refuses is a stele with too
-/// many layers: at roughly 350 bytes of descriptor and annotations apiece, a
-/// manifest reaches 4 MiB somewhere around twelve thousand of them — nearly
-/// seven times a mainnet stele's ~1,816. The comparison is in layers because
+/// The ceiling is [`MANIFEST_SIZE_LIMIT`]. What it refuses is a snapshot with
+/// too many layers: at roughly 350 bytes of descriptor and annotations apiece,
+/// a manifest reaches 4 MiB somewhere around twelve thousand of them — nearly
+/// seven times a mainnet snapshot's ~1,816. The comparison is in layers because
 /// layers are what the ceiling counts; Dolos ADR-004's ~600 is a count of
-/// *epochs*, and a mainnet stele carries three layers per epoch plus sixteen
+/// *epochs*, and a mainnet snapshot carries three layers per epoch plus sixteen
 /// state shards. It is not a limit anything is expected to reach; it is the
 /// limit that turns "the registry answered 413" into a refusal that names the
 /// document and the number of layers in it.
@@ -2971,7 +2978,7 @@ fn check_envelope(manifest: &OciImageManifest) -> Result<(), Error> {
         }
         // Fail closed. A registry that strips `artifactType` — the OCI 1.1
         // field this artifact is discovered by — has published something this
-        // client cannot recognise as a stele, and reading it anyway would make
+        // client cannot recognise as a snapshot, and reading it anyway would make
         // the discovery contract advisory.
         None => {
             return Err(Error::ManifestMismatch(format!(
@@ -3000,9 +3007,9 @@ fn check_envelope(manifest: &OciImageManifest) -> Result<(), Error> {
 /// Both correspondences are checked, and they are not the same check: the
 /// `diffId` annotation is what the map is *built* from, and positional
 /// correspondence with `inscription.layers` is what proves the manifest
-/// describes this document's layers and not some other stele's. A manifest that
-/// carried the right blobs in the wrong order would pass the first and fail the
-/// second.
+/// describes this document's layers and not some other snapshot's. A manifest
+/// that carried the right blobs in the wrong order would pass the first and
+/// fail the second.
 ///
 /// Pure, so the parsing half of the artifact is frozen by the same golden as
 /// the building half.
@@ -3570,7 +3577,7 @@ mod tests {
         assert!(message.contains("sha256:aa") && message.contains("3 attempt"));
         assert!(message.contains("sha256:bb"), "the last cause: {message}");
 
-        // Still a refusal of the stele underneath.
+        // Still a refusal of the snapshot underneath.
         assert!(exhausted.is_blob_refusal());
 
         let mut calls = 0;
@@ -3645,7 +3652,7 @@ mod tests {
             "oci://ghcr.io/",                        // still no repository path
             "oci:///txpipe/dolos",                   // no host
             "oci://ghcr.io/txpipe/dolos/",           // a trailing slash
-            "oci://ghcr.io/txpipe/dolos:v1",         // a tag names a stele
+            "oci://ghcr.io/txpipe/dolos:v1",         // a tag names a snapshot
             "oci://ghcr.io/txpipe/dolos@sha256:abc", // and so does a digest
             "",
         ] {

@@ -325,7 +325,7 @@ mod tests {
         check(&[Need::unsized_because(
             "staging this publish",
             temp.path(),
-            "this repository holds no stele to size from",
+            "this repository holds no snapshot to size from",
         )])
         .unwrap();
     }
