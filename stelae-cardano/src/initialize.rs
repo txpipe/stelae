@@ -127,11 +127,14 @@ fn seed_wal(config: &crate::RootConfig) -> Result<(), AnyError> {
     Ok(())
 }
 
-/// How a restore runs: bounded by the configured history window.
+/// How a restore runs: bounded by the configured history window, one layer
+/// at a time, with `journals` bytes of store journals counted by the space
+/// preflight. No source is recorded, so a resume checks only the progress file.
 fn restoring<'a>(
     config: &'a crate::RootConfig,
     genesis: &Genesis,
     options: &Options,
+    journals: u64,
 ) -> Restoring<'a> {
     Restoring {
         network_magic: u64::from(genesis.network_magic()),
@@ -139,7 +142,32 @@ fn restoring<'a>(
         storage_path: &config.storage.path,
         resume: options.resume,
         skip_space_check: options.skip_space_check,
+        journals,
+        read_ahead: 1,
+        source: None,
     }
+}
+
+/// What the stores' journals may hold between them: each fjall store's
+/// `journal_mb`, and nothing for a backend that keeps no such journal.
+fn journals(
+    archive: &dolos::adapters::ArchiveStoreBackend,
+    state: &dolos::adapters::StateStoreBackend,
+) -> u64 {
+    use dolos::adapters::{ArchiveStoreBackend, StateStoreBackend};
+
+    const MIB: u64 = 1024 * 1024;
+
+    let state = match state {
+        StateStoreBackend::Fjall(state) => state.tuning().journal_mb,
+        _ => 0,
+    };
+    let archive = match archive {
+        ArchiveStoreBackend::Fjall(archive) => archive.tuning().journal_mb,
+        _ => 0,
+    };
+
+    (state + archive) * MIB
 }
 
 fn restore(
@@ -150,7 +178,7 @@ fn restore(
 ) -> Result<u64, AnyError> {
     let archive = dolos::storage::open_archive_store(config)?;
     let state = dolos::storage::open_state_store(config)?;
-    let restoring = restoring(config, genesis, options);
+    let restoring = restoring(config, genesis, options, journals(&archive, &state));
     let target = Target::new(&archive, &state);
 
     let outcome = match &options.source {
@@ -320,12 +348,15 @@ mod tests {
         );
         let genesis = crate::config::genesis(&rolling).unwrap();
         assert_eq!(
-            restoring(&rolling, &genesis, &options).max_history,
+            restoring(&rolling, &genesis, &options, 0).max_history,
             Some(432_000)
         );
 
         let unbounded = crate::RootConfig::new(dolos_core::config::ChainConfig::known("preview"));
-        assert_eq!(restoring(&unbounded, &genesis, &options).max_history, None);
+        assert_eq!(
+            restoring(&unbounded, &genesis, &options, 0).max_history,
+            None
+        );
     }
 
     #[test]

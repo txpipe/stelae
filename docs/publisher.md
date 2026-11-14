@@ -9,14 +9,21 @@ No command starts or shells out to a Dolos executable.
 ## Source and dependency identity
 
 Every Dolos crate in the publisher's dependency graph, normal and dev, is
-pinned to `bf66dcc66cd65228539c8401e291807e947c61ec`, the merge of
-[PR 1564](https://github.com/txpipe/dolos/pull/1564), which adds boundary
-preparation and staged export. An ordinary export is now a batch of one over
-that machinery, with the same canonical output. `DOLOS_REVISION` in
-`stelae-cardano/src/lib.rs` names the same commit. Since the earlier pin,
-`1db3e41f`, no store contract, WAL version or profile version has changed, so
-stores synced at that pin carry over. The Stelae snapshot envelope
-`application/vnd.stelae.snapshot.v1` came earlier, with
+pinned to `a95ecdebe8666ddde29578d7a734af5ce8f16375`, the merge of
+[PR 1599](https://github.com/txpipe/dolos/pull/1599), which builds fjall from
+the [txpipe fork](https://github.com/txpipe/fjall) at
+`ae794ad448d90214c3491df4c50f59f0fe15cf90` (fjall 3.1.13 on lsm-tree 3.1.10).
+The publisher's own `fjall` dependency names the same fork revision, so the
+graph holds one fjall. The fork lets a write at the L0 halt, or one waiting on
+a worker that has died, return instead of waiting forever (see
+[A volume that fills](#a-volume-that-fills)). `DOLOS_REVISION` in
+`stelae-cardano/src/lib.rs` names the same commit. Boundary preparation and
+staged export came with the merge of
+[PR 1564](https://github.com/txpipe/dolos/pull/1564), `bf66dcc6`: an ordinary
+export is a batch of one over that machinery, with the same canonical output.
+Since that pin, no WAL version or profile version has changed; the store
+traits gained a `persist` call, which the publisher does not implement. The
+Stelae snapshot envelope `application/vnd.stelae.snapshot.v1` came earlier, with
 [PR 1553](https://github.com/txpipe/dolos/pull/1553).
 
 The `io.txpipe.dolos.cardano` profile was frozen for Dolos v2 earlier, at
@@ -32,9 +39,9 @@ Initialization does not refuse stores synced at an earlier pin (opening them
 only wipes their WAL), so delete a kept claim before the upgrade, as for any
 storage pin change (see
 [publisher-packaging.md](publisher-packaging.md)). The normative profile is
-[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/bf66dcc66cd65228539c8401e291807e947c61ec/crates/snapshot/PROFILE.md)
+[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/a95ecdebe8666ddde29578d7a734af5ce8f16375/crates/snapshot/PROFILE.md)
 at the pinned commit, and the preparation contract this host consumes is
-[`docs/contracts/export-preparation.md`](https://github.com/txpipe/dolos/blob/bf66dcc66cd65228539c8401e291807e947c61ec/docs/contracts/export-preparation.md).
+[`docs/contracts/export-preparation.md`](https://github.com/txpipe/dolos/blob/a95ecdebe8666ddde29578d7a734af5ce8f16375/docs/contracts/export-preparation.md).
 
 Like every revision since the publisher retirement of
 [PR 1335](https://github.com/txpipe/dolos/pull/1335), the pin retains the
@@ -298,13 +305,12 @@ Three cases read differently:
   asks you to check both and doesn't call the volume full. Each store's close also
   waits up to a minute for flushes a dead worker will never finish, so on a volume
   still full a rerun can take minutes to stop.
-- **A hang.** On the pinned fjall, backpressure and shutdown can wait on workers
-  that have already died, and making room doesn't wake them. A rerun can park at its
-  first store close, with or without the check above, when the room is below what
-  one compaction writes. No figure is measured for mainnet. The process stays up
-  using no CPU, which consumes no `backoffLimit`, and the chart has no liveness probe
-  or deadline. Kill it, then rerun with more room than one compaction writes, because
-  several can run at once across the stores: a rerun with too little can park again.
+- **A write waiting on a worker.** The pinned fjall ends the waits that hung on
+  earlier pins: a write held by backpressure or at the L0 write halt returns
+  `FjallError: Poisoned` once the worker it waits on has died, and a store's close
+  returns after it. The run then stops as in the first case. Rerun with more room
+  than one compaction writes, because several can run at once across the stores: a
+  rerun with too little stops again.
 - **A download filling it.** The Mithril client reports only the locations it
   tried, so the failed fetch adds the free bytes of the download directory: read a
   low figure as a full volume. A stopped download can also leave partial or absent

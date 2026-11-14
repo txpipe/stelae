@@ -26,9 +26,10 @@ pub use dolos_snapshot::{
 };
 
 /// The Dolos revision this publisher reads its configuration and stores with:
-/// the boundary preparation facade (txpipe/dolos PR #1564). The v2 profile was
-/// frozen earlier, at e39a38a3 (PR #1548).
-pub const DOLOS_REVISION: &str = "bf66dcc66cd65228539c8401e291807e947c61ec";
+/// the build of fjall from the txpipe fork (txpipe/dolos PR #1599), over the
+/// boundary preparation facade of PR #1564. The v2 profile was frozen earlier,
+/// at e39a38a3 (PR #1548).
+pub const DOLOS_REVISION: &str = "a95ecdebe8666ddde29578d7a734af5ce8f16375";
 
 #[cfg(test)]
 mod dependency_identity {
