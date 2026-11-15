@@ -2816,11 +2816,11 @@ fn chapter_inscription(sequence: u64) -> Inscription {
 /// publish neither wrote nor carried, is refused at the seal, and nothing is
 /// tagged.
 ///
-/// This is the manifest–inscription agreement in `SPEC.md`, refused before
-/// anything is pushed. It is not a chain rule: a publish that writes the
-/// earlier layer's bytes again, or carries its blob with `adopt_carried`,
-/// seals. Keeping an earlier layer out is the export's part, by asking only
-/// for its own layers.
+/// This is the manifest–inscription agreement in `SPEC.md`, refused after the
+/// layer blobs are up and before the inscription or a manifest is pushed. It
+/// is not a chain rule: a publish that writes the earlier layer's bytes again,
+/// or carries its blob with `adopt_carried`, seals. Keeping an earlier layer
+/// out is the export's part, by asking only for its own layers.
 #[test]
 fn a_seal_refuses_an_earlier_layer_this_publish_did_not_write() {
     let fault = FaultRegistry::spawn();

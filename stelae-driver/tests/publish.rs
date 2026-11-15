@@ -473,23 +473,31 @@ fn a_publish_is_refused_when_its_predecessor_moved() {
     let first = publish(&registry, &record, 1);
     let expected = (1, first.digest().unwrap());
 
-    // Expecting an empty repository, the publish finds the first snapshot.
-    let err = chained_in(
-        Publishing::new(&registry)
-            .recording_in(record.as_path())
-            .following(None),
-        2,
-    )
-    .err()
-    .expect("a publish expecting an empty repository chained to a snapshot");
+    // Expecting an empty repository, or another writer's snapshot at the same
+    // sequence, the publish finds the first snapshot.
+    let elsewhere = (1, stelae::Digest::compute("another writer's inscription"));
 
-    assert!(
-        matches!(
-            err,
-            stelae_driver::Error::Stelae(stelae::Error::PredecessorMoved { .. })
-        ),
-        "{err:?}"
-    );
+    for (follows, what) in [
+        (None, "an empty repository"),
+        (Some(elsewhere), "another snapshot at the same sequence"),
+    ] {
+        let err = chained_in(
+            Publishing::new(&registry)
+                .recording_in(record.as_path())
+                .following(follows),
+            2,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("a publish expecting {what} chained to the first snapshot"));
+
+        assert!(
+            matches!(
+                err,
+                stelae_driver::Error::Stelae(stelae::Error::PredecessorMoved { .. })
+            ),
+            "{err:?}"
+        );
+    }
 
     let chained = chained_in(
         Publishing::new(&registry)
