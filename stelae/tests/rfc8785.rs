@@ -1,10 +1,11 @@
 //! RFC 8785 (JSON Canonicalization Scheme) conformance.
 //!
 //! The inscription digest is the identity of a snapshot: independent publishers
-//! reproduce it, signatures cover it, and `history` chains it. All of that
-//! rests on canonicalization being *the same function* everywhere — so the JCS
-//! implementation is not an implementation detail to be assumed correct, it is
-//! a conformance surface with an official test suite. This file runs it.
+//! reproduce it, signatures cover it, and the next inscription's `previous`
+//! links to it. All of that rests on canonicalization being *the same
+//! function* everywhere — so the JCS implementation is not an implementation
+//! detail to be assumed correct, it is a conformance surface with an official
+//! test suite. This file runs it.
 //!
 //! Everything here goes through `stelae::canonical_json`, the same entry point
 //! `Inscription::canonicalize` uses, rather than the underlying crate directly:
@@ -52,7 +53,7 @@ fn official_vectors() {
 
 /// Canonicalization is idempotent: feeding the canonical form back in returns
 /// it unchanged. A publisher that re-canonicalizes a document it received must
-/// land on the same bytes, or `history` verification breaks.
+/// land on the same bytes, or verifying a `previous` link breaks.
 #[test]
 fn canonicalization_is_idempotent() {
     for name in VECTORS {

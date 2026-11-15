@@ -818,7 +818,8 @@ fn write_snapshot_fallibly<W: SnapshotWriter>(
         },
     );
 
-    inscription.layers = vec![written_notes.descriptor, written_index.descriptor];
+    inscription.diff = vec![written_notes.descriptor];
+    inscription.tip = vec![written_index.descriptor];
 
     snapshot.seal(&ToyProfile, &inscription)?;
 
@@ -830,8 +831,7 @@ fn records_of<R: SnapshotReader>(snapshot: &R, inscription: &Inscription) -> Vec
     let index = snapshot.blob_index().unwrap();
 
     inscription
-        .layers
-        .iter()
+        .layers()
         .map(|descriptor| {
             let mut reader = snapshot
                 .stream_layer(&index, &ToyProfile, descriptor, Limits::default())
@@ -880,7 +880,7 @@ fn a_snapshot_survives_the_round_trip() {
     println!(
         "identity: {} ({} layers)",
         published.digest().unwrap(),
-        published.layers.len()
+        published.layers().count()
     );
 
     // Both tags resolve, and to the same snapshot.
@@ -904,7 +904,7 @@ fn a_snapshot_survives_the_round_trip() {
 
     assert_eq!(pulled_blobs.len(), disk_blobs.len());
 
-    for descriptor in &published.layers {
+    for descriptor in published.layers() {
         assert_eq!(
             pulled_blobs.blob_for(&descriptor.diff_id),
             disk_blobs.blob_for(&descriptor.diff_id),
@@ -922,7 +922,7 @@ fn a_snapshot_survives_the_round_trip() {
 
     println!(
         "pulled {} layers, {} compressed bytes",
-        published.layers.len(),
+        published.layers().count(),
         latest.total_compressed_size(),
     );
 
@@ -932,8 +932,7 @@ fn a_snapshot_survives_the_round_trip() {
     let index = latest.blob_index().unwrap();
 
     let summed: u64 = published
-        .layers
-        .iter()
+        .layers()
         .map(|layer| {
             latest
                 .compressed_size(&index, layer)
@@ -1081,8 +1080,8 @@ fn a_second_push_uploads_only_what_is_missing() {
 
     // The skip is not a lie: both snapshots pull back whole, and the layer that
     // was skipped is the one the first push put there.
-    let notes = &first.layers[0];
-    assert_eq!(notes.diff_id, second.layers[0].diff_id);
+    let notes = &first.diff[0];
+    assert_eq!(notes.diff_id, second.diff[0].diff_id);
 
     for sequence in [first.sequence, second.sequence] {
         let snapshot = registry.pull_sequence(&ToyProfile, sequence).unwrap();
@@ -1287,7 +1286,7 @@ fn neither_direction_holds_a_layer() {
             level: COMPRESSION_LEVEL as i64,
         },
     );
-    inscription.layers = vec![layer.descriptor.clone()];
+    inscription.diff = vec![layer.descriptor.clone()];
 
     registry.seal(&ToyProfile, &inscription).unwrap();
 
@@ -1332,7 +1331,7 @@ fn neither_direction_holds_a_layer() {
     let blobs = snapshot.blob_index().unwrap();
 
     let mut reader = snapshot
-        .stream_layer(&blobs, &ToyProfile, &read.layers[0], Limits::default())
+        .stream_layer(&blobs, &ToyProfile, &read.diff[0], Limits::default())
         .unwrap();
 
     let mut count = 1u64; // the header record, already consumed
@@ -1483,7 +1482,7 @@ fn a_layer_under_the_threshold_goes_up_in_one_request() {
         },
     );
 
-    inscription.layers = vec![small.descriptor.clone(), bulk.descriptor.clone()];
+    inscription.diff = vec![small.descriptor.clone(), bulk.descriptor.clone()];
 
     registry.seal(&ToyProfile, &inscription).unwrap();
 
@@ -1527,7 +1526,7 @@ fn a_layer_under_the_threshold_goes_up_in_one_request() {
 
     let blobs = snapshot.blob_index().unwrap();
 
-    for (described, written) in read.layers.iter().zip([&small, &bulk]) {
+    for (described, written) in read.layers().zip([&small, &bulk]) {
         let mut reader = snapshot
             .stream_layer(&blobs, &ToyProfile, described, Limits::default())
             .unwrap();
@@ -1632,7 +1631,7 @@ fn the_single_request_path_is_bounded_by_its_byte_budget() {
             written.digests.compressed_size,
         );
 
-        inscription.layers.push(written.descriptor);
+        inscription.diff.push(written.descriptor);
     }
 
     registry.seal(&ToyProfile, &inscription).unwrap();
@@ -1640,8 +1639,7 @@ fn the_single_request_path_is_bounded_by_its_byte_budget() {
     let held = sampler.finish();
 
     let published: u64 = inscription
-        .layers
-        .iter()
+        .layers()
         .map(|layer| layer.uncompressed_size)
         .sum();
 
@@ -1694,8 +1692,8 @@ fn a_layer_that_is_not_the_one_described_is_refused() {
 
     // The notes layer's blob, under the index layer's descriptor: a real blob,
     // correctly named, holding the wrong layer.
-    let mut swapped = inscription.layers[1].clone();
-    swapped.diff_id = inscription.layers[0].diff_id;
+    let mut swapped = inscription.tip[0].clone();
+    swapped.diff_id = inscription.diff[0].diff_id;
 
     let err = snapshot
         .stream_layer(&blobs, &ToyProfile, &swapped, Limits::default())
@@ -1704,7 +1702,7 @@ fn a_layer_that_is_not_the_one_described_is_refused() {
     assert!(matches!(err, Error::LayerMismatch { .. }), "{err:?}");
 
     // And a descriptor naming a layer the snapshot does not carry.
-    let mut absent = inscription.layers[0].clone();
+    let mut absent = inscription.diff[0].clone();
     absent.diff_id = digest_of(0xee);
 
     let err = snapshot
@@ -1732,11 +1730,12 @@ fn a_same_kind_blob_is_refused_when_the_layer_ends() {
     let fixture = Fixture::spawn();
     let registry = fixture.registry("stelae/tamper-same-kind");
 
-    // Two layers of one kind under one scope, differing only in how many
-    // records they hold, so their headers are byte-identical and their
-    // identities are not.
-    let write = |count: u64| {
-        let (header, scope) = notes_scope(3);
+    // Two layers of one kind with byte-identical headers, differing in how
+    // many records they hold, so their identities are not the same. The
+    // inscription lists each under its own scope, as it lists every layer;
+    // the header records cannot tell them apart.
+    let write = |count: u64, scope: serde_json::Value| {
+        let (header, _) = notes_scope(3);
 
         let mut sink = registry
             .layer_sink(
@@ -1753,8 +1752,8 @@ fn a_same_kind_blob_is_refused_when_the_layer_ends() {
         sink.finish().unwrap()
     };
 
-    let short = write(3);
-    let long = write(6);
+    let short = write(3, json!({"chapter": 3}));
+    let long = write(6, json!({"chapter": 3, "edition": 2}));
 
     let mut inscription = Inscription::new(
         &ToyProfile,
@@ -1767,7 +1766,7 @@ fn a_same_kind_blob_is_refused_when_the_layer_ends() {
         },
     );
 
-    inscription.layers = vec![short.descriptor.clone(), long.descriptor.clone()];
+    inscription.diff = vec![short.descriptor.clone(), long.descriptor.clone()];
     registry.seal(&ToyProfile, &inscription).unwrap();
 
     let snapshot = registry.pull_latest(&ToyProfile).unwrap();
@@ -1919,14 +1918,14 @@ fn a_staging_directory_that_cannot_be_used_names_itself() {
     let index = snapshot.blob_index().unwrap();
 
     let err = snapshot
-        .stream_layer(&index, &ToyProfile, &published.layers[0], Limits::default())
+        .stream_layer(&index, &ToyProfile, &published.diff[0], Limits::default())
         .expect_err("staged a pulled blob in a regular file");
 
     names_it(&err);
 }
 
 /// `latest` tells "this repository holds nothing" apart from "this repository
-/// could not be read", which is the distinction a publisher's history chain
+/// could not be read", which is the distinction a publisher's chain of links
 /// rests on.
 ///
 /// Both halves against a real server, because the shape a registry uses to say
@@ -1965,7 +1964,7 @@ fn latest_is_absent_until_something_is_published() {
 ///
 /// Two claims, and the second is the one with teeth. `Registry::latest` turns
 /// "no such manifest" into `None`, and a publisher reads `None` as "nothing to
-/// chain to" and starts a fresh history — so a 401 widening into absence would
+/// chain to" and starts a fresh lineage — so a 401 widening into absence would
 /// silently restart the attestation chain against a registry that simply did
 /// not recognise the caller. `is_absent` is written not to, and this is that
 /// claim against a server that really answers 401 rather than against a
@@ -2084,7 +2083,7 @@ fn a_layer_is_carried_forward_on_the_manifest_that_names_it() {
     source.take_transfer();
 
     source
-        .adopt_layer(&snapshot, published.layers[0].clone())
+        .adopt_layer(&snapshot, published.diff[0].clone())
         .unwrap();
 
     let transfer = source.take_transfer();
@@ -2130,12 +2129,13 @@ fn a_verified_carry_refuses_a_blob_the_repository_does_not_hold() {
     // caller holds is a fact about bytes rather than a promise about a
     // registry.
     elsewhere
-        .adopt_layer(&snapshot, published.layers[0].clone())
+        .adopt_layer(&snapshot, published.diff[0].clone())
         .unwrap();
 
     // The seal is where the promise is collected, and it is refused.
     let mut inscription = published.clone();
-    inscription.layers = vec![published.layers[0].clone()];
+    inscription.diff = vec![published.diff[0].clone()];
+    inscription.tip.clear();
 
     let err = elsewhere.seal(&ToyProfile, &inscription).unwrap_err();
 
@@ -2200,7 +2200,7 @@ fn concurrency_changes_the_cost_of_a_publish_and_not_the_snapshot() {
     // been there before it: two layers, both uploaded.
     let counted = serial.transfer();
 
-    assert_eq!(counted.layers_uploaded, one.layers.len() as u64);
+    assert_eq!(counted.layers_uploaded, one.layers().count() as u64);
     assert_eq!(counted.layers_skipped, 0);
 
     // And the concurrent one accounts for exactly the same layers and the same
@@ -2348,7 +2348,7 @@ fn a_deferred_upload_that_fails_fails_every_seal() {
         },
     );
 
-    inscription.layers = vec![written.descriptor];
+    inscription.diff = vec![written.descriptor];
 
     let refused = registry
         .seal(&ToyProfile, &inscription)
@@ -2510,12 +2510,7 @@ fn first_layer(registry: &Registry, inscription: &Inscription) -> Result<(), Err
     let index = snapshot.blob_index()?;
 
     snapshot
-        .stream_layer(
-            &index,
-            &ToyProfile,
-            &inscription.layers[0],
-            Limits::default(),
-        )
+        .stream_layer(&index, &ToyProfile, &inscription.diff[0], Limits::default())
         .map(drop)
 }
 
@@ -2743,7 +2738,7 @@ fn write_layers<W: SnapshotWriter>(snapshot: &W, count: u64) -> Inscription {
         },
     );
 
-    inscription.layers = layers;
+    inscription.diff = layers;
     snapshot.seal(&ToyProfile, &inscription).unwrap();
 
     inscription
@@ -2872,18 +2867,18 @@ fn a_read_ahead_hands_layers_back_in_order() {
 
     let snapshot = registry.pull_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let layers = inscription.layers.clone();
+    let layers = inscription.diff.clone();
 
     let mut taken = 0;
     for (reader, descriptor) in snapshot
         .stream_layers(&index, &ToyProfile, layers, Limits::default(), 8)
-        .zip(&inscription.layers)
+        .zip(inscription.layers())
     {
         prove(reader.unwrap(), descriptor);
         taken += 1;
     }
 
-    assert_eq!(taken, inscription.layers.len());
+    assert_eq!(taken, inscription.layers().count());
 
     let mut back_to_front = blobs.clone();
     back_to_front.reverse();
@@ -2906,7 +2901,7 @@ fn a_read_ahead_is_bounded_by_its_depth() {
 
     let snapshot = registry.pull_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let layers = inscription.layers.clone();
+    let layers = inscription.diff.clone();
 
     let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 3);
 
@@ -2915,9 +2910,9 @@ fn a_read_ahead_is_bounded_by_its_depth() {
     let first = stream.next().unwrap().unwrap();
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(fetched(&fault), sorted(&fault.layers()[..3]));
-    prove(first, &inscription.layers[0]);
+    prove(first, &inscription.diff[0]);
 
-    for descriptor in &inscription.layers[1..] {
+    for descriptor in &inscription.diff[1..] {
         prove(stream.next().unwrap().unwrap(), descriptor);
     }
     assert!(stream.next().is_none());
@@ -2985,7 +2980,7 @@ fn a_read_ahead_opens_a_layer_only_when_it_is_taken() {
         .iter()
         .map(|l| l.size as u64)
         .sum();
-    let layers = inscription.layers.clone();
+    let layers = inscription.diff.clone();
     let opening = Opening::default();
     let caller = std::thread::current().id();
 
@@ -2995,12 +2990,12 @@ fn a_read_ahead_opens_a_layer_only_when_it_is_taken() {
     eventually("every blob to land", || moved.bytes() == total);
     assert_eq!(opening.opened(), vec![caller], "a layer was opened untaken");
 
-    for descriptor in &inscription.layers[1..] {
+    for descriptor in &inscription.diff[1..] {
         prove(stream.next().unwrap().unwrap(), descriptor);
     }
-    prove(first, &inscription.layers[0]);
+    prove(first, &inscription.diff[0]);
 
-    assert_eq!(opening.opened(), vec![caller; inscription.layers.len()]);
+    assert_eq!(opening.opened(), vec![caller; inscription.layers().count()]);
 }
 
 /// Each take opens the layer it hands over and no other, however many staged
@@ -3020,13 +3015,13 @@ fn a_read_ahead_opens_only_the_layer_each_take_hands_over() {
         .iter()
         .map(|l| l.size as u64)
         .sum();
-    let layers = inscription.layers.clone();
+    let layers = inscription.diff.clone();
     let opening = Opening::default();
     let caller = std::thread::current().id();
 
     let mut stream = snapshot.stream_layers(&index, &opening, layers, Limits::default(), 4);
 
-    for (taken, descriptor) in inscription.layers.iter().enumerate() {
+    for (taken, descriptor) in inscription.layers().enumerate() {
         let reader = stream.next().unwrap().unwrap();
 
         if taken == 0 {
@@ -3060,12 +3055,12 @@ fn a_read_ahead_reports_a_failed_layer_at_its_turn() {
 
     let snapshot = registry.pull_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let layers = inscription.layers.clone();
+    let layers = inscription.diff.clone();
 
     let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 8);
 
-    prove(stream.next().unwrap().unwrap(), &inscription.layers[0]);
-    prove(stream.next().unwrap().unwrap(), &inscription.layers[1]);
+    prove(stream.next().unwrap().unwrap(), &inscription.diff[0]);
+    prove(stream.next().unwrap().unwrap(), &inscription.diff[1]);
 
     let failed = stream.next().unwrap().unwrap_err();
     let Error::RetriesExhausted { attempts, .. } = &failed else {
@@ -3106,18 +3101,18 @@ fn a_read_ahead_refuses_an_unplaced_layer_at_its_turn() {
     let snapshot = registry.pull_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
 
-    let mut absent = inscription.layers[0].clone();
+    let mut absent = inscription.diff[0].clone();
     absent.diff_id = Digest::from_bytes([0xab; 32]);
     let layers = vec![
-        inscription.layers[0].clone(),
+        inscription.diff[0].clone(),
         absent,
-        inscription.layers[1].clone(),
-        inscription.layers[2].clone(),
+        inscription.diff[1].clone(),
+        inscription.diff[2].clone(),
     ];
 
     let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 8);
 
-    prove(stream.next().unwrap().unwrap(), &inscription.layers[0]);
+    prove(stream.next().unwrap().unwrap(), &inscription.diff[0]);
 
     // Time for any pull started past the refusal to reach the registry.
     std::thread::sleep(Duration::from_millis(100));
@@ -3154,13 +3149,13 @@ fn dropping_a_read_ahead_cancels_its_pulls() {
 
     let snapshot = registry.pull_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let layers = inscription.layers.clone();
+    let layers = inscription.diff.clone();
 
     let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 4);
 
     // Two taken: the third and fourth are staged, the fifth is still waiting
     // on the registry.
-    for descriptor in &inscription.layers[..2] {
+    for descriptor in &inscription.diff[..2] {
         prove(stream.next().unwrap().unwrap(), descriptor);
     }
     eventually("the fifth pull to reach the registry", || {
@@ -3204,11 +3199,11 @@ fn dropping_a_read_ahead_cancels_a_pull_waiting_to_retry() {
 
     let snapshot = registry.pull_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let layers = inscription.layers.clone();
+    let layers = inscription.diff.clone();
 
     let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 4);
 
-    for descriptor in &inscription.layers[..2] {
+    for descriptor in &inscription.diff[..2] {
         prove(stream.next().unwrap().unwrap(), descriptor);
     }
     eventually("the fifth pull to be cut off", || {
@@ -3241,17 +3236,17 @@ fn a_retry_inside_a_read_ahead_is_announced_once() {
 
     let snapshot = registry.pull_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let layers = inscription.layers.clone();
+    let layers = inscription.diff.clone();
 
     let mut taken = 0;
     for (reader, descriptor) in snapshot
         .stream_layers(&index, &ToyProfile, layers, Limits::default(), 8)
-        .zip(&inscription.layers)
+        .zip(inscription.layers())
     {
         prove(reader.unwrap(), descriptor);
         taken += 1;
     }
-    assert_eq!(taken, inscription.layers.len());
+    assert_eq!(taken, inscription.layers().count());
 
     let retries = moved.retries();
     assert_eq!(retries.len(), 1, "{retries:?}");
@@ -3273,7 +3268,7 @@ fn a_read_ahead_of_one_is_a_stream_layer_loop() {
     let snapshot = registry.pull_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
 
-    for descriptor in &inscription.layers {
+    for descriptor in inscription.layers() {
         let reader = snapshot
             .stream_layer(&index, &ToyProfile, descriptor, Limits::default())
             .unwrap();
@@ -3286,16 +3281,16 @@ fn a_read_ahead_of_one_is_a_stream_layer_loop() {
     for ahead in [0, 1] {
         fault.forget();
 
-        let layers = inscription.layers.clone();
+        let layers = inscription.diff.clone();
         let mut stream =
             snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), ahead);
 
         let first = stream.next().unwrap().unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(fault.arrived().len(), 1, "depth {ahead} fetched ahead");
-        prove(first, &inscription.layers[0]);
+        prove(first, &inscription.diff[0]);
 
-        for (reader, descriptor) in stream.zip(&inscription.layers[1..]) {
+        for (reader, descriptor) in stream.zip(&inscription.diff[1..]) {
             prove(reader.unwrap(), descriptor);
         }
 
@@ -3313,7 +3308,7 @@ fn a_read_ahead_of_two_fetches_one_layer_ahead() {
 
     let snapshot = registry.pull_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let layers = inscription.layers.clone();
+    let layers = inscription.diff.clone();
 
     let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 2);
 
@@ -3327,9 +3322,9 @@ fn a_read_ahead_of_two_fetches_one_layer_ahead() {
         sorted(&fault.layers()[..2]),
         "depth 2 did not fetch exactly one layer ahead",
     );
-    prove(first, &inscription.layers[0]);
+    prove(first, &inscription.diff[0]);
 
-    for descriptor in &inscription.layers[1..] {
+    for descriptor in &inscription.diff[1..] {
         prove(stream.next().unwrap().unwrap(), descriptor);
     }
     assert!(
@@ -3368,12 +3363,12 @@ fn read_ahead_wall_clock() {
     let walls: Vec<Duration> = [1, 4, 8]
         .into_iter()
         .map(|ahead| {
-            let layers = inscription.layers.clone();
+            let layers = inscription.diff.clone();
             let started = Instant::now();
 
             for (reader, descriptor) in snapshot
                 .stream_layers(&index, &ToyProfile, layers, Limits::default(), ahead)
-                .zip(&inscription.layers)
+                .zip(inscription.layers())
             {
                 prove(reader.unwrap(), descriptor);
             }
@@ -3381,7 +3376,7 @@ fn read_ahead_wall_clock() {
             let wall = started.elapsed();
             println!(
                 "depth {ahead}: {wall:.2?} for {} layers",
-                inscription.layers.len()
+                inscription.layers().count()
             );
 
             wall

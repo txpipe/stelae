@@ -13,20 +13,26 @@ normative. Where a rule needs an example, the Dolos profile
 (`io.txpipe.dolos.cardano`) supplies it, as illustration and never as
 requirement.
 
-**Status: frozen.** Protocol version 1, as this document describes it, is
-frozen with Dolos v2, and so is the Dolos profile at version 1
+**Status: frozen, reopened by decision 0080.** Protocol version 1, as this
+document describes it, is frozen with Dolos v2, and so is the Dolos profile at
+version 1
 ([`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/main/crates/snapshot/PROFILE.md)).
-Changes from here on follow the [compatibility](#compatibility) rules: the
-inscription schema and the envelope media types stay fail-closed, so any
-change to them takes a protocol version bump; only payload record content
-may grow within a version, and only as that section describes.
+Decision 0080 changes the inscription in place before that release, at the
+same versions and with no compatibility path: its layer list becomes the
+`diff` and `tip` arrays and its `history` becomes the `previous` link, and an
+implementation of either form refuses the other's documents. Changes after it
+follow the [compatibility](#compatibility) rules: the inscription schema and
+the envelope media types stay fail-closed, so any change to them takes a
+protocol version bump; only payload record content may grow within a version,
+and only as that section describes.
 
 ## Overview
 
 A Stelae **snapshot** is one published artifact set at one sequence point: a
 set of compressed **layers** plus an **inscription** — a canonical JSON
-document listing the uncompressed digest of every layer along with the
-profile, sequence and position that identify what the snapshot is *of*. The
+document listing the uncompressed digest of each of its own layers, a link to
+the inscription before it, and the profile, sequence and position that
+identify what the snapshot is *of*. The
 protocol owns framing, the signable document, transport,
 attestation and restore planning; a **profile** owns layer kinds, record
 shapes, position, parameters, tag rendering and store semantics.
@@ -146,65 +152,91 @@ depends on it.
 The inscription is the canonical, signable document of a snapshot: the OCI
 config blob, canonical JSON per RFC 8785 (JCS). Generic keys plus three
 profile-owned opaque objects — `position`, `parameters` and each layer's
-`scope`:
+`scope`. Its two layer arrays and its link are decision 0080's:
 
 ```json
 { "schema": 1,
   "profile": {"name": "io.txpipe.dolos.cardano", "version": 1},
   "sequence": 550,
+  "previous": {"sequence": 549, "inscriptionDigest": "sha256:…"},
   "position": { "…": "profile-owned" },
   "parameters": { "…": "profile-owned" },
   "compression": {"algo": "zstd", "level": 9},
-  "history": [
-    {"sequence": 548, "inscriptionDigest": "sha256:…"},
-    {"sequence": 549, "inscriptionDigest": "sha256:…"} ],
-  "layers": [
-    {"kind": "blocks", "mediaType": "application/vnd.dolos.stelae.blocks.v1+zstd",
-     "diffId": "sha256:…", "records": 21600, "uncompressedSize": 43210000,
-     "scope": {"epoch": 0, "startSlot": 0, "endSlot": 21599}} ] }
+  "diff": [
+    {"kind": "log-epochs", "mediaType": "application/vnd.dolos.stelae.log-epochs.v1+zstd",
+     "diffId": "sha256:…", "records": 2, "uncompressedSize": 1840,
+     "scope": { "…": "profile-owned" }} ],
+  "tip": [
+    {"kind": "state-utxos", "mediaType": "application/vnd.dolos.stelae.state-utxos.v1+zstd",
+     "diffId": "sha256:…", "records": 812004, "uncompressedSize": 98123456,
+     "scope": { "…": "profile-owned" }} ] }
 ```
 
 - `schema` is the protocol's own version; verifiers fail closed on anything
   but the versions they implement.
 - `sequence` is the protocol's monotonic ordering key. What it counts is the
   profile's decision (the Dolos profile sets it to the epoch).
+- `previous` links to the inscription before this one; see
+  [the link](#the-link).
 - `position`, `parameters` and `scope` are canonicalized by JCS like every
   other key, so determinism holds without the protocol interpreting them.
-  Verifiers reject unknown *generic* top-level keys, so extension happens
-  only inside those three objects.
+  Verifiers reject unknown *generic* keys at the top level and inside the
+  generic objects, so extension happens only inside those three objects.
 - Determinism and signing are defined only over this document's sha256.
 - Restore verifies registry blob digests (transport integrity) and diffIds
   (canonical identity).
 
-### History
+### Diff and tip
 
-`history` embeds the digest of every previously published inscription, so the
-latest signed inscription transitively attests the entire publication history
-(~80 bytes per sequence — negligible for a config blob). This makes
-attestation outlive blob retention: a snapshot whose blobs have long been
-garbage-collected can still be verified by anyone holding a copy, because the
-copy carries its own inscription — check that inscription's digest against
-the `history` of the latest signed one, then the layers against its diffIds.
-No external trusted storage of attestations is required.
+An inscription lists only its own layers, in two arrays, and both are always
+present:
 
-Retention is the publisher's policy, not the protocol's: a publisher keeps a
-trailing window of immutable tags, untagged blobs are the registry's garbage
-collector's to reclaim, and blobs still referenced by later manifests
-survive on their own. `history` is what makes that policy safe — trust
-evidence for a reclaimed snapshot survives in every later inscription.
+- `diff` holds the layers every later snapshot of the lineage inherits.
+- `tip` holds the layers that belong to this snapshot alone. It may be empty.
 
-**History invariant:** `history` contains exactly one entry per published
-sequence, contiguous from the dataset's first published sequence (pinned
-per dataset alongside the default repository) up to `sequence - 1`, in
-strictly ascending order — no gaps, no duplicates. JCS canonicalizes object
-keys but preserves array order, so the ordering is normative. Verifiers
-reject inscriptions that violate the invariant. This is a reproducibility
-requirement as much as a safety one: independent publishers converge on
-byte-identical inscriptions only if the publication schedule and history
-encoding are canonical. If the list ever outgrows the inscription, the
-designated evolution is a sequence-indexed Merkle Mountain Range commitment
-(`{root, size}`) — a schema-versioned change that can be built retroactively
-from the flat list.
+The layer set of the snapshot at sequence N is the `diff` of every
+inscription of its lineage up to N, plus the `tip` of N. A diff only adds,
+and a tip is not part of it. Every later snapshot is made of a lineage's
+`diff` layers, so they are kept for as long as the lineage is; no later
+snapshot uses a `tip`, so which tips are kept is the registry's policy.
+
+The profile assigns each layer to one array. A layer goes to `diff` once its
+content is final; until then, each snapshot carries the layer's current form
+in `tip`. A kind alone does not decide the array. JCS preserves array order,
+so the order within each array is normative, and the profile fixes it.
+
+**Layer invariant:** a `(kind, scope)` pair appears at most once across
+`diff` and `tip` together, scopes compared by their canonical JSON. Verifiers
+reject an inscription that lists one twice.
+
+**Append-only:** no inscription replaces or amends a layer of an earlier one.
+A correction to published data starts a new lineage at a new repository path.
+
+### The link
+
+`previous` names the inscription this one follows, by its `sequence` and its
+`inscriptionDigest`. That inscription carries its own link, so the latest
+signed inscription transitively attests every inscription of its lineage, at
+a cost that does not grow with the chain. Attestation outlives blob retention:
+a snapshot whose blobs have been reclaimed can still be verified by anyone
+holding a copy of it — follow the links back from the latest signed
+inscription, through the inscriptions in between, to that sequence, compare
+the digest, then check the layers against their diffIds. No external trusted
+storage of attestations is required.
+
+**Link invariant:** `previous` is omitted from the first inscription of a
+lineage, and is never `null`. A lineage may start at any sequence; its first
+inscription then lists in `diff` everything final up to its cut. When
+`previous` is present, its `sequence` is lower than this inscription's.
+Verifiers reject an inscription that violates this.
+
+A publisher holds itself to the stricter rule: a new inscription links to the
+repository's latest snapshot, at `sequence - 1`, and a publish that would
+leave a gap or repeat a sequence is refused, naming both sequences. The
+protocol does not hold a verifier to that rule, because how a lineage is
+numbered is its publisher's schedule. Independent publishers converge on
+byte-identical inscriptions only if they link to the same predecessor: the
+link is part of the identity.
 
 A side-effect of anchoring identity on uncompressed content digests is that
 layer *content* can be mirrored over any content-addressed transport — or
@@ -234,9 +266,10 @@ refuses anything else.
   `application/vnd.stelae.inscription.v1+json`, `digest` is the sha256 of the
   canonical inscription bytes — the same digest independent parties reproduce
   and sign — and `size` is those bytes' length.
-- `layers`: one descriptor per inscription layer, **in inscription order**.
-  Each carries the layer's `mediaType` exactly as the inscription states it,
-  the compressed blob's `digest` and `size`, and the three annotations below.
+- `layers`: one descriptor per inscription layer, **in inscription order**:
+  every `diff` layer, then every `tip` layer. Each carries the layer's
+  `mediaType` exactly as the inscription states it, the compressed blob's
+  `digest` and `size`, and the three annotations below.
 - No `subject` and no manifest-level `annotations`.
 
 The manifest bytes are canonical JSON per RFC 8785, through the same

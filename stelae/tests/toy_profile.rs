@@ -258,18 +258,15 @@ fn write_snapshot(root: &std::path::Path) -> (Inscription, stelae::Digest) {
         },
     );
 
-    inscription.history = vec![
-        stelae::HistoryEntry {
-            sequence: 1,
-            inscription_digest: stelae::Digest::from_bytes([0x11; 32]),
-        },
-        stelae::HistoryEntry {
-            sequence: 2,
-            inscription_digest: stelae::Digest::from_bytes([0x22; 32]),
-        },
-    ];
+    inscription.previous = Some(stelae::Link {
+        sequence: 2,
+        inscription_digest: stelae::Digest::from_bytes([0x22; 32]),
+    });
 
-    inscription.layers = vec![written_notes.descriptor, written_index.descriptor];
+    // The notes are a closed chapter every later snapshot inherits; the index
+    // is rebuilt whole each time, so it belongs to this snapshot alone.
+    inscription.diff = vec![written_notes.descriptor];
+    inscription.tip = vec![written_index.descriptor];
 
     let digest = snapshot.seal(&ToyProfile, &inscription).unwrap();
 
@@ -330,7 +327,7 @@ fn writes_a_snapshot_and_reads_it_back() {
     assert_eq!(index_layer.records().count(), NOTES.len());
 
     // And both layers read back identically without ever being held.
-    for descriptor in &read.layers {
+    for descriptor in read.layers() {
         read_both_ways(&snapshot, &index, descriptor).unwrap();
     }
 }
@@ -403,7 +400,8 @@ fn a_directory_streams_layers_as_stream_layer_reads_them() {
     };
 
     // Back to front, so the order is the caller's and not the inscription's.
-    let named: Vec<LayerDescriptor> = inscription.layers.iter().rev().cloned().collect();
+    let mut named: Vec<LayerDescriptor> = inscription.layers().cloned().collect();
+    named.reverse();
 
     let looped: Vec<_> = named
         .iter()
@@ -425,16 +423,16 @@ fn a_directory_streams_layers_as_stream_layer_reads_them() {
         assert_eq!(streamed, looped, "depth {ahead}");
     }
 
-    let mut absent = inscription.layers[0].clone();
+    let mut absent = inscription.diff[0].clone();
     absent.diff_id = stelae::Digest::from_bytes([0xab; 32]);
 
     let mut stream = snapshot.stream_layers(
         &index,
         &ToyProfile,
         vec![
-            inscription.layers[0].clone(),
+            inscription.diff[0].clone(),
             absent,
-            inscription.layers[1].clone(),
+            inscription.tip[0].clone(),
         ],
         Limits::default(),
         8,
@@ -462,7 +460,7 @@ fn finish_confirms_the_layer_whether_or_not_the_records_were_read() {
 
     let snapshot = SnapshotDir::open(temp.path()).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let descriptor = &inscription.layers[0];
+    let descriptor = &inscription.diff[0];
 
     // Not a single content record consumed.
     let untouched = snapshot
@@ -502,7 +500,7 @@ fn two_independent_writes_produce_the_same_inscription_digest() {
         std::fs::read(second.path().join("inscription.json")).unwrap(),
     );
 
-    for descriptor in &left.layers {
+    for descriptor in left.layers() {
         let left_blob = SnapshotDir::open(first.path())
             .unwrap()
             .blob_index()
@@ -530,7 +528,7 @@ fn layers_round_trip_byte_identically() {
     let snapshot = SnapshotDir::open(temp.path()).unwrap();
     let index = snapshot.blob_index().unwrap();
 
-    for descriptor in &inscription.layers {
+    for descriptor in inscription.layers() {
         let layer = snapshot
             .read_layer(&index, &ToyProfile, descriptor)
             .unwrap();
@@ -866,7 +864,7 @@ fn the_core_composes_no_vendor_owned_string() {
 
     assert_eq!(inscription.profile.name, ToyProfile.name());
 
-    for descriptor in &inscription.layers {
+    for descriptor in inscription.layers() {
         let from_profile = ToyProfile.layer_media_type(&descriptor.kind).unwrap();
         assert_eq!(descriptor.media_type, from_profile);
     }
@@ -926,7 +924,7 @@ fn opaque_fields_are_carried_not_interpreted() {
             level: COMPRESSION_LEVEL as i64,
         },
     );
-    inscription.layers = vec![written.descriptor];
+    inscription.diff = vec![written.descriptor];
     snapshot.seal(&ToyProfile, &inscription).unwrap();
 
     let read = SnapshotDir::open(temp.path())
@@ -936,7 +934,7 @@ fn opaque_fields_are_carried_not_interpreted() {
 
     assert_eq!(read.position, alien);
     assert_eq!(read.parameters, alien);
-    assert_eq!(read.layers[0].scope, alien);
+    assert_eq!(read.diff[0].scope, alien);
 
     let index = SnapshotDir::open(temp.path())
         .unwrap()
@@ -944,7 +942,7 @@ fn opaque_fields_are_carried_not_interpreted() {
         .unwrap();
     let layer = SnapshotDir::open(temp.path())
         .unwrap()
-        .read_layer(&index, &ToyProfile, &read.layers[0])
+        .read_layer(&index, &ToyProfile, &read.diff[0])
         .unwrap();
     assert_eq!(layer.header().scope, header_scope);
 }
@@ -992,7 +990,7 @@ fn a_foreign_profile_is_refused() {
     // skippable at read and refused only on the publish side — see
     // `an_unknown_layer_kind_is_skippable_at_read_and_refused_at_publish`.
     let mut unknown_kind = inscription.clone();
-    unknown_kind.layers[0].kind = "receipts".to_owned();
+    unknown_kind.diff[0].kind = "receipts".to_owned();
     unknown_kind.check_profile(&ToyProfile).unwrap();
     let err = unknown_kind.check_profile_strict(&ToyProfile).unwrap_err();
     assert!(matches!(err, Error::UnknownLayerKind { .. }), "{err:?}");
@@ -1005,7 +1003,7 @@ fn a_retired_infix_layer_is_refused() {
     let temp = tempfile::tempdir().unwrap();
     let (mut inscription, _) = write_snapshot(temp.path());
 
-    for layer in &mut inscription.layers {
+    for layer in inscription.diff.iter_mut().chain(&mut inscription.tip) {
         layer.media_type = layer.media_type.replace(".stelae.", ".stele.");
     }
 
@@ -1044,7 +1042,7 @@ fn tampering_is_caught_on_read() {
     let blob = snapshot
         .blob_index()
         .unwrap()
-        .blob_for(&inscription.layers[0].diff_id)
+        .blob_for(&inscription.diff[0].diff_id)
         .unwrap();
 
     let path = snapshot.blob_path(&blob);
@@ -1058,9 +1056,9 @@ fn tampering_is_caught_on_read() {
     // read of the layer itself — against the identity the inscription pins,
     // which is the stronger claim of the two.
     let index = snapshot.blob_index().unwrap();
-    assert_eq!(index.blob_for(&inscription.layers[0].diff_id), Some(blob));
+    assert_eq!(index.blob_for(&inscription.diff[0].diff_id), Some(blob));
     assert!(snapshot
-        .read_layer(&index, &ToyProfile, &inscription.layers[0])
+        .read_layer(&index, &ToyProfile, &inscription.diff[0])
         .is_err());
 
     // The scan does look, and refuses before a descriptor is consulted at all.
@@ -1081,7 +1079,7 @@ fn a_blob_that_does_not_decompress_is_refused_as_its_layer() {
 
     let snapshot = SnapshotDir::open(temp.path()).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let descriptor = &inscription.layers[0];
+    let descriptor = &inscription.diff[0];
     let path = snapshot.blob_path(&index.blob_for(&descriptor.diff_id).unwrap());
     let bytes = std::fs::read(&path).unwrap();
 
@@ -1203,7 +1201,7 @@ fn a_blob_that_cannot_be_read_keeps_the_readers_error() {
 
     let snapshot = SnapshotDir::open(temp.path()).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let descriptor = &inscription.layers[0];
+    let descriptor = &inscription.diff[0];
     let path = snapshot.blob_path(&index.blob_for(&descriptor.diff_id).unwrap());
 
     // A directory opens, and its first read fails.
@@ -1239,7 +1237,7 @@ fn the_scan_passes_over_a_blob_that_is_not_a_layer() {
     let snapshot = SnapshotDir::open(temp.path()).unwrap();
     let scanned = without_sidecar(temp.path(), || snapshot.blob_index().unwrap());
 
-    assert_eq!(scanned.len(), inscription.layers.len());
+    assert_eq!(scanned.len(), inscription.layers().count());
 }
 
 /// A seal writes the map, and it is the map the scan would have rebuilt.
@@ -1260,7 +1258,7 @@ fn a_sealed_directory_states_its_blob_map() {
 
     assert_eq!(stated.len(), scanned.len());
 
-    for descriptor in &inscription.layers {
+    for descriptor in inscription.layers() {
         assert!(stated.blob_for(&descriptor.diff_id).is_some());
         assert_eq!(
             stated.blob_for(&descriptor.diff_id),
@@ -1286,14 +1284,14 @@ fn the_sidecar_is_read_instead_of_the_blobs() {
     let snapshot = SnapshotDir::open(temp.path()).unwrap();
     let before = snapshot.blob_index().unwrap();
 
-    for descriptor in &inscription.layers {
+    for descriptor in inscription.layers() {
         let blob = before.blob_for(&descriptor.diff_id).unwrap();
         std::fs::write(snapshot.blob_path(&blob), b"").unwrap();
     }
 
     let after = snapshot.blob_index().unwrap();
 
-    for descriptor in &inscription.layers {
+    for descriptor in inscription.layers() {
         assert_eq!(
             after.blob_for(&descriptor.diff_id),
             before.blob_for(&descriptor.diff_id),
@@ -1353,9 +1351,10 @@ fn an_incomplete_map_is_not_written() {
     // A second descriptor, for a layer nothing here ever wrote.
     let mut absent = written.descriptor.clone();
     absent.diff_id = stelae::Digest::from_bytes([0xcd; 32]);
+    absent.scope = json!({"chapter": 4});
 
     let mut inscription = bulk_inscription();
-    inscription.layers = vec![written.descriptor, absent];
+    inscription.diff = vec![written.descriptor, absent];
 
     snapshot.seal(&ToyProfile, &inscription).unwrap();
 
@@ -1366,7 +1365,7 @@ fn an_incomplete_map_is_not_written() {
         .unwrap()
         .blob_index()
         .unwrap();
-    assert!(index.blob_for(&inscription.layers[0].diff_id).is_some());
+    assert!(index.blob_for(&inscription.diff[0].diff_id).is_some());
 }
 
 /// A seal that fails publishes no map rather than the last one.
@@ -1430,7 +1429,7 @@ fn the_scan_the_sidecar_removes() {
         (scanned, start.elapsed())
     });
 
-    for descriptor in &inscription.layers {
+    for descriptor in inscription.layers() {
         assert_eq!(
             stated.blob_for(&descriptor.diff_id),
             scanned.blob_for(&descriptor.diff_id),
@@ -1440,14 +1439,12 @@ fn the_scan_the_sidecar_removes() {
     }
 
     let uncompressed: u64 = inscription
-        .layers
-        .iter()
+        .layers()
         .map(|layer| layer.uncompressed_size)
         .sum();
 
     let compressed: u64 = inscription
-        .layers
-        .iter()
+        .layers()
         .map(|layer| {
             let blob = stated.blob_for(&layer.diff_id).unwrap();
             std::fs::metadata(snapshot.blob_path(&blob)).unwrap().len()
@@ -1458,7 +1455,7 @@ fn the_scan_the_sidecar_removes() {
         "{} layers, {compressed} compressed / {uncompressed} uncompressed bytes\n\
          blob_index by scan:    {by_scan:?}\n\
          blob_index by sidecar: {by_sidecar:?}",
-        inscription.layers.len(),
+        inscription.layers().count(),
     );
 }
 
@@ -1552,7 +1549,7 @@ fn bulk_snapshot(root: &std::path::Path, layers: u64, records: u64, body: usize)
     }
 
     let mut inscription = bulk_inscription();
-    inscription.layers = descriptors;
+    inscription.diff = descriptors;
 
     snapshot.seal(&ToyProfile, &inscription).unwrap();
 
@@ -1569,22 +1566,22 @@ fn a_descriptor_that_disagrees_with_its_layer_is_refused() {
     let snapshot = SnapshotDir::open(temp.path()).unwrap();
     let index = snapshot.blob_index().unwrap();
 
-    let mut wrong_size = inscription.layers[0].clone();
+    let mut wrong_size = inscription.diff[0].clone();
     wrong_size.uncompressed_size += 1;
     let err = read_both_ways(&snapshot, &index, &wrong_size).unwrap_err();
     assert!(matches!(err, Error::LayerMismatch { .. }), "{err:?}");
 
-    let mut wrong_count = inscription.layers[0].clone();
+    let mut wrong_count = inscription.diff[0].clone();
     wrong_count.records += 1;
     let err = read_both_ways(&snapshot, &index, &wrong_count).unwrap_err();
     assert!(matches!(err, Error::LayerMismatch { .. }), "{err:?}");
 
-    let mut wrong_kind = inscription.layers[0].clone();
+    let mut wrong_kind = inscription.diff[0].clone();
     wrong_kind.kind = "index".to_owned();
     let err = read_both_ways(&snapshot, &index, &wrong_kind).unwrap_err();
     assert!(matches!(err, Error::LayerMismatch { .. }), "{err:?}");
 
-    let mut absent = inscription.layers[0].clone();
+    let mut absent = inscription.diff[0].clone();
     absent.diff_id = stelae::Digest::from_bytes([0xab; 32]);
     let err = read_both_ways(&snapshot, &index, &absent).unwrap_err();
     assert!(matches!(err, Error::LayerNotFound { .. }), "{err:?}");
@@ -1593,7 +1590,7 @@ fn a_descriptor_that_disagrees_with_its_layer_is_refused() {
     // decompression rather than after it, on both paths: the claim is the
     // ceiling, and a blob that expands past its own descriptor is not read to
     // the end just to be told so.
-    let mut too_small = inscription.layers[0].clone();
+    let mut too_small = inscription.diff[0].clone();
     too_small.uncompressed_size -= 1;
     let err = read_both_ways(&snapshot, &index, &too_small).unwrap_err();
     assert!(matches!(err, Error::DecompressedTooLarge { .. }), "{err:?}");
@@ -1613,7 +1610,7 @@ fn a_malformed_record_is_reported_not_counted() {
     let (inscription, _) = write_snapshot(temp.path());
 
     let snapshot = SnapshotDir::open(temp.path()).unwrap();
-    let descriptor = inscription.layers[0].clone();
+    let descriptor = inscription.diff[0].clone();
 
     // Take the layer's bytes back out and append the head of a CBOR text string
     // that never arrives — a byte the framing must refuse.
@@ -1683,7 +1680,7 @@ fn a_layer_media_type_that_is_not_the_profiles_is_refused() {
 
     let with_media_type = |media_type: &str| {
         let mut tampered = inscription.clone();
-        tampered.layers[0].media_type = media_type.to_owned();
+        tampered.diff[0].media_type = media_type.to_owned();
         tampered
     };
 
@@ -1780,7 +1777,7 @@ fn golden_digests_pin_the_encoding() {
 
     assert_eq!(
         digest.to_string(),
-        "sha256:cd83855e8946dc9012f9ede51fd2d449f5cc300cfb52987556cfb55dd4d6167d",
+        "sha256:9d3014295b43fe4c6dbc4a0bf39531d8790f3b851eadb31428115c1ff365f157",
         "inscription digest drifted"
     );
 
@@ -1799,9 +1796,7 @@ fn golden_digests_pin_the_encoding() {
         ),
     ];
 
-    for (descriptor, (kind, diff_id, records, size)) in
-        inscription.layers.iter().zip(expected_layers)
-    {
+    for (descriptor, (kind, diff_id, records, size)) in inscription.layers().zip(expected_layers) {
         assert_eq!(descriptor.kind, kind);
         assert_eq!(descriptor.diff_id.to_string(), diff_id, "{kind} diffId");
         assert_eq!(descriptor.records, records, "{kind} record count");
@@ -1811,23 +1806,50 @@ fn golden_digests_pin_the_encoding() {
     // The canonical document itself, so a change to key naming or ordering is
     // visible in the diff rather than only as a moved hash.
     let canonical = String::from_utf8(inscription.canonicalize().unwrap()).unwrap();
+    assert_eq!(canonical, golden_document(Some(GOLDEN_LINK)));
+}
+
+/// The same snapshot as the first inscription of its lineage: no `previous`
+/// key at all, and every other byte as above.
+#[test]
+fn golden_digest_of_a_first_inscription() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut first, _) = write_snapshot(temp.path());
+    first.previous = None;
+
     assert_eq!(
-        canonical,
-        concat!(
-            r#"{"compression":{"algo":"zstd","level":9},"#,
-            r#""history":[{"inscriptionDigest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","sequence":1},"#,
-            r#"{"inscriptionDigest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","sequence":2}],"#,
-            r#""layers":[{"diffId":"sha256:e4f2187aa877f927788b5b4d59241fa2c92de3077eae30022731b4cfba0614f8","kind":"notes","#,
-            r#""mediaType":"application/vnd.example.stelae.notes.v1+zstd","records":4,"#,
-            r#""scope":{"chapter":3,"firstId":1,"lastId":3},"uncompressedSize":155},"#,
-            r#"{"diffId":"sha256:c00d73e03ccfa604f1c7ed5294f2986a4987d3400286ebda8c233503b350e502","kind":"index","#,
-            r#""mediaType":"application/vnd.example.stelae.index.v1+zstd","records":4,"#,
-            r#""scope":{"chapter":3},"uncompressedSize":77}],"#,
-            r#""parameters":{"noteWidth":40,"titleOrder":"byte"},"#,
-            r#""position":{"chapter":3,"curator":{"name":"example","since":1998},"shelf":"east"},"#,
-            r#""profile":{"name":"dev.example.toy","version":1},"schema":1,"sequence":3}"#,
-        )
+        first.digest().unwrap().to_string(),
+        "sha256:b19af455ade1a795148c462c4a43a2125a57430f3a3d0cde336a3f85c83816d5",
+        "first inscription digest drifted"
     );
+
+    let canonical = String::from_utf8(first.canonicalize().unwrap()).unwrap();
+    assert_eq!(canonical, golden_document(None));
+}
+
+/// The link `write_snapshot` gives its inscription, as canonical JSON.
+const GOLDEN_LINK: &str = concat!(
+    r#""previous":{"inscriptionDigest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","#,
+    r#""sequence":2},"#,
+);
+
+/// The canonical document `write_snapshot` seals, with `link` in its sorted
+/// place or no link at all.
+fn golden_document(link: Option<&str>) -> String {
+    [
+        r#"{"compression":{"algo":"zstd","level":9},"#,
+        r#""diff":[{"diffId":"sha256:e4f2187aa877f927788b5b4d59241fa2c92de3077eae30022731b4cfba0614f8","kind":"notes","#,
+        r#""mediaType":"application/vnd.example.stelae.notes.v1+zstd","records":4,"#,
+        r#""scope":{"chapter":3,"firstId":1,"lastId":3},"uncompressedSize":155}],"#,
+        r#""parameters":{"noteWidth":40,"titleOrder":"byte"},"#,
+        r#""position":{"chapter":3,"curator":{"name":"example","since":1998},"shelf":"east"},"#,
+        link.unwrap_or_default(),
+        r#""profile":{"name":"dev.example.toy","version":1},"schema":1,"sequence":3,"#,
+        r#""tip":[{"diffId":"sha256:c00d73e03ccfa604f1c7ed5294f2986a4987d3400286ebda8c233503b350e502","kind":"index","#,
+        r#""mediaType":"application/vnd.example.stelae.index.v1+zstd","records":4,"#,
+        r#""scope":{"chapter":3},"uncompressedSize":77}]}"#,
+    ]
+    .concat()
 }
 
 /// The discarding writer is faithful, not merely fast.
@@ -1890,11 +1912,7 @@ fn a_discarding_writer_reproduces_what_a_directory_stores() {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
 
-    for (stored, reproduced) in stored
-        .layers
-        .iter()
-        .zip([&reproduced_notes, &reproduced_index])
-    {
+    for (stored, reproduced) in stored.layers().zip([&reproduced_notes, &reproduced_index]) {
         assert_eq!(
             *stored, reproduced.descriptor,
             "{}: the descriptor a publish would have written",
@@ -1937,11 +1955,9 @@ fn a_discarding_writer_reproduces_what_a_directory_stores() {
         },
     );
 
-    inscription.history = stored.history.clone();
-    inscription.layers = vec![
-        reproduced_notes.descriptor.clone(),
-        reproduced_index.descriptor.clone(),
-    ];
+    inscription.previous = stored.previous;
+    inscription.diff = vec![reproduced_notes.descriptor.clone()];
+    inscription.tip = vec![reproduced_index.descriptor.clone()];
 
     assert_eq!(
         Discarding.seal(&ToyProfile, &inscription).unwrap(),
@@ -2016,7 +2032,7 @@ fn published_ahead(root: &std::path::Path, scope: serde_json::Value) -> Inscript
         )
         .unwrap();
 
-    inscription.layers.push(written.descriptor);
+    inscription.diff.push(written.descriptor);
     snapshot.seal(&FutureToyProfile, &inscription).unwrap();
 
     inscription

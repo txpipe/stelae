@@ -3,8 +3,12 @@
 //! The inscription is the OCI config blob of a snapshot and the anchor of the
 //! whole protocol. Its sha256, taken over its RFC 8785 canonical JSON encoding,
 //! is the snapshot's identity: what independent publishers reproduce, what
-//! signatures cover, and what `history` chains together so the newest signed
-//! inscription transitively attests every earlier one.
+//! signatures cover, and what the next inscription's `previous` names, so the
+//! newest signed inscription transitively attests every earlier one.
+//!
+//! An inscription lists only its own layers, in two arrays. `diff` holds the
+//! layers every later snapshot inherits; `tip` holds the layers that belong to
+//! this snapshot alone. Which array a layer goes to is the profile's decision.
 //!
 //! Three of its fields — `position`, `parameters` and each layer's `scope` —
 //! are the profile's, and this module never looks inside them. They are held as
@@ -23,7 +27,9 @@
 //! **An invalid inscription has no digest.** [`Inscription::canonicalize`]
 //! validates first, so it is not possible to obtain canonical bytes — and
 //! therefore an identity — for a document that violates the schema, the naming
-//! rules or the history invariant.
+//! rules, the link invariant or the one-layer-per-scope rule.
+
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -52,10 +58,13 @@ pub struct Compression {
     pub level: i64,
 }
 
-/// One prior publication, as attested by this inscription.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The inscription a snapshot follows in its lineage.
+///
+/// One link and not a list: the inscription it names carries its own link, so
+/// the newest inscription attests the whole chain back to the lineage's first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct HistoryEntry {
+pub struct Link {
     pub sequence: u64,
     pub inscription_digest: Digest,
 }
@@ -95,20 +104,38 @@ pub struct Inscription {
     /// The protocol's monotonic ordering key. A profile decides what it counts
     /// (the Dolos profile sets it to the Cardano epoch).
     pub sequence: u64,
+    /// The inscription this one follows. Omitted, never `null`, in the first
+    /// inscription of a lineage, which may start at any sequence.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_link"
+    )]
+    pub previous: Option<Link>,
     /// Profile-owned, opaque: where in its source domain this snapshot stands.
     pub position: serde_json::Value,
     /// Profile-owned, opaque: the parameters a reader needs to interpret the
     /// layers.
     pub parameters: serde_json::Value,
     pub compression: Compression,
-    /// Every prior publication, contiguous and ascending, ending at
-    /// `sequence - 1`.
-    pub history: Vec<HistoryEntry>,
-    pub layers: Vec<LayerDescriptor>,
+    /// The layers every later snapshot of the lineage inherits.
+    pub diff: Vec<LayerDescriptor>,
+    /// The layers that belong to this snapshot alone. Always present, and may
+    /// be empty.
+    pub tip: Vec<LayerDescriptor>,
+}
+
+/// A `previous` key that is present must hold a link: `null` is refused rather
+/// than read as the start of a lineage, which only omitting the key says.
+fn present_link<'de, D>(deserializer: D) -> Result<Option<Link>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Link::deserialize(deserializer).map(Some)
 }
 
 impl Inscription {
-    /// An inscription at the current schema version, with no history and no
+    /// An inscription at the current schema version, with no link and no
     /// layers yet.
     pub fn new(
         profile: &dyn Profile,
@@ -124,11 +151,12 @@ impl Inscription {
                 version: profile.version(),
             },
             sequence,
+            previous: None,
             position,
             parameters,
             compression,
-            history: Vec::new(),
-            layers: Vec::new(),
+            diff: Vec::new(),
+            tip: Vec::new(),
         }
     }
 
@@ -154,7 +182,7 @@ impl Inscription {
     /// happens only inside `position`, `parameters` and `scope`), a schema
     /// version this implementation does not implement, a number outside the
     /// JCS-safe integer range, a malformed profile name or payload media type,
-    /// and any violation of the history invariant.
+    /// a violation of the link invariant, and a kind and scope listed twice.
     ///
     /// It deliberately does *not* check which profile the inscription belongs
     /// to — that needs the profile implementation, and is
@@ -186,6 +214,11 @@ impl Inscription {
         check_safe_numbers(&value)
     }
 
+    /// Every layer this inscription lists: `diff`, then `tip`.
+    pub fn layers(&self) -> impl Iterator<Item = &LayerDescriptor> {
+        self.diff.iter().chain(&self.tip)
+    }
+
     /// Refuse an inscription this profile implementation cannot read.
     ///
     /// Two ways it fails, both clean refusals rather than a partial restore:
@@ -213,7 +246,7 @@ impl Inscription {
 
         let kinds = profile.kinds();
 
-        for layer in &self.layers {
+        for layer in self.layers() {
             // Left to `unknown_layers`. Its media type is still checked:
             // `validate_structure` has already established that it parses and
             // does not squat the reserved `stelae` vendor.
@@ -252,7 +285,7 @@ impl Inscription {
         Ok(())
     }
 
-    /// The layers whose kind `profile` does not define, in inscription order.
+    /// The layers whose kind `profile` does not define, `diff` then `tip`.
     ///
     /// The client half of an additive change. A profile that gains a kind
     /// publishes it as a new media type on a new layer, and an older reader
@@ -268,8 +301,7 @@ impl Inscription {
     pub fn unknown_layers<'a>(&'a self, profile: &dyn Profile) -> Vec<&'a LayerDescriptor> {
         let kinds = profile.kinds();
 
-        self.layers
-            .iter()
+        self.layers()
             .filter(|layer| !kinds.contains(&layer.kind.as_str()))
             .collect()
     }
@@ -296,18 +328,18 @@ impl Inscription {
         Ok(())
     }
 
-    /// Layers of a given kind, in inscription order.
+    /// Layers of a given kind, `diff` then `tip`.
     pub fn layers_of_kind<'a>(
         &'a self,
         kind: &'a str,
     ) -> impl Iterator<Item = &'a LayerDescriptor> + 'a {
-        self.layers.iter().filter(move |l| l.kind == kind)
+        self.layers().filter(move |l| l.kind == kind)
     }
 
-    /// Total uncompressed bytes across every layer — the restore-time disk
-    /// preflight, in the one place that knows the sizes.
+    /// Total uncompressed bytes across every layer this inscription lists —
+    /// the restore-time disk preflight, in the one place that knows the sizes.
     pub fn uncompressed_size(&self) -> u64 {
-        self.layers.iter().map(|l| l.uncompressed_size).sum()
+        self.layers().map(|l| l.uncompressed_size).sum()
     }
 
     fn validate_structure(&self) -> Result<(), Error> {
@@ -330,7 +362,7 @@ impl Inscription {
             ));
         }
 
-        for layer in &self.layers {
+        for layer in self.layers() {
             if layer.kind.is_empty() {
                 return Err(Error::Canonicalization(
                     "a layer descriptor has an empty kind".to_owned(),
@@ -342,82 +374,67 @@ impl Inscription {
             MediaType::parse(&layer.media_type)?;
         }
 
-        self.validate_history()
+        self.validate_link()?;
+        self.validate_one_layer_per_scope()
     }
 
-    /// `history` holds exactly one entry per published sequence, strictly
-    /// ascending, contiguous, ending at `sequence - 1`.
+    /// `previous`, when present, names a sequence below this one.
     ///
-    /// The protocol cannot know where a repository's history *starts* — the
-    /// first published sequence is a deployment parameter pinned alongside the
-    /// repository — so the invariant checked here is the part that is
-    /// universal: no gaps, no duplicates, no reordering, and nothing
-    /// missing between the last entry and this snapshot.
-    fn validate_history(&self) -> Result<(), Error> {
-        for (index, entry) in self.history.iter().enumerate() {
-            if entry.sequence >= self.sequence {
-                return Err(Error::HistoryInvariant(format!(
-                    "entry {index} has sequence {} which is not below this snapshot's sequence {}",
-                    entry.sequence, self.sequence
-                )));
+    /// Below and not exactly one below: how a lineage numbers its snapshots
+    /// is its publisher's schedule, so the universal part is a chain that only
+    /// runs backwards. [`link_for`] is the stricter rule a publisher builds by.
+    fn validate_link(&self) -> Result<(), Error> {
+        match self.previous {
+            Some(previous) if previous.sequence >= self.sequence => {
+                Err(Error::LinkInvariant(format!(
+                    "previous names sequence {} which is not below this snapshot's sequence {}",
+                    previous.sequence, self.sequence
+                )))
             }
-
-            if index == 0 {
-                continue;
-            }
-
-            let previous = self.history[index - 1].sequence;
-
-            match entry.sequence.cmp(&previous) {
-                std::cmp::Ordering::Less => {
-                    return Err(Error::HistoryInvariant(format!(
-                        "entry {index} has sequence {} after sequence {previous}: \
-                         history must be strictly ascending",
-                        entry.sequence
-                    )))
-                }
-                std::cmp::Ordering::Equal => {
-                    return Err(Error::HistoryInvariant(format!(
-                        "sequence {} appears more than once",
-                        entry.sequence
-                    )))
-                }
-                std::cmp::Ordering::Greater if entry.sequence != previous + 1 => {
-                    return Err(Error::HistoryInvariant(format!(
-                        "gap between sequence {previous} and sequence {}",
-                        entry.sequence
-                    )))
-                }
-                std::cmp::Ordering::Greater => {}
-            }
+            _ => Ok(()),
         }
+    }
 
-        if let Some(last) = self.history.last() {
-            if last.sequence + 1 != self.sequence {
-                return Err(Error::HistoryInvariant(format!(
-                    "history ends at sequence {} but this snapshot is sequence {}",
-                    last.sequence, self.sequence
-                )));
+    /// No `(kind, scope)` pair appears twice across `diff` and `tip`.
+    ///
+    /// Scopes are compared by their canonical encoding, the bytes the digest
+    /// covers. A pair listed twice is two layers claiming one place in the
+    /// dataset, and nothing in the document says which of them is meant.
+    fn validate_one_layer_per_scope(&self) -> Result<(), Error> {
+        let mut seen = BTreeSet::new();
+
+        for layer in self.layers() {
+            let scope = String::from_utf8(canonical_json(&layer.scope)?)
+                .map_err(|e| Error::Canonicalization(e.to_string()))?;
+
+            let pair = (layer.kind.as_str(), scope);
+
+            if seen.contains(&pair) {
+                return Err(Error::DuplicateLayer {
+                    kind: layer.kind.clone(),
+                    scope: pair.1,
+                });
             }
+
+            seen.insert(pair);
         }
 
         Ok(())
     }
 }
 
-/// The history a snapshot at `sequence` carries when it follows `previous`.
+/// The link a snapshot at `sequence` carries when it follows `previous`.
 ///
-/// The constructive half of the invariant [`Inscription::validate`] checks: one
-/// builds the chain, the other refuses a document whose chain is broken.
+/// The constructive half of the invariant [`Inscription::validate`] checks, and
+/// the stricter one: a publisher extends its lineage one sequence at a time.
 ///
-/// The three legal readings of what came before, and the one refusal:
+/// The two legal readings of what came before, and the one refusal:
 ///
-/// - **nothing there** — an empty history, which the protocol permits at any
-///   sequence. The first snapshot of a repository carries no history, and so
-///   does a publisher deliberately starting a new one at sequence 500;
-/// - **the snapshot before this one** — the old history plus an entry naming
-///   it. Contiguous by construction, so the protocol's invariant passes rather
-///   than being relied upon;
+/// - **nothing there** — no link, which the protocol permits at any sequence.
+///   The first snapshot of a lineage carries none, and so does a publisher
+///   deliberately starting one at sequence 500;
+/// - **the snapshot before this one** — a link naming its sequence and its
+///   inscription digest;
 /// - **anything else** — refused, naming both sequences and, for a gap, the
 ///   distance between them. A gap means a publisher skipped sequences, an equal
 ///   sequence means it is republishing one, and a higher one means the
@@ -429,27 +446,20 @@ impl Inscription {
 ///
 /// It lives beside the invariant rather than beside a transport because a
 /// verifier reaches it without one, and a rule this load-bearing should not be
-/// compiled out of a build that still has to reproduce a chained digest.
-pub fn history_for(
-    previous: Option<&Inscription>,
-    sequence: u64,
-) -> Result<Vec<HistoryEntry>, Error> {
+/// compiled out of a build that still has to reproduce a linked digest.
+pub fn link_for(previous: Option<&Inscription>, sequence: u64) -> Result<Option<Link>, Error> {
     let Some(previous) = previous else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
 
     let latest = previous.sequence;
 
     let reason = match latest.checked_add(1) {
         Some(next) if next == sequence => {
-            let mut history = previous.history.clone();
-
-            history.push(HistoryEntry {
+            return Ok(Some(Link {
                 sequence: latest,
                 inscription_digest: previous.digest()?,
-            });
-
-            return Ok(history);
+            }));
         }
         _ if latest >= sequence => {
             "this snapshot is at or behind the repository's latest; a republish would restart the \
@@ -463,7 +473,7 @@ pub fn history_for(
         ),
     };
 
-    Err(Error::HistoryBreak {
+    Err(Error::LinkBreak {
         latest,
         publishing: sequence,
         reason,
@@ -557,44 +567,37 @@ mod tests {
         Digest::from_bytes([byte; 32])
     }
 
-    fn sample() -> Inscription {
-        let mut inscription = Inscription::new(
-            &Toy,
-            3,
-            json!({"chapter": 3, "label": "third"}),
-            json!({"noteWidth": 40}),
-            Compression {
-                algo: "zstd".to_owned(),
-                level: 9,
-            },
-        );
-
-        inscription.history = vec![
-            HistoryEntry {
-                sequence: 1,
-                inscription_digest: digest_of(1),
-            },
-            HistoryEntry {
-                sequence: 2,
-                inscription_digest: digest_of(2),
-            },
-        ];
-
-        inscription.layers = vec![LayerDescriptor {
+    fn notes(diff_id: u8, scope: serde_json::Value) -> LayerDescriptor {
+        LayerDescriptor {
             kind: "notes".to_owned(),
             media_type: "application/vnd.example.stelae.notes.v1+zstd".to_owned(),
-            diff_id: digest_of(3),
+            diff_id: digest_of(diff_id),
             records: 5,
             uncompressed_size: 128,
-            scope: json!({"chapter": 3}),
-        }];
+            scope,
+        }
+    }
+
+    /// A linked inscription with one layer in each array.
+    fn sample() -> Inscription {
+        let mut inscription = at(
+            3,
+            Some(Link {
+                sequence: 2,
+                inscription_digest: digest_of(2),
+            }),
+        );
+
+        inscription.position = json!({"chapter": 3, "label": "third"});
+        inscription.diff = vec![notes(3, json!({"chapter": 3}))];
+        inscription.tip = vec![notes(4, json!({"draft": 4}))];
 
         inscription
     }
 
-    /// An inscription at `sequence` carrying `history`, for the chain rules
-    /// below: the fields `history_for` reads and nothing else.
-    fn at(sequence: u64, history: Vec<HistoryEntry>) -> Inscription {
+    /// An inscription at `sequence` carrying `previous` and no layers, for the
+    /// chain rules below.
+    fn at(sequence: u64, previous: Option<Link>) -> Inscription {
         let mut inscription = Inscription::new(
             &Toy,
             sequence,
@@ -606,55 +609,53 @@ mod tests {
             },
         );
 
-        inscription.history = history;
+        inscription.previous = previous;
         inscription
     }
 
-    fn entry(sequence: u64) -> HistoryEntry {
-        HistoryEntry {
-            sequence,
-            inscription_digest: Digest::compute(sequence.to_be_bytes()),
-        }
+    fn reparse(value: &serde_json::Value) -> Result<Inscription, Error> {
+        Inscription::parse(&serde_json::to_vec(value).unwrap())
     }
 
-    /// The first snapshot of a repository carries no history, at any sequence.
+    /// The first snapshot of a lineage carries no link, at any sequence.
     #[test]
-    fn an_empty_repository_starts_a_history() {
-        assert!(history_for(None, 0).unwrap().is_empty());
-        assert!(history_for(None, 500).unwrap().is_empty());
+    fn an_empty_repository_starts_a_lineage() {
+        assert_eq!(link_for(None, 0).unwrap(), None);
+        assert_eq!(link_for(None, 500).unwrap(), None);
     }
 
     #[test]
-    fn a_publish_that_follows_latest_extends_the_chain() {
-        let previous = at(3, vec![entry(1), entry(2)]);
+    fn a_publish_that_follows_latest_links_to_it() {
+        let previous = sample();
 
-        let history = history_for(Some(&previous), 4).unwrap();
+        let link = link_for(Some(&previous), 4).unwrap();
 
         assert_eq!(
-            history.iter().map(|e| e.sequence).collect::<Vec<_>>(),
-            vec![1, 2, 3],
-            "the old history plus an entry naming the snapshot it came from"
+            link,
+            Some(Link {
+                sequence: 3,
+                inscription_digest: previous.digest().unwrap(),
+            }),
+            "the sequence and the identity of the snapshot it came from"
         );
 
-        assert_eq!(history[2].inscription_digest, previous.digest().unwrap());
-
         // The invariant holds by construction rather than by inspection: a
-        // document built on this history validates.
-        at(4, history).validate().unwrap();
+        // document built on this link validates.
+        at(4, link).validate().unwrap();
     }
 
     /// All three refusals name both sequences, because which of the three it is
     /// decides what the publisher does about it.
     #[test]
     fn a_publish_that_does_not_follow_latest_is_refused() {
-        let previous = at(497, vec![]);
+        let previous = at(497, None);
 
         for publishing in [500, 497, 496] {
-            let err = history_for(Some(&previous), publishing).unwrap_err();
+            let err = link_for(Some(&previous), publishing).unwrap_err();
             let message = err.to_string();
 
             assert!(
-                matches!(err, Error::HistoryBreak { .. }),
+                matches!(err, Error::LinkBreak { .. }),
                 "{publishing}: {err:?}"
             );
 
@@ -668,19 +669,19 @@ mod tests {
 
     #[test]
     fn a_gap_and_a_republish_are_told_apart() {
-        let previous = at(497, vec![]);
+        let previous = at(497, None);
 
-        assert!(history_for(Some(&previous), 500)
+        assert!(link_for(Some(&previous), 500)
             .unwrap_err()
             .to_string()
             .contains("gap"));
 
-        assert!(history_for(Some(&previous), 497)
+        assert!(link_for(Some(&previous), 497)
             .unwrap_err()
             .to_string()
             .contains("republish"));
 
-        assert!(history_for(Some(&previous), 496)
+        assert!(link_for(Some(&previous), 496)
             .unwrap_err()
             .to_string()
             .contains("republish"));
@@ -691,9 +692,9 @@ mod tests {
     /// the message should not have to subtract to find out which they have.
     #[test]
     fn a_gap_names_the_distance_alongside_both_sequences() {
-        let previous = at(497, vec![]);
+        let previous = at(497, None);
 
-        let message = history_for(Some(&previous), 500).unwrap_err().to_string();
+        let message = link_for(Some(&previous), 500).unwrap_err().to_string();
 
         assert!(message.contains("497"), "{message}");
         assert!(message.contains("500"), "{message}");
@@ -709,12 +710,72 @@ mod tests {
         // whitespace, so the bytes are the same on any run.
         assert_eq!(canonical, inscription.canonicalize().unwrap());
         let text = String::from_utf8(canonical.clone()).unwrap();
-        assert!(text.starts_with(r#"{"compression":{"algo":"zstd","level":9},"history":"#));
+        assert!(text.starts_with(r#"{"compression":{"algo":"zstd","level":9},"diff":[{"#));
+        assert!(text.contains(r#""previous":{"inscriptionDigest":"sha256:"#));
+        assert!(text.contains(r#""tip":[{"#));
         assert!(!text.contains(' '));
 
         let parsed = Inscription::parse(&canonical).unwrap();
         assert_eq!(parsed, inscription);
         assert_eq!(parsed.digest().unwrap(), inscription.digest().unwrap());
+    }
+
+    /// The first inscription of a lineage has no `previous` key at all, and
+    /// `tip` is written even when it is empty.
+    #[test]
+    fn a_first_inscription_omits_previous_and_keeps_an_empty_tip() {
+        let mut first = sample();
+        first.previous = None;
+        first.tip.clear();
+
+        let text = String::from_utf8(first.canonicalize().unwrap()).unwrap();
+        assert!(!text.contains("previous"), "{text}");
+        assert!(text.contains(r#""tip":[]"#), "{text}");
+
+        assert_eq!(Inscription::parse(text.as_bytes()).unwrap(), first);
+    }
+
+    /// Only omission starts a lineage. A `null` link is not a spelling of it,
+    /// and neither array may be left out.
+    #[test]
+    fn rejects_a_null_previous_and_a_missing_array() {
+        let mut value = serde_json::to_value(sample()).unwrap();
+        value["previous"] = serde_json::Value::Null;
+
+        let err = reparse(&value).unwrap_err();
+        assert!(
+            matches!(&err, Error::Json(e) if e.to_string().contains("invalid type: null")),
+            "{err:?}"
+        );
+
+        for missing in ["diff", "tip"] {
+            let mut value = serde_json::to_value(sample()).unwrap();
+            value.as_object_mut().unwrap().remove(missing);
+
+            let err = reparse(&value).unwrap_err();
+            assert!(
+                matches!(&err, Error::Json(e) if e.to_string().contains("missing field")),
+                "{missing}: {err:?}"
+            );
+        }
+    }
+
+    /// The single layer list and the full history are not read as anything:
+    /// a document in that shape is refused, like any other unknown key.
+    #[test]
+    fn rejects_the_single_layer_list_and_the_history() {
+        for (old, replaces) in [("layers", "diff"), ("history", "previous")] {
+            let mut value = serde_json::to_value(sample()).unwrap();
+            let object = value.as_object_mut().unwrap();
+            let moved = object.remove(replaces).unwrap();
+            object.insert(old.to_owned(), json!([moved]));
+
+            let err = reparse(&value).unwrap_err();
+            assert!(
+                matches!(&err, Error::Json(e) if e.to_string().contains("unknown field")),
+                "{old}: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -749,7 +810,7 @@ mod tests {
             .unwrap()
             .insert("extra".to_owned(), json!(1));
 
-        let err = Inscription::parse(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+        let err = reparse(&value).unwrap_err();
         assert!(
             matches!(&err, Error::Json(e) if e.to_string().contains("unknown field")),
             "{err:?}"
@@ -760,7 +821,7 @@ mod tests {
     /// extension happens only inside the three opaque ones.
     #[test]
     fn rejects_an_unknown_key_in_a_nested_generic_object() {
-        for pointer in ["/profile", "/compression", "/layers/0", "/history/0"] {
+        for pointer in ["/profile", "/compression", "/previous", "/diff/0", "/tip/0"] {
             let inscription = sample();
             let mut value = serde_json::to_value(&inscription).unwrap();
             value
@@ -770,7 +831,7 @@ mod tests {
                 .unwrap()
                 .insert("extra".to_owned(), json!(1));
 
-            let err = Inscription::parse(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+            let err = reparse(&value).unwrap_err();
             assert!(
                 matches!(&err, Error::Json(e) if e.to_string().contains("unknown field")),
                 "{pointer}: {err:?}"
@@ -792,12 +853,12 @@ mod tests {
             let mut inscription = sample();
             inscription.position = value.clone();
             inscription.parameters = value.clone();
-            inscription.layers[0].scope = value.clone();
+            inscription.diff[0].scope = value.clone();
 
             let canonical = inscription.canonicalize().unwrap();
             let parsed = Inscription::parse(&canonical).unwrap();
             assert_eq!(parsed.position, value);
-            assert_eq!(parsed.layers[0].scope, value);
+            assert_eq!(parsed.diff[0].scope, value);
         }
     }
 
@@ -843,9 +904,10 @@ mod tests {
         inscription.check_profile(&Toy).unwrap();
 
         // A layer kind the profile does not define is readable — skippable, and
-        // reported — but not publishable.
+        // reported — but not publishable, in either array.
         let mut inscription = sample();
-        inscription.layers[0].kind = "blocks".to_owned();
+        inscription.diff[0].kind = "blocks".to_owned();
+        inscription.tip[0].kind = "state".to_owned();
         inscription.check_profile(&Toy).unwrap();
 
         assert_eq!(
@@ -854,11 +916,22 @@ mod tests {
                 .iter()
                 .map(|l| l.kind.as_str())
                 .collect::<Vec<_>>(),
-            vec!["blocks"],
+            vec!["blocks", "state"],
         );
 
         let err = inscription.check_profile_strict(&Toy).unwrap_err();
         assert!(matches!(err, Error::UnknownLayerKind { .. }), "{err:?}");
+    }
+
+    /// A media type outside the profile's vendor is refused in `tip` as it is
+    /// in `diff`.
+    #[test]
+    fn a_tip_layer_is_held_to_the_profile_media_type() {
+        let mut inscription = sample();
+        inscription.tip[0].media_type = "application/vnd.acme.stelae.notes.v1+zstd".to_owned();
+
+        let err = inscription.check_profile(&Toy).unwrap_err();
+        assert!(matches!(err, Error::InvalidMediaType { .. }), "{err:?}");
     }
 
     #[test]
@@ -873,109 +946,137 @@ mod tests {
 
     #[test]
     fn rejects_a_payload_media_type_in_the_reserved_namespace() {
-        let mut inscription = sample();
-        inscription.layers[0].media_type = "application/vnd.stelae.stelae.notes.v1+zstd".to_owned();
+        for array in [0, 1] {
+            let mut inscription = sample();
+            let layer = match array {
+                0 => &mut inscription.diff[0],
+                _ => &mut inscription.tip[0],
+            };
+            layer.media_type = "application/vnd.stelae.stelae.notes.v1+zstd".to_owned();
 
-        let err = inscription.validate().unwrap_err();
-        assert!(matches!(err, Error::InvalidMediaType { .. }), "{err:?}");
+            let err = inscription.validate().unwrap_err();
+            assert!(matches!(err, Error::InvalidMediaType { .. }), "{err:?}");
+        }
     }
 
     #[test]
-    fn history_accepts_a_contiguous_ascending_chain() {
+    fn rejects_an_empty_kind_in_either_array() {
+        for array in [0, 1] {
+            let mut inscription = sample();
+            let layer = match array {
+                0 => &mut inscription.diff[0],
+                _ => &mut inscription.tip[0],
+            };
+            layer.kind.clear();
+
+            let err = inscription.validate().unwrap_err();
+            assert!(
+                matches!(&err, Error::Canonicalization(m) if m.contains("empty kind")),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// The link may name any earlier sequence: the protocol holds a chain to
+    /// running backwards, and leaves a lineage's numbering to its publisher.
+    #[test]
+    fn the_link_names_an_earlier_sequence() {
         sample().validate().unwrap();
 
-        // The first snapshot of a repository carries no history.
-        let mut first = sample();
-        first.sequence = 0;
-        first.history.clear();
-        first.validate().unwrap();
-    }
-
-    #[test]
-    fn history_rejects_a_gap() {
-        let mut inscription = sample();
-        inscription.sequence = 4;
-        inscription.history = vec![
-            HistoryEntry {
-                sequence: 1,
-                inscription_digest: digest_of(1),
-            },
-            HistoryEntry {
-                sequence: 3,
-                inscription_digest: digest_of(3),
-            },
-        ];
-
-        let err = inscription.validate().unwrap_err();
-        assert!(
-            matches!(&err, Error::HistoryInvariant(m) if m.contains("gap")),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn history_rejects_a_duplicate() {
-        let mut inscription = sample();
-        inscription.history = vec![
-            HistoryEntry {
-                sequence: 2,
-                inscription_digest: digest_of(1),
-            },
-            HistoryEntry {
-                sequence: 2,
-                inscription_digest: digest_of(2),
-            },
-        ];
-
-        let err = inscription.validate().unwrap_err();
-        assert!(
-            matches!(&err, Error::HistoryInvariant(m) if m.contains("more than once")),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn history_rejects_reordering() {
-        let mut inscription = sample();
-        inscription.history = vec![
-            HistoryEntry {
-                sequence: 2,
-                inscription_digest: digest_of(2),
-            },
-            HistoryEntry {
-                sequence: 1,
-                inscription_digest: digest_of(1),
-            },
-        ];
-
-        let err = inscription.validate().unwrap_err();
-        assert!(
-            matches!(&err, Error::HistoryInvariant(m) if m.contains("ascending")),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn history_must_reach_the_current_sequence() {
-        let mut inscription = sample();
-        inscription.sequence = 9;
-
-        let err = inscription.validate().unwrap_err();
-        assert!(
-            matches!(&err, Error::HistoryInvariant(m) if m.contains("ends at sequence")),
-            "{err:?}"
-        );
-
-        let mut inscription = sample();
-        inscription.history.push(HistoryEntry {
-            sequence: 3,
-            inscription_digest: digest_of(3),
+        let mut skipped = sample();
+        skipped.previous = Some(Link {
+            sequence: 1,
+            inscription_digest: digest_of(1),
         });
-        let err = inscription.validate().unwrap_err();
+        skipped.validate().unwrap();
+
+        // A lineage may start at any sequence, the very first included.
+        at(0, None).validate().unwrap();
+        at(500, None).validate().unwrap();
+    }
+
+    #[test]
+    fn the_link_rejects_this_sequence_and_a_later_one() {
+        for named in [3, 4] {
+            let mut inscription = sample();
+            inscription.previous = Some(Link {
+                sequence: named,
+                inscription_digest: digest_of(9),
+            });
+
+            let err = inscription.validate().unwrap_err();
+            assert!(
+                matches!(&err, Error::LinkInvariant(m) if m.contains("not below")),
+                "{named}: {err:?}"
+            );
+
+            // An invalid link has no identity either.
+            assert!(inscription.canonicalize().is_err());
+        }
+    }
+
+    /// One `(kind, scope)` pair, one layer: within an array and across the two.
+    #[test]
+    fn rejects_a_kind_and_scope_listed_twice() {
+        let mut across = sample();
+        across.tip = vec![notes(4, json!({"chapter": 3}))];
+
+        let mut in_diff = sample();
+        in_diff.diff.push(notes(5, json!({"chapter": 3})));
+
+        let mut in_tip = sample();
+        in_tip.tip.push(notes(5, json!({"draft": 4})));
+
+        // The same bytes twice are still two layers for one scope.
+        let mut identical = sample();
+        identical.diff.push(identical.diff[0].clone());
+
+        for (case, inscription) in [
+            ("across", across),
+            ("in diff", in_diff),
+            ("in tip", in_tip),
+            ("identical", identical),
+        ] {
+            let err = inscription.validate().unwrap_err();
+            assert!(
+                matches!(&err, Error::DuplicateLayer { kind, .. } if kind == "notes"),
+                "{case}: {err:?}"
+            );
+            assert!(err.to_string().contains("more than once"), "{case}: {err}");
+        }
+    }
+
+    /// Scopes are compared as canonical JSON, so key order cannot hide a
+    /// duplicate, and the kind is half of the pair.
+    #[test]
+    fn a_pair_is_a_kind_and_a_canonical_scope() {
+        let mut reordered = sample();
+        reordered.diff = vec![notes(3, json!({"chapter": 3, "shelf": "east"}))];
+        reordered.tip = vec![notes(4, json!({"shelf": "east", "chapter": 3}))];
+
+        let err = reordered.validate().unwrap_err();
         assert!(
-            matches!(&err, Error::HistoryInvariant(m) if m.contains("not below")),
+            matches!(&err, Error::DuplicateLayer { scope, .. } if scope == r#"{"chapter":3,"shelf":"east"}"#),
             "{err:?}"
         );
+
+        // The same scope under another kind is another layer.
+        let mut other_kind = sample();
+        let mut index = notes(5, json!({"chapter": 3}));
+        index.kind = "index".to_owned();
+        index.media_type = "application/vnd.example.stelae.index.v1+zstd".to_owned();
+        other_kind.tip.push(index);
+        other_kind.validate().unwrap();
+    }
+
+    /// A parsed document is held to the pair rule too, not only a built one.
+    #[test]
+    fn parse_rejects_a_kind_and_scope_listed_twice() {
+        let mut value = serde_json::to_value(sample()).unwrap();
+        value["tip"][0]["scope"] = json!({"chapter": 3});
+
+        let err = reparse(&value).unwrap_err();
+        assert!(matches!(err, Error::DuplicateLayer { .. }), "{err:?}");
     }
 
     #[test]
@@ -983,14 +1084,30 @@ mod tests {
         let safe = MAX_SAFE_INTEGER as u64;
 
         let mut inscription = sample();
-        inscription.layers[0].uncompressed_size = safe;
+        inscription.diff[0].uncompressed_size = safe;
         inscription.canonicalize().unwrap();
 
         let mut inscription = sample();
-        inscription.layers[0].uncompressed_size = safe + 1;
+        inscription.diff[0].uncompressed_size = safe + 1;
         let err = inscription.canonicalize().unwrap_err();
         assert!(
-            matches!(&err, Error::UnsafeInteger { path, .. } if path == "$.layers[0].uncompressedSize"),
+            matches!(&err, Error::UnsafeInteger { path, .. } if path == "$.diff[0].uncompressedSize"),
+            "{err:?}"
+        );
+
+        let mut inscription = sample();
+        inscription.tip[0].records = safe + 1;
+        let err = inscription.canonicalize().unwrap_err();
+        assert!(
+            matches!(&err, Error::UnsafeInteger { path, .. } if path == "$.tip[0].records"),
+            "{err:?}"
+        );
+
+        let mut inscription = sample();
+        inscription.sequence = safe + 1;
+        let err = inscription.canonicalize().unwrap_err();
+        assert!(
+            matches!(&err, Error::UnsafeInteger { path, .. } if path == "$.sequence"),
             "{err:?}"
         );
 
@@ -1036,26 +1153,24 @@ mod tests {
 
     #[test]
     fn parse_rejects_unsafe_numbers_in_raw_bytes() {
-        let raw = br#"{"schema":1,"profile":{"name":"dev.example.toy","version":1},"sequence":1,"position":{"n":18446744073709551615},"parameters":{},"compression":{"algo":"zstd","level":9},"history":[],"layers":[]}"#;
+        let raw = br#"{"schema":1,"profile":{"name":"dev.example.toy","version":1},"sequence":1,"position":{"n":18446744073709551615},"parameters":{},"compression":{"algo":"zstd","level":9},"diff":[],"tip":[]}"#;
 
         let err = Inscription::parse(raw).unwrap_err();
         assert!(matches!(err, Error::UnsafeInteger { .. }), "{err:?}");
     }
 
     #[test]
-    fn uncompressed_size_sums_the_layers() {
+    fn layers_run_diff_then_tip() {
         let mut inscription = sample();
-        inscription.layers.push(LayerDescriptor {
-            kind: "notes".to_owned(),
-            media_type: "application/vnd.example.stelae.notes.v1+zstd".to_owned(),
-            diff_id: digest_of(4),
-            records: 2,
-            uncompressed_size: 72,
-            scope: json!({"chapter": 4}),
-        });
+        inscription.diff.push(notes(5, json!({"chapter": 4})));
 
-        assert_eq!(inscription.uncompressed_size(), 200);
-        assert_eq!(inscription.layers_of_kind("notes").count(), 2);
+        assert_eq!(
+            inscription.layers().map(|l| l.diff_id).collect::<Vec<_>>(),
+            vec![digest_of(3), digest_of(5), digest_of(4)],
+        );
+
+        assert_eq!(inscription.uncompressed_size(), 3 * 128);
+        assert_eq!(inscription.layers_of_kind("notes").count(), 3);
         assert_eq!(inscription.layers_of_kind("blocks").count(), 0);
     }
 }

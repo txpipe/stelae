@@ -56,7 +56,7 @@ pub struct Manifest {
     pub media_type: Option<String>,
     /// The inscription, as the config blob.
     pub config: Descriptor,
-    /// One per layer, in inscription order.
+    /// One per layer, in inscription order: `diff`, then `tip`.
     pub layers: Vec<Descriptor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<Descriptor>,
@@ -90,10 +90,10 @@ pub struct Descriptor {
 /// descriptor and the blob that is pushed under it cannot be computed from two
 /// different encodings of the same document.
 ///
-/// Layers are listed in **inscription order**, matched by `diffId`: the
-/// canonical document fixes the order, and the manifest follows it rather than
-/// the order the sinks happened to finish in. Anything that does not match both
-/// ways is a refusal.
+/// Layers are listed in **inscription order**, `diff` then `tip`, matched by
+/// `diffId`: the canonical document fixes the order, and the manifest follows
+/// it rather than the order the sinks happened to finish in. Anything that does
+/// not match both ways is a refusal.
 ///
 /// Pure, so the shape of the artifact is frozen by a golden that needs no
 /// network.
@@ -104,9 +104,9 @@ pub fn build_manifest(
     let config = inscription.canonicalize()?;
 
     let mut taken = vec![false; layers.len()];
-    let mut descriptors = Vec::with_capacity(inscription.layers.len());
+    let mut descriptors = Vec::with_capacity(inscription.diff.len() + inscription.tip.len());
 
-    for described in &inscription.layers {
+    for described in inscription.layers() {
         // Matched by identity, and the first unclaimed one wins: two layers
         // with the same `diffId` are the same bytes, so which of them a
         // descriptor points at cannot be observed.
@@ -247,31 +247,29 @@ pub(crate) fn check_envelope(manifest: &Manifest) -> Result<(), Error> {
 ///
 /// Both correspondences are checked, and they are not the same check: the
 /// `diffId` annotation is what the map is *built* from, and positional
-/// correspondence with `inscription.layers` is what proves the manifest
-/// describes this document's layers and not some other snapshot's. A manifest
-/// that carried the right blobs in the wrong order would pass the first and
-/// fail the second.
+/// correspondence with the inscription's layers, `diff` then `tip`, is what
+/// proves the manifest describes this document's layers and not some other
+/// snapshot's. A manifest that carried the right blobs in the wrong order
+/// would pass the first and fail the second.
 ///
 /// Pure, so the parsing half of the artifact is frozen by the same golden as
 /// the building half.
 pub fn read_manifest(manifest: &Manifest, inscription: &Inscription) -> Result<BlobIndex, Error> {
     check_envelope(manifest)?;
 
-    if manifest.layers.len() != inscription.layers.len() {
+    let described = inscription.diff.len() + inscription.tip.len();
+
+    if manifest.layers.len() != described {
         return Err(Error::ManifestMismatch(format!(
-            "the manifest carries {} layer(s) and the inscription describes {}",
+            "the manifest carries {} layer(s) and the inscription describes {described}",
             manifest.layers.len(),
-            inscription.layers.len(),
         )));
     }
 
     let mut blobs = BlobIndex::default();
 
-    for (position, (layer, described)) in manifest
-        .layers
-        .iter()
-        .zip(inscription.layers.iter())
-        .enumerate()
+    for (position, (layer, described)) in
+        manifest.layers.iter().zip(inscription.layers()).enumerate()
     {
         let annotation = layer
             .annotations
