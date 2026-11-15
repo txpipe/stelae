@@ -100,16 +100,27 @@ fn export_to_dir(dir: &Path, predecessor: &dyn Predecessor, number: u64) -> Seal
     export(&snapshot, predecessor, &epoch(&fixture, number)).unwrap()
 }
 
+/// Every fixture file, the newest one included: an empty file 3 stands for
+/// the file a node opens after it, so file 2 counts as closed.
 #[test]
 fn each_file_s_bodies_concatenate_to_its_chunk() {
-    let fixture = fixture();
+    let dir = copy_of(&[0, 1, 2]);
+    for extension in ["chunk", "primary", "secondary"] {
+        fs::write(dir.path().join(format!("00003.{extension}")), b"").unwrap();
+    }
 
-    for number in [0, 1] {
+    for number in [0, 1, 2] {
         let out = tempfile::tempdir().unwrap();
-        export_to_dir(out.path(), &Follows(prior(number)), number);
+        let snapshot = SnapshotDir::create(out.path()).unwrap();
+        export(
+            &snapshot,
+            &Follows(prior(number)),
+            &epoch(dir.path(), number),
+        )
+        .unwrap();
 
-        let blocks = read_back(&SnapshotDir::open(out.path()).unwrap());
-        let chunk = fs::read(fixture.join(format!("{number:05}.chunk"))).unwrap();
+        let blocks = read_back(&snapshot);
+        let chunk = fs::read(fixture().join(format!("{number:05}.chunk"))).unwrap();
         let bodies: Vec<u8> = blocks.iter().flat_map(|b| b.body.clone()).collect();
 
         assert!(!blocks.is_empty());
