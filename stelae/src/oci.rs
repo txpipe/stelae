@@ -11,34 +11,41 @@
 //! [`crate::dir::SnapshotDir`] could have been, and a profile driving one
 //! writes the same code.
 //!
-//! ## Two documents, one snapshot
+//! ## Two kinds of document, one snapshot
 //!
-//! A snapshot in a registry is an OCI image manifest whose config blob is the
-//! inscription:
+//! A sequence in a registry is published as up to two OCI image manifests
+//! whose config blob is the same inscription (decision 0080):
 //!
 //! ```text
-//! manifest   artifactType application/vnd.stelae.snapshot.v1
-//!   config   application/vnd.stelae.inscription.v1+json  -> the inscription
-//!   layers[] the profile's media types, in inscription order,
-//!            each annotated with its kind, its diffId and its scope
+//! <tag>       the diff manifest, artifactType application/vnd.stelae.snapshot.v1
+//!   config    application/vnd.stelae.inscription.v1+json  -> the inscription
+//!   layers[]  the inscription's diff, in order, each annotated with its kind,
+//!             its diffId and its scope
+//! <tag>.tip   the tip manifest: the same envelope and config, and the
+//!             inscription's tip, in order; not written when tip is empty
+//! latest      the newest sequence's diff manifest
 //! ```
 //!
-//! The two documents describe one thing from two sides. The inscription holds
-//! **identity** — `diffId`s, over uncompressed bytes, reproducible by a
-//! publisher who compressed differently. The manifest holds **transport** —
-//! compressed digests and sizes, which are what a registry addresses a blob by
-//! and are not stable across zstd versions. Neither is derivable from the
-//! other, which is why [`crate::BlobIndex`] exists at all, and why a directory
-//! has to write the same map down for itself in
+//! `<tag>` is what the profile renders for the sequence, and the protocol
+//! appends [`crate::TIP_SUFFIX`].
+//!
+//! The inscription and a manifest describe one thing from two sides. The
+//! inscription holds **identity** — `diffId`s, over uncompressed bytes,
+//! reproducible by a publisher who compressed differently. The manifest holds
+//! **transport** — compressed digests and sizes, which are what a registry
+//! addresses a blob by and are not stable across zstd versions. Neither is
+//! derivable from the other, which is why [`crate::BlobIndex`] exists at all,
+//! and why a directory has to write the same map down for itself in
 //! [`crate::dir::BLOB_INDEX_FILE`] — or, lacking one, reconstruct by brute
 //! force what a manifest states.
 //!
 //! Because they are two views of one snapshot, **a disagreement between them is
-//! a refusal**, in either direction: a layer the inscription describes and the
-//! manifest does not carry cannot be fetched, and a layer the manifest carries
-//! and the inscription does not describe is a blob nothing attests. Positional
-//! correspondence is checked as well as the `diffId` annotations, so the
-//! ordering the canonical document fixes is the ordering on the wire.
+//! a refusal**, in either direction: a layer the inscription describes and its
+//! manifest does not carry cannot be fetched, and a layer a manifest carries
+//! and the inscription does not describe is a blob nothing attests. Each
+//! manifest is held to its own array, positionally as well as by the `diffId`
+//! annotations, so the ordering the canonical document fixes is the ordering
+//! on the wire.
 //!
 //! ## Bounded by layers, in both directions
 //!
@@ -125,8 +132,8 @@
 //! > **A manifest must never name a blob the registry has not committed.**
 //!
 //! So [`SnapshotWriter::seal`] is the join. Every deferred round trip is
-//! awaited there — before the manifest is built, before the config blob goes
-//! up, before either tag is written — and the first failure among them fails
+//! awaited there — before the manifests are built, before the config blob goes
+//! up, before any tag is written — and the first failure among them fails
 //! the seal, in the state a failed seal has always left behind: layers unspent,
 //! nothing tagged, and the caller free to seal again. A publish that dies
 //! mid-flight leaves untagged blobs the registry reclaims, exactly as a serial
@@ -284,10 +291,10 @@ use crate::{
     inscription::{Inscription, LayerDescriptor},
     layer::LayerReader,
     manifest::{
-        build_manifest, check_envelope, manifest_bytes, read_manifest, Descriptor, Manifest,
-        IMAGE_MANIFEST_MEDIA_TYPE,
+        build_manifests, check_envelope, manifest_bytes, read_manifest, Array, Descriptor,
+        Manifest, Manifests, IMAGE_MANIFEST_MEDIA_TYPE,
     },
-    profile::{checked_tag_for_sequence, validate_tag, Profile},
+    profile::{checked_tag_for_sequence, tip_tag, validate_tag, Profile},
     progress::{Event, Observer},
     transport::{
         open_layer, BlobIndex, LayerSpec, LayerStream, RecordSink, SnapshotReader, SnapshotWriter,
@@ -1033,12 +1040,12 @@ impl Registry {
         std::mem::take(&mut self.shared.locked().transfer)
     }
 
-    /// Resolve `tag` into a readable snapshot.
+    /// Resolve `tag` into a readable snapshot: one sequence's diff and tip.
     ///
     /// The order is the specification, and every step is what makes the next
     /// one safe:
     ///
-    /// 1. tag → manifest, which names the config blob;
+    /// 1. tag → the diff manifest, which names the config blob;
     /// 2. config blob → its bytes, bounded by the size the manifest claims and
     ///    verified against the digest it is addressed by;
     /// 3. those bytes → the inscription, whose *own* digest must equal that
@@ -1050,35 +1057,33 @@ impl Registry {
     ///    restore. The read-side check, deliberately: a pull serves a reader,
     ///    and a caller that is about to *publish* on top of what it pulled owes
     ///    the stricter [`Inscription::check_profile_strict`] of its own;
-    /// 5. manifest ↔ inscription cross-check, which yields the [`BlobIndex`].
+    /// 5. the diff manifest ↔ the inscription's `diff`;
+    /// 6. when `tip` is not empty, the tip manifest under the sequence's tag
+    ///    plus [`crate::TIP_SUFFIX`] ↔ the inscription's `tip`. Together they
+    ///    yield the [`BlobIndex`].
+    ///
+    /// The tip manifest is found from the inscription's own sequence, so a
+    /// pull of the moving tag finds it too. A sequence whose diff manifest
+    /// is published and whose tip manifest is not is [`Error::TipGone`],
+    /// which [`Error::is_absent`] does not count as absence.
     pub fn pull(&self, profile: &dyn Profile, tag: &str) -> Result<Snapshot, Error> {
         validate_tag(tag)?;
 
         let reference = self.shared.tagged(tag);
+        let diff = self.shared.pull_manifest(&reference)?;
 
-        let subject = format!("manifest {reference}");
-
-        let (manifest, _digest) = self.shared.reading(&subject, || {
-            Ok(self.shared.runtime.block_on(
-                self.shared
-                    .client
-                    .pull_image_manifest(&reference, &self.shared.auth),
-            )?)
-        })?;
-        let manifest = from_oci(manifest);
-
-        check_envelope(&manifest)?;
+        check_envelope(&diff)?;
 
         let raw = self
             .shared
-            .pull_blob_bytes(&reference, &to_oci(&manifest.config))?;
+            .pull_blob_bytes(&reference, &to_oci(&diff.config))?;
         let inscription = Inscription::parse(&raw)?;
 
         if inscription.canonicalize()? != raw {
             return Err(Error::NonCanonicalInscription);
         }
 
-        let config_digest = manifest.config.digest.parse::<Digest>()?;
+        let config_digest = diff.config.digest.parse::<Digest>()?;
         let identity = inscription.digest()?;
 
         if identity != config_digest {
@@ -1091,12 +1096,33 @@ impl Registry {
 
         inscription.check_profile(profile)?;
 
-        let blobs = read_manifest(&manifest, &inscription)?;
+        let mut blobs = read_manifest(&diff, &inscription, Array::Diff)?;
+
+        let tip = if inscription.tip.is_empty() {
+            None
+        } else {
+            let tag = tip_tag(&checked_tag_for_sequence(profile, inscription.sequence)?)?;
+
+            let tip = match self.shared.pull_manifest(&self.shared.tagged(&tag)) {
+                Ok(tip) => tip,
+                Err(error) if error.is_absent() => {
+                    return Err(Error::TipGone {
+                        sequence: inscription.sequence,
+                        tag,
+                    })
+                }
+                Err(error) => return Err(error),
+            };
+
+            blobs.extend(read_manifest(&tip, &inscription, Array::Tip)?);
+
+            Some(tip)
+        };
 
         Ok(Snapshot {
             shared: Arc::clone(&self.shared),
             reference,
-            manifest,
+            manifests: Manifests { diff, tip },
             inscription,
             blobs,
         })
@@ -1108,7 +1134,8 @@ impl Registry {
         self.pull(profile, &tag)
     }
 
-    /// Resolve the profile's moving tag — the most recent snapshot.
+    /// Resolve the profile's moving tag — the most recent snapshot, by its
+    /// diff manifest, and its tip.
     pub fn pull_latest(&self, profile: &dyn Profile) -> Result<Snapshot, Error> {
         let tag = profile.moving_tag().to_owned();
         self.pull(profile, &tag)
@@ -1131,6 +1158,10 @@ impl Registry {
     /// ways depending on which layer of the client noticed it. Matching them
     /// here rather than at a caller is the point: this is the only module in
     /// the crate that has any business naming an `oci_client` error type.
+    ///
+    /// A latest snapshot whose tip manifest is gone is [`Error::TipGone`], not
+    /// `None`: the repository holds a snapshot, and restarting the lineage
+    /// over it would break the chain.
     pub fn latest(&self, profile: &dyn Profile) -> Result<Option<Snapshot>, Error> {
         match self.pull_latest(profile) {
             Ok(snapshot) => Ok(Some(snapshot)),
@@ -2137,25 +2168,31 @@ impl SnapshotWriter for Registry {
         })
     }
 
-    /// Publish the manifest, and with it the snapshot.
+    /// Publish the manifests, and with them the snapshot.
     ///
     /// The order is the whole of the safety argument:
     ///
     /// 1. **every layer blob is up.** The round trips were deferred by
     ///    [`RecordSink::finish`] and ran concurrently; this is where they are
     ///    joined, and the first failure among them is this call's failure;
-    /// 2. the inscription goes up as the config blob;
-    /// 3. the manifest is tagged with the immutable tag the profile renders for
-    ///    this sequence;
-    /// 4. and **only then** the moving tag moves.
+    /// 2. the inscription goes up as the config blob both manifests carry;
+    /// 3. the tip manifest, listing `tip`, is tagged with the sequence's tag
+    ///    plus [`crate::TIP_SUFFIX`]. A sequence whose `tip` is empty has none;
+    /// 4. the diff manifest, listing `diff`, is tagged with the immutable tag
+    ///    the profile renders for this sequence;
+    /// 5. and **only then** the moving tag moves to the diff manifest.
     ///
     /// Step 1 is the serialization point the concurrency is arranged around:
-    /// the manifest is built *after* it, so no document this transport writes
-    /// can name a blob the registry has not committed. Step 4 is last so that a
-    /// reader following `latest` never resolves to a snapshot whose blobs are
-    /// still uploading. A push that dies in the middle leaves untagged blobs
-    /// the registry will reclaim, and a `latest` that still points at the
-    /// previous snapshot — which is a snapshot, and restores.
+    /// the manifests are built *after* it, so no document this transport writes
+    /// can name a blob the registry has not committed. Step 3 comes before
+    /// step 4 so that an existing sequence tag implies its tip was written.
+    /// Step 5 is last so that a reader following `latest` never resolves to a
+    /// snapshot whose blobs are still uploading. A push that dies in the middle
+    /// leaves untagged blobs the registry will reclaim, or a tip manifest with
+    /// no sequence tag beside it, and a `latest` that still points at the
+    /// previous snapshot — which is a snapshot, and restores. Every step writes
+    /// the same bytes when it is repeated, so a seal or a publish after the
+    /// interruption finishes what it started.
     ///
     /// **A seal that succeeds consumes the layers finished since the last
     /// one.** One transport can therefore publish several snapshots in turn —
@@ -2183,10 +2220,11 @@ impl SnapshotWriter for Registry {
     /// failure reaches this join it has already been asked
     /// [`Options::attempts`] times.
     fn seal(&self, profile: &dyn Profile, inscription: &Inscription) -> Result<Digest, Error> {
-        // Both tags before either push. Validating the moving tag after the
+        // Every tag before any push. Validating the moving tag after the
         // sequence manifest is already public would make a bad tag something
         // the registry finds out about half way through.
         let sequence_tag = checked_tag_for_sequence(profile, inscription.sequence)?;
+        let tip_tag = tip_tag(&sequence_tag)?;
         let moving_tag = profile.moving_tag().to_owned();
         validate_tag(&moving_tag)?;
 
@@ -2199,18 +2237,24 @@ impl SnapshotWriter for Registry {
         // sealed again once the caller has decided what to do about it.
         self.shared.join_layers()?;
 
-        // Scoped so the guard is gone before anything touches the network.
-        let (body, config) = {
+        // Scoped so the guard is gone before anything touches the network. Both
+        // manifests are held to the size ceiling before either is pushed.
+        let (diff, tip, config) = {
             let state = self.shared.locked();
-            let (manifest, config) = build_manifest(inscription, &state.pending)?;
-            (manifest_bytes(&manifest)?, config)
+            let (manifests, config) = build_manifests(inscription, &state.pending)?;
+            let tip = manifests.tip.as_ref().map(manifest_bytes).transpose()?;
+            (manifest_bytes(&manifests.diff)?, tip, config)
         };
 
         let identity = Digest::compute(&config);
         self.shared.put_bytes(&identity, config)?;
 
-        self.shared.push_manifest(&sequence_tag, body.clone())?;
-        self.shared.push_manifest(&moving_tag, body)?;
+        if let Some(tip) = tip {
+            self.shared.push_manifest(&tip_tag, tip)?;
+        }
+
+        self.shared.push_manifest(&sequence_tag, diff.clone())?;
+        self.shared.push_manifest(&moving_tag, diff)?;
 
         // Only here, with nothing fallible left, are the layers spent.
         self.shared.locked().pending.clear();
@@ -2229,6 +2273,19 @@ impl SnapshotWriter for Registry {
 }
 
 impl Shared {
+    /// The manifest under `reference`, read under the read budget.
+    fn pull_manifest(&self, reference: &Reference) -> Result<Manifest, Error> {
+        let subject = format!("manifest {reference}");
+
+        let (manifest, _digest) = self.reading(&subject, || {
+            Ok(self
+                .runtime
+                .block_on(self.client.pull_image_manifest(reference, &self.auth))?)
+        })?;
+
+        Ok(from_oci(manifest))
+    }
+
     fn push_manifest(&self, tag: &str, body: Vec<u8>) -> Result<(), Error> {
         let reference = self.tagged(tag);
 
@@ -2325,17 +2382,18 @@ impl RecordSink for RegistrySink {
     }
 }
 
-/// A snapshot pulled from a registry, and the read handle over it.
+/// A snapshot pulled from a registry, and the read handle over it: one
+/// sequence's diff and tip.
 ///
-/// Everything cheap has already happened by the time this exists: the manifest
-/// and the inscription are in hand, verified against each other, and the
-/// `diffId`→blob map came off the manifest rather than out of a scan. What is
-/// left is the layers, and those are fetched one at a time as
+/// Everything cheap has already happened by the time this exists: the
+/// manifests and the inscription are in hand, verified against each other, and
+/// the `diffId`→blob map came off the manifests rather than out of a scan. What
+/// is left is the layers, and those are fetched one at a time as
 /// [`SnapshotReader::stream_layer`] is called.
 pub struct Snapshot {
     shared: Arc<Shared>,
     reference: Reference,
-    manifest: Manifest,
+    manifests: Manifests,
     inscription: Inscription,
     blobs: BlobIndex,
 }
@@ -2346,18 +2404,31 @@ impl std::fmt::Debug for Snapshot {
         f.debug_struct("Snapshot")
             .field("reference", &self.reference.whole())
             .field("sequence", &self.inscription.sequence)
-            .field("layers", &self.manifest.layers.len())
+            .field("layers", &self.layers().count())
             .finish_non_exhaustive()
     }
 }
 
 impl Snapshot {
-    /// The manifest this snapshot was read from.
+    /// The diff manifest this snapshot was read from, the one its tag names.
     pub fn manifest(&self) -> &Manifest {
-        &self.manifest
+        &self.manifests.diff
     }
 
-    /// Compressed bytes across every layer, as the manifest reports them.
+    /// The tip manifest this snapshot was read from, or `None` when its `tip`
+    /// is empty.
+    pub fn tip_manifest(&self) -> Option<&Manifest> {
+        self.manifests.tip.as_ref()
+    }
+
+    /// Every layer descriptor of both manifests: the diff's, then the tip's.
+    fn layers(&self) -> impl Iterator<Item = &Descriptor> {
+        let tip = self.manifests.tip.iter().flat_map(|tip| &tip.layers);
+
+        self.manifests.diff.layers.iter().chain(tip)
+    }
+
+    /// Compressed bytes across every layer, as the manifests report them.
     ///
     /// The whole-snapshot case of [`SnapshotReader::compressed_size`], for a
     /// caller that wants the total without walking the inscription — a
@@ -2365,31 +2436,24 @@ impl Snapshot {
     /// wants the per-layer figure, because what it is going to fetch is a
     /// subset.
     pub fn total_compressed_size(&self) -> u64 {
-        self.manifest
-            .layers
-            .iter()
-            .map(|layer| layer.size.max(0) as u64)
-            .sum()
+        self.layers().map(|layer| layer.size.max(0) as u64).sum()
     }
 
-    /// The manifest's own descriptor for a layer, by identity.
+    /// A manifest's own descriptor for a layer, by identity.
     ///
     /// One lookup, shared by the read path and the size estimate, so the two
     /// cannot come to disagree about which blob holds a layer. Two steps and
     /// both are needed: the [`BlobIndex`] maps identity to a blob digest, and
-    /// the manifest maps that digest to the descriptor carrying the compressed
+    /// the manifests map that digest to the descriptor carrying the compressed
     /// size the download is held to.
     fn layer_of(&self, index: &BlobIndex, descriptor: &LayerDescriptor) -> Option<&Descriptor> {
         let blob = index.blob_for(&descriptor.diff_id)?.to_string();
 
-        self.manifest
-            .layers
-            .iter()
-            .find(|layer| layer.digest == blob)
+        self.layers().find(|layer| layer.digest == blob)
     }
 
-    /// [`Snapshot::layer_of`] for a read, where a layer the manifest does not
-    /// place is a refusal.
+    /// [`Snapshot::layer_of`] for a read, where a layer no manifest places is
+    /// a refusal.
     fn placed(
         &self,
         index: &BlobIndex,
@@ -2414,13 +2478,14 @@ impl SnapshotReader for Snapshot {
         Ok(self.blobs.clone())
     }
 
-    /// Read the layer's compressed size off the manifest.
+    /// Read the layer's compressed size off its manifest.
     ///
     /// Free, and the reason a registry restore can report a correct total
-    /// before it fetches anything: the manifest is already in hand by the time
-    /// a [`Snapshot`] exists. A negative size — a manifest claiming something
-    /// impossible — reads as `None` rather than as a number, so it widens the
-    /// estimate's stated uncertainty instead of shrinking its total.
+    /// before it fetches anything: the manifests are already in hand by the
+    /// time a [`Snapshot`] exists. A negative size — a manifest claiming
+    /// something impossible — reads as `None` rather than as a number, so
+    /// it widens the estimate's stated uncertainty instead of shrinking its
+    /// total.
     fn compressed_size(
         &self,
         index: &BlobIndex,
@@ -3372,6 +3437,14 @@ mod tests {
         assert!(!Error::Registry(server_error(403)).is_absent());
         assert!(!Error::Registry(envelope(OciErrorCode::Denied)).is_absent());
         assert!(!Error::NonCanonicalInscription.is_absent());
+
+        // A sequence whose tip is gone is published: its diff is there.
+        let gone = Error::TipGone {
+            sequence: 4,
+            tag: "chapter-4.tip".to_owned(),
+        };
+        assert!(!gone.is_absent());
+        assert!(!gone.is_blob_refusal());
     }
 
     /// A password never reaches a log through this type.

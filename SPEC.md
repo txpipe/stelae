@@ -19,7 +19,8 @@ version 1
 ([`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/main/crates/snapshot/PROFILE.md)).
 Decision 0080 changes the inscription in place before that release, at the
 same versions and with no compatibility path: its layer list becomes the
-`diff` and `tip` arrays and its `history` becomes the `previous` link, and an
+`diff` and `tip` arrays, its `history` becomes the `previous` link, and a
+sequence is published under a diff manifest and a tip manifest. An
 implementation of either form refuses the other's documents. Changes after it
 follow the [compatibility](#compatibility) rules: the inscription schema and
 the envelope media types stay fail-closed, so any change to them takes a
@@ -262,26 +263,71 @@ snapshot's.
 
 ## OCI layout
 
-- One repository per (profile, dataset). The protocol requires an immutable
-  tag per sequence plus a moving `latest`; the profile renders the strings.
-- `artifactType: application/vnd.stelae.snapshot.v1` — the envelope names one
-  Stelae snapshot; layer media types per the profile; three annotations per
-  layer, named below.
+- One repository per (profile, dataset). Every manifest in it carries
+  `artifactType: application/vnd.stelae.snapshot.v1`, the envelope that names
+  a Stelae snapshot, the profile's layer media types, and three annotations
+  per layer, named below.
+- A sequence is published under two manifests that carry the same
+  inscription as their config (decision 0080). The **diff manifest** lists the
+  inscription's `diff`, and the **tip manifest** lists its `tip`. A sequence
+  whose `tip` is empty has no tip manifest. The diff manifest is never
+  deleted. The tip manifest, and the blobs only it names, may be, as the
+  registry's policy.
+
+### Tags
+
+| Tag | Names | Written |
+| --- | --- | --- |
+| `<tag>` | the sequence's diff manifest | once, by the sequence's publish |
+| `<tag>.tip` | the sequence's tip manifest | once, by the same publish, when `tip` is not empty |
+| `latest` | the newest sequence's diff manifest | moved by every publish |
+
+`<tag>` is the tag the profile renders for the sequence. The Cardano profiles
+render `epoch-N`, with no zero padding and no profile or lineage name, so
+their tags are `epoch-N`, `epoch-N.tip` and `latest`.
+
+The protocol owns the `.tip` suffix and appends it. A profile renders only the
+sequence's tag. A rendered or moving tag that ends in `.tip` is refused, and a
+rendered tag must leave room for the suffix within OCI's 128 characters. A
+reader asking for a tag that ends in `.tip` is refused too, because such a tag
+names one array of a snapshot and not the snapshot.
+
+A publish writes, in this order:
+
+1. the layer blobs;
+2. the inscription, as the config blob of both manifests;
+3. the tip manifest, under `<tag>.tip`;
+4. the diff manifest, under `<tag>`;
+5. `latest`, moved to the diff manifest.
+
+So an existing `<tag>` implies its tip was written, and `latest` never names a
+sequence whose blobs or tip were not up. Each step writes the same bytes when
+it is repeated, so a publish that stopped part way is finished by sealing or
+publishing the same sequence again.
+
+A reader resolves `<tag>`, or `latest`, to the diff manifest and reads the
+inscription it names. When the inscription's `tip` is not empty, the reader
+also reads the tip manifest, under the tag the profile renders for the
+inscription's `sequence`, plus `.tip`. A tip manifest missing beside its diff
+manifest is its own failure, distinct from an absent sequence: the tip is
+gone, the diff stays, every later snapshot is built on it, and only a restore
+at this sequence is lost.
 
 ### The manifest
 
-A snapshot in a registry is one OCI image manifest, and its shape is closed: a
-conforming publisher writes exactly the fields below, and a conforming client
-refuses anything else.
+Each manifest of a sequence is an OCI image manifest, and its shape is
+closed: a conforming publisher writes exactly the fields below, and a
+conforming client refuses anything else.
 
 - `schemaVersion: 2`; `mediaType: application/vnd.oci.image.manifest.v1+json`;
   `artifactType: application/vnd.stelae.snapshot.v1`.
-- `config` is the inscription's descriptor: `mediaType` is
-  `application/vnd.stelae.inscription.v1+json`, `digest` is the sha256 of the
-  canonical inscription bytes — the same digest independent parties reproduce
-  and sign — and `size` is those bytes' length.
-- `layers`: one descriptor per inscription layer, **in inscription order**:
-  every `diff` layer, then every `tip` layer. Each carries the layer's
+- `config` is the inscription's descriptor, the same in both manifests:
+  `mediaType` is `application/vnd.stelae.inscription.v1+json`, `digest` is the
+  sha256 of the canonical inscription bytes — the same digest independent
+  parties reproduce and sign — and `size` is those bytes' length.
+- `layers`: one descriptor per layer of the one array the manifest lists,
+  **in that array's order**. The diff manifest lists every `diff` layer, and
+  the tip manifest every `tip` layer. Each descriptor carries the layer's
   `mediaType` exactly as the inscription states it, the compressed blob's
   `digest` and `size`, and the three annotations below.
 - No `subject` and no manifest-level `annotations`.
@@ -312,16 +358,18 @@ without fetching the config blob, and a client may ignore them.
 
 ### Manifest–inscription agreement
 
-The manifest and the inscription are two views of one snapshot — the inscription
-holds identity, the manifest holds transport — and a disagreement between
-them, in either direction, is a refusal, never a preference.
+The manifests and the inscription are views of one snapshot — the
+inscription holds identity, the manifests hold transport — and a disagreement
+between them, in either direction, is a refusal, never a preference.
+Agreement is per array: the diff manifest is held to `diff` and the tip
+manifest to `tip`.
 
-A publisher refuses to build a manifest — before anything is pushed — when
+A publisher refuses to build the manifests — before anything is pushed — when
 the inscription describes a layer that was never written, or a layer was
-written that the inscription does not describe: a blob nothing attests must
-not be published.
+written that neither array describes: a blob nothing attests must not be
+published.
 
-A client refuses a manifest — before any blob is fetched — when:
+A client refuses a manifest — before any of its layer blobs is fetched — when:
 
 - `artifactType` is missing. This fails closed by choice: a registry that
   strips the OCI 1.1 discovery field has published something a client cannot
@@ -332,22 +380,28 @@ A client refuses a manifest — before any blob is fetched — when:
   no alias and no migration path, and a manifest bearing it is refused like
   any foreign type.
 - the config descriptor's media type is not the inscription's.
-- the manifest's layer count differs from the inscription's.
+- the config descriptor's digest is not the inscription's. A tip manifest
+  under a sequence's `.tip` tag that names another inscription is not that
+  sequence's tip.
+- the manifest's layer count differs from its array's.
 - a layer carries no `store.stelae.layer.diffId` annotation, so nothing says
   which layer it holds.
-- a layer's `diffId` annotation disagrees with the inscription's layer *at
-  that position*. Positional correspondence is a check of its own: a manifest
+- a layer's `diffId` annotation disagrees with its array's layer *at that
+  position*. Positional correspondence is a check of its own: a manifest
   carrying the right blobs in the wrong order passes the map and fails the
   order.
-- a layer's media type disagrees with the inscription's at that position.
+- a layer's media type disagrees with its array's at that position.
 
 ### The manifest size ceiling
 
 A manifest past **4 MiB** (`stelae::MANIFEST_SIZE_LIMIT`) is refused before
-the push. The figure is not a limit the OCI specification imposes; it is the
-ceiling registries converge on, and the refusal is measured on the exact
-canonical bytes that would have been pushed, so it names the document and its
-layer count instead of arriving later as a registry's `413`. A descriptor
+the push, and each manifest of a sequence is held to it on its own, before
+either is pushed. The figure is not a limit the OCI specification imposes; it
+is the ceiling registries converge on, and the refusal is measured on the
+exact canonical bytes that would have been pushed, so it names the document
+and its layer count instead of arriving later as a registry's `413`. A
+manifest lists one array of one inscription, so its size depends on what one
+sequence adds and not on the length of the chain. A descriptor
 with its annotations costs ~350 bytes, so the ceiling falls near 12,000
 layers; a profile's layer arithmetic must stay inside it (the Dolos profile's
 own accounting lives in its half of the spec).
@@ -379,8 +433,9 @@ own accounting lives in its half of the spec).
 ## Restore planning
 
 A client reads a snapshot in a fixed order, refusing early: resolve the tag to
-a manifest and refuse any manifest–inscription disagreement (above, before
-any blob is fetched); verify the inscription's digest, `schema`, profile
+the sequence's diff manifest and, when its `tip` is not empty, its tip
+manifest, and refuse any manifest–inscription disagreement (above, before
+any layer blob is fetched); verify the inscription's digest, `schema`, profile
 name and major version, and signatures; plan; then fetch, verifying each
 blob's registry digest (transport integrity) and its `diffId` (canonical
 identity).

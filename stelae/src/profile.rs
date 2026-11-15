@@ -28,7 +28,7 @@
 //! 3. The protocol never parses layer bodies or a profile's opaque objects. An
 //!    unknown profile is a clean refusal, never a partial restore.
 
-use crate::{frame::DEFAULT_MAX_RECORD, Error, MOVING_TAG, RESERVED_VENDOR};
+use crate::{frame::DEFAULT_MAX_RECORD, Error, MOVING_TAG, RESERVED_VENDOR, TIP_SUFFIX};
 
 /// A vendor's definition of what its stelae contain.
 ///
@@ -58,6 +58,10 @@ pub trait Profile {
     fn layer_media_type(&self, kind: &str) -> Result<String, Error>;
 
     /// The immutable tag under which a snapshot at `sequence` is published.
+    ///
+    /// It names the sequence's diff manifest. The protocol appends
+    /// [`TIP_SUFFIX`] to name its tip manifest, so the tag must not end in the
+    /// suffix and must leave room for it within the 128-character tag limit.
     fn tag_for_sequence(&self, sequence: u64) -> Result<String, Error>;
 
     /// The moving tag pointing at the most recent snapshot. Profiles may
@@ -115,11 +119,28 @@ pub fn checked_layer_media_type(profile: &dyn Profile, kind: &str) -> Result<Str
 }
 
 /// Ask `profile` for the immutable tag of `sequence` and enforce OCI tag syntax
-/// on the answer.
+/// on the answer, and on the tip tag the protocol derives from it.
 pub fn checked_tag_for_sequence(profile: &dyn Profile, sequence: u64) -> Result<String, Error> {
     let tag = profile.tag_for_sequence(sequence)?;
-    validate_tag(&tag)?;
+    tip_tag(&tag)?;
     Ok(tag)
+}
+
+/// The tag of the tip manifest beside the sequence tag `tag`: `tag` followed by
+/// [`TIP_SUFFIX`].
+///
+/// Refuses a `tag` that [`validate_tag`] refuses, and one too long to take the
+/// suffix.
+pub fn tip_tag(tag: &str) -> Result<String, Error> {
+    validate_tag(tag)?;
+
+    let tip = format!("{tag}{TIP_SUFFIX}");
+    check_tag_syntax(&tip).map_err(|_| Error::InvalidTag {
+        value: tag.to_owned(),
+        reason: format!("leaves no room for the {TIP_SUFFIX:?} suffix within 128 characters"),
+    })?;
+
+    Ok(tip)
 }
 
 /// Validate a profile name: reverse-DNS, lowercase, at least two labels.
@@ -161,8 +182,28 @@ pub fn validate_profile_name(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Validate an OCI tag: `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`.
+/// Validate a tag a profile renders or a reader asks for: OCI tag syntax,
+/// `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`, and not ending in [`TIP_SUFFIX`].
+///
+/// The suffix is the protocol's, so a tag ending in it names a tip manifest
+/// and never a snapshot. [`tip_tag`] is the one way to spell one.
 pub fn validate_tag(tag: &str) -> Result<(), Error> {
+    check_tag_syntax(tag)?;
+
+    if tag.ends_with(TIP_SUFFIX) {
+        return Err(Error::InvalidTag {
+            value: tag.to_owned(),
+            reason: format!(
+                "ends in {TIP_SUFFIX:?}, which the protocol appends to name a tip manifest"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// OCI tag syntax alone: `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`.
+fn check_tag_syntax(tag: &str) -> Result<(), Error> {
     let invalid = |reason: &str| Error::InvalidTag {
         value: tag.to_owned(),
         reason: reason.to_owned(),
@@ -568,6 +609,36 @@ mod tests {
         assert!(validate_tag(&"a".repeat(129)).is_err());
     }
 
+    /// The protocol owns the `.tip` suffix: no tag a profile renders or a
+    /// reader asks for ends in it, and the tip tag is the sequence tag with it
+    /// appended.
+    #[test]
+    fn the_tip_suffix_is_the_protocols() {
+        for owned in ["epoch-550.tip", "latest.tip", "_.tip", "a.tip"] {
+            let err = validate_tag(owned).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidTag { reason, .. } if reason.contains(".tip")),
+                "{owned:?}: {err:?}"
+            );
+        }
+
+        // Only the suffix: `.tip` elsewhere in a tag is an ordinary tag.
+        for ordinary in ["epoch-550.tipped", "tip", "a.tip.b", "epoch-550-tip"] {
+            validate_tag(ordinary).unwrap();
+        }
+
+        assert_eq!(tip_tag("epoch-550").unwrap(), "epoch-550.tip");
+        assert!(tip_tag("epoch-550.tip").is_err(), "a tip of a tip");
+        assert!(tip_tag("with space").is_err());
+
+        assert_eq!(tip_tag(&"a".repeat(124)).unwrap().len(), 128);
+        let err = tip_tag(&"a".repeat(125)).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidTag { reason, .. } if reason.contains("no room")),
+            "{err:?}"
+        );
+    }
+
     struct Fake {
         media_type: &'static str,
         tag: &'static str,
@@ -622,6 +693,18 @@ mod tests {
             tag: "note 1",
         };
         assert!(checked_tag_for_sequence(&bad_tag, 1).is_err());
+
+        // A rendered tag that is the protocol's tip spelling, or that leaves no
+        // room for it, is refused before anything is pushed under it.
+        static NO_ROOM: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "n".repeat(125));
+
+        for tag in ["note-1.tip", NO_ROOM.as_str()] {
+            let rendered = Fake {
+                media_type: "application/vnd.example.stelae.notes.v1+zstd",
+                tag,
+            };
+            assert!(checked_tag_for_sequence(&rendered, 1).is_err(), "{tag:?}");
+        }
 
         // A kind the profile does not declare never reaches the profile at all.
         let err = checked_layer_media_type(&good, "blocks").unwrap_err();

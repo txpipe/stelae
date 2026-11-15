@@ -751,7 +751,7 @@ impl StagingPeak {
 /// split is what keeps it honest, since a shortfall against the last publish's
 /// sizes is still a measured shortfall.
 ///
-/// Off the manifest the pull already fetched, and no per-layer `HEAD`: the
+/// Off the manifests the pull already fetched, and no per-layer `HEAD`: the
 /// promise a profile's dry run makes about touching nothing holds here too.
 ///
 /// `Ok(None)` is a first publish — no predecessor, nothing to size from — which

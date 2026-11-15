@@ -1,11 +1,16 @@
-//! A snapshot's manifest: the OCI image manifest it is published under,
-//! whichever transport holds it.
+//! A snapshot's manifests: the OCI image manifests it is published under,
+//! whichever transport holds them.
 //!
-//! A registry serves this document and a directory can hold the same one, so
-//! its types, its bytes and the reading of it belong to the protocol rather
-//! than to a transport. The types mirror the OCI image manifest and descriptor
-//! field for field; [`crate::oci`] converts to and from its client's types at
-//! its own boundary and calls the functions here.
+//! A sequence is published under two (decision 0080). The diff manifest lists
+//! the inscription's `diff`, the tip manifest lists its `tip`, and both carry
+//! the same inscription as their config. A sequence whose `tip` is empty has
+//! no tip manifest.
+//!
+//! A registry serves these documents and a directory can hold the same ones,
+//! so their types, their bytes and the reading of them belong to the protocol
+//! rather than to a transport. The types mirror the OCI image manifest and
+//! descriptor field for field; [`crate::oci`] converts to and from its
+//! client's types at its own boundary and calls the functions here.
 
 use std::collections::BTreeMap;
 
@@ -56,7 +61,7 @@ pub struct Manifest {
     pub media_type: Option<String>,
     /// The inscription, as the config blob.
     pub config: Descriptor,
-    /// One per layer, in inscription order: `diff`, then `tip`.
+    /// One per layer of the one array this manifest lists, in its order.
     pub layers: Vec<Descriptor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<Descriptor>,
@@ -84,29 +89,111 @@ pub struct Descriptor {
     pub artifact_type: Option<String>,
 }
 
-/// Build the manifest for a snapshot whose layers are already written.
+/// Which of an inscription's two arrays a manifest lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Array {
+    /// `diff`, listed by the manifest under the sequence's tag.
+    Diff,
+    /// `tip`, listed by the manifest under that tag plus [`crate::TIP_SUFFIX`].
+    Tip,
+}
+
+impl Array {
+    /// This array of `inscription`.
+    pub fn of(self, inscription: &Inscription) -> &[LayerDescriptor] {
+        match self {
+            Array::Diff => &inscription.diff,
+            Array::Tip => &inscription.tip,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Array::Diff => "diff",
+            Array::Tip => "tip",
+        }
+    }
+}
+
+/// The manifests one sequence is published under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Manifests {
+    /// Lists `diff`. Always written, so a sequence's tag exists exactly when
+    /// its diff was published.
+    pub diff: Manifest,
+    /// Lists `tip`; `None` when the inscription's `tip` is empty.
+    pub tip: Option<Manifest>,
+}
+
+/// Build the manifests for a snapshot whose layers are already written.
 ///
-/// Returns it together with the canonical inscription bytes, so the config
-/// descriptor and the blob that is pushed under it cannot be computed from two
-/// different encodings of the same document.
+/// Returns them together with the canonical inscription bytes, so the config
+/// descriptor both manifests carry and the blob pushed under it cannot be
+/// computed from two different encodings of the same document.
 ///
-/// Layers are listed in **inscription order**, `diff` then `tip`, matched by
-/// `diffId`: the canonical document fixes the order, and the manifest follows
-/// it rather than the order the sinks happened to finish in. Anything that does
-/// not match both ways is a refusal.
+/// Each manifest lists its array in **inscription order**, matched by
+/// `diffId`: the canonical document fixes the order, and the manifests follow
+/// it rather than the order the sinks happened to finish in. A layer the
+/// inscription describes and nobody wrote, or one written and described by
+/// neither array, is a refusal.
 ///
 /// Pure, so the shape of the artifact is frozen by a golden that needs no
 /// network.
-pub fn build_manifest(
+pub fn build_manifests(
     inscription: &Inscription,
     layers: &[WrittenLayer],
-) -> Result<(Manifest, Vec<u8>), Error> {
+) -> Result<(Manifests, Vec<u8>), Error> {
     let config = inscription.canonicalize()?;
 
     let mut taken = vec![false; layers.len()];
-    let mut descriptors = Vec::with_capacity(inscription.diff.len() + inscription.tip.len());
+    let diff = claim(&inscription.diff, layers, &mut taken)?;
+    let tip = claim(&inscription.tip, layers, &mut taken)?;
 
-    for described in inscription.layers() {
+    if let Some(orphan) = taken.iter().position(|used| !used) {
+        let layer = &layers[orphan].descriptor;
+
+        return Err(Error::ManifestMismatch(format!(
+            "a {:?} layer ({}) was written but the inscription does not describe it; \
+             a blob nothing attests would be published",
+            layer.kind, layer.diff_id,
+        )));
+    }
+
+    let config_descriptor = Descriptor {
+        media_type: INSCRIPTION_MEDIA_TYPE.to_owned(),
+        digest: Digest::compute(&config).to_string(),
+        size: config.len() as i64,
+        ..Default::default()
+    };
+
+    let manifest = |layers: Vec<Descriptor>| Manifest {
+        schema_version: 2,
+        media_type: Some(IMAGE_MANIFEST_MEDIA_TYPE.to_owned()),
+        artifact_type: Some(ARTIFACT_TYPE.to_owned()),
+        config: config_descriptor.clone(),
+        layers,
+        subject: None,
+        annotations: None,
+    };
+
+    let manifests = Manifests {
+        diff: manifest(diff),
+        tip: (!tip.is_empty()).then(|| manifest(tip)),
+    };
+
+    Ok((manifests, config))
+}
+
+/// The descriptors of one array, each matched to a written layer not yet
+/// claimed by an earlier one.
+fn claim(
+    described: &[LayerDescriptor],
+    layers: &[WrittenLayer],
+    taken: &mut [bool],
+) -> Result<Vec<Descriptor>, Error> {
+    let mut descriptors = Vec::with_capacity(described.len());
+
+    for described in described {
         // Matched by identity, and the first unclaimed one wins: two layers
         // with the same `diffId` are the same bytes, so which of them a
         // descriptor points at cannot be observed.
@@ -126,32 +213,7 @@ pub fn build_manifest(
         descriptors.push(layer_descriptor(described, layer)?);
     }
 
-    if let Some(orphan) = taken.iter().position(|used| !used) {
-        let layer = &layers[orphan].descriptor;
-
-        return Err(Error::ManifestMismatch(format!(
-            "a {:?} layer ({}) was written but the inscription does not describe it; \
-             a blob nothing attests would be published",
-            layer.kind, layer.diff_id,
-        )));
-    }
-
-    let manifest = Manifest {
-        schema_version: 2,
-        media_type: Some(IMAGE_MANIFEST_MEDIA_TYPE.to_owned()),
-        artifact_type: Some(ARTIFACT_TYPE.to_owned()),
-        config: Descriptor {
-            media_type: INSCRIPTION_MEDIA_TYPE.to_owned(),
-            digest: Digest::compute(&config).to_string(),
-            size: config.len() as i64,
-            ..Default::default()
-        },
-        layers: descriptors,
-        subject: None,
-        annotations: None,
-    };
-
-    Ok((manifest, config))
+    Ok(descriptors)
 }
 
 fn layer_descriptor(
@@ -182,8 +244,9 @@ fn layer_descriptor(
 /// has one answer to "what are the bytes of this JSON document" rather than two
 /// that agree until they do not.
 ///
-/// The ceiling is [`MANIFEST_SIZE_LIMIT`]. What it refuses is a snapshot with
-/// too many layers: at roughly 350 bytes of descriptor and annotations apiece,
+/// The ceiling is [`MANIFEST_SIZE_LIMIT`], held to each manifest of a sequence
+/// on its own. What it refuses is a manifest listing too many layers: at
+/// roughly 350 bytes of descriptor and annotations apiece,
 /// a manifest reaches 4 MiB somewhere around twelve thousand of them — nearly
 /// seven times a mainnet snapshot's ~1,816. The comparison is in layers because
 /// layers are what the ceiling counts; Dolos ADR-004's ~600 is a count of
@@ -238,46 +301,60 @@ pub(crate) fn check_envelope(manifest: &Manifest) -> Result<(), Error> {
     Ok(())
 }
 
-/// Read the identity→blob map off a manifest, holding it against the
-/// inscription.
+/// Read the identity→blob map off one manifest, holding it against the
+/// array of the inscription it lists.
 ///
 /// The registry's answer to the question [`crate::dir::BLOB_INDEX_FILE`]
 /// answers for a directory, and the reason a registry restore has always read
 /// every blob once instead of twice.
 ///
-/// Both correspondences are checked, and they are not the same check: the
-/// `diffId` annotation is what the map is *built* from, and positional
-/// correspondence with the inscription's layers, `diff` then `tip`, is what
-/// proves the manifest describes this document's layers and not some other
-/// snapshot's. A manifest that carried the right blobs in the wrong order
-/// would pass the first and fail the second.
+/// Three correspondences are checked, and they are not the same check. The
+/// config names this inscription, so a tip manifest of another sequence is not
+/// read as this one's. The `diffId` annotation is what the map is *built* from.
+/// Positional correspondence with `array` proves the manifest describes this
+/// document's layers and not some other snapshot's: a manifest that carried
+/// the right blobs in the wrong order would pass the second and fail the
+/// third.
 ///
 /// Pure, so the parsing half of the artifact is frozen by the same golden as
 /// the building half.
-pub fn read_manifest(manifest: &Manifest, inscription: &Inscription) -> Result<BlobIndex, Error> {
+pub fn read_manifest(
+    manifest: &Manifest,
+    inscription: &Inscription,
+    array: Array,
+) -> Result<BlobIndex, Error> {
     check_envelope(manifest)?;
 
-    let described = inscription.diff.len() + inscription.tip.len();
+    let name = array.name();
+    let identity = inscription.digest()?.to_string();
 
-    if manifest.layers.len() != described {
+    if manifest.config.digest != identity {
         return Err(Error::ManifestMismatch(format!(
-            "the manifest carries {} layer(s) and the inscription describes {described}",
+            "the {name} manifest's config is {}, and the inscription is {identity}",
+            manifest.config.digest,
+        )));
+    }
+
+    let described = array.of(inscription);
+
+    if manifest.layers.len() != described.len() {
+        return Err(Error::ManifestMismatch(format!(
+            "the {name} manifest carries {} layer(s) and the inscription's {name} describes {}",
             manifest.layers.len(),
+            described.len(),
         )));
     }
 
     let mut blobs = BlobIndex::default();
 
-    for (position, (layer, described)) in
-        manifest.layers.iter().zip(inscription.layers()).enumerate()
-    {
+    for (position, (layer, described)) in manifest.layers.iter().zip(described).enumerate() {
         let annotation = layer
             .annotations
             .as_ref()
             .and_then(|annotations| annotations.get(DIFF_ID_ANNOTATION))
             .ok_or_else(|| {
                 Error::ManifestMismatch(format!(
-                    "layer {position} carries no {DIFF_ID_ANNOTATION} annotation, \
+                    "{name} layer {position} carries no {DIFF_ID_ANNOTATION} annotation, \
                      so nothing says which layer it holds"
                 ))
             })?;
@@ -286,7 +363,7 @@ pub fn read_manifest(manifest: &Manifest, inscription: &Inscription) -> Result<B
 
         if diff_id != described.diff_id {
             return Err(Error::ManifestMismatch(format!(
-                "layer {position} is annotated {diff_id} and the inscription describes \
+                "{name} layer {position} is annotated {diff_id} and the inscription describes \
                  {} there",
                 described.diff_id,
             )));
@@ -294,7 +371,7 @@ pub fn read_manifest(manifest: &Manifest, inscription: &Inscription) -> Result<B
 
         if layer.media_type != described.media_type {
             return Err(Error::ManifestMismatch(format!(
-                "layer {position} is {:?} in the manifest and {:?} in the inscription",
+                "{name} layer {position} is {:?} in the manifest and {:?} in the inscription",
                 layer.media_type, described.media_type,
             )));
         }
