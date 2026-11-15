@@ -499,10 +499,13 @@ can read a window out of one), and store writes are the host's.
   to fetch, in the order it chooses, and which data to source elsewhere. A
   kind the client does not implement is skipped and reported, per rule 3
   above.
-- The schema map a restore checks (see
-  [profiles, naming and media types](#profiles-naming-and-media-types)) is per
-  inscription: each inscription's `parameters` describe the layers it lists,
-  so a client checks the map of every inscription whose layers it reads.
+- The namespace gate (see
+  [profiles, naming and media types](#profiles-naming-and-media-types)) reads
+  the head's schema map, which declares the namespaces the snapshot defines.
+  An earlier inscription's map describes only the layers that inscription
+  lists, and gates nothing: a lineage continues across a namespace the
+  profile adds, and an earlier inscription whose map lacks it is not
+  refused.
 - The progress file (`stelae::plan::RestoreProgress`) records the inscription
   digest and the diffIds of completed layers, at a path the host chooses. Its
   resume rule is content-based: a layer is done when its `diffId` is
