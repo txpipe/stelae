@@ -261,7 +261,7 @@
 //! variables and the precedence between them.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -274,7 +274,7 @@ use std::{
 use futures_util::Stream;
 use oci_client::{
     client::{ClientConfig, ClientProtocol},
-    manifest::{OciDescriptor, OciImageManifest, OCI_IMAGE_MEDIA_TYPE},
+    manifest::{OciDescriptor, OciImageManifest},
     secrets::RegistryAuth,
     Client,
 };
@@ -284,15 +284,19 @@ pub use oci_client::Reference;
 use crate::{
     digest::{read_uninterrupted, LayerDigests, LayerWriter},
     frame::{CanonicalCbor, Limits, SeqWriter},
-    inscription::{canonical_json, Inscription, LayerDescriptor},
+    inscription::{Inscription, LayerDescriptor},
     layer::LayerReader,
+    manifest::{
+        build_manifest, check_envelope, manifest_bytes, read_manifest, Descriptor, Manifest,
+        IMAGE_MANIFEST_MEDIA_TYPE,
+    },
     profile::{checked_tag_for_sequence, validate_tag, Profile},
     progress::{Event, Observer},
     transport::{
         open_layer, BlobIndex, LayerSpec, LayerStream, RecordSink, SnapshotReader, SnapshotWriter,
         WrittenLayer,
     },
-    Digest, Error, ARTIFACT_TYPE, INSCRIPTION_MEDIA_TYPE, MANIFEST_SIZE_LIMIT,
+    Digest, Error,
 };
 
 /// How a [`Registry`] authenticates.
@@ -353,28 +357,6 @@ impl Auth {
         }
     }
 }
-
-/// Annotation naming a layer's profile-defined kind.
-///
-/// The three annotation keys below are the specification's: SPEC.md's "OCI
-/// layout" section names them, reverse-DNS under
-/// `stelae.store`, a domain TxPipe owns. They are transport metadata and sit
-/// outside the inscription, so they are outside a snapshot's identity — but
-/// only two of them are informational. [`DIFF_ID_ANNOTATION`] is normative,
-/// because it is load-bearing on the way back: it *is* the identity→blob map a
-/// directory has to rebuild by decompressing everything. The golden freezes
-/// all three.
-pub const KIND_ANNOTATION: &str = "store.stelae.layer.kind";
-
-/// Annotation carrying a layer's `diffId` — its identity, and the key of the
-/// map a pull reads off the manifest.
-pub const DIFF_ID_ANNOTATION: &str = "store.stelae.layer.diffId";
-
-/// Annotation carrying the canonical JSON of a layer's profile-owned scope.
-///
-/// Informational: a human or a generic tool reading the manifest can see which
-/// epoch or shard a blob covers without fetching the config blob.
-pub const SCOPE_ANNOTATION: &str = "store.stelae.layer.scope";
 
 /// How much of a *streamed* layer is held in memory on the way up.
 ///
@@ -1111,10 +1093,13 @@ impl Registry {
                     .pull_image_manifest(&reference, &self.shared.auth),
             )?)
         })?;
+        let manifest = from_oci(manifest);
 
         check_envelope(&manifest)?;
 
-        let raw = self.shared.pull_blob_bytes(&reference, &manifest.config)?;
+        let raw = self
+            .shared
+            .pull_blob_bytes(&reference, &to_oci(&manifest.config))?;
         let inscription = Inscription::parse(&raw)?;
 
         if inscription.canonicalize()? != raw {
@@ -2159,7 +2144,7 @@ impl Shared {
     /// `use_monolithic_push` is set on the client, so `push_blob` sends a
     /// `POST` and a `PUT` rather than opening a chunked session for a
     /// document of a few kilobytes. No resident-byte permit — the
-    /// inscription is bounded by [`MANIFEST_SIZE_LIMIT`]'s order of
+    /// inscription is bounded by [`crate::MANIFEST_SIZE_LIMIT`]'s order of
     /// magnitude and by being one document, not by a budget shared with the
     /// layers.
     fn put_bytes(&self, digest: &Digest, bytes: Vec<u8>) -> Result<(), Error> {
@@ -2476,7 +2461,7 @@ impl Shared {
             self.runtime.block_on(self.client.push_manifest_raw(
                 &reference,
                 body.clone(),
-                http::HeaderValue::from_static(OCI_IMAGE_MEDIA_TYPE),
+                http::HeaderValue::from_static(IMAGE_MANIFEST_MEDIA_TYPE),
             ))?;
 
             Ok(())
@@ -2575,7 +2560,7 @@ impl RecordSink for RegistrySink {
 pub struct Snapshot {
     shared: Arc<Shared>,
     reference: Reference,
-    manifest: OciImageManifest,
+    manifest: Manifest,
     inscription: Inscription,
     blobs: BlobIndex,
 }
@@ -2592,8 +2577,8 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
-    /// The OCI manifest this snapshot was read from.
-    pub fn manifest(&self) -> &OciImageManifest {
+    /// The manifest this snapshot was read from.
+    pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
 
@@ -2619,7 +2604,7 @@ impl Snapshot {
     /// both are needed: the [`BlobIndex`] maps identity to a blob digest, and
     /// the manifest maps that digest to the descriptor carrying the compressed
     /// size the download is held to.
-    fn layer_of(&self, index: &BlobIndex, descriptor: &LayerDescriptor) -> Option<&OciDescriptor> {
+    fn layer_of(&self, index: &BlobIndex, descriptor: &LayerDescriptor) -> Option<&Descriptor> {
         let blob = index.blob_for(&descriptor.diff_id)?.to_string();
 
         self.manifest
@@ -2634,7 +2619,7 @@ impl Snapshot {
         &self,
         index: &BlobIndex,
         descriptor: &LayerDescriptor,
-    ) -> Result<&OciDescriptor, Error> {
+    ) -> Result<&Descriptor, Error> {
         self.layer_of(index, descriptor)
             .ok_or_else(|| Error::LayerNotFound {
                 kind: descriptor.kind.clone(),
@@ -2685,7 +2670,7 @@ impl SnapshotReader for Snapshot {
         let file = self
             .shared
             .runtime
-            .block_on(self.shared.pull_layer(&self.reference, oci))?;
+            .block_on(self.shared.pull_layer(&self.reference, &to_oci(oci)))?;
 
         LayerReader::new(file, profile, descriptor, limits)
     }
@@ -2766,7 +2751,7 @@ impl ReadAhead<'_> {
             let pull = self.snapshot.placed(self.index, &descriptor).map(|oci| {
                 shared
                     .runtime
-                    .spawn(shared.pull_layer(&self.snapshot.reference, oci))
+                    .spawn(shared.pull_layer(&self.snapshot.reference, &to_oci(oci)))
             });
 
             // Nothing after a refusal is handed over, so nothing after it is
@@ -2843,230 +2828,60 @@ impl Drop for ReadAhead<'_> {
     }
 }
 
-/// Build the manifest for a snapshot whose layers are already written.
-///
-/// Returns it together with the canonical inscription bytes, so the config
-/// descriptor and the blob that is pushed under it cannot be computed from two
-/// different encodings of the same document.
-///
-/// Layers are listed in **inscription order**, matched by `diffId`: the
-/// canonical document fixes the order, and the manifest follows it rather than
-/// the order the sinks happened to finish in. Anything that does not match both
-/// ways is a refusal — see the module documentation.
-///
-/// Pure, so the shape of the artifact is frozen by a golden that needs no
-/// network.
-pub fn build_manifest(
-    inscription: &Inscription,
-    layers: &[WrittenLayer],
-) -> Result<(OciImageManifest, Vec<u8>), Error> {
-    let config = inscription.canonicalize()?;
+/// The client's manifest as the protocol's, field for field, so nothing a
+/// registry served is dropped before [`read_manifest`] judges it.
+fn from_oci(manifest: OciImageManifest) -> Manifest {
+    let OciImageManifest {
+        schema_version,
+        media_type,
+        config,
+        layers,
+        subject,
+        artifact_type,
+        annotations,
+    } = manifest;
 
-    let mut taken = vec![false; layers.len()];
-    let mut descriptors = Vec::with_capacity(inscription.layers.len());
-
-    for described in &inscription.layers {
-        // Matched by identity, and the first unclaimed one wins: two layers
-        // with the same `diffId` are the same bytes, so which of them a
-        // descriptor points at cannot be observed.
-        let found = layers
-            .iter()
-            .enumerate()
-            .find(|(index, layer)| !taken[*index] && layer.descriptor.diff_id == described.diff_id);
-
-        let Some((index, layer)) = found else {
-            return Err(Error::ManifestMismatch(format!(
-                "the inscription describes a {:?} layer ({}) that was never written",
-                described.kind, described.diff_id,
-            )));
-        };
-
-        taken[index] = true;
-        descriptors.push(layer_descriptor(described, layer)?);
+    Manifest {
+        schema_version,
+        media_type,
+        config: from_oci_descriptor(config),
+        layers: layers.into_iter().map(from_oci_descriptor).collect(),
+        subject: subject.map(from_oci_descriptor),
+        artifact_type,
+        annotations,
     }
-
-    if let Some(orphan) = taken.iter().position(|used| !used) {
-        let layer = &layers[orphan].descriptor;
-
-        return Err(Error::ManifestMismatch(format!(
-            "a {:?} layer ({}) was written but the inscription does not describe it; \
-             a blob nothing attests would be published",
-            layer.kind, layer.diff_id,
-        )));
-    }
-
-    let manifest = OciImageManifest {
-        schema_version: 2,
-        media_type: Some(OCI_IMAGE_MEDIA_TYPE.to_owned()),
-        artifact_type: Some(ARTIFACT_TYPE.to_owned()),
-        config: OciDescriptor {
-            media_type: INSCRIPTION_MEDIA_TYPE.to_owned(),
-            digest: Digest::compute(&config).to_string(),
-            size: config.len() as i64,
-            ..Default::default()
-        },
-        layers: descriptors,
-        subject: None,
-        annotations: None,
-    };
-
-    Ok((manifest, config))
 }
 
-fn layer_descriptor(
-    described: &LayerDescriptor,
-    written: &WrittenLayer,
-) -> Result<OciDescriptor, Error> {
-    let scope = String::from_utf8(canonical_json(&described.scope)?)
-        .map_err(|e| Error::Canonicalization(e.to_string()))?;
+fn from_oci_descriptor(descriptor: OciDescriptor) -> Descriptor {
+    let OciDescriptor {
+        media_type,
+        digest,
+        size,
+        urls,
+        annotations,
+        artifact_type,
+    } = descriptor;
 
-    let annotations = BTreeMap::from([
-        (KIND_ANNOTATION.to_owned(), described.kind.clone()),
-        (DIFF_ID_ANNOTATION.to_owned(), described.diff_id.to_string()),
-        (SCOPE_ANNOTATION.to_owned(), scope),
-    ]);
-
-    Ok(OciDescriptor {
-        media_type: described.media_type.clone(),
-        digest: written.digests.blob_digest.to_string(),
-        size: written.digests.compressed_size as i64,
-        annotations: Some(annotations),
-        ..Default::default()
-    })
+    Descriptor {
+        media_type,
+        digest,
+        size,
+        urls,
+        annotations,
+        artifact_type,
+    }
 }
 
-/// The exact bytes of a manifest, canonicalized and held to the size ceiling.
-///
-/// RFC 8785 through the same canonicalizer the inscription uses, so this crate
-/// has one answer to "what are the bytes of this JSON document" rather than two
-/// that agree until they do not.
-///
-/// The ceiling is [`MANIFEST_SIZE_LIMIT`]. What it refuses is a snapshot with
-/// too many layers: at roughly 350 bytes of descriptor and annotations apiece,
-/// a manifest reaches 4 MiB somewhere around twelve thousand of them — nearly
-/// seven times a mainnet snapshot's ~1,816. The comparison is in layers because
-/// layers are what the ceiling counts; Dolos ADR-004's ~600 is a count of
-/// *epochs*, and a mainnet snapshot carries three layers per epoch plus sixteen
-/// state shards. It is not a limit anything is expected to reach; it is the
-/// limit that turns "the registry answered 413" into a refusal that names the
-/// document and the number of layers in it.
-///
-/// `a_manifest_past_the_size_ceiling_is_refused` in `tests/oci.rs` measures
-/// those figures rather than asserting them; keep the two in step.
-pub fn manifest_bytes(manifest: &OciImageManifest) -> Result<Vec<u8>, Error> {
-    let body = canonical_json(&serde_json::to_value(manifest)?)?;
-
-    if body.len() > MANIFEST_SIZE_LIMIT {
-        return Err(Error::ManifestTooLarge {
-            size: body.len(),
-            layers: manifest.layers.len(),
-        });
+/// A protocol descriptor as the client's, for the blob pulls that take one.
+fn to_oci(descriptor: &Descriptor) -> OciDescriptor {
+    OciDescriptor {
+        media_type: descriptor.media_type.clone(),
+        digest: descriptor.digest.clone(),
+        size: descriptor.size,
+        urls: descriptor.urls.clone(),
+        annotations: descriptor.annotations.clone(),
+        artifact_type: descriptor.artifact_type.clone(),
     }
-
-    Ok(body)
-}
-
-/// Check that a manifest is a Stelae snapshot's before anything inside it is
-/// trusted.
-fn check_envelope(manifest: &OciImageManifest) -> Result<(), Error> {
-    match manifest.artifact_type.as_deref() {
-        Some(ARTIFACT_TYPE) => {}
-        Some(other) => {
-            return Err(Error::ManifestMismatch(format!(
-                "artifactType is {other:?}, not {ARTIFACT_TYPE:?}"
-            )))
-        }
-        // Fail closed. A registry that strips `artifactType` — the OCI 1.1
-        // field this artifact is discovered by — has published something this
-        // client cannot recognise as a snapshot, and reading it anyway would make
-        // the discovery contract advisory.
-        None => {
-            return Err(Error::ManifestMismatch(format!(
-                "no artifactType; a Stelae snapshot's manifest carries {ARTIFACT_TYPE:?}"
-            )))
-        }
-    }
-
-    if manifest.config.media_type != INSCRIPTION_MEDIA_TYPE {
-        return Err(Error::ManifestMismatch(format!(
-            "config blob is {:?}, not the inscription's {INSCRIPTION_MEDIA_TYPE:?}",
-            manifest.config.media_type,
-        )));
-    }
-
-    Ok(())
-}
-
-/// Read the identity→blob map off a manifest, holding it against the
-/// inscription.
-///
-/// The registry's answer to the question [`crate::dir::BLOB_INDEX_FILE`]
-/// answers for a directory, and the reason a registry restore has always read
-/// every blob once instead of twice.
-///
-/// Both correspondences are checked, and they are not the same check: the
-/// `diffId` annotation is what the map is *built* from, and positional
-/// correspondence with `inscription.layers` is what proves the manifest
-/// describes this document's layers and not some other snapshot's. A manifest
-/// that carried the right blobs in the wrong order would pass the first and
-/// fail the second.
-///
-/// Pure, so the parsing half of the artifact is frozen by the same golden as
-/// the building half.
-pub fn read_manifest(
-    manifest: &OciImageManifest,
-    inscription: &Inscription,
-) -> Result<BlobIndex, Error> {
-    check_envelope(manifest)?;
-
-    if manifest.layers.len() != inscription.layers.len() {
-        return Err(Error::ManifestMismatch(format!(
-            "the manifest carries {} layer(s) and the inscription describes {}",
-            manifest.layers.len(),
-            inscription.layers.len(),
-        )));
-    }
-
-    let mut blobs = BlobIndex::default();
-
-    for (position, (oci, described)) in manifest
-        .layers
-        .iter()
-        .zip(inscription.layers.iter())
-        .enumerate()
-    {
-        let annotation = oci
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.get(DIFF_ID_ANNOTATION))
-            .ok_or_else(|| {
-                Error::ManifestMismatch(format!(
-                    "layer {position} carries no {DIFF_ID_ANNOTATION} annotation, \
-                     so nothing says which layer it holds"
-                ))
-            })?;
-
-        let diff_id = annotation.parse::<Digest>()?;
-
-        if diff_id != described.diff_id {
-            return Err(Error::ManifestMismatch(format!(
-                "layer {position} is annotated {diff_id} and the inscription describes \
-                 {} there",
-                described.diff_id,
-            )));
-        }
-
-        if oci.media_type != described.media_type {
-            return Err(Error::ManifestMismatch(format!(
-                "layer {position} is {:?} in the manifest and {:?} in the inscription",
-                oci.media_type, described.media_type,
-            )));
-        }
-
-        blobs.insert(diff_id, oci.digest.parse::<Digest>()?);
-    }
-
-    Ok(blobs)
 }
 
 /// A staged layer, as a stream of chunks.
@@ -3216,9 +3031,58 @@ impl<W: Write + Unpin> tokio::io::AsyncWrite for Blocking<'_, W> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use oci_client::errors::{OciDistributionError, OciEnvelope, OciError, OciErrorCode};
 
     use super::*;
+
+    /// The media type the protocol names is the one the client speaks.
+    #[test]
+    fn the_manifest_media_type_is_the_clients() {
+        assert_eq!(
+            IMAGE_MANIFEST_MEDIA_TYPE,
+            oci_client::manifest::OCI_IMAGE_MEDIA_TYPE
+        );
+    }
+
+    /// A manifest read through the client converts back to the protocol's
+    /// without a byte changing, every optional field set so none is dropped.
+    #[test]
+    fn a_manifest_crosses_the_client_boundary_unchanged() {
+        let descriptor = |digest: &str| Descriptor {
+            media_type: "application/vnd.example.layer.v1+zstd".to_owned(),
+            digest: digest.to_owned(),
+            size: 91,
+            urls: Some(vec!["https://mirror.invalid/blob".to_owned()]),
+            annotations: Some(BTreeMap::from([("k".to_owned(), "v".to_owned())])),
+            artifact_type: Some("application/vnd.example.thing.v1".to_owned()),
+        };
+
+        let manifest = Manifest {
+            schema_version: 2,
+            media_type: Some(IMAGE_MANIFEST_MEDIA_TYPE.to_owned()),
+            config: descriptor(&format!("sha256:{}", "a".repeat(64))),
+            layers: vec![descriptor(&format!("sha256:{}", "b".repeat(64)))],
+            subject: Some(descriptor(&format!("sha256:{}", "c".repeat(64)))),
+            artifact_type: Some(crate::ARTIFACT_TYPE.to_owned()),
+            annotations: Some(BTreeMap::from([("m".to_owned(), "n".to_owned())])),
+        };
+
+        let body = manifest_bytes(&manifest).unwrap();
+        let client: OciImageManifest = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(to_oci(&manifest.config).digest, client.config.digest);
+
+        let back = from_oci(client);
+
+        assert_eq!(back, manifest);
+        assert_eq!(manifest_bytes(&back).unwrap(), body);
+        assert_eq!(
+            from_oci_descriptor(to_oci(&manifest.layers[0])),
+            manifest.layers[0]
+        );
+    }
 
     fn envelope(code: OciErrorCode) -> OciDistributionError {
         OciDistributionError::RegistryError {
