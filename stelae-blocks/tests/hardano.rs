@@ -2,8 +2,9 @@
 //!
 //! The fixture is preprod's first three immutable files, as Mithril certifies
 //! them: Byron epochs 0, 1 and 2, one 21,600-slot file each. File 0 opens
-//! with the chain's epoch boundary block. Epochs 0 and 1 are exported; file 2
-//! is there to show that file 1 is closed.
+//! with the chain's epoch boundary block. Each file is exported as its own
+//! epoch, closed by the next one (an empty file 3 closes file 2), and files 0
+//! and 1 are also exported as one two-file epoch.
 //!
 //! `preprod-blocks` holds one block of each later era, the smallest of an
 //! immutable file early in it, with the node's 56-byte secondary-index entry
@@ -262,8 +263,8 @@ fn an_epoch_over_several_files_takes_each_of_them() {
     );
 }
 
-/// An index that cannot be read fails the export; it never drops the file's
-/// blocks.
+/// An index that cannot be read fails the export: an empty primary index, and
+/// a secondary index cut short in its last entry.
 #[test]
 fn an_unreadable_index_is_refused() {
     let out = tempfile::tempdir().unwrap();
