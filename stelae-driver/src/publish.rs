@@ -972,12 +972,33 @@ mod tests {
         assert_eq!(offered(3), vec![notes]);
         assert!(offered(2).is_empty(), "notes not yet final were offered");
 
-        let elsewhere = Origin {
-            dataset_id: 2,
-            ..origin()
-        };
-
-        assert!(record.table(&elsewhere, &Settling, 3).unwrap().is_empty());
+        // Any field of the origin differing is a record from somewhere else.
+        for elsewhere in [
+            Origin {
+                repository: "registry.example/other".to_owned(),
+                ..origin()
+            },
+            Origin {
+                dataset_id: 2,
+                ..origin()
+            },
+            Origin {
+                parameters: json!({"width": 2}),
+                ..origin()
+            },
+            Origin {
+                compression: Compression {
+                    algo: "zstd".to_owned(),
+                    level: 3,
+                },
+                ..origin()
+            },
+        ] {
+            assert!(
+                record.table(&elsewhere, &Settling, 3).unwrap().is_empty(),
+                "a record from {elsewhere:?} was offered"
+            );
+        }
     }
 
     /// A registry a node opens through here, as Dolos does for a restore,

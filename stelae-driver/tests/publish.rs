@@ -161,20 +161,29 @@ fn layers(sequence: u64) -> Vec<(LayerSpec, Vec<CanonicalCbor>)> {
     ]
 }
 
-/// The publish of `sequence` that follows whatever `registry` holds, recording
-/// at `record`.
-fn chained<'a>(registry: &'a Registry, record: &Path, sequence: u64) -> Chained<'a> {
+/// The publish of `sequence` that follows whatever `publishing`'s repository
+/// holds.
+fn chained_in(
+    publishing: Publishing<'_>,
+    sequence: u64,
+) -> Result<Chained<'_>, stelae_driver::Error> {
+    let registry = publishing.registry;
     let latest = registry.latest(&Shelf).unwrap();
 
     Chained::new(
         &Shelf,
-        Publishing::new(registry).recording_in(record),
+        publishing,
         latest.as_ref(),
         sequence,
         &json!({"chapter": sequence}),
         Origin::of(registry, 1, json!({}), compression()),
     )
-    .unwrap()
+}
+
+/// The publish of `sequence` that follows whatever `registry` holds, recording
+/// at `record`.
+fn chained<'a>(registry: &'a Registry, record: &Path, sequence: u64) -> Chained<'a> {
+    chained_in(Publishing::new(registry).recording_in(record), sequence).unwrap()
 }
 
 /// What an export does per layer: resume it, or build it, and note it.
@@ -238,6 +247,26 @@ fn eventually(what: &str, done: impl Fn() -> bool) {
     }
 }
 
+/// An attempt at `sequence` that lands all its layers, waits until they are
+/// up, and stops before the seal, leaving its record behind.
+fn interrupt(fault: &FaultRegistry, record: &Path, sequence: u64) {
+    let interrupted = open(fault);
+    let chained = chained(&interrupted, record, sequence);
+
+    for layer in build(&chained, &interrupted, sequence) {
+        let blob = interrupted
+            .carried(&layer.diff_id)
+            .unwrap()
+            .digests
+            .blob_digest
+            .to_string();
+
+        eventually("an interrupted layer's upload", || {
+            fault.pushed().contains(&blob)
+        });
+    }
+}
+
 /// The publish at N+1 links to N, and uploads and lists only its own layers.
 #[test]
 fn a_chained_publish_uploads_and_lists_only_its_own_layers() {
@@ -254,7 +283,20 @@ fn a_chained_publish_uploads_and_lists_only_its_own_layers() {
     registry.take_transfer();
     let before = fault.pushed().len();
 
-    let second = publish(&registry, &record, 2);
+    // Asked under any key of the first snapshot, the publish at 2 offers
+    // nothing of it.
+    let chained = chained(&registry, &record, 2);
+
+    for layer in first.layers() {
+        assert!(
+            chained.resume(&layer.kind, &layer.scope).unwrap().is_none(),
+            "the publish at 2 offered the first snapshot's {} layer",
+            layer.kind
+        );
+    }
+
+    let layers = build(&chained, &registry, 2);
+    let second = seal(&chained, &registry, 2, layers);
     let transfer = registry.take_transfer();
 
     assert_eq!(
@@ -305,26 +347,7 @@ fn an_interrupted_publish_resumes_its_diff_layers_and_rebuilds_its_tip() {
     let record = storage.path().join("publish.json");
 
     publish(&open(&fault), &record, 1);
-
-    // The attempt at 2 lands both its layers, waits until both are up, and
-    // stops before the seal.
-    {
-        let interrupted = open(&fault);
-        let chained = chained(&interrupted, &record, 2);
-
-        for layer in build(&chained, &interrupted, 2) {
-            let blob = interrupted
-                .carried(&layer.diff_id)
-                .unwrap()
-                .digests
-                .blob_digest
-                .to_string();
-
-            eventually("an interrupted layer's upload", || {
-                fault.pushed().contains(&blob)
-            });
-        }
-    }
+    interrupt(&fault, &record, 2);
 
     let recorded = PublishRecord::load(&record).unwrap().unwrap();
     let kinds: Vec<_> = recorded
@@ -362,4 +385,119 @@ fn an_interrupted_publish_resumes_its_diff_layers_and_rebuilds_its_tip() {
     publish(&elsewhere, &clean_record, 1);
 
     assert_eq!(resumed, publish(&elsewhere, &clean_record, 2));
+}
+
+/// A recorded layer whose blob the repository no longer holds is built again
+/// rather than named, and the snapshot is the one an uninterrupted publish
+/// would have sealed.
+#[test]
+fn a_recorded_layer_whose_blob_is_gone_is_built_again() {
+    let fault = FaultRegistry::spawn();
+    let storage = tempfile::tempdir().unwrap();
+    let record = storage.path().join("publish.json");
+
+    publish(&open(&fault), &record, 1);
+    interrupt(&fault, &record, 2);
+
+    // Every blob `HEAD` now answers 404, so the recorded notes are gone as far
+    // as the restart can tell.
+    fault.fail_heads(404);
+
+    let registry = open(&fault);
+    let chained = chained(&registry, &record, 2);
+    let layers = build(&chained, &registry, 2);
+
+    assert_eq!(
+        chained.resumed(),
+        0,
+        "a layer whose blob is gone was resumed"
+    );
+
+    let rebuilt = seal(&chained, &registry, 2, layers);
+    let transfer = registry.take_transfer();
+
+    assert_eq!(transfer.layers_reused, 0);
+    assert!(!record.exists(), "the record outlived the seal");
+
+    let clean = FaultRegistry::spawn();
+    let elsewhere = open(&clean);
+    let clean_record = storage.path().join("clean.json");
+
+    publish(&elsewhere, &clean_record, 1);
+
+    assert_eq!(rebuilt, publish(&elsewhere, &clean_record, 2));
+}
+
+/// The operator's `--rebuild` builds every layer and resumes none, whatever
+/// the record says.
+#[test]
+fn a_rebuild_resumes_nothing_from_the_record() {
+    let fault = FaultRegistry::spawn();
+    let storage = tempfile::tempdir().unwrap();
+    let record = storage.path().join("publish.json");
+
+    publish(&open(&fault), &record, 1);
+    interrupt(&fault, &record, 2);
+
+    let registry = open(&fault);
+    let chained = chained_in(
+        Publishing::new(&registry)
+            .recording_in(record.as_path())
+            .rebuilding(true),
+        2,
+    )
+    .unwrap();
+    let layers = build(&chained, &registry, 2);
+
+    assert_eq!(chained.resumed(), 0, "a rebuild resumed a recorded layer");
+
+    seal(&chained, &registry, 2, layers);
+    let transfer = registry.take_transfer();
+
+    assert_eq!(transfer.layers_reused, 0, "a layer came from the record");
+    assert_eq!(
+        transfer.layers_skipped, 2,
+        "both layers are built again and found up"
+    );
+}
+
+/// A publish that holds the repository to a predecessor it no longer shows is
+/// refused, and one that holds it to the right one chains.
+#[test]
+fn a_publish_is_refused_when_its_predecessor_moved() {
+    let fault = FaultRegistry::spawn();
+    let registry = open(&fault);
+    let storage = tempfile::tempdir().unwrap();
+    let record = storage.path().join("publish.json");
+
+    let first = publish(&registry, &record, 1);
+    let expected = (1, first.digest().unwrap());
+
+    // Expecting an empty repository, the publish finds the first snapshot.
+    let err = chained_in(
+        Publishing::new(&registry)
+            .recording_in(record.as_path())
+            .following(None),
+        2,
+    )
+    .err()
+    .expect("a publish expecting an empty repository chained to a snapshot");
+
+    assert!(
+        matches!(
+            err,
+            stelae_driver::Error::Stelae(stelae::Error::PredecessorMoved { .. })
+        ),
+        "{err:?}"
+    );
+
+    let chained = chained_in(
+        Publishing::new(&registry)
+            .recording_in(record.as_path())
+            .following(Some(expected)),
+        2,
+    )
+    .unwrap();
+
+    assert_eq!(chained.predecessor(), Some(expected));
 }

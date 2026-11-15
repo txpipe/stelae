@@ -2812,14 +2812,17 @@ fn chapter_inscription(sequence: u64) -> Inscription {
     )
 }
 
-/// An inscription that lists a layer of the snapshot before it is refused at
-/// the seal, and nothing is tagged.
+/// An inscription that lists a layer of the snapshot before it, which this
+/// publish neither wrote nor carried, is refused at the seal, and nothing is
+/// tagged.
 ///
-/// No call carries an earlier snapshot's layer into a new one, so the only
-/// way to list it is to write it again. Refused before anything is pushed,
-/// as the manifest–inscription agreement in `SPEC.md` requires.
+/// This is the manifest–inscription agreement in `SPEC.md`, refused before
+/// anything is pushed. It is not a chain rule: a publish that writes the
+/// earlier layer's bytes again, or carries its blob with `adopt_carried`,
+/// seals. Keeping an earlier layer out is the export's part, by asking only
+/// for its own layers.
 #[test]
-fn a_seal_refuses_an_earlier_snapshots_layer() {
+fn a_seal_refuses_an_earlier_layer_this_publish_did_not_write() {
     let fault = FaultRegistry::spawn();
     let registry = faulty(&fault, "stelae/chain");
 

@@ -241,4 +241,31 @@ mod tests {
         assert!(inscription.diff.is_empty());
         assert!(inscription.tip.is_empty());
     }
+
+    /// A placement replaces what the inscription listed, and a refused one
+    /// leaves it as it was.
+    #[test]
+    fn a_placement_replaces_the_arrays_and_a_refused_one_keeps_them() {
+        let mut inscription = inscription(7);
+        inscription.diff = vec![layer("notes", 1)];
+        inscription.tip = vec![layer("state", 9)];
+
+        place_layers(
+            &Shelf,
+            &mut inscription,
+            [layer("notes", 2), layer("state", 0)],
+        )
+        .unwrap();
+
+        assert_eq!(inscription.diff, vec![layer("notes", 2)]);
+        assert_eq!(inscription.tip, vec![layer("state", 0)]);
+
+        let mut unscoped = layer("notes", 0);
+        unscoped.scope = json!({});
+
+        place_layers(&Shelf, &mut inscription, [layer("notes", 3), unscoped]).unwrap_err();
+
+        assert_eq!(inscription.diff, vec![layer("notes", 2)]);
+        assert_eq!(inscription.tip, vec![layer("state", 0)]);
+    }
 }
