@@ -28,6 +28,8 @@
 //! - [`inscription`] — the inscription schema, its RFC 8785 canonicalization,
 //!   its digest, its `diff` and `tip` arrays, and the `previous` link that
 //!   chains it to the inscription before it.
+//! - [`chain`] — a snapshot resolved by following those links: every
+//!   inscription back to its lineage's first, and the layer set they make.
 //! - [`profile`] — the [`Profile`] trait plus the protocol's media-type,
 //!   profile name and tag naming rules.
 //! - [`transport`] — the seam a snapshot is written through and read back from:
@@ -45,7 +47,7 @@
 //! - [`dir`] — a minimal on-disk snapshot: the first implementation of that
 //!   seam, and the one a snapshot is inspectable by hand through.
 //! - [`oci`] — (feature `oci`) an OCI registry as the other implementation:
-//!   push with blob-skip, pull by manifest.
+//!   push with blob-skip, pull by manifest, resolve a chain.
 //!
 //! ## Boundaries this crate keeps
 //!
@@ -56,6 +58,7 @@
 //! - It has no `dolos-*` dependency, so extracting it later is a directory move
 //!   rather than a refactor.
 
+pub mod chain;
 pub mod codec;
 pub mod digest;
 pub mod dir;
@@ -70,6 +73,7 @@ pub mod profile;
 pub mod progress;
 pub mod transport;
 
+pub use chain::{Chain, ChainLayer};
 pub use digest::{Digest, LayerDigests, LayerWriter};
 pub use frame::{CanonicalCbor, LayerHeader, Limits, Measure, RecordReader, SeqReader, SeqWriter};
 pub use inscription::{
@@ -219,7 +223,9 @@ pub enum Error {
         supported: u64,
     },
 
-    /// An inscription whose `previous` does not name an earlier sequence.
+    /// An inscription whose `previous` does not name an earlier sequence, or
+    /// a link of a chain answered by an inscription at another sequence or by
+    /// one the chain already holds.
     #[error("link invariant violated: {0}")]
     LinkInvariant(String),
 
@@ -230,6 +236,31 @@ pub enum Error {
          each kind and scope once across diff and tip"
     )]
     DuplicateLayer { kind: String, scope: String },
+
+    /// A layer kind and scope listed twice in one snapshot's layer set: by two
+    /// inscriptions' `diff`, or by a `diff` and the head's `tip`.
+    #[error(
+        "layer kind {kind:?} at scope {scope} is listed by sequence {first} and again by sequence \
+         {again}; a snapshot holds each kind and scope once across its chain"
+    )]
+    DuplicateInChain {
+        kind: String,
+        scope: String,
+        first: u64,
+        again: u64,
+    },
+
+    /// A link the transport holds no document for: the inscription at `from`
+    /// follows `sequence`, and nothing is there.
+    ///
+    /// Neither an absent snapshot nor a gone tip. The snapshot at `from` is
+    /// published, and so may every later one be; what is missing is inside
+    /// their chain, so none of them can be resolved.
+    #[error(
+        "the snapshot at sequence {from} follows sequence {sequence}, and no document for \
+         {sequence} is here: its chain is broken"
+    )]
+    MissingLink { from: u64, sequence: u64 },
 
     /// A publish held to one predecessor, reading another under the moving tag.
     ///

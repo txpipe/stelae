@@ -98,7 +98,11 @@ use stelae::{
     frame::{encode, CanonicalCbor, Limits},
     inscription::{link_for, LayerDescriptor},
     manifest::{manifest_bytes, Manifest, DIFF_ID_ANNOTATION},
-    oci::{Auth, Options, Registry, DEFAULT_ATTEMPTS, DEFAULT_READ_ATTEMPTS, DEFAULT_READ_DELAY},
+    oci::{
+        Auth, Options, Registry, Snapshot, DEFAULT_ATTEMPTS, DEFAULT_READ_ATTEMPTS,
+        DEFAULT_READ_DELAY,
+    },
+    plan::Remaining,
     progress::{Event, Observer, Progress},
     Compression, Digest, Error, Inscription, LayerReader, LayerSpec, Profile, RecordSink,
     SnapshotReader, SnapshotWriter, TIP_SUFFIX,
@@ -1140,6 +1144,35 @@ fn a_nested_repository_is_a_repository_of_its_own() {
     let err = outer.pull_sequence(&ToyProfile, 4).unwrap_err();
     assert!(err.is_absent(), "{err:?}");
     let err = inner.pull_sequence(&ToyProfile, 3).unwrap_err();
+    assert!(err.is_absent(), "{err:?}");
+}
+
+/// A five-sequence chain resolves and restores off a real registry.
+///
+/// The walk reads one window from the head's link, which reaches below the
+/// first sequence, so the registry's own answer for a tag it never held is
+/// read as absence there and dropped.
+#[test]
+#[ignore = "spawns a registry"]
+fn a_chain_resolves_off_the_registry() {
+    let _serial = exclusive();
+
+    let fixture = Fixture::spawn();
+    let registry = fixture.registry("stelae/chain");
+    let published = publish_lineage(&registry, 1, 5);
+
+    for snapshot in [
+        registry.resolve_latest(&ToyProfile).unwrap(),
+        registry.resolve_sequence(&ToyProfile, 5).unwrap(),
+    ] {
+        let chain = snapshot.chain().unwrap();
+        assert_eq!(chain.inscriptions(), &published[..]);
+
+        let layers: Vec<LayerDescriptor> = chain.descriptors().cloned().collect();
+        assert_eq!(restored(&snapshot, &layers), lineage_records(&published));
+    }
+
+    let err = registry.resolve_sequence(&ToyProfile, 9).unwrap_err();
     assert!(err.is_absent(), "{err:?}");
 }
 
@@ -2769,6 +2802,40 @@ fn write_layers<W: SnapshotWriter>(snapshot: &W, count: u64) -> Inscription {
     inscription
 }
 
+/// `count` sequences from 1, sealed in turn and each linked to the one before,
+/// each adding one notes layer to `diff`: a chain whose layer set is more
+/// layers than a read-ahead's depth, one per inscription. Returns that layer
+/// set, in chain order.
+fn write_chain(registry: &Registry, count: u64) -> Vec<LayerDescriptor> {
+    let mut previous: Option<Inscription> = None;
+    let mut layers = Vec::new();
+
+    for sequence in 1..=count {
+        let (header, scope) = notes_scope(sequence);
+        let records: Vec<CanonicalCbor> = (0..=sequence).map(note_record).collect();
+
+        let layer = registry
+            .write_layer(
+                &ToyProfile,
+                &LayerSpec::new("notes", header, scope),
+                COMPRESSION_LEVEL,
+                &records,
+            )
+            .unwrap()
+            .descriptor;
+
+        let mut inscription = chapter_inscription(sequence);
+        inscription.previous = link_for(previous.as_ref(), sequence).unwrap();
+        inscription.diff = vec![layer.clone()];
+        registry.seal(&ToyProfile, &inscription).unwrap();
+
+        layers.push(layer);
+        previous = Some(inscription);
+    }
+
+    layers
+}
+
 /// What a transport reported while it read: bytes landed, and each retry with
 /// its reason.
 #[derive(Default)]
@@ -2824,21 +2891,21 @@ fn faulty_in(fault: &FaultRegistry, repository: &str, scratch_dir: Option<PathBu
     .unwrap()
 }
 
-/// A snapshot of `count` layers on a fresh fault registry, the transport that
-/// published it watched from then on.
+/// A chain of `count` one-layer sequences on a fresh fault registry, its
+/// layer set, and the transport that published it, watched from then on.
 fn published_layers(
     repository: &str,
     count: u64,
     scratch_dir: Option<PathBuf>,
-) -> (FaultRegistry, Registry, Inscription, Arc<Moved>) {
+) -> (FaultRegistry, Registry, Vec<LayerDescriptor>, Arc<Moved>) {
     let fault = FaultRegistry::spawn();
     let registry = faulty_in(&fault, repository, scratch_dir);
-    let inscription = write_layers(&registry, count);
+    let layers = write_chain(&registry, count);
 
     let moved = Arc::new(Moved::default());
     registry.observe(Observer::new(moved.clone()));
 
-    (fault, registry, inscription, moved)
+    (fault, registry, layers, moved)
 }
 
 /// The layer `GET`s the registry has seen, as a set: pulls started together
@@ -3434,35 +3501,333 @@ fn neither_manifest_nor_the_inscription_grows_with_the_chain() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// A snapshot resolved through its chain
+// ---------------------------------------------------------------------------
+
+/// Chapters `first..=last` sealed in turn through `registry`, each linked to
+/// the one before: its notes in `diff`, its index in `tip`, and parameters of
+/// its own.
+fn publish_lineage(registry: &Registry, first: u64, last: u64) -> Vec<Inscription> {
+    let mut published: Vec<Inscription> = Vec::new();
+
+    for sequence in first..=last {
+        let mut inscription = write_chapter_layers(registry, sequence);
+        inscription.parameters = json!({"noteWidth": 40 + sequence});
+        inscription.previous = link_for(published.last(), sequence).unwrap();
+
+        registry.seal(&ToyProfile, &inscription).unwrap();
+        published.push(inscription);
+    }
+
+    published
+}
+
+/// A transport on `fault` that walks a chain `window` sequences at a time.
+fn walking(fault: &FaultRegistry, repository: &str, window: usize) -> Registry {
+    install_crypto_provider();
+
+    Registry::open(
+        &fault.url(repository).parse().unwrap(),
+        Options {
+            insecure: true,
+            read_delay: Duration::from_millis(1),
+            chain_window: window,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+/// The content records of each layer of `layers`, streamed from `snapshot`
+/// ahead of the caller and each proven against its descriptor.
+fn restored(snapshot: &Snapshot, layers: &[LayerDescriptor]) -> Vec<Vec<Vec<u8>>> {
+    let index = snapshot.blob_index().unwrap();
+
+    snapshot
+        .stream_layers(&index, &ToyProfile, layers.to_vec(), Limits::default(), 4)
+        .zip(layers)
+        .map(|(reader, descriptor)| {
+            let mut reader = reader.unwrap();
+            let mut records = Vec::new();
+
+            while let Some(record) = reader.next_record() {
+                records.push(record.unwrap().to_vec());
+            }
+
+            assert_eq!(reader.finish().unwrap().diff_id, descriptor.diff_id);
+
+            records
+        })
+        .collect()
+}
+
+/// What [`publish_lineage`] wrote into the layer set of its last chapter:
+/// every chapter's notes, then the last chapter's index.
+fn lineage_records(published: &[Inscription]) -> Vec<Vec<Vec<u8>>> {
+    let bytes = |records: Vec<CanonicalCbor>| -> Vec<Vec<u8>> {
+        records.iter().map(|r| r.as_bytes().to_vec()).collect()
+    };
+    let head = published.last().unwrap().sequence;
+
+    published
+        .iter()
+        .map(|chapter| bytes(chapter_notes(chapter.sequence)))
+        .chain([bytes((1..=head).map(note_record).collect())])
+        .collect()
+}
+
+/// Done criterion 1: a five-sequence chain restores from a registry through
+/// the toy profile.
+///
+/// The walk reads two sequences at a time, so it takes two windows. The
+/// result is the whole snapshot: every inscription back to the first, the
+/// layer set in order, each layer's own inscription, a blob index and
+/// compressed sizes over all of it, and the records.
+#[test]
+fn a_five_sequence_chain_restores_through_the_toy_profile() {
+    let fault = FaultRegistry::spawn();
+    let published = publish_lineage(&faulty(&fault, "stelae/five"), 1, 5);
+    let registry = walking(&fault, "stelae/five", 2);
+
+    let snapshot = registry.resolve_latest(&ToyProfile).unwrap();
+    let chain = snapshot.chain().unwrap();
+
+    assert_eq!(chain.inscriptions(), &published[..]);
+    assert_eq!(chain.identity(), published[4].digest().unwrap());
+    assert_eq!(snapshot.read_inscription().unwrap(), published[4]);
+
+    let layers: Vec<LayerDescriptor> = chain.descriptors().cloned().collect();
+    let expected: Vec<LayerDescriptor> = published
+        .iter()
+        .map(|chapter| chapter.diff[0].clone())
+        .chain([published[4].tip[0].clone()])
+        .collect();
+    assert_eq!(layers, expected);
+
+    for layer in chain.layers() {
+        assert_eq!(
+            chain.origin(layer).unwrap().parameters,
+            json!({"noteWidth": 40 + layer.sequence}),
+        );
+    }
+
+    let index = snapshot.blob_index().unwrap();
+    assert_eq!(index.len(), 6);
+
+    let remaining = Remaining::of(&snapshot, &index, &layers).unwrap();
+    assert_eq!((remaining.layers, remaining.unsized_layers), (6, 0));
+    assert_eq!(remaining.compressed_bytes, snapshot.total_compressed_size());
+
+    assert_eq!(restored(&snapshot, &layers), lineage_records(&published));
+
+    // Each earlier diff manifest once, no earlier tip, nothing below the
+    // first sequence.
+    for sequence in 1..=4 {
+        assert_eq!(fault.gets(&format!("manifests/chapter-{sequence}")), 1);
+        assert_eq!(fault.gets(&format!("manifests/chapter-{sequence}.tip")), 0);
+    }
+    assert_eq!(fault.gets("manifests/chapter-0"), 0);
+
+    // A sequence inside the chain resolves to its own tip.
+    let fourth = registry.resolve_sequence(&ToyProfile, 4).unwrap();
+    let chain = fourth.chain().unwrap();
+    assert_eq!(chain.inscriptions(), &published[..4]);
+
+    let layers: Vec<LayerDescriptor> = chain.descriptors().cloned().collect();
+    assert_eq!(layers.last(), Some(&published[3].tip[0]));
+    assert_eq!(restored(&fourth, &layers), lineage_records(&published[..4]));
+
+    // A pull follows no link.
+    let pulled = registry.pull_latest(&ToyProfile).unwrap();
+    assert!(pulled.chain().is_none());
+    assert_eq!(pulled.blob_index().unwrap().len(), 2);
+}
+
+/// A lineage may start at a later sequence. The walk ends at its first
+/// inscription, and the sequences it read ahead below it were absent and are
+/// dropped.
+#[test]
+fn a_chain_that_starts_at_a_later_sequence_resolves() {
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/late");
+    let published = publish_lineage(&registry, 100, 104);
+
+    let snapshot = registry.resolve_latest(&ToyProfile).unwrap();
+    let chain = snapshot.chain().unwrap();
+
+    assert_eq!(chain.inscriptions(), &published[..]);
+    assert_eq!(chain.first().sequence, 100);
+    assert_eq!(chain.first().previous, None);
+
+    // One window from the head's link, 103 down to 88.
+    assert_eq!(fault.gets("manifests/chapter-99"), 1);
+    assert_eq!(fault.gets("manifests/chapter-88"), 1);
+    assert_eq!(fault.gets("manifests/chapter-87"), 0);
+
+    let layers: Vec<LayerDescriptor> = chain.descriptors().cloned().collect();
+    assert_eq!(restored(&snapshot, &layers), lineage_records(&published));
+}
+
+/// Done criterion 2, the first failure: a document missing inside the chain
+/// is its own error, naming both sequences, and not absence.
+#[test]
+fn a_document_missing_inside_the_chain_is_not_an_absent_snapshot() {
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/missing");
+    publish_lineage(&registry, 1, 5);
+
+    fault.forget_manifest("chapter-2");
+
+    for err in [
+        registry.resolve_latest(&ToyProfile).unwrap_err(),
+        registry.resolve_sequence(&ToyProfile, 3).unwrap_err(),
+    ] {
+        assert!(
+            matches!(
+                err,
+                Error::MissingLink {
+                    from: 3,
+                    sequence: 2
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!err.is_absent());
+    }
+
+    // The head alone still reads, and the snapshot before the gap resolves.
+    assert!(registry.latest(&ToyProfile).unwrap().is_some());
+    let first = registry.resolve_sequence(&ToyProfile, 1).unwrap();
+    assert_eq!(first.chain().unwrap().inscriptions().len(), 1);
+}
+
+/// Done criterion 2, the second failure: a deleted tip refuses a restore at
+/// its own sequence and at no later one, because only the head's tip is read.
+#[test]
+fn a_deleted_tip_refuses_only_its_own_sequence() {
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/deleted");
+    publish_lineage(&registry, 1, 5);
+
+    fault.forget_manifest("chapter-3.tip");
+
+    let err = registry.resolve_sequence(&ToyProfile, 3).unwrap_err();
+    assert!(
+        matches!(&err, Error::TipGone { sequence: 3, tag } if tag == "chapter-3.tip"),
+        "{err:?}"
+    );
+    assert!(!err.is_absent());
+
+    let latest = registry.resolve_latest(&ToyProfile).unwrap();
+    assert_eq!(latest.chain().unwrap().inscriptions().len(), 5);
+
+    fault.forget_manifest("chapter-5.tip");
+
+    let err = registry.resolve_latest(&ToyProfile).unwrap_err();
+    assert!(matches!(err, Error::TipGone { sequence: 5, .. }), "{err:?}");
+}
+
+/// Done criterion 2, the third failure: a head the repository does not hold
+/// is absence, and only that is.
+#[test]
+fn an_absent_head_is_absence() {
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/absent");
+
+    let err = registry.resolve_latest(&ToyProfile).unwrap_err();
+    assert!(err.is_absent(), "{err:?}");
+
+    publish_lineage(&registry, 1, 5);
+
+    let err = registry.resolve_sequence(&ToyProfile, 9).unwrap_err();
+    assert!(err.is_absent(), "{err:?}");
+    assert!(matches!(err, Error::Registry(_)), "{err:?}");
+}
+
+/// A link answered with another document is refused: one already in the
+/// chain is a loop, and any other is a digest the link does not name.
+#[test]
+fn a_link_answered_with_another_document_is_refused() {
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/substituted");
+    publish_lineage(&registry, 1, 5);
+
+    fault.put_manifest("chapter-3", fault.manifest("chapter-5").unwrap());
+
+    let err = registry.resolve_latest(&ToyProfile).unwrap_err();
+    assert!(
+        matches!(&err, Error::LinkInvariant(why) if why.contains("loop")),
+        "{err:?}"
+    );
+
+    fault.put_manifest("chapter-3", fault.manifest("chapter-2").unwrap());
+
+    let err = registry.resolve_latest(&ToyProfile).unwrap_err();
+    assert!(
+        matches!(&err, Error::DigestMismatch { subject, .. }
+            if subject.contains("sequence 3, linked from sequence 4")),
+        "{err:?}"
+    );
+}
+
+/// A walk reads a window of sequences at once, and the window is the bound:
+/// with every manifest answered slowly, three at once and never more.
+#[test]
+fn a_walk_reads_its_documents_in_bounded_windows() {
+    let _serial = exclusive();
+
+    let fault = FaultRegistry::spawn();
+    publish_lineage(&faulty(&fault, "stelae/windows"), 1, 8);
+
+    let slow: Vec<String> = (0..=7)
+        .map(|sequence| format!("manifests/chapter-{sequence}"))
+        .collect();
+    fault.delay(&slow, Duration::from_millis(100));
+
+    let registry = walking(&fault, "stelae/windows", 3);
+    let snapshot = registry.resolve_latest(&ToyProfile).unwrap();
+
+    assert_eq!(snapshot.chain().unwrap().inscriptions().len(), 8);
+    assert_eq!(fault.manifests_peak(), 3, "the window was not the bound");
+
+    for key in &slow {
+        assert_eq!(fault.gets(key), 1, "{key} was read twice");
+    }
+}
+
 /// Layers come back in the order they were named when later downloads finish
-/// first, and each one proves its own layer.
+/// first, and each one proves its own layer. The order is the caller's: here
+/// the chain's layer set, newest first.
 #[test]
 fn a_read_ahead_hands_layers_back_in_order() {
     let _serial = exclusive();
 
-    let (fault, registry, inscription, _) = published_layers("stelae/ahead-order", 4, None);
-    let blobs = fault.layers();
+    let (fault, registry, mut layers, _) = published_layers("stelae/ahead-order", 4, None);
+    layers.reverse();
+    let mut blobs = fault.listed();
+    blobs.reverse();
 
-    // The earliest layer is the slowest, so the downloads land back to front.
+    // The earliest layer named is the slowest, so the downloads land back to
+    // front.
     for (position, blob) in blobs.iter().enumerate() {
         let delay = Duration::from_millis(100 * (blobs.len() - position) as u64);
         fault.delay(std::slice::from_ref(blob), delay);
     }
 
-    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let snapshot = registry.resolve_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let layers = inscription.diff.clone();
 
     let mut taken = 0;
     for (reader, descriptor) in snapshot
-        .stream_layers(&index, &ToyProfile, layers, Limits::default(), 8)
-        .zip(inscription.layers())
+        .stream_layers(&index, &ToyProfile, layers.clone(), Limits::default(), 8)
+        .zip(&layers)
     {
         prove(reader.unwrap(), descriptor);
         taken += 1;
     }
 
-    assert_eq!(taken, inscription.layers().count());
+    assert_eq!(taken, layers.len());
 
     let mut back_to_front = blobs.clone();
     back_to_front.reverse();
@@ -3480,23 +3845,23 @@ fn a_read_ahead_hands_layers_back_in_order() {
 fn a_read_ahead_is_bounded_by_its_depth() {
     let _serial = exclusive();
 
-    let (fault, registry, inscription, _) = published_layers("stelae/ahead-bound", 8, None);
-    fault.delay(&fault.layers(), Duration::from_millis(50));
+    let (fault, registry, layers, _) = published_layers("stelae/ahead-bound", 8, None);
+    fault.delay(&fault.listed(), Duration::from_millis(50));
 
-    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let snapshot = registry.resolve_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let layers = inscription.diff.clone();
 
-    let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 3);
+    let mut stream =
+        snapshot.stream_layers(&index, &ToyProfile, layers.clone(), Limits::default(), 3);
 
     // Holding the first layer, the two behind it land and are staged, and
     // nothing past them starts.
     let first = stream.next().unwrap().unwrap();
     std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(fetched(&fault), sorted(&fault.layers()[..3]));
-    prove(first, &inscription.diff[0]);
+    assert_eq!(fetched(&fault), sorted(&fault.listed()[..3]));
+    prove(first, &layers[0]);
 
-    for descriptor in &inscription.diff[1..] {
+    for descriptor in &layers[1..] {
         prove(stream.next().unwrap().unwrap(), descriptor);
     }
     assert!(stream.next().is_none());
@@ -3508,7 +3873,7 @@ fn a_read_ahead_is_bounded_by_its_depth() {
     );
     assert_eq!(
         fetched(&fault),
-        sorted(&fault.layers()),
+        sorted(&fault.listed()),
         "a layer was fetched twice",
     );
 }
@@ -3554,32 +3919,26 @@ impl Profile for Opening {
 fn a_read_ahead_opens_a_layer_only_when_it_is_taken() {
     let _serial = exclusive();
 
-    let (_fault, registry, inscription, moved) = published_layers("stelae/ahead-open", 4, None);
+    let (_fault, registry, layers, moved) = published_layers("stelae/ahead-open", 4, None);
 
-    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let snapshot = registry.resolve_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let total: u64 = snapshot
-        .manifest()
-        .layers
-        .iter()
-        .map(|l| l.size as u64)
-        .sum();
-    let layers = inscription.diff.clone();
+    let total = snapshot.total_compressed_size();
     let opening = Opening::default();
     let caller = std::thread::current().id();
 
-    let mut stream = snapshot.stream_layers(&index, &opening, layers, Limits::default(), 4);
+    let mut stream = snapshot.stream_layers(&index, &opening, layers.clone(), Limits::default(), 4);
     let first = stream.next().unwrap().unwrap();
 
     eventually("every blob to land", || moved.bytes() == total);
     assert_eq!(opening.opened(), vec![caller], "a layer was opened untaken");
 
-    for descriptor in &inscription.diff[1..] {
+    for descriptor in &layers[1..] {
         prove(stream.next().unwrap().unwrap(), descriptor);
     }
-    prove(first, &inscription.diff[0]);
+    prove(first, &layers[0]);
 
-    assert_eq!(opening.opened(), vec![caller; inscription.layers().count()]);
+    assert_eq!(opening.opened(), vec![caller; layers.len()]);
 }
 
 /// Each take opens the layer it hands over and no other, however many staged
@@ -3588,24 +3947,17 @@ fn a_read_ahead_opens_a_layer_only_when_it_is_taken() {
 fn a_read_ahead_opens_only_the_layer_each_take_hands_over() {
     let _serial = exclusive();
 
-    let (_fault, registry, inscription, moved) =
-        published_layers("stelae/ahead-open-each", 4, None);
+    let (_fault, registry, layers, moved) = published_layers("stelae/ahead-open-each", 4, None);
 
-    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let snapshot = registry.resolve_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let total: u64 = snapshot
-        .manifest()
-        .layers
-        .iter()
-        .map(|l| l.size as u64)
-        .sum();
-    let layers = inscription.diff.clone();
+    let total = snapshot.total_compressed_size();
     let opening = Opening::default();
     let caller = std::thread::current().id();
 
-    let mut stream = snapshot.stream_layers(&index, &opening, layers, Limits::default(), 4);
+    let mut stream = snapshot.stream_layers(&index, &opening, layers.clone(), Limits::default(), 4);
 
-    for (taken, descriptor) in inscription.layers().enumerate() {
+    for (taken, descriptor) in layers.iter().enumerate() {
         let reader = stream.next().unwrap().unwrap();
 
         if taken == 0 {
@@ -3630,21 +3982,21 @@ fn a_read_ahead_opens_only_the_layer_each_take_hands_over() {
 fn a_read_ahead_reports_a_failed_layer_at_its_turn() {
     let _serial = exclusive();
 
-    let (fault, registry, inscription, moved) = published_layers("stelae/ahead-error", 5, None);
-    let blobs = fault.layers();
+    let (fault, registry, layers, moved) = published_layers("stelae/ahead-error", 5, None);
+    let blobs = fault.listed();
 
     // The failing layer gives up well before the two in front of it land.
     fault.delay(&blobs[..2], Duration::from_millis(200));
     fault.fail_always(&blobs[2], Fault::Truncate);
 
-    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let snapshot = registry.resolve_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let layers = inscription.diff.clone();
 
-    let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 8);
+    let mut stream =
+        snapshot.stream_layers(&index, &ToyProfile, layers.clone(), Limits::default(), 8);
 
-    prove(stream.next().unwrap().unwrap(), &inscription.diff[0]);
-    prove(stream.next().unwrap().unwrap(), &inscription.diff[1]);
+    prove(stream.next().unwrap().unwrap(), &layers[0]);
+    prove(stream.next().unwrap().unwrap(), &layers[1]);
 
     let failed = stream.next().unwrap().unwrap_err();
     let Error::RetriesExhausted { attempts, .. } = &failed else {
@@ -3679,24 +4031,25 @@ fn a_read_ahead_reports_a_failed_layer_at_its_turn() {
 fn a_read_ahead_refuses_an_unplaced_layer_at_its_turn() {
     let _serial = exclusive();
 
-    let (fault, registry, inscription, _) = published_layers("stelae/ahead-absent", 4, None);
-    let blobs = fault.layers();
+    let (fault, registry, layers, _) = published_layers("stelae/ahead-absent", 4, None);
+    let blobs = fault.listed();
 
-    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let snapshot = registry.resolve_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
 
-    let mut absent = inscription.diff[0].clone();
+    let mut absent = layers[0].clone();
     absent.diff_id = Digest::from_bytes([0xab; 32]);
     let layers = vec![
-        inscription.diff[0].clone(),
+        layers[0].clone(),
         absent,
-        inscription.diff[1].clone(),
-        inscription.diff[2].clone(),
+        layers[1].clone(),
+        layers[2].clone(),
     ];
 
-    let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 8);
+    let mut stream =
+        snapshot.stream_layers(&index, &ToyProfile, layers.clone(), Limits::default(), 8);
 
-    prove(stream.next().unwrap().unwrap(), &inscription.diff[0]);
+    prove(stream.next().unwrap().unwrap(), &layers[0]);
 
     // Time for any pull started past the refusal to reach the registry.
     std::thread::sleep(Duration::from_millis(100));
@@ -3725,27 +4078,27 @@ fn dropping_a_read_ahead_cancels_its_pulls() {
 
     let scratch = tempfile::tempdir().unwrap();
     let staging = scratch.path().join("staging");
-    let (fault, registry, inscription, moved) =
+    let (fault, registry, layers, moved) =
         published_layers("stelae/ahead-drop", 8, Some(staging.clone()));
 
     let delay = Duration::from_millis(500);
-    fault.delay(&fault.layers(), delay);
+    fault.delay(&fault.listed(), delay);
 
-    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let snapshot = registry.resolve_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let layers = inscription.diff.clone();
 
-    let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 4);
+    let mut stream =
+        snapshot.stream_layers(&index, &ToyProfile, layers.clone(), Limits::default(), 4);
 
     // Two taken: the third and fourth are staged, the fifth is still waiting
     // on the registry.
-    for descriptor in &inscription.diff[..2] {
+    for descriptor in &layers[..2] {
         prove(stream.next().unwrap().unwrap(), descriptor);
     }
     eventually("the fifth pull to reach the registry", || {
         fault.arrived().len() == 5
     });
-    assert_eq!(fetched(&fault), sorted(&fault.layers()[..5]));
+    assert_eq!(fetched(&fault), sorted(&fault.listed()[..5]));
 
     let dropping = Instant::now();
     drop(stream);
@@ -3772,22 +4125,22 @@ fn dropping_a_read_ahead_cancels_a_pull_waiting_to_retry() {
     let backoff = Duration::from_secs(1);
     let fault = FaultRegistry::spawn();
     let registry = faulty_waiting(&fault, "stelae/ahead-drop-retry", backoff);
-    let inscription = write_layers(&registry, 8);
+    let layers = write_chain(&registry, 8);
     let moved = Arc::new(Moved::default());
     registry.observe(Observer::new(moved.clone()));
 
     // The fifth layer's first transfer is cut off, so its pull is waiting to
     // try again when the stream is dropped.
-    let blob = fault.layers()[4].clone();
+    let blob = fault.listed()[4].clone();
     fault.fail_next(&blob, &[Fault::Truncate]);
 
-    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let snapshot = registry.resolve_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let layers = inscription.diff.clone();
 
-    let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 4);
+    let mut stream =
+        snapshot.stream_layers(&index, &ToyProfile, layers.clone(), Limits::default(), 4);
 
-    for descriptor in &inscription.diff[..2] {
+    for descriptor in &layers[..2] {
         prove(stream.next().unwrap().unwrap(), descriptor);
     }
     eventually("the fifth pull to be cut off", || {
@@ -3813,24 +4166,23 @@ fn dropping_a_read_ahead_cancels_a_pull_waiting_to_retry() {
 fn a_retry_inside_a_read_ahead_is_announced_once() {
     let _serial = exclusive();
 
-    let (fault, registry, inscription, moved) = published_layers("stelae/ahead-retry", 8, None);
-    let blob = fault.layers()[3].clone();
+    let (fault, registry, layers, moved) = published_layers("stelae/ahead-retry", 8, None);
+    let blob = fault.listed()[3].clone();
 
     fault.fail_next(&blob, &[Fault::Truncate]);
 
-    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let snapshot = registry.resolve_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let layers = inscription.diff.clone();
 
     let mut taken = 0;
     for (reader, descriptor) in snapshot
-        .stream_layers(&index, &ToyProfile, layers, Limits::default(), 8)
-        .zip(inscription.layers())
+        .stream_layers(&index, &ToyProfile, layers.clone(), Limits::default(), 8)
+        .zip(&layers)
     {
         prove(reader.unwrap(), descriptor);
         taken += 1;
     }
-    assert_eq!(taken, inscription.layers().count());
+    assert_eq!(taken, layers.len());
 
     let retries = moved.retries();
     assert_eq!(retries.len(), 1, "{retries:?}");
@@ -3847,12 +4199,12 @@ fn a_retry_inside_a_read_ahead_is_announced_once() {
 fn a_read_ahead_of_one_is_a_stream_layer_loop() {
     let _serial = exclusive();
 
-    let (fault, registry, inscription, _) = published_layers("stelae/ahead-serial", 4, None);
+    let (fault, registry, layers, _) = published_layers("stelae/ahead-serial", 4, None);
 
-    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let snapshot = registry.resolve_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
 
-    for descriptor in inscription.layers() {
+    for descriptor in &layers {
         let reader = snapshot
             .stream_layer(&index, &ToyProfile, descriptor, Limits::default())
             .unwrap();
@@ -3860,21 +4212,25 @@ fn a_read_ahead_of_one_is_a_stream_layer_loop() {
     }
 
     let looped = fault.arrived();
-    assert_eq!(looped, fault.layers());
+    assert_eq!(looped, fault.listed());
 
     for ahead in [0, 1] {
         fault.forget();
 
-        let layers = inscription.diff.clone();
-        let mut stream =
-            snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), ahead);
+        let mut stream = snapshot.stream_layers(
+            &index,
+            &ToyProfile,
+            layers.clone(),
+            Limits::default(),
+            ahead,
+        );
 
         let first = stream.next().unwrap().unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(fault.arrived().len(), 1, "depth {ahead} fetched ahead");
-        prove(first, &inscription.diff[0]);
+        prove(first, &layers[0]);
 
-        for (reader, descriptor) in stream.zip(&inscription.diff[1..]) {
+        for (reader, descriptor) in stream.zip(&layers[1..]) {
             prove(reader.unwrap(), descriptor);
         }
 
@@ -3888,13 +4244,13 @@ fn a_read_ahead_of_one_is_a_stream_layer_loop() {
 fn a_read_ahead_of_two_fetches_one_layer_ahead() {
     let _serial = exclusive();
 
-    let (fault, registry, inscription, _) = published_layers("stelae/ahead-two", 4, None);
+    let (fault, registry, layers, _) = published_layers("stelae/ahead-two", 4, None);
 
-    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let snapshot = registry.resolve_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
-    let layers = inscription.diff.clone();
 
-    let mut stream = snapshot.stream_layers(&index, &ToyProfile, layers, Limits::default(), 2);
+    let mut stream =
+        snapshot.stream_layers(&index, &ToyProfile, layers.clone(), Limits::default(), 2);
 
     let first = stream.next().unwrap().unwrap();
     eventually("the second pull to reach the registry", || {
@@ -3903,12 +4259,12 @@ fn a_read_ahead_of_two_fetches_one_layer_ahead() {
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(
         fetched(&fault),
-        sorted(&fault.layers()[..2]),
+        sorted(&fault.listed()[..2]),
         "depth 2 did not fetch exactly one layer ahead",
     );
-    prove(first, &inscription.diff[0]);
+    prove(first, &layers[0]);
 
-    for descriptor in &inscription.diff[1..] {
+    for descriptor in &layers[1..] {
         prove(stream.next().unwrap().unwrap(), descriptor);
     }
     assert!(
@@ -3938,30 +4294,32 @@ fn read_ahead_wall_clock() {
 
     let _serial = exclusive();
 
-    let (fault, registry, inscription, _) = published_layers("stelae/ahead-wall", 200, None);
-    fault.delay(&fault.layers(), Duration::from_millis(300));
+    let (fault, registry, layers, _) = published_layers("stelae/ahead-wall", 200, None);
+    fault.delay(&fault.listed(), Duration::from_millis(300));
 
-    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    let snapshot = registry.resolve_latest(&ToyProfile).unwrap();
     let index = snapshot.blob_index().unwrap();
 
     let walls: Vec<Duration> = [1, 4, 8]
         .into_iter()
         .map(|ahead| {
-            let layers = inscription.diff.clone();
             let started = Instant::now();
 
             for (reader, descriptor) in snapshot
-                .stream_layers(&index, &ToyProfile, layers, Limits::default(), ahead)
-                .zip(inscription.layers())
+                .stream_layers(
+                    &index,
+                    &ToyProfile,
+                    layers.clone(),
+                    Limits::default(),
+                    ahead,
+                )
+                .zip(&layers)
             {
                 prove(reader.unwrap(), descriptor);
             }
 
             let wall = started.elapsed();
-            println!(
-                "depth {ahead}: {wall:.2?} for {} layers",
-                inscription.layers().count()
-            );
+            println!("depth {ahead}: {wall:.2?} for {} layers", layers.len());
 
             wall
         })

@@ -488,9 +488,13 @@ pub trait SnapshotReader {
     /// content: they are what a verifier hashes, so a re-encoded copy carries a
     /// digest nobody else computes and is rejected rather than silently
     /// repaired.
+    ///
+    /// For a snapshot resolved through its chain ([`crate::chain`]), this is
+    /// the head's inscription, and the chain lists the layers.
     fn read_inscription(&self) -> Result<Inscription, Error>;
 
-    /// The `diffId` → blob map for this snapshot.
+    /// The `diffId` → blob map for this snapshot: across the whole layer set
+    /// when it was resolved through its chain.
     fn blob_index(&self) -> Result<BlobIndex, Error>;
 
     /// How many compressed bytes fetching this layer moves, if the transport

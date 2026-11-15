@@ -47,6 +47,14 @@
 //! annotations, so the ordering the canonical document fixes is the ordering
 //! on the wire.
 //!
+//! ## One sequence, or the whole snapshot
+//!
+//! [`Registry::pull`] reads one sequence: its two manifests and its
+//! inscription, and so its own layers. That is what a publisher needs of its
+//! predecessor. [`Registry::resolve`] reads the whole snapshot: the head as a
+//! pull reads it, then every sequence its links reach, a window of tags at a
+//! time ([`crate::chain`]). Its [`Snapshot`] streams any layer of the set.
+//!
 //! ## Bounded by layers, in both directions
 //!
 //! Both push paths need the blob's digest *up front*, and a layer's digest is
@@ -265,7 +273,7 @@
 //! variables and the precedence between them.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -286,6 +294,7 @@ use oci_client::{
 pub use oci_client::Reference;
 
 use crate::{
+    chain::Chain,
     digest::{read_uninterrupted, LayerWriter},
     frame::{CanonicalCbor, Limits, SeqWriter},
     inscription::{Inscription, LayerDescriptor},
@@ -506,6 +515,14 @@ pub const DEFAULT_READ_DELAY: Duration = Duration::from_secs(2);
 /// The longest single wait between read attempts.
 pub const READ_DELAY_CAP: Duration = Duration::from_secs(60);
 
+/// How many sequences [`Registry::resolve`] reads at once while it walks a
+/// chain.
+///
+/// Each sequence costs two small round trips, its diff manifest and its
+/// inscription, so a walk is latency-bound. Sixteen keeps a chain of several
+/// hundred sequences to a few dozen rounds.
+pub const DEFAULT_CHAIN_WINDOW: usize = 16;
+
 /// How to reach a registry.
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -596,6 +613,12 @@ pub struct Options {
     /// several small layers share it, and a layer larger than the whole budget
     /// cannot exist because the threshold is clamped to it.
     pub upload_memory: u64,
+
+    /// How many sequences a chain walk reads at once.
+    ///
+    /// Defaults to [`DEFAULT_CHAIN_WINDOW`]; `0` is read as `1`. See
+    /// [`Registry::resolve`].
+    pub chain_window: usize,
 }
 
 impl Default for Options {
@@ -611,6 +634,7 @@ impl Default for Options {
             read_delay: DEFAULT_READ_DELAY,
             monolithic_max: DEFAULT_MONOLITHIC_MAX,
             upload_memory: DEFAULT_UPLOAD_MEMORY,
+            chain_window: DEFAULT_CHAIN_WINDOW,
         }
     }
 }
@@ -820,6 +844,8 @@ struct Shared {
     /// [`Options::monolithic_max`], as it was resolved against
     /// [`Options::upload_memory`].
     monolithic_max: u64,
+    /// [`Options::chain_window`], as it was resolved.
+    chain_window: usize,
 }
 
 #[derive(Default)]
@@ -974,6 +1000,7 @@ impl Registry {
                 read_delay: options.read_delay,
                 resident: Arc::new(tokio::sync::Semaphore::new(upload_memory as usize)),
                 monolithic_max,
+                chain_window: options.chain_window.max(1),
             }),
         })
     }
@@ -1066,6 +1093,11 @@ impl Registry {
     /// pull of the moving tag finds it too. A sequence whose diff manifest
     /// is published and whose tip manifest is not is [`Error::TipGone`],
     /// which [`Error::is_absent`] does not count as absence.
+    ///
+    /// **One sequence, not the snapshot.** The layers of the inscriptions
+    /// before it are not read, so the result holds this sequence's own layers
+    /// only: what a publisher reads of its predecessor. A restore reads the
+    /// whole snapshot through [`Registry::resolve`].
     pub fn pull(&self, profile: &dyn Profile, tag: &str) -> Result<Snapshot, Error> {
         validate_tag(tag)?;
 
@@ -1077,22 +1109,7 @@ impl Registry {
         let raw = self
             .shared
             .pull_blob_bytes(&reference, &to_oci(&diff.config))?;
-        let inscription = Inscription::parse(&raw)?;
-
-        if inscription.canonicalize()? != raw {
-            return Err(Error::NonCanonicalInscription);
-        }
-
-        let config_digest = diff.config.digest.parse::<Digest>()?;
-        let identity = inscription.digest()?;
-
-        if identity != config_digest {
-            return Err(Error::DigestMismatch {
-                subject: "inscription".to_owned(),
-                expected: config_digest.to_string(),
-                actual: identity.to_string(),
-            });
-        }
+        let inscription = inscription_of(&diff, &raw)?;
 
         inscription.check_profile(profile)?;
 
@@ -1119,26 +1136,100 @@ impl Registry {
             Some(tip)
         };
 
+        let placed = placed(diff.layers.iter().chain(tip.iter().flat_map(|t| &t.layers)));
+
         Ok(Snapshot {
             shared: Arc::clone(&self.shared),
             reference,
             manifests: Manifests { diff, tip },
             inscription,
             blobs,
+            placed,
+            chain: None,
         })
     }
 
-    /// Resolve the immutable tag `profile` renders for `sequence`.
+    /// Pull the immutable tag `profile` renders for `sequence`.
     pub fn pull_sequence(&self, profile: &dyn Profile, sequence: u64) -> Result<Snapshot, Error> {
         let tag = checked_tag_for_sequence(profile, sequence)?;
         self.pull(profile, &tag)
     }
 
-    /// Resolve the profile's moving tag — the most recent snapshot, by its
-    /// diff manifest, and its tip.
+    /// Pull the profile's moving tag — the most recent sequence, by its diff
+    /// manifest, and its tip.
     pub fn pull_latest(&self, profile: &dyn Profile) -> Result<Snapshot, Error> {
         let tag = profile.moving_tag().to_owned();
         self.pull(profile, &tag)
+    }
+
+    /// Resolve `tag` into the whole snapshot: the sequence it names, read as
+    /// [`Registry::pull`] reads it, and every inscription its links reach
+    /// ([`Chain::walk`]).
+    ///
+    /// Tags are predictable, so the walk does not wait on one link to ask for
+    /// the next. From each link it reads that sequence and the ones below it,
+    /// [`Options::chain_window`] at once, on the transport's runtime: each
+    /// sequence's diff manifest and inscription, held to each other as a pull
+    /// holds them. A sequence read ahead that the chain does not reach is
+    /// dropped, absent or not, so a lineage that starts late costs a few
+    /// `404`s below its first sequence. Only the head's tip manifest is read.
+    ///
+    /// The result's [`BlobIndex`] and compressed sizes cover the whole layer
+    /// set, so its reader streams any of it, in the order a caller names.
+    ///
+    /// Three failures stay apart: an absent head is the registry's absence
+    /// ([`Error::is_absent`]); a head whose tip manifest is gone is
+    /// [`Error::TipGone`]; a document missing inside the chain is
+    /// [`Error::MissingLink`]. Only the first is absence.
+    pub fn resolve(&self, profile: &dyn Profile, tag: &str) -> Result<Snapshot, Error> {
+        let mut snapshot = self.pull(profile, tag)?;
+        let window = self.shared.chain_window as u64;
+
+        let mut ahead: BTreeMap<u64, Result<Option<Linked>, Error>> = BTreeMap::new();
+        let mut walked = Vec::new();
+
+        let chain = Chain::walk(profile, snapshot.inscription.clone(), |link| {
+            if !ahead.contains_key(&link.sequence) {
+                let wanted: Vec<u64> = (link.sequence.saturating_sub(window - 1)..=link.sequence)
+                    .rev()
+                    .filter(|sequence| !ahead.contains_key(sequence))
+                    .collect();
+
+                ahead.extend(self.shared.pull_window(profile, &wanted));
+            }
+
+            let linked = ahead.remove(&link.sequence).unwrap_or(Ok(None))?;
+
+            Ok(linked.map(|linked| {
+                walked.push((linked.manifest, linked.blobs));
+                linked.inscription
+            }))
+        })?;
+
+        for (manifest, blobs) in walked {
+            snapshot.blobs.extend(blobs);
+            snapshot.placed.extend(placed(&manifest.layers));
+        }
+
+        snapshot.chain = Some(chain);
+
+        Ok(snapshot)
+    }
+
+    /// Resolve the immutable tag `profile` renders for `sequence`.
+    pub fn resolve_sequence(
+        &self,
+        profile: &dyn Profile,
+        sequence: u64,
+    ) -> Result<Snapshot, Error> {
+        let tag = checked_tag_for_sequence(profile, sequence)?;
+        self.resolve(profile, &tag)
+    }
+
+    /// Resolve the profile's moving tag: the most recent snapshot, whole.
+    pub fn resolve_latest(&self, profile: &dyn Profile) -> Result<Snapshot, Error> {
+        let tag = profile.moving_tag().to_owned();
+        self.resolve(profile, &tag)
     }
 
     /// The most recent snapshot, or `None` if this repository has never held
@@ -1241,6 +1332,10 @@ fn is_absent(error: &oci_client::errors::OciDistributionError) -> bool {
 impl Error {
     /// Whether a pull failed because the repository holds no such manifest,
     /// rather than because the registry could not answer.
+    ///
+    /// Only the manifest a caller named counts. A gone tip
+    /// ([`Error::TipGone`]) and a document missing inside a chain
+    /// ([`Error::MissingLink`]) are not absence.
     pub fn is_absent(&self) -> bool {
         match self {
             Error::Registry(error) => is_absent(error),
@@ -2286,6 +2381,124 @@ impl Shared {
         Ok(from_oci(manifest))
     }
 
+    /// The sequences in `wanted`, each read as a task on the runtime and all
+    /// awaited: its document, `None` where the repository holds none, or the
+    /// error that ended its read. A sequence whose tag the profile refuses
+    /// keeps that refusal.
+    fn pull_window(
+        &self,
+        profile: &dyn Profile,
+        wanted: &[u64],
+    ) -> Vec<(u64, Result<Option<Linked>, Error>)> {
+        let reads: Vec<_> = wanted
+            .iter()
+            .map(|&sequence| {
+                let read = checked_tag_for_sequence(profile, sequence)
+                    .map(|tag| self.runtime.spawn(self.pull_linked(self.tagged(&tag))));
+
+                (sequence, read)
+            })
+            .collect();
+
+        let joined = self.runtime.block_on(async {
+            let mut joined = Vec::with_capacity(reads.len());
+
+            for (sequence, read) in reads {
+                joined.push(match read {
+                    Ok(task) => (sequence, Ok(task.await)),
+                    Err(error) => (sequence, Err(error)),
+                });
+            }
+
+            joined
+        });
+
+        // A panicking read is a bug in this module, re-raised as `ReadAhead`
+        // re-raises one; no read is aborted, so no other join error occurs.
+        joined
+            .into_iter()
+            .map(|(sequence, read)| {
+                let read = read.and_then(|task| match task {
+                    Ok(linked) => linked,
+                    Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+                    Err(join) => Err(std::io::Error::other(join).into()),
+                });
+
+                (sequence, read)
+            })
+            .collect()
+    }
+
+    /// One sequence of a chain under `reference`: its diff manifest and
+    /// inscription, held to each other as [`Registry::pull`] holds them, or
+    /// `None` when the repository holds no manifest or no inscription there.
+    ///
+    /// A future built out of clones, as [`Shared::pull_layer`] is, so a walk
+    /// can spawn it.
+    fn pull_linked(
+        &self,
+        reference: Reference,
+    ) -> impl std::future::Future<Output = Result<Option<Linked>, Error>> + Send + 'static {
+        let client = self.client.clone();
+        let auth = self.auth.clone();
+        let observer = self.observer();
+        let policy = Policy::read(self.read_attempts, self.read_delay);
+
+        async move {
+            let (client, reference, auth, watching) = (&client, &reference, &auth, &observer);
+
+            let subject = format!("manifest {reference}");
+            let pulled = reading_async(policy, &subject, watching, move || async move {
+                Ok(client.pull_image_manifest(reference, auth).await?)
+            })
+            .await;
+
+            let manifest = match pulled {
+                Ok((manifest, _digest)) => from_oci(manifest),
+                Err(error) if error.is_absent() => return Ok(None),
+                Err(error) => return Err(error),
+            };
+
+            check_envelope(&manifest)?;
+
+            let config = to_oci(&manifest.config);
+            let subject = format!("blob {}", config.digest);
+            let config = &config;
+
+            // Bounded by the size the manifest claims, as the head's is; the
+            // buffer grows with what arrives rather than with the claim.
+            let raw = reading_async(policy, &subject, watching, move || async move {
+                let mut raw = Vec::new();
+
+                client
+                    .pull_blob(
+                        reference,
+                        config,
+                        Blocking::new(&mut raw, config.size, &config.digest, Observer::silent()),
+                    )
+                    .await?;
+
+                Ok(raw)
+            })
+            .await;
+
+            let raw = match raw {
+                Ok(raw) => raw,
+                Err(error) if error.is_absent() => return Ok(None),
+                Err(error) => return Err(error),
+            };
+
+            let inscription = inscription_of(&manifest, &raw)?;
+            let blobs = read_manifest(&manifest, &inscription, Array::Diff)?;
+
+            Ok(Some(Linked {
+                manifest,
+                inscription,
+                blobs,
+            }))
+        }
+    }
+
     fn push_manifest(&self, tag: &str, body: Vec<u8>) -> Result<(), Error> {
         let reference = self.tagged(tag);
 
@@ -2382,20 +2595,71 @@ impl RecordSink for RegistrySink {
     }
 }
 
-/// A snapshot pulled from a registry, and the read handle over it: one
-/// sequence's diff and tip.
+/// A snapshot read from a registry, and the read handle over it.
 ///
-/// Everything cheap has already happened by the time this exists: the
-/// manifests and the inscription are in hand, verified against each other, and
-/// the `diffId`→blob map came off the manifests rather than out of a scan. What
-/// is left is the layers, and those are fetched one at a time as
-/// [`SnapshotReader::stream_layer`] is called.
+/// [`Registry::pull`] reads one sequence's diff and tip, and
+/// [`Registry::resolve`] the whole snapshot through its chain. Either way the
+/// cheap part is done by the time this exists: the manifests and the
+/// inscriptions are in hand, verified against each other, and the
+/// `diffId`→blob map came off the manifests rather than out of a scan. What
+/// is left is the layers, fetched as [`SnapshotReader::stream_layer`] or
+/// [`SnapshotReader::stream_layers`] asks.
+///
+/// [`SnapshotReader::read_inscription`] is the head's inscription, the one the
+/// tag names.
 pub struct Snapshot {
     shared: Arc<Shared>,
     reference: Reference,
     manifests: Manifests,
     inscription: Inscription,
     blobs: BlobIndex,
+    /// Every layer descriptor of the manifests read, by blob digest.
+    placed: BTreeMap<String, Descriptor>,
+    chain: Option<Chain>,
+}
+
+/// A sequence of a chain as a walk reads it: its diff manifest, its
+/// inscription, and the `diffId`→blob map the one gives the other.
+struct Linked {
+    manifest: Manifest,
+    inscription: Inscription,
+    blobs: BlobIndex,
+}
+
+/// The layer descriptors of manifests, by blob digest.
+fn placed<'a>(layers: impl IntoIterator<Item = &'a Descriptor>) -> BTreeMap<String, Descriptor> {
+    layers
+        .into_iter()
+        .map(|layer| (layer.digest.clone(), layer.clone()))
+        .collect()
+}
+
+/// The inscription a manifest's config blob holds, held to the digest the
+/// manifest addresses it by.
+///
+/// The bytes must be the canonical encoding, and the inscription's own digest
+/// must be the config digest: the one place identity and transport are held
+/// against each other, which stops a manifest from pointing at a document
+/// nobody signed.
+fn inscription_of(manifest: &Manifest, raw: &[u8]) -> Result<Inscription, Error> {
+    let inscription = Inscription::parse(raw)?;
+
+    if inscription.canonicalize()? != raw {
+        return Err(Error::NonCanonicalInscription);
+    }
+
+    let config_digest = manifest.config.digest.parse::<Digest>()?;
+    let identity = inscription.digest()?;
+
+    if identity != config_digest {
+        return Err(Error::DigestMismatch {
+            subject: "inscription".to_owned(),
+            expected: config_digest.to_string(),
+            actual: identity.to_string(),
+        });
+    }
+
+    Ok(inscription)
 }
 
 /// What was resolved, and nothing about the connection that resolved it.
@@ -2404,31 +2668,35 @@ impl std::fmt::Debug for Snapshot {
         f.debug_struct("Snapshot")
             .field("reference", &self.reference.whole())
             .field("sequence", &self.inscription.sequence)
-            .field("layers", &self.layers().count())
+            .field("resolved", &self.chain.is_some())
+            .field("layers", &self.placed.len())
             .finish_non_exhaustive()
     }
 }
 
 impl Snapshot {
-    /// The diff manifest this snapshot was read from, the one its tag names.
+    /// The head's diff manifest, the one its tag names.
     pub fn manifest(&self) -> &Manifest {
         &self.manifests.diff
     }
 
-    /// The tip manifest this snapshot was read from, or `None` when its `tip`
-    /// is empty.
+    /// The head's tip manifest, or `None` when its `tip` is empty.
     pub fn tip_manifest(&self) -> Option<&Manifest> {
         self.manifests.tip.as_ref()
     }
 
-    /// Every layer descriptor of both manifests: the diff's, then the tip's.
-    fn layers(&self) -> impl Iterator<Item = &Descriptor> {
-        let tip = self.manifests.tip.iter().flat_map(|tip| &tip.layers);
-
-        self.manifests.diff.layers.iter().chain(tip)
+    /// The chain this snapshot was resolved through: every inscription from
+    /// its lineage's first to the head, and the layer set they make.
+    ///
+    /// `None` for a snapshot read by [`Registry::pull`], which follows no
+    /// link and holds the head's own layers only.
+    pub fn chain(&self) -> Option<&Chain> {
+        self.chain.as_ref()
     }
 
-    /// Compressed bytes across every layer, as the manifests report them.
+    /// Compressed bytes across every layer this snapshot can fetch, as the
+    /// manifests report them: the head's own layers after a pull, the whole
+    /// layer set after a resolve.
     ///
     /// The whole-snapshot case of [`SnapshotReader::compressed_size`], for a
     /// caller that wants the total without walking the inscription — a
@@ -2436,7 +2704,10 @@ impl Snapshot {
     /// wants the per-layer figure, because what it is going to fetch is a
     /// subset.
     pub fn total_compressed_size(&self) -> u64 {
-        self.layers().map(|layer| layer.size.max(0) as u64).sum()
+        self.placed
+            .values()
+            .map(|layer| layer.size.max(0) as u64)
+            .sum()
     }
 
     /// A manifest's own descriptor for a layer, by identity.
@@ -2449,7 +2720,7 @@ impl Snapshot {
     fn layer_of(&self, index: &BlobIndex, descriptor: &LayerDescriptor) -> Option<&Descriptor> {
         let blob = index.blob_for(&descriptor.diff_id)?.to_string();
 
-        self.layers().find(|layer| layer.digest == blob)
+        self.placed.get(&blob)
     }
 
     /// [`Snapshot::layer_of`] for a read, where a layer no manifest places is
