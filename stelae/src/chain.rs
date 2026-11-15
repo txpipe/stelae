@@ -25,7 +25,7 @@
 //! 5. it is an inscription of the profile being read.
 //!
 //! The walk ends at the first inscription without a link, at any sequence: a
-//! lineage may start late (umbrella ruling 2).
+//! lineage may start late (`SPEC.md`, "The link").
 //!
 //! ## One layer per kind and scope, across the chain
 //!
