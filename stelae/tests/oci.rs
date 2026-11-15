@@ -3174,6 +3174,52 @@ fn a_gone_tip_is_not_an_absent_sequence() {
     assert!(err.is_absent(), "{err:?}");
 }
 
+/// A tip manifest the registry fails to serve is not a gone tip. Its read has
+/// the diff manifest's budget: cut off once, it is read again; cut off every
+/// time, the budget runs out; a refusal other than a 404 is itself, once.
+#[test]
+fn a_tip_the_registry_cannot_serve_is_not_a_gone_tip() {
+    let _serial = exclusive();
+
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/flaky-tip");
+    publish_chapters(&registry);
+
+    let retries = Arc::new(Retries::default());
+    registry.observe(Observer::new(retries.clone()));
+    let key = "manifests/chapter-4.tip";
+
+    fault.fail_next(key, &[Fault::Truncate]);
+    let snapshot = registry.pull_sequence(&ToyProfile, 4).unwrap();
+    assert!(snapshot.tip_manifest().is_some());
+    assert_eq!(fault.gets(key), 2, "the tip manifest was not read again");
+    assert_eq!(retries.seen(), vec![(1, DEFAULT_READ_ATTEMPTS - 1)]);
+
+    fault.fail_always(key, Fault::Truncate);
+    let before = fault.gets(key);
+    let err = registry.pull_sequence(&ToyProfile, 4).unwrap_err();
+    assert!(
+        matches!(&err, Error::RetriesExhausted { attempts, .. } if *attempts == DEFAULT_READ_ATTEMPTS),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("chapter-4.tip"), "{err}");
+    assert!(!err.is_absent());
+    assert_eq!(fault.gets(key) - before, DEFAULT_READ_ATTEMPTS as usize);
+
+    for code in [403, 429] {
+        fault.fail_always(key, Fault::Status(code));
+        let before = fault.gets(key);
+        for err in [
+            registry.pull_sequence(&ToyProfile, 4).unwrap_err(),
+            registry.latest(&ToyProfile).unwrap_err(),
+        ] {
+            assert!(matches!(err, Error::Registry(_)), "a {code} became {err:?}");
+            assert!(!err.is_absent());
+        }
+        assert_eq!(fault.gets(key) - before, 2, "a {code} was retried");
+    }
+}
+
 /// A tip manifest of another inscription under this sequence's `.tip` tag is
 /// refused, rather than read as this sequence's tip.
 #[test]
