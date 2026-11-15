@@ -23,6 +23,7 @@ producer and consumer; it carries no Cardano assumption.
 | --- | --- |
 | [`stelae`](stelae/) | The wire protocol: framing, inscription, digests, plan/resume, the directory and OCI transports. The normative crate — a third party implements a profile against this and nothing else. |
 | [`stelae-driver`](stelae-driver/) | Profile-generic lifecycle machinery: the chained-publish lifecycle, restore budget/checkpoint, preflight, retry, reporting. A profile author's toolkit, never required for wire compatibility. |
+| [`stelae-blocks`](stelae-blocks/) | The `io.txpipe.cardano.blocks` profile: one layer of raw Cardano blocks per epoch, for any client. Its codec, a writer and a reader; no node dependency. Specified in [`stelae-blocks/PROFILE.md`](stelae-blocks/PROFILE.md). |
 | [`stelae-cardano`](stelae-cardano/) | Cardano application integration: cold-start restore, publication policy and the sequential Mithril backfill state machine. The only workspace crate allowed to depend on Dolos. |
 | [`stelae-publisher`](stelae-publisher/) | The `stelae-publisher` executable and its operator-facing commands. |
 
@@ -51,6 +52,9 @@ Dolos, in
 Both are frozen with Dolos v2: protocol version 1 and the
 `io.txpipe.dolos.cardano` profile at version 1. Later changes follow the
 compatibility rules in [`SPEC.md`](SPEC.md#compatibility).
+
+The blocks profile, `io.txpipe.cardano.blocks`, is specified with its crate,
+in [`stelae-blocks/PROFILE.md`](stelae-blocks/PROFILE.md).
 
 A snapshot's OCI manifest names the envelope `artifactType`
 `application/vnd.stelae.snapshot.v1`. Readers refuse the retired

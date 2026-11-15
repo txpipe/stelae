@@ -5,7 +5,7 @@
 # a single tag and a consumer pins both crates with one git reference.
 [workspace]
 resolver = "2"
-members = ["stelae", "stelae-driver", "stelae-cardano", "stelae-publisher"]
+members = ["stelae", "stelae-driver", "stelae-blocks", "stelae-cardano", "stelae-publisher"]
 
 [workspace.package]
 version = "0.6.0"
