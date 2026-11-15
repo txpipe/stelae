@@ -10,15 +10,19 @@
 //! - [`record`] — the `blocks` record codec and its order rule.
 //! - [`scope`] — the epoch scope a layer carries, in both of its encodings.
 //! - [`layer`] — writing a layer from records and reading one back.
+//! - `hardano` (feature `hardano`) — an epoch's blocks read out of the Haskell
+//!   node's immutable files, sealed as a blocks snapshot.
 //!
 //! Every layer is final once its epoch has closed, so every layer goes in an
 //! inscription's `diff` and a blocks snapshot has no tip.
 
+#[cfg(feature = "hardano")]
+pub mod hardano;
 pub mod layer;
 pub mod record;
 pub mod scope;
 
-use std::ops::Range;
+use std::{ops::Range, path::PathBuf};
 
 use serde_json::json;
 use stelae::{inscription::Inscription, Compression, Profile};
@@ -55,6 +59,9 @@ pub enum Error {
     #[error(transparent)]
     Stelae(#[from] stelae::Error),
 
+    #[error(transparent)]
+    Driver(#[from] stelae_driver::Error),
+
     #[error("malformed blocks record: {0}")]
     MalformedRecord(String),
 
@@ -75,6 +82,29 @@ pub enum Error {
 
     #[error("the inscription's {field} is not the shape this profile writes: {reason}")]
     MalformedInscription { field: String, reason: String },
+
+    /// A snapshot whose link does not fit where it stands in its lineage.
+    #[error("cannot seal the blocks snapshot at sequence {sequence}: {reason}")]
+    Lineage { sequence: u64, reason: String },
+
+    /// An immutable file the epoch covers is absent, whole or in part.
+    #[error("immutable file {file:05} is missing: {path} does not exist")]
+    MissingFile { file: u64, path: PathBuf },
+
+    /// The directory skips file numbers inside the epoch.
+    #[error("immutable files are not contiguous: {after:05} is followed by {next:05}")]
+    FileGap { after: u64, next: u64 },
+
+    /// The epoch's last file is the directory's newest, which a node may
+    /// still be appending to.
+    #[error("immutable file {file:05} may still be open: no later file follows it")]
+    OpenFile { file: u64 },
+
+    #[error("cannot read immutable file {file:05}: {reason}")]
+    Immutable { file: u64, reason: String },
+
+    #[error("malformed block in immutable file {file:05}: {reason}")]
+    MalformedBlock { file: u64, reason: String },
 }
 
 impl Error {

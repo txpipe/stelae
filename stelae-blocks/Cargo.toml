@@ -8,15 +8,37 @@ repository.workspace = true
 readme = "PROFILE.md"
 
 # A client-neutral profile: it depends on the protocol and the driver and on
-# no node implementation. `cargo tree -p stelae-blocks -e normal` must match
-# nothing `^(dolos|pallas)(-|$)`.
+# no node implementation. Without the `hardano` feature, `cargo tree -p
+# stelae-blocks -e normal` must match nothing `^(dolos|pallas)(-|$)`; with
+# it, pallas and still no Dolos.
+[features]
+# Read an epoch's blocks out of the Haskell node's immutable files and seal a
+# snapshot of them. Off by default, so a consumer of the profile does not
+# inherit pallas.
+hardano = ["dep:pallas-hardano", "dep:pallas-traverse"]
+
 [dependencies]
 stelae = { path = "../stelae", version = "=0.6.0" }
 stelae-driver = { path = "../stelae-driver", version = "=0.6.0" }
 
 minicbor = { version = "0.26", features = ["std"] }
+pallas-hardano = { version = "1.4.0", optional = true }
+pallas-traverse = { version = "1.4.0", optional = true }
 serde_json = "1.0.122"
 thiserror = "2.0.12"
 
 [dev-dependencies]
 tempfile = "3.20.0"
+# The end-to-end test seals into a registry, so it needs the transport, and
+# installs `ring` as the process's crypto provider as `stelae`'s registry
+# tests do. Dev-dependencies, so the boundary check above is unaffected.
+stelae = { path = "../stelae", version = "=0.6.0", features = ["oci"] }
+stelae-driver = { path = "../stelae-driver", version = "=0.6.0", features = ["oci"] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+] }
+
+[[test]]
+name = "hardano"
+required-features = ["hardano"]

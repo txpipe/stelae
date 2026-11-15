@@ -63,6 +63,26 @@ jobs:
         with:
           command: check advisories bans
 
+  # The workspace jobs build with every feature, so stelae-blocks is also
+  # checked as Dolos takes it: without `hardano`, and without pallas.
+  blocks-default-features:
+    name: stelae-blocks without hardano
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.93
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked -p stelae-blocks --all-targets -- -D warnings
+      - run: cargo test --locked -p stelae-blocks
+      - name: No Dolos or pallas crate in the tree
+        run: |
+          cargo tree --locked -p stelae-blocks -e normal --prefix none > "$RUNNER_TEMP/tree.txt"
+          if grep -E '^(dolos|pallas)(-| )' "$RUNNER_TEMP/tree.txt"; then exit 1; fi
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -92,3 +112,4 @@ jobs:
       # CI requirement instead of silently treating the registry gate as run.
       - run: cargo test --locked -p stelae --all-features --test oci -- --ignored --nocapture
       - run: cargo test --locked -p stelae-cardano --all-features --test batch -- --ignored --nocapture
+      - run: cargo test --locked -p stelae-blocks --features hardano --test hardano -- --ignored --nocapture

@@ -4818,6 +4818,9 @@ name = "stelae-blocks"
 version = "0.6.0"
 dependencies = [
  "minicbor 0.26.5",
+ "pallas-hardano",
+ "pallas-traverse",
+ "rustls",
  "serde_json",
  "stelae 0.6.0",
  "stelae-driver 0.6.0",
