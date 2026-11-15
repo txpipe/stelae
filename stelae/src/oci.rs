@@ -105,13 +105,10 @@
 //!
 //! A publish is not one transfer; it is a few hundred small ones. A snapshot's
 //! layers are cut at record-type and epoch granularity, so a mainnet publish
-//! moves tens of new blobs of half a megabyte each and carries hundreds of
-//! older ones forward — and every one of those, new or carried, costs at least
-//! one round trip to a registry that may be an ocean away. Run in sequence, the
-//! path spends nearly all of its wall clock waiting on a socket with the CPU
-//! and the link both idle, and the carried-forward half makes it *worse every
-//! epoch*: the snapshot gains layers, so the publish gains round trips, so the
-//! cycle time grows linearly with the history behind it.
+//! moves tens of blobs of half a megabyte each, and every one of those costs at
+//! least one round trip to a registry that may be an ocean away. Run in
+//! sequence, the path spends nearly all of its wall clock waiting on a socket
+//! with the CPU and the link both idle.
 //!
 //! Nothing about that is a bandwidth problem, so the answer is not bigger
 //! layers — the cut geometry is the profile's, and it is deliberate. The answer
@@ -282,7 +279,7 @@ use oci_client::{
 pub use oci_client::Reference;
 
 use crate::{
-    digest::{read_uninterrupted, LayerDigests, LayerWriter},
+    digest::{read_uninterrupted, LayerWriter},
     frame::{CanonicalCbor, Limits, SeqWriter},
     inscription::{Inscription, LayerDescriptor},
     layer::LayerReader,
@@ -432,14 +429,12 @@ pub struct Transfer {
     pub layers_uploaded: u64,
     /// Layer blobs the registry already had, and that were not.
     pub layers_skipped: u64,
-    /// Layer blobs that were never built, because [`Registry::adopt_layer`]
-    /// took them from a snapshot already in this repository — or because
-    /// [`Registry::adopt_carried`] took them from an earlier attempt of this
-    /// same publish.
+    /// Layer blobs that were never built, because [`Registry::adopt_carried`]
+    /// took them from an interrupted attempt of this same publish.
     ///
     /// Deliberately not folded into `layers_skipped`. A skipped layer was
     /// built, hashed and then found to be present already, so the publisher
-    /// paid for it and saved only the upload; an adopted one was never read out
+    /// paid for it and saved only the upload; a reused one was never read out
     /// of a store at all. They are different costs and a publisher comparing
     /// two publishes wants to tell them apart.
     pub layers_reused: u64,
@@ -447,8 +442,8 @@ pub struct Transfer {
     pub bytes_uploaded: u64,
     /// Compressed bytes the skip saved.
     pub bytes_skipped: u64,
-    /// Compressed bytes an adopted layer did not move, as the manifest or the
-    /// record it came from reports them.
+    /// Compressed bytes a reused layer did not move, as the record it came
+    /// from reports them.
     pub bytes_reused: u64,
 }
 
@@ -543,25 +538,6 @@ pub struct Options {
     /// does, and in the unit that one is spent in.
     pub concurrency: usize,
 
-    /// Re-prove that the registry still holds a blob being adopted out of a
-    /// manifest this transport pulled.
-    ///
-    /// Off, and that is the plain reading of the distribution specification
-    /// rather than an optimism: a blob referenced by a manifest under a live
-    /// tag is not garbage, and a registry that reclaims one has broken the
-    /// contract that makes *the snapshot the manifest came from* restorable —
-    /// which the `HEAD` would not have saved either. Paying a round trip per
-    /// carried layer to re-establish that is what made the publish path's cost
-    /// grow with the history behind it, for a check whose failure means the
-    /// repository is already unusable.
-    ///
-    /// On, [`Registry::adopt_layer`] proves each blob before the manifest names
-    /// it, concurrently with everything else the publish is doing — so the
-    /// check costs latency it can hide rather than latency it serializes. For
-    /// an operator publishing into a registry whose retention they do not
-    /// trust.
-    pub verify_adopted: bool,
-
     /// How many times a round trip is made before its failure is the caller's.
     ///
     /// Defaults to [`DEFAULT_ATTEMPTS`]. `0` and `1` both mean one attempt and
@@ -623,7 +599,6 @@ impl Default for Options {
             scratch_dir: None,
             auth: Auth::default(),
             concurrency: DEFAULT_CONCURRENCY,
-            verify_adopted: false,
             attempts: DEFAULT_ATTEMPTS,
             read_attempts: DEFAULT_READ_ATTEMPTS,
             read_delay: DEFAULT_READ_DELAY,
@@ -805,8 +780,6 @@ struct Shared {
     /// property a restore depends on — the reader is created inside the driver
     /// and there is no other moment to wire it.
     observer: Mutex<Observer>,
-    /// [`Options::verify_adopted`], as it was given.
-    verify_adopted: bool,
     /// [`Options::concurrency`], as it was resolved — the permit count, kept
     /// beside the semaphore because the semaphore's own count is whatever is
     /// free at the moment it is asked.
@@ -988,7 +961,6 @@ impl Registry {
                 permits: Arc::new(tokio::sync::Semaphore::new(concurrency)),
                 inflight: Mutex::new(Vec::new()),
                 observer: Mutex::new(Observer::silent()),
-                verify_adopted: options.verify_adopted,
                 concurrency,
                 attempts: options.attempts.max(1),
                 read_attempts: options.read_attempts.max(1),
@@ -1167,126 +1139,19 @@ impl Registry {
         }
     }
 
-    /// Carry a layer this repository already holds into the snapshot being
-    /// written, without building it.
-    ///
-    /// This is the operation a content-addressed registry makes possible and a
-    /// directory does not: the caller has established — by whatever rule its
-    /// profile owns — that a layer it *would* write is the layer a previous
-    /// snapshot already published, so the bytes need neither be produced nor
-    /// sent, and the new manifest simply points at the blob the old one
-    /// pointed at.
-    ///
-    /// **The new snapshot attests a layer it did not reproduce.** That is the
-    /// trade, and it is the caller's to make: nothing here can check that the
-    /// descriptor describes those bytes, because checking would mean reading
-    /// them, which is the cost being avoided.
-    ///
-    /// ## What is not checked, and why that is the default
-    ///
-    /// `source` is a snapshot this transport *pulled*: its manifest is live in
-    /// this repository under a tag, and it names this blob. A registry is not
-    /// permitted to reclaim a blob in that position, and one that does has
-    /// already broken the snapshot the descriptor came from — a `HEAD` here
-    /// would find the damage a publish too late and could not have
-    /// prevented it.
-    ///
-    /// Re-establishing it per carried layer per publish is what made this path
-    /// cost a round trip for every layer of history behind the snapshot, and
-    /// made each publish slower than the one before it for a reason that
-    /// had nothing to do with what it was publishing. So it is not paid by
-    /// default. [`Options::verify_adopted`] restores the proof for an
-    /// operator who wants it, and pays for it concurrently rather than in
-    /// sequence: the `HEAD` still lands before the manifest names the blob,
-    /// which is the only ordering that was ever load-bearing.
-    ///
-    /// The caller names the layer by its `descriptor` — identity, out of an
-    /// inscription — and the snapshot it came from. The blob digest and the
-    /// compressed size are read off *that snapshot's manifest*, by exactly the
-    /// lookup [`SnapshotReader::stream_layer`] uses, rather than passed in
-    /// beside the descriptor: they are transport facts, they belong to the
-    /// manifest, and a caller assembling the pair by hand is a caller that
-    /// can mismatch them.
-    pub fn adopt_layer(&self, source: &Snapshot, descriptor: LayerDescriptor) -> Result<(), Error> {
-        let missing = || Error::LayerNotFound {
-            kind: descriptor.kind.clone(),
-            diff_id: descriptor.diff_id.to_string(),
-        };
-
-        let blob = source
-            .blobs
-            .blob_for(&descriptor.diff_id)
-            .ok_or_else(missing)?;
-        let named = blob.to_string();
-
-        let oci = source
-            .manifest
-            .layers
-            .iter()
-            .find(|layer| layer.digest == named)
-            .ok_or_else(missing)?;
-
-        // Refused rather than clamped. A descriptor's size is an `i64` and a
-        // negative one is a manifest saying something impossible; clamping it
-        // to zero would carry that zero into the new manifest, where it becomes
-        // the ceiling a later reader holds the download to — so the snapshot would
-        // publish looking well-formed and refuse to restore. Every other
-        // malformed-manifest shape here is a refusal, and this is one too.
-        let compressed_size = u64::try_from(oci.size).map_err(|_| {
-            Error::ManifestMismatch(format!(
-                "layer {:?} ({}) claims a compressed size of {}",
-                descriptor.kind, descriptor.diff_id, oci.size,
-            ))
-        })?;
-
-        let adopted = WrittenLayer {
-            digests: LayerDigests {
-                diff_id: descriptor.diff_id,
-                blob_digest: blob,
-                uncompressed_size: descriptor.uncompressed_size,
-                compressed_size,
-            },
-            descriptor,
-        };
-
-        // A manifest naming a blob the registry no longer has is a refusal and
-        // not a miss: the snapshot that named it is published, and something has
-        // reclaimed underneath it. See [`Registry::adopt_carried`] for the case
-        // where the same absence is merely a rebuild — and `Options` for why
-        // this transport does not go looking for it by default.
-        if self.shared.verify_adopted {
-            let permit = self.shared.permit();
-
-            self.shared.prove_blob(&adopted, permit);
-        }
-
-        let mut state = self.shared.locked();
-        state.transfer.layers_reused += 1;
-        state.transfer.bytes_reused += adopted.digests.compressed_size;
-        state.pending.push(adopted);
-
-        Ok(())
-    }
-
     /// Carry a layer that is already in this repository, named in full.
     ///
-    /// [`Registry::adopt_layer`] with the lookup already done — for a caller
-    /// holding a [`WrittenLayer`] this transport produced earlier rather than a
-    /// snapshot to read one out of. The pair is still not assembled by hand: it
-    /// is the measurement [`RecordSink::finish`] returned when the blob
-    /// went up, carried across whatever interruption the caller survived.
+    /// For a publish resuming after an interruption: `layer` is the
+    /// [`WrittenLayer`] [`RecordSink::finish`] returned when the blob went up
+    /// in an earlier attempt of the same publish, so the new manifest can name
+    /// that blob without the layer being built again.
     ///
     /// **The blob check is a verdict, not an assertion.** `Ok(false)` means the
-    /// registry does not hold it and nothing was carried, which is a caller's
-    /// cue to build the layer after all. That is the difference from
-    /// [`Registry::adopt_layer`], where the same answer is an error: a
-    /// published manifest that names a reclaimed blob is a snapshot nobody can
-    /// restore, while a caller's own note that has gone stale costs a rebuild
-    /// and nothing else.
+    /// registry does not hold it and nothing was carried, which is the
+    /// caller's cue to build the layer after all.
     ///
-    /// Nothing here checks that the descriptor describes those bytes, for the
-    /// reason [`Registry::adopt_layer`] gives: checking would mean reading
-    /// them, which is the cost being avoided.
+    /// Nothing here checks that the descriptor describes those bytes: checking
+    /// would mean reading them, which is the cost being avoided.
     pub fn adopt_carried(&self, layer: WrittenLayer) -> Result<bool, Error> {
         if !self.shared.blob_exists(&layer.digests.blob_digest)? {
             return Ok(false);
@@ -2095,49 +1960,6 @@ impl Shared {
         });
     }
 
-    /// Prove — later — that the registry still holds a blob being carried
-    /// forward.
-    ///
-    /// [`Options::verify_adopted`] only. Deferred for the reason an upload is,
-    /// and joined at the same point: what the check has to beat is the manifest
-    /// naming the blob, not the descriptor being handed back.
-    fn prove_blob(&self, layer: &WrittenLayer, permit: Permit) {
-        let kind = layer.descriptor.kind.clone();
-        let diff_id = layer.descriptor.diff_id;
-        let blob = layer.digests.blob_digest;
-
-        let client = self.client.clone();
-        let repository = self.repository.clone();
-        let observer = self.observer();
-        let attempts = self.attempts;
-
-        self.defer(async move {
-            let _permit = permit;
-            let named = blob.to_string();
-
-            // The retry is over the round trip and not over the verdict: a
-            // registry that answered "no" answered, and asking a second time is
-            // how a publisher talks itself into carrying a blob that is gone.
-            let present = retrying_async(attempts, &observer, || {
-                let client = client.clone();
-                let repository = repository.clone();
-                let named = named.clone();
-
-                async move { Ok(client.blob_exists(&repository, &named).await?) }
-            })
-            .await?;
-
-            match present {
-                true => Ok(()),
-                false => Err(Error::BlobMissing {
-                    kind,
-                    diff_id: diff_id.to_string(),
-                    blob: named,
-                }),
-            }
-        });
-    }
-
     /// Upload a small blob a caller already holds — the inscription, and
     /// nothing else.
     ///
@@ -2315,61 +2137,13 @@ impl SnapshotWriter for Registry {
         })
     }
 
-    /// Put the second descriptor in the list [`SnapshotWriter::seal`] builds
-    /// the manifest from.
-    ///
-    /// The override the default's documentation asks for: this transport pairs
-    /// every layer the inscription describes against a layer it wrote, and a
-    /// descriptor with nothing beside it fails the seal. Nothing is uploaded
-    /// and nothing is checked — the blob was handed to the upload pool when the
-    /// first descriptor's sink finished, in this same publish, and the seal
-    /// joins that upload before it names either descriptor. So there is no
-    /// state of the registry under which it is there for one name and absent
-    /// for the other.
-    ///
-    /// Counted as **skipped** rather than reused, by the distinction
-    /// [`Transfer::layers_reused`] draws: these bytes were built out of a
-    /// store, hashed, and then not uploaded again — which is a blob-skip
-    /// exactly, and not a layer that was never read.
-    ///
-    /// ## And silent, unlike the blob-skip on the upload path
-    ///
-    /// That path emits [`Event::Blob`] with `moved: false` because a watcher
-    /// hearing only about uploads would read the skip as a stall. Nothing
-    /// stalls here: the caller closes the second descriptor's layer as
-    /// `Transferred`, so the layer cursor advances on its own, and the blob
-    /// this describes finished uploading moments ago in this same publish.
-    /// The event drives a per-blob bar, so emitting one would reset it to
-    /// "already in the registry" for bytes that had just crossed the wire —
-    /// which reads as a redundant upload rather than as one blob acquiring a
-    /// second name.
-    ///
-    /// The counters above do record it, and there the double count is the
-    /// reading that is wanted: a publisher comparing two publishes wants the
-    /// dump's bytes to appear as bytes it did not pay to move again.
-    fn carry_again(
-        &self,
-        written: &WrittenLayer,
-        scope: serde_json::Value,
-    ) -> Result<WrittenLayer, Error> {
-        let again = crate::transport::again(written, scope);
-
-        let mut state = self.shared.locked();
-        state.transfer.layers_skipped += 1;
-        state.transfer.bytes_skipped += again.digests.compressed_size;
-        state.pending.push(again.clone());
-
-        Ok(again)
-    }
-
     /// Publish the manifest, and with it the snapshot.
     ///
     /// The order is the whole of the safety argument:
     ///
     /// 1. **every layer blob is up.** The round trips were deferred by
-    ///    [`RecordSink::finish`] and [`Registry::adopt_layer`] and ran
-    ///    concurrently; this is where they are joined, and the first failure
-    ///    among them is this call's failure;
+    ///    [`RecordSink::finish`] and ran concurrently; this is where they are
+    ///    joined, and the first failure among them is this call's failure;
     /// 2. the inscription goes up as the config blob;
     /// 3. the manifest is tagged with the immutable tag the profile renders for
     ///    this sequence;
@@ -2959,11 +2733,8 @@ struct BlobPastDescriptor {
 /// about its size costs its size and not the disk.
 ///
 /// A negative size clamps to a ceiling of zero here, and that is deliberate
-/// rather than an oversight — unlike [`Registry::adopt_layer`], which refuses
-/// one. The directions differ: a zero ceiling refuses every non-empty blob,
-/// which is the safe answer to a manifest claiming something impossible, while
-/// clamping on the way *into* a manifest would publish that impossible claim
-/// forward as a number a later reader trusts.
+/// rather than an oversight: a zero ceiling refuses every non-empty blob,
+/// which is the safe answer to a manifest claiming something impossible.
 struct Blocking<'a, W: Write> {
     inner: &'a mut W,
     written: u64,

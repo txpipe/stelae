@@ -321,27 +321,6 @@ pub enum Error {
     )]
     ManifestTooLarge { size: usize, layers: usize },
 
-    /// A layer a publisher asked to carry forward, whose blob the repository no
-    /// longer holds.
-    ///
-    /// Distinct from [`Error::LayerNotFound`], which is about a snapshot that
-    /// does not describe a layer. This one is the opposite shape: a
-    /// snapshot describes it, and the bytes are gone — a descriptor
-    /// pointing at a blob a registry has reclaimed. Publishing it would
-    /// produce a well-formed snapshot nobody can restore, so it is refused
-    /// where it is discovered rather than where it would eventually be
-    /// noticed.
-    #[cfg(feature = "oci")]
-    #[error(
-        "layer {kind:?} ({diff_id}) cannot be carried forward: this repository no longer holds \
-         its blob {blob}"
-    )]
-    BlobMissing {
-        kind: String,
-        diff_id: String,
-        blob: String,
-    },
-
     /// A seal asked again of a transport whose layers did not all land.
     ///
     /// The publish path moves its layers concurrently and joins them at the

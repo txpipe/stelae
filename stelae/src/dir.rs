@@ -491,9 +491,8 @@ impl SnapshotDir {
     /// sidecar and keeps the scan it always had, which is the same fallback a
     /// snapshot published before this file existed relies on.
     ///
-    /// One `diffId` may carry several descriptors — a retained state dump and
-    /// the tip shard it was cut from are one blob under two scopes — so the map
-    /// is keyed by identity and the file lists each blob once.
+    /// The map is keyed by identity, so the file lists each blob once even
+    /// where two descriptors name one `diffId`.
     ///
     /// Declining leaves the snapshot with no sidecar, which
     /// [`SnapshotWriter::seal`] has already seen to: a directory sealed a

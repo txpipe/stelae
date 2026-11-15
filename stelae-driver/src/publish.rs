@@ -1,16 +1,17 @@
 //! The chained-publish lifecycle against a repository.
 //!
 //! Everything a publisher does once it is standing in front of a *repository*
-//! rather than a transport: what the new snapshot says about the ones already
-//! in it, and what it may take from them. Generic over
-//! [`DriverProfile`][crate::DriverProfile] throughout — every document that
-//! crosses this module is composed by a profile and only compared here.
+//! rather than a transport: what the new snapshot says about the one before it,
+//! and what an interrupted attempt of the same publish left behind. Generic
+//! over [`DriverProfile`][crate::DriverProfile] throughout — every document
+//! that crosses this module is composed by a profile and only compared here.
 //!
 //! What is *not* here is where any of it lives on a host: a resumption record's
 //! path is handed in, never derived. A node's storage layout is the profile's.
 //!
-//! See the profile-side module that wraps this for the publish rules
-//! themselves — the chain-or-refuse contract, what a reused layer asserts, and
+//! A publish never re-lists a layer of an earlier snapshot: it uploads and
+//! lists the layers its profile assigns to its own sequence. See the
+//! profile-side module that wraps this for the chain-or-refuse contract and
 //! what an interrupted publish leaves behind.
 
 use std::{
@@ -26,13 +27,13 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use stelae::{
-    inscription::{Compression, Inscription, LayerDescriptor, Link},
+    inscription::{Compression, LayerDescriptor, Link},
     oci::{Auth, Options, Registry, Repository, Snapshot, DEFAULT_CONCURRENCY},
     transport::WrittenLayer,
     Digest, SnapshotReader as _,
 };
 
-use crate::{scope_key, DriverProfile, Error, Predecessor, Standing};
+use crate::{scope_key, DriverProfile, Error, Predecessor, Role, Standing};
 
 /// Open a repository in a registry.
 ///
@@ -52,9 +53,8 @@ use crate::{scope_key, DriverProfile, Error, Predecessor, Standing};
 /// `scratch_dir` is where layers are staged, in both directions. The transport
 /// creates it when the first layer needs it, so it need not exist yet.
 ///
-/// `tuning` is the publish path's concurrency and the one check an operator may
-/// want back; [`Tuning::default`] is what every caller that is not publishing
-/// wants.
+/// `tuning` is how the publish path moves its layers; [`Tuning::default`] is
+/// what every caller that is not publishing wants.
 ///
 /// **Never call any of this from inside an async context.** The transport owns
 /// a runtime and enters it with `block_on`; `stelae::oci`'s module
@@ -80,7 +80,6 @@ fn options(insecure: bool, auth: Auth, scratch_dir: PathBuf, tuning: Tuning) -> 
         scratch_dir: Some(scratch_dir),
         auth,
         concurrency: tuning.concurrency.map_or(DEFAULT_CONCURRENCY, Into::into),
-        verify_adopted: tuning.verify_adopted,
         // Not an operator's knob and deliberately not one: the number that
         // absorbs a registry's transient `5xx` is the transport's own
         // measurement, and an outage longer than it is answered a level up,
@@ -117,11 +116,6 @@ pub struct Tuning {
     /// How many layer round trips run at once; `None` is
     /// [`DEFAULT_CONCURRENCY`].
     pub concurrency: Option<NonZeroUsize>,
-
-    /// Re-prove that the registry still holds each blob carried forward out of
-    /// the predecessor's manifest. See [`stelae::oci::Options::verify_adopted`]
-    /// for why this is off.
-    pub verify_adopted: bool,
 }
 
 /// Where a publish is going, and what the host running it knows about itself.
@@ -147,7 +141,7 @@ pub struct Publishing<'a> {
     /// and resumes nothing.
     pub record_path: Option<PathBuf>,
 
-    /// The operator's `--rebuild`: build every layer, inherit none, and start
+    /// The operator's `--rebuild`: build every layer, resume none, and start
     /// the record over.
     pub rebuild: bool,
 
@@ -191,7 +185,7 @@ impl<'a> Publishing<'a> {
     }
 }
 
-/// What a record has to agree with before a single layer in it is adopted.
+/// What a record has to agree with before a single layer in it is resumed.
 ///
 /// Everything a recorded layer's bytes and address depend on that is *not* in
 /// the layer's own key. The key is the kind plus the descriptor scope, and that
@@ -271,7 +265,7 @@ impl Origin {
     }
 }
 
-/// The epoch layers an interrupted publish got as far as uploading.
+/// The `diff` layers an interrupted publish got as far as uploading.
 ///
 /// Written after each layer's upload succeeds and deleted once the snapshot is
 /// sealed, so a record that exists describes a publish that did not finish. See
@@ -284,7 +278,7 @@ pub struct PublishRecord {
 
     /// The layers whose blobs are up, each as the transport measured it.
     ///
-    /// The whole [`WrittenLayer`] rather than the digest pair the adoption
+    /// The whole [`WrittenLayer`] rather than the digest pair the resumption
     /// needs: the descriptor is what the new manifest has to state about the
     /// layer, and a record that held only its identity would have to invent the
     /// rest. In the canonical order of their keys, so the same progress is the
@@ -340,7 +334,8 @@ impl PublishRecord {
         .map_err(Error::Stelae)
     }
 
-    /// The layers this record offers, keyed the way [`Chained`] looks them up.
+    /// The layers this record offers a publish at `sequence`, keyed the way
+    /// [`Chained`] looks them up.
     ///
     /// An [`Origin`] the caller is not publishing under offers nothing: see
     /// [`Origin`] for why a mismatch is a fresh start rather than a merge.
@@ -348,6 +343,7 @@ impl PublishRecord {
         &self,
         origin: &Origin,
         profile: &dyn DriverProfile,
+        sequence: u64,
     ) -> Result<BTreeMap<(String, String), WrittenLayer>, Error> {
         if &self.origin != origin {
             tracing::info!(
@@ -364,13 +360,13 @@ impl PublishRecord {
         let mut table = BTreeMap::new();
 
         for layer in &self.layers {
-            // The same filter `inheritable_layers` applies to a predecessor's
-            // manifest, applied again on the way in: a record naming a state
-            // *tip* shard is a record nothing wrote, and honouring one would
-            // carry a stale tip into a manifest. A retained dump's scope names
-            // its epoch, so it passes here for the same reason an epoch layer
-            // does.
-            if !profile.is_inheritable(&layer.descriptor.kind, &layer.descriptor.scope) {
+            // The filter `Chained::landed` applies on the way out, applied
+            // again on the way in: a record naming a tip layer is a record
+            // nothing wrote, and honouring one would carry a stale tip into a
+            // manifest.
+            let role = profile.role(&layer.descriptor.kind, &layer.descriptor.scope, sequence)?;
+
+            if role != Role::Diff {
                 continue;
             }
 
@@ -454,40 +450,32 @@ pub fn standing(
     ))
 }
 
-/// The publish this one follows, in a repository — which may be itself.
+/// The publish this one follows, in a repository — and this publish, if an
+/// earlier attempt of it was interrupted.
 ///
-/// Holds the link it hands to the new inscription and the two tables of
-/// layers it is willing to let the new snapshot carry forward rather than
-/// build, both keyed by the pair that decides it: the layer's kind and the
-/// canonical encoding of its profile-owned scope.
-///
-/// The tables answer the same question from different standing. `inheritable`
-/// is the *predecessor's manifest* — a snapshot the repository serves, so a
-/// layer missing from it is a fault. `resumable` is *this publish's own record*
-/// of an attempt that died before it could write a manifest — a note, so a
-/// layer missing from the registry is only a rebuild. The manifest is consulted
-/// first, because a repository that states it holds a layer needs no note to
-/// say so.
+/// Holds the link it hands to the new inscription and the layers an
+/// interrupted attempt recorded, keyed by the pair that identifies a layer: its
+/// kind and the canonical encoding of its profile-owned scope. Nothing of the
+/// predecessor's layers is held: a publish uploads and lists only its own.
 pub struct Chained<'a> {
     registry: &'a Registry,
     /// Held rather than threaded, because [`Predecessor::landed`] is asked by
     /// the export's producer pool and has nowhere to take one from.
     profile: &'a (dyn DriverProfile + Sync),
-    source: Option<&'a Snapshot>,
+    sequence: u64,
     predecessor: Option<(u64, Digest)>,
     previous: Option<Link>,
-    inheritable: BTreeMap<(String, String), LayerDescriptor>,
     resumable: BTreeMap<(String, String), WrittenLayer>,
     record: Option<Recording>,
-    /// Atomic, like the record's lock below: [`export::export`] asks a
-    /// predecessor about layers from a pool of producer threads.
-    adopted: AtomicUsize,
+    /// Atomic, like the record's lock below: an export asks a predecessor
+    /// about layers from a pool of producer threads.
+    resumed: AtomicUsize,
 }
 
 /// The resumption record this publish is writing, open.
 ///
-/// Seeded with what it inherits, so the file is the whole of what is up rather
-/// than the whole of what *this attempt* put up: an attempt that adopts twenty
+/// Seeded with what it resumes, so the file is the whole of what is up rather
+/// than the whole of what *this attempt* put up: an attempt that resumes twenty
 /// layers and adds one, then dies, has to leave twenty-one behind or the third
 /// attempt pays for the difference.
 ///
@@ -511,7 +499,7 @@ impl<'a> Chained<'a> {
     pub fn new(
         profile: &'a (dyn DriverProfile + Sync),
         publishing: Publishing<'a>,
-        latest: Option<&'a Snapshot>,
+        latest: Option<&Snapshot>,
         sequence: u64,
         position: &serde_json::Value,
         origin: Origin,
@@ -547,30 +535,21 @@ impl<'a> Chained<'a> {
 
         if let Some(previous) = &inscription {
             // The pull that fetched this checked as a reader; this is the
-            // publish side, which inherits the chain and must attest it.
+            // publish side, which extends the chain and must attest it.
             previous.check_profile_strict(profile)?;
             profile.check_same_dataset(previous, position)?;
         }
 
         let previous = stelae::inscription::link_for(inscription.as_ref(), sequence)?;
 
-        // Built only when it can be used. `rebuild` is the publisher choosing
-        // to reproduce rather than inherit, and it stops here rather than at
-        // `adopt` so that nothing downstream has to remember it was set.
-        let inheritable = match (rebuild, &inscription) {
-            (false, Some(previous)) => inheritable_layers(previous, profile)?,
-            _ => BTreeMap::new(),
-        };
-
-        // Read on the same terms, and it is the *honouring* that `rebuild`
-        // gates rather than the reading — the asymmetry a restore's checkpoint
-        // states, for the same reason. A publisher that asked to rebuild gets a
-        // record that starts empty and overwrites whatever was there, so
-        // nothing an earlier attempt believed can survive the run that was
-        // meant to settle it.
+        // It is the *honouring* that `rebuild` gates rather than the reading —
+        // the asymmetry a restore's checkpoint states, for the same reason. A
+        // publisher that asked to rebuild gets a record that starts empty and
+        // overwrites whatever was there, so nothing an earlier attempt believed
+        // can survive the run that was meant to settle it.
         let resumable = match (rebuild, record_path.as_deref()) {
             (false, Some(record_path)) => match PublishRecord::load(record_path)? {
-                Some(record) => record.table(&origin, profile)?,
+                Some(record) => record.table(&origin, profile, sequence)?,
                 None => BTreeMap::new(),
             },
             _ => BTreeMap::new(),
@@ -579,7 +558,7 @@ impl<'a> Chained<'a> {
         if !resumable.is_empty() {
             tracing::info!(
                 layers = resumable.len(),
-                "an interrupted publish left epoch layers in this repository; \
+                "an interrupted publish left layers in this repository; \
                  they will be carried forward rather than rebuilt"
             );
         }
@@ -593,13 +572,12 @@ impl<'a> Chained<'a> {
         Ok(Self {
             registry,
             profile,
-            source: latest.filter(|_| !rebuild),
+            sequence,
             predecessor,
             previous,
-            inheritable,
             resumable,
             record,
-            adopted: AtomicUsize::new(0),
+            resumed: AtomicUsize::new(0),
         })
     }
 
@@ -608,9 +586,10 @@ impl<'a> Chained<'a> {
         self.predecessor
     }
 
-    /// How many layers this publish carried forward rather than built.
-    pub fn adopted(&self) -> usize {
-        self.adopted.load(Ordering::Relaxed)
+    /// How many layers this publish carried from an interrupted attempt
+    /// rather than built.
+    pub fn resumed(&self) -> usize {
+        self.resumed.load(Ordering::Relaxed)
     }
 
     /// Delete the resumption record.
@@ -631,36 +610,14 @@ impl Predecessor for Chained<'_> {
         self.previous
     }
 
-    /// What [`preview`] reports, and it spends no `HEAD`: the promise a dry run
-    /// makes is about what the scopes permit. The record's own gate — that the
-    /// registry still holds the blob — runs in [`Predecessor::adopt`] and can
-    /// turn one of these into a rebuild, which is the direction a dry run is
-    /// allowed to be wrong in.
-    fn carried_forward(&self, kind: &str, scope: &serde_json::Value) -> Result<bool, Error> {
-        let key = scope_key(kind, scope)?;
-
-        Ok(self.inheritable.contains_key(&key) || self.resumable.contains_key(&key))
-    }
-
-    fn adopt(
+    /// The record's answer, gated on the registry's own blob check: a recorded
+    /// layer whose blob is gone is rebuilt, not refused.
+    fn resume(
         &self,
         kind: &str,
         scope: &serde_json::Value,
     ) -> Result<Option<LayerDescriptor>, Error> {
-        let key = scope_key(kind, scope)?;
-
-        // The arrangement and the answer are one act, in both branches: by the
-        // time this returns a descriptor, the transport is already carrying the
-        // blob, and the `HEAD` that proves the registry still has it has already
-        // happened.
-        if let (Some(source), Some(descriptor)) = (self.source, self.inheritable.get(&key)) {
-            self.registry.adopt_layer(source, descriptor.clone())?;
-            self.adopted.fetch_add(1, Ordering::Relaxed);
-
-            return Ok(Some(descriptor.clone()));
-        }
-
-        let Some(recorded) = self.resumable.get(&key) else {
+        let Some(recorded) = self.resumable.get(&scope_key(kind, scope)?) else {
             return Ok(None);
         };
 
@@ -674,7 +631,7 @@ impl Predecessor for Chained<'_> {
             return Ok(None);
         }
 
-        self.adopted.fetch_add(1, Ordering::Relaxed);
+        self.resumed.fetch_add(1, Ordering::Relaxed);
 
         Ok(Some(recorded.descriptor.clone()))
     }
@@ -684,9 +641,10 @@ impl Predecessor for Chained<'_> {
             return Ok(());
         };
 
-        if !self
+        if self
             .profile
-            .is_inheritable(&descriptor.kind, &descriptor.scope)
+            .role(&descriptor.kind, &descriptor.scope, self.sequence)?
+            != Role::Diff
         {
             return Ok(());
         }
@@ -703,11 +661,8 @@ impl Predecessor for Chained<'_> {
         };
 
         // The transport is asked for its *measurement* and not for its
-        // descriptor. `carried` finds a layer by `diffId`, and one `diffId` can
-        // now wear two descriptors — the dump a publish cuts out of its own tip
-        // is the tip's bytes — so recording what the lookup returned verbatim
-        // would file the dump under the tip's scope, where nothing looks for it
-        // and where it would be discarded on the way back in.
+        // descriptor: `carried` finds a layer by `diffId`, and the descriptor
+        // the caller states is the one the manifest will list.
         let written = WrittenLayer {
             descriptor: descriptor.clone(),
             digests: written.digests,
@@ -727,79 +682,6 @@ impl Predecessor for Chained<'_> {
         }
         .save(&record.path)
     }
-}
-
-/// The layers a new snapshot may inherit from `previous`, keyed by kind and
-/// scope.
-///
-/// [`DriverProfile::is_inheritable`] decides, and it decides on the scope as
-/// well as the kind. A state *tip* shard is out: it changes every publish, and
-/// — independently — its descriptor scope names no epoch, so scope equality
-/// could not tell one publish's shard from another's. A retained state dump is
-/// in: it is a closed epoch's state under a scope that names that epoch.
-/// `digests` has no source in this slice.
-///
-/// Two layers of one kind claiming one scope, described differently in any
-/// respect, is a refusal rather than a first-wins: it means the snapshot being
-/// chained to describes the same window twice and disagrees with itself about
-/// what is in it, and inheriting either answer would publish that disagreement
-/// forward. "In any respect" and not "with different identities", because
-/// `records` and `uncompressed_size` are determined by the bytes a `diff_id`
-/// names — so a disagreement about them under one identity is the same
-/// contradiction wearing a quieter shape.
-pub fn inheritable_layers(
-    previous: &Inscription,
-    profile: &dyn DriverProfile,
-) -> Result<BTreeMap<(String, String), LayerDescriptor>, Error> {
-    let mut inheritable = BTreeMap::new();
-
-    for layer in previous.layers() {
-        if !profile.is_inheritable(&layer.kind, &layer.scope) {
-            continue;
-        }
-
-        let key = scope_key(&layer.kind, &layer.scope)?;
-
-        if let Some(existing) = inheritable.get(&key) {
-            let existing: &LayerDescriptor = existing;
-
-            // The whole descriptor, not the identity alone. `records` and
-            // `uncompressed_size` are functions of the bytes `diff_id` names,
-            // so two descriptors sharing an identity and disagreeing about
-            // either are a snapshot contradicting itself just as surely as two
-            // identities would be — and `adopt_layer` carries
-            // `uncompressed_size` forward into a snapshot that never reads the
-            // bytes that would settle it.
-            if existing != layer {
-                // Spelled out rather than named by identity alone: the two can
-                // now differ while sharing a `diff_id`, and a message printing
-                // one digest twice would describe nothing.
-                let describe = |layer: &LayerDescriptor| {
-                    format!(
-                        "{} ({} records, {} bytes)",
-                        layer.diff_id, layer.records, layer.uncompressed_size,
-                    )
-                };
-
-                return Err(Error::malformed_inscription(
-                    format!("layers[{}]", layer.kind),
-                    format!(
-                        "sequence {} describes {} twice at one scope, as {} and as {}",
-                        previous.sequence,
-                        layer.kind,
-                        describe(existing),
-                        describe(layer),
-                    ),
-                ));
-            }
-
-            continue;
-        }
-
-        inheritable.insert(key, layer.clone());
-    }
-
-    Ok(inheritable)
 }
 
 /// What a publish holds staged on disk at its peak.
@@ -862,10 +744,12 @@ impl StagingPeak {
 ///
 /// A proxy, and deliberately so: the numbers are the *predecessor's* layers,
 /// not this publish's, because this publish's layers do not exist until it
-/// builds them and sizing them would mean building them. One sequence of drift
-/// is what the proxy costs, against a check that otherwise cannot exist at all
-/// — and the refuse/warn split is what keeps it honest, since a shortfall
-/// against the last publish's sizes is still a measured shortfall.
+/// builds them and sizing them would mean building them. The predecessor's
+/// inscription lists only the layers its own publish wrote, so the proxy is
+/// one publish against the next. One sequence of drift is what it costs,
+/// against a check that otherwise cannot exist at all — and the refuse/warn
+/// split is what keeps it honest, since a shortfall against the last publish's
+/// sizes is still a measured shortfall.
 ///
 /// Off the manifest the pull already fetched, and no per-layer `HEAD`: the
 /// promise a profile's dry run makes about touching nothing holds here too.
@@ -967,7 +851,155 @@ fn staging_need(peak: Option<StagingPeak>, scratch_dir: &Path) -> crate::preflig
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+    use stelae::{Inscription, LayerDigests};
+
     use super::*;
+
+    /// A profile whose notes for chapter `c` stay in the tip at sequence `c`
+    /// and are final from `c + 1`, and whose index is always the tip.
+    struct Settling;
+
+    impl stelae::Profile for Settling {
+        fn name(&self) -> &str {
+            "dev.example.settling"
+        }
+
+        fn version(&self) -> u64 {
+            1
+        }
+
+        fn kinds(&self) -> &[&str] {
+            &["notes", "index"]
+        }
+
+        fn layer_media_type(&self, kind: &str) -> Result<String, stelae::Error> {
+            Ok(format!("application/vnd.example.stelae.{kind}.v1+zstd"))
+        }
+
+        fn tag_for_sequence(&self, sequence: u64) -> Result<String, stelae::Error> {
+            Ok(format!("chapter-{sequence}"))
+        }
+    }
+
+    impl DriverProfile for Settling {
+        fn epoch_kinds(&self) -> &[&str] {
+            &["notes"]
+        }
+
+        fn dense_epoch_kinds(&self) -> &[&str] {
+            &["notes"]
+        }
+
+        fn is_state_kind(&self, kind: &str) -> bool {
+            kind == "index"
+        }
+
+        fn role(
+            &self,
+            kind: &str,
+            scope: &serde_json::Value,
+            sequence: u64,
+        ) -> Result<Role, Error> {
+            match (kind, scope["chapter"].as_u64()) {
+                ("notes", Some(chapter)) if chapter < sequence => Ok(Role::Diff),
+                _ => Ok(Role::Tip),
+            }
+        }
+
+        fn check_same_dataset(
+            &self,
+            _previous: &Inscription,
+            _position: &serde_json::Value,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn origin() -> Origin {
+        Origin {
+            repository: "registry.example/shelf".to_owned(),
+            dataset_id: 1,
+            parameters: json!({}),
+            compression: Compression {
+                algo: "zstd".to_owned(),
+                level: 9,
+            },
+        }
+    }
+
+    fn written(kind: &str, chapter: u64) -> WrittenLayer {
+        let diff_id = Digest::compute(format!("{kind}-{chapter}"));
+
+        WrittenLayer {
+            descriptor: LayerDescriptor {
+                kind: kind.to_owned(),
+                media_type: format!("application/vnd.example.stelae.{kind}.v1+zstd"),
+                diff_id,
+                records: 1,
+                uncompressed_size: 1,
+                scope: json!({"chapter": chapter}),
+            },
+            digests: LayerDigests {
+                diff_id,
+                blob_digest: Digest::compute(format!("blob-{kind}-{chapter}")),
+                uncompressed_size: 1,
+                compressed_size: 1,
+            },
+        }
+    }
+
+    /// A record offers a publish only the layers its role places in `diff` at
+    /// the sequence being published, so the same record answers differently
+    /// for two sequences, and a record from another origin offers nothing.
+    #[test]
+    fn a_record_offers_only_what_is_diff_at_the_publishing_sequence() {
+        let record = PublishRecord {
+            origin: origin(),
+            layers: vec![written("notes", 2), written("index", 3)],
+        };
+
+        let offered = |sequence| {
+            record
+                .table(&origin(), &Settling, sequence)
+                .unwrap()
+                .into_keys()
+                .collect::<Vec<_>>()
+        };
+
+        let notes = scope_key("notes", &json!({"chapter": 2})).unwrap();
+
+        assert_eq!(offered(3), vec![notes]);
+        assert!(offered(2).is_empty(), "notes not yet final were offered");
+
+        // Any field of the origin differing is a record from somewhere else.
+        for elsewhere in [
+            Origin {
+                repository: "registry.example/other".to_owned(),
+                ..origin()
+            },
+            Origin {
+                dataset_id: 2,
+                ..origin()
+            },
+            Origin {
+                parameters: json!({"width": 2}),
+                ..origin()
+            },
+            Origin {
+                compression: Compression {
+                    algo: "zstd".to_owned(),
+                    level: 3,
+                },
+                ..origin()
+            },
+        ] {
+            assert!(
+                record.table(&elsewhere, &Settling, 3).unwrap().is_empty(),
+                "a record from {elsewhere:?} was offered"
+            );
+        }
+    }
 
     /// A registry a node opens through here, as Dolos does for a restore,
     /// reads under the transport's default budget rather than a shortened one.

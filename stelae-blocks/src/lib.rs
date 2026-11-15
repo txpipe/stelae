@@ -121,8 +121,8 @@ impl Profile for BlocksProfile {
     }
 }
 
-/// What the lifecycle asks: one dense kind, no tip, and every layer
-/// inheritable, because a closed epoch's blocks never change.
+/// What the lifecycle asks: one dense kind, no tip, and every layer in `diff`,
+/// because a closed epoch's blocks never change.
 impl stelae_driver::DriverProfile for BlocksProfile {
     fn epoch_kinds(&self) -> &[&str] {
         &KINDS
@@ -136,8 +136,19 @@ impl stelae_driver::DriverProfile for BlocksProfile {
         false
     }
 
-    fn is_inheritable(&self, kind: &str, _scope: &serde_json::Value) -> bool {
-        kind == BLOCKS
+    fn role(
+        &self,
+        kind: &str,
+        _scope: &serde_json::Value,
+        _sequence: u64,
+    ) -> Result<stelae_driver::Role, stelae_driver::Error> {
+        match kind {
+            BLOCKS => Ok(stelae_driver::Role::Diff),
+            other => Err(stelae_driver::Error::Unplaced {
+                kind: other.to_owned(),
+                reason: format!("{PROFILE_NAME} has no such kind"),
+            }),
+        }
     }
 
     /// Two snapshots describe one dataset when their positions name the same
@@ -321,10 +332,17 @@ mod tests {
     }
 
     #[test]
-    fn every_layer_is_inheritable_and_none_is_tip() {
+    fn every_layer_is_diff_and_none_is_tip() {
         let scope = json!({"epoch": 0, "startSlot": 0, "endSlot": 1});
 
-        assert!(BlocksProfile.is_inheritable(BLOCKS, &scope));
+        assert_eq!(
+            BlocksProfile.role(BLOCKS, &scope, 1).unwrap(),
+            stelae_driver::Role::Diff
+        );
+        assert!(matches!(
+            BlocksProfile.role("state", &scope, 1),
+            Err(stelae_driver::Error::Unplaced { .. })
+        ));
         assert!(!BlocksProfile.is_state_kind(BLOCKS));
         assert_eq!(BlocksProfile.dense_epoch_kinds(), &[BLOCKS]);
     }
