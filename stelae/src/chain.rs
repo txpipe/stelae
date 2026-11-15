@@ -478,6 +478,8 @@ mod tests {
             ),
             "{err:?}"
         );
+        // `is_absent` is the registry transport's, so it exists with `oci`.
+        #[cfg(feature = "oci")]
         assert!(!err.is_absent());
     }
 
