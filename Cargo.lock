@@ -4874,7 +4874,6 @@ version = "0.6.0"
 dependencies = [
  "fs4",
  "hex",
- "minicbor 0.26.5",
  "rustls",
  "serde",
  "serde_json",
