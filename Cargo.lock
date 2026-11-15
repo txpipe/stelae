@@ -4814,6 +4814,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "stelae-blocks"
+version = "0.6.0"
+dependencies = [
+ "minicbor 0.26.5",
+ "serde_json",
+ "stelae 0.6.0",
+ "stelae-driver 0.6.0",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "stelae-cardano"
 version = "0.6.0"
 dependencies = [
