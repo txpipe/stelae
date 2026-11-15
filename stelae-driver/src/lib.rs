@@ -43,7 +43,7 @@ pub mod restore;
 pub mod retry;
 
 pub use predecessor::{First, Predecessor};
-pub use profile::DriverProfile;
+pub use profile::{place_layers, DriverProfile};
 
 /// Errors raised by the driver.
 ///
@@ -88,12 +88,12 @@ pub enum Error {
     DatasetMismatch { expected: u64, found: u64 },
 
     /// A publish that would not extend the repository's chain. Raised by
-    /// [`stelae::inscription::history_for`] and carried here unchanged.
+    /// [`stelae::inscription::link_for`] and carried here unchanged.
     #[error(
         "this repository's latest snapshot is sequence {latest} and this publish is sequence \
          {publishing}: {reason}"
     )]
-    HistoryBreak {
+    LinkBreak {
         latest: u64,
         publishing: u64,
         reason: String,
@@ -104,7 +104,7 @@ pub enum Error {
 /// arriving wrapped.
 ///
 /// [`stelae::codec`] raises `MalformedRecord` and
-/// [`stelae::inscription::history_for`] raises `HistoryBreak`; both were this
+/// [`stelae::inscription::link_for`] raises `LinkBreak`; both were this
 /// crate's errors before they moved down into the protocol, and both are
 /// matched on by callers. Flattening keeps the variant a caller matches and the
 /// message an operator reads exactly what they were, at the cost of a `match`
@@ -116,11 +116,11 @@ impl From<stelae::Error> for Error {
             stelae::Error::MalformedRecord { kind, reason } => {
                 Self::MalformedRecord { kind, reason }
             }
-            stelae::Error::HistoryBreak {
+            stelae::Error::LinkBreak {
                 latest,
                 publishing,
                 reason,
-            } => Self::HistoryBreak {
+            } => Self::LinkBreak {
                 latest,
                 publishing,
                 reason,
@@ -155,7 +155,7 @@ impl Error {
 /// both halves of it are already in hand: the sequence a repository's latest
 /// snapshot carries, and the sequence the node's cursor derived. Without it the
 /// ordinary case — nothing has closed since last time — arrives as the
-/// [`Error::HistoryBreak`] refusal a skipped sequence does, and a job on a
+/// [`Error::LinkBreak`] refusal a skipped sequence does, and a job on a
 /// timer cannot tell the two apart.
 ///
 /// A pure comparison over two numbers rather than a method on a transport, so

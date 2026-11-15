@@ -4,19 +4,18 @@
 //! that need nothing but a document. The transport-shaped one — the publish
 //! this one follows *in a repository* — is [`crate::publish::Chained`].
 
-use stelae::inscription::{HistoryEntry, LayerDescriptor};
+use stelae::inscription::{LayerDescriptor, Link};
 
 use crate::Error;
 
 /// The publish this one follows.
 ///
-/// Two questions, one concept: what a new inscription attests about the
-/// snapshots before it, and which of their layers it may carry forward rather
-/// than build again. Both are answers only the previous publish has, and
-/// holding them together is what lets a publisher rebuild everything while
-/// still chaining — the `--rebuild` case, which suppresses
-/// [`Predecessor::adopt`] and leaves [`Predecessor::history`] exactly as it
-/// was.
+/// Two questions, one concept: which snapshot a new inscription links to, and
+/// which of its layers it may carry forward rather than build again. Both are
+/// answers only the previous publish has, and holding them together is what
+/// lets a publisher rebuild everything while still chaining — the `--rebuild`
+/// case, which suppresses [`Predecessor::adopt`] and leaves
+/// [`Predecessor::previous`] exactly as it was.
 ///
 /// The publish this one follows can be **this publish, interrupted**, which is
 /// what [`Predecessor::landed`] is for: a snapshot that never got sealed left
@@ -29,13 +28,12 @@ use crate::Error;
 /// implementor that keeps state — an adoption counter, a resumption record —
 /// keeps it behind its own synchronization.
 pub trait Predecessor: Sync {
-    /// The history the new inscription carries: every prior publication,
-    /// contiguous and ascending, ending at `sequence - 1`.
+    /// The link the new inscription carries: the snapshot it follows, or
+    /// `None` where it starts a lineage.
     ///
-    /// Assembling it is the implementor's business, and the protocol holds it
-    /// to the invariant when the document is validated
-    /// (`stelae::inscription`).
-    fn history(&self) -> &[HistoryEntry];
+    /// Making it is the implementor's business, and the protocol holds it to
+    /// the invariant when the document is validated (`stelae::inscription`).
+    fn previous(&self) -> Option<Link>;
 
     /// The descriptor to adopt for a layer of `kind` at `scope`, or `None` to
     /// build it from the stores.
@@ -108,16 +106,16 @@ pub trait Predecessor: Sync {
     }
 }
 
-/// The first snapshot of a repository: no history, nothing to inherit.
+/// The first snapshot of a lineage: no link, nothing to inherit.
 ///
-/// The protocol permits an empty history at any sequence, so this is not only
-/// the very first publish — it is every publish into a directory, which has no
-/// way to be asked what it already holds.
+/// The protocol lets a lineage start at any sequence, so this is not only the
+/// very first publish — it is every publish into a directory, which has no way
+/// to be asked what it already holds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct First;
 
 impl Predecessor for First {
-    fn history(&self) -> &[HistoryEntry] {
-        &[]
+    fn previous(&self) -> Option<Link> {
+        None
     }
 }

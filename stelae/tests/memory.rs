@@ -246,10 +246,10 @@ fn streaming_a_layer_does_not_scale_with_its_size() {
             level: COMPRESSION_LEVEL as i64,
         },
     );
-    inscription.layers = vec![written.descriptor.clone()];
+    inscription.diff = vec![written.descriptor.clone()];
     snapshot.seal(&BulkProfile, &inscription).unwrap();
 
-    let descriptor = &inscription.layers[0];
+    let descriptor = &inscription.diff[0];
     assert!(
         descriptor.uncompressed_size > (MINIMUM_WINDOWS * stelae::frame::DEFAULT_WINDOW) as u64,
         "the layer has to dwarf the window for this to prove anything"

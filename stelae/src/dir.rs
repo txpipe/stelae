@@ -513,7 +513,7 @@ impl SnapshotDir {
         {
             let written = lock(&self.written);
 
-            for descriptor in &inscription.layers {
+            for descriptor in inscription.layers() {
                 match written.get(&descriptor.diff_id) {
                     Some(blob) => layers.insert(descriptor.diff_id, *blob),
                     None => return self.remove_blob_index(),

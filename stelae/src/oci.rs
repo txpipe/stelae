@@ -1148,11 +1148,12 @@ impl Registry {
     /// The whole value of this over [`Registry::pull_latest`] is the
     /// distinction it draws, and the distinction is load-bearing rather than
     /// convenient. A publisher chains each snapshot to the one before it, so
-    /// "there is nothing to chain to" starts a history and *anything else*
+    /// "there is nothing to chain to" starts a lineage and *anything else*
     /// must not: a timeout, a 500 or an expired token read as absence would
     /// silently restart the chain, which is the exact outcome an inscription's
-    /// `history` exists to prevent. So only the shapes a registry uses to say
-    /// "no such manifest" become `None`, and every other failure propagates.
+    /// `previous` link exists to prevent. So only the shapes a registry uses to
+    /// say "no such manifest" become `None`, and every other failure
+    /// propagates.
     ///
     /// Those shapes are three, because `oci-client` reports a 404 in three
     /// ways depending on which layer of the client noticed it. Matching them
@@ -2384,9 +2385,9 @@ impl SnapshotWriter for Registry {
     ///
     /// **A seal that succeeds consumes the layers finished since the last
     /// one.** One transport can therefore publish several snapshots in turn —
-    /// which is what a publisher chaining a `history` does — and a second seal
-    /// of the same inscription is refused rather than republishing a manifest
-    /// over layers that are no longer accounted for.
+    /// which is what a publisher linking each to the one before does — and a
+    /// second seal of the same inscription is refused rather than republishing
+    /// a manifest over layers that are no longer accounted for.
     ///
     /// **A seal that fails consumes nothing.** Every fallible step runs before
     /// the layers are taken, so a registry that answers a manifest push with a
@@ -3573,10 +3574,11 @@ mod tests {
     /// registry that is empty.
     ///
     /// [`Registry::latest`] turns absence into `None`, and a publisher reads
-    /// `None` as "nothing to chain to" and starts a fresh history. So a
+    /// `None` as "nothing to chain to" and starts a fresh lineage. So a
     /// timeout, a 500 or an expired token widening into absence would silently
     /// restart the attestation chain — which is the outcome an inscription's
-    /// `history` exists to prevent, arrived at without anything looking wrong.
+    /// `previous` link exists to prevent, arrived at without anything looking
+    /// wrong.
     #[test]
     fn a_failed_request_is_never_absence() {
         assert!(!is_absent(&server_error(500)));

@@ -26,7 +26,8 @@
 //! - [`layer`] — reading a layer as a stream: records out of a bounded window,
 //!   both digests on the way past, confirmation at the end.
 //! - [`inscription`] — the inscription schema, its RFC 8785 canonicalization,
-//!   its digest, and the `history` attestation invariant.
+//!   its digest, its `diff` and `tip` arrays, and the `previous` link that
+//!   chains it to the inscription before it.
 //! - [`profile`] — the [`Profile`] trait plus the protocol's media-type,
 //!   profile name and tag naming rules.
 //! - [`transport`] — the seam a snapshot is written through and read back from:
@@ -72,7 +73,7 @@ pub mod transport;
 pub use digest::{Digest, LayerDigests, LayerWriter};
 pub use frame::{CanonicalCbor, LayerHeader, Limits, Measure, RecordReader, SeqReader, SeqWriter};
 pub use inscription::{
-    canonical_json, Compression, HistoryEntry, Inscription, LayerDescriptor, ProfileRef,
+    canonical_json, Compression, Inscription, LayerDescriptor, Link, ProfileRef,
 };
 pub use layer::LayerReader;
 pub use plan::{Remaining, RestoreProgress, Resume};
@@ -211,13 +212,22 @@ pub enum Error {
         supported: u64,
     },
 
-    #[error("history invariant violated: {0}")]
-    HistoryInvariant(String),
+    /// An inscription whose `previous` does not name an earlier sequence.
+    #[error("link invariant violated: {0}")]
+    LinkInvariant(String),
+
+    /// Two layers of one kind at one scope, across an inscription's `diff`
+    /// and `tip`. `scope` is the scope's canonical JSON.
+    #[error(
+        "layer kind {kind:?} at scope {scope} is listed more than once; an inscription lists \
+         each kind and scope once across diff and tip"
+    )]
+    DuplicateLayer { kind: String, scope: String },
 
     /// A publish held to one predecessor, reading another under the moving tag.
     ///
     /// Raised before anything is uploaded, so nothing attests a snapshot the
-    /// caller never checked and nothing starts the history over.
+    /// caller never checked and nothing restarts the lineage.
     #[cfg(feature = "oci")]
     #[error(
         "this publish follows {expected:?}, and the repository's latest snapshot is {found:?}: \
@@ -228,12 +238,13 @@ pub enum Error {
         found: Option<(u64, String)>,
     },
 
-    /// A publish that would not extend the repository's chain.
+    /// A publish that would not extend the repository's chain, so no link
+    /// can be made to the repository's latest snapshot.
     ///
     /// Both sequences are in the message because the fix depends on which of
     /// them is wrong: a gap means a publisher skipped epochs, an equal or lower
     /// sequence means it is republishing one. There is deliberately no flag
-    /// that overrides this — see [`inscription::history_for`].
+    /// that overrides this — see [`inscription::link_for`].
     ///
     /// `reason` is owned rather than static so a gap can state its *distance*.
     /// "The repository is at 500 and you are at 540" is a different incident
@@ -243,7 +254,7 @@ pub enum Error {
         "this repository's latest snapshot is sequence {latest} and this publish is sequence \
          {publishing}: {reason}"
     )]
-    HistoryBreak {
+    LinkBreak {
         latest: u64,
         publishing: u64,
         reason: String,

@@ -16,7 +16,7 @@ use stelae::{
         build_manifest, manifest_bytes, read_manifest, Manifest, DIFF_ID_ANNOTATION,
         KIND_ANNOTATION, SCOPE_ANNOTATION,
     },
-    Compression, Digest, Error, HistoryEntry, Inscription, LayerDigests, Profile, WrittenLayer,
+    Compression, Digest, Error, Inscription, LayerDigests, Link, Profile, WrittenLayer,
 };
 
 /// The envelope earlier releases wrote. Refused, with no alias.
@@ -84,39 +84,34 @@ fn fixture() -> (Inscription, Vec<WrittenLayer>) {
         },
     );
 
-    inscription.history = vec![
-        HistoryEntry {
-            sequence: 1,
-            inscription_digest: digest_of(0x11),
-        },
-        HistoryEntry {
-            sequence: 2,
-            inscription_digest: digest_of(0x22),
-        },
-    ];
+    inscription.previous = Some(Link {
+        sequence: 2,
+        inscription_digest: digest_of(0x22),
+    });
 
-    inscription.layers = vec![
-        LayerDescriptor {
-            kind: "notes".to_owned(),
-            media_type: NOTES_MEDIA_TYPE.to_owned(),
-            diff_id: digest_of(0xaa),
-            records: 4,
-            uncompressed_size: 155,
-            scope: json!({"chapter": 3}),
-        },
-        LayerDescriptor {
-            kind: "index".to_owned(),
-            media_type: INDEX_MEDIA_TYPE.to_owned(),
-            diff_id: digest_of(0xbb),
-            records: 4,
-            uncompressed_size: 77,
-            scope: json!({"chapter": 3, "sortedBy": "title"}),
-        },
-    ];
+    inscription.diff = vec![LayerDescriptor {
+        kind: "notes".to_owned(),
+        media_type: NOTES_MEDIA_TYPE.to_owned(),
+        diff_id: digest_of(0xaa),
+        records: 4,
+        uncompressed_size: 155,
+        scope: json!({"chapter": 3}),
+    }];
 
+    inscription.tip = vec![LayerDescriptor {
+        kind: "index".to_owned(),
+        media_type: INDEX_MEDIA_TYPE.to_owned(),
+        diff_id: digest_of(0xbb),
+        records: 4,
+        uncompressed_size: 77,
+        scope: json!({"chapter": 3, "sortedBy": "title"}),
+    }];
+
+    // The tip's layer finished first, which is not the order the manifest
+    // lists them in.
     let layers = vec![
-        written(&inscription.layers[0], digest_of(0xa1), 91, 155),
-        written(&inscription.layers[1], digest_of(0xb1), 60, 77),
+        written(&inscription.tip[0], digest_of(0xb1), 60, 77),
+        written(&inscription.diff[0], digest_of(0xa1), 91, 155),
     ];
 
     (inscription, layers)
@@ -166,8 +161,8 @@ fn the_manifest_shape_is_frozen() {
         String::from_utf8(body).unwrap(),
         concat!(
             r#"{"artifactType":"application/vnd.stelae.snapshot.v1","#,
-            r#""config":{"digest":"sha256:aeb1754e4a744864cd811f4f8a0dfaefe2599c5161521e605c094c9a1407b441","#,
-            r#""mediaType":"application/vnd.stelae.inscription.v1+json","size":875},"#,
+            r#""config":{"digest":"sha256:486ad3376c0285ad01f99f147983050d8b664c9b76a2419d012f624cdae4d82e","#,
+            r#""mediaType":"application/vnd.stelae.inscription.v1+json","size":771},"#,
             r#""layers":[{"annotations":{"#,
             r#""store.stelae.layer.diffId":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
             r#""store.stelae.layer.kind":"notes","#,
@@ -246,7 +241,7 @@ fn every_layer_is_annotated_with_its_kind_diff_id_and_scope() {
     let (inscription, layers) = fixture();
     let (manifest, _) = build_manifest(&inscription, &layers).unwrap();
 
-    for (oci, described) in manifest.layers.iter().zip(&inscription.layers) {
+    for (oci, described) in manifest.layers.iter().zip(inscription.layers()) {
         let annotations = oci.annotations.as_ref().unwrap();
 
         assert_eq!(annotations[KIND_ANNOTATION], described.kind);
@@ -383,12 +378,13 @@ fn a_manifest_past_the_size_ceiling_is_refused() {
 
     let (template, written_template) = {
         let (inscription, layers) = fixture();
-        (inscription.layers[0].clone(), layers[0].clone())
+        (inscription.diff[0].clone(), layers[1].clone())
     };
 
     let build = |count: usize| {
         let (mut inscription, _) = fixture();
-        inscription.layers.clear();
+        inscription.diff.clear();
+        inscription.tip.clear();
 
         let mut layers = Vec::with_capacity(count);
 
@@ -405,7 +401,7 @@ fn a_manifest_past_the_size_ceiling_is_refused() {
             layer.descriptor = described.clone();
             layer.digests.diff_id = described.diff_id;
 
-            inscription.layers.push(described);
+            inscription.diff.push(described);
             layers.push(layer);
         }
 

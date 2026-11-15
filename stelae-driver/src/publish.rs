@@ -26,7 +26,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use stelae::{
-    inscription::{Compression, HistoryEntry, Inscription, LayerDescriptor},
+    inscription::{Compression, Inscription, LayerDescriptor, Link},
     oci::{Auth, Options, Registry, Repository, Snapshot, DEFAULT_CONCURRENCY},
     transport::WrittenLayer,
     Digest, SnapshotReader as _,
@@ -456,7 +456,7 @@ pub fn standing(
 
 /// The publish this one follows, in a repository — which may be itself.
 ///
-/// Holds the history it hands to the new inscription and the two tables of
+/// Holds the link it hands to the new inscription and the two tables of
 /// layers it is willing to let the new snapshot carry forward rather than
 /// build, both keyed by the pair that decides it: the layer's kind and the
 /// canonical encoding of its profile-owned scope.
@@ -475,7 +475,7 @@ pub struct Chained<'a> {
     profile: &'a (dyn DriverProfile + Sync),
     source: Option<&'a Snapshot>,
     predecessor: Option<(u64, Digest)>,
-    history: Vec<HistoryEntry>,
+    previous: Option<Link>,
     inheritable: BTreeMap<(String, String), LayerDescriptor>,
     resumable: BTreeMap<(String, String), WrittenLayer>,
     record: Option<Recording>,
@@ -552,7 +552,7 @@ impl<'a> Chained<'a> {
             profile.check_same_dataset(previous, position)?;
         }
 
-        let history = stelae::inscription::history_for(inscription.as_ref(), sequence)?;
+        let previous = stelae::inscription::link_for(inscription.as_ref(), sequence)?;
 
         // Built only when it can be used. `rebuild` is the publisher choosing
         // to reproduce rather than inherit, and it stops here rather than at
@@ -595,7 +595,7 @@ impl<'a> Chained<'a> {
             profile,
             source: latest.filter(|_| !rebuild),
             predecessor,
-            history,
+            previous,
             inheritable,
             resumable,
             record,
@@ -627,8 +627,8 @@ impl<'a> Chained<'a> {
 }
 
 impl Predecessor for Chained<'_> {
-    fn history(&self) -> &[HistoryEntry] {
-        &self.history
+    fn previous(&self) -> Option<Link> {
+        self.previous
     }
 
     /// What [`preview`] reports, and it spends no `HEAD`: the promise a dry run
@@ -753,7 +753,7 @@ pub fn inheritable_layers(
 ) -> Result<BTreeMap<(String, String), LayerDescriptor>, Error> {
     let mut inheritable = BTreeMap::new();
 
-    for layer in &previous.layers {
+    for layer in previous.layers() {
         if !profile.is_inheritable(&layer.kind, &layer.scope) {
             continue;
         }
@@ -888,7 +888,7 @@ pub fn staging_peak(
     let mut peak = StagingPeak::default();
     let mut others = Vec::new();
 
-    for descriptor in &inscription.layers {
+    for descriptor in inscription.layers() {
         match previous.compressed_size(&blobs, descriptor)? {
             None => peak.unsized_layers += 1,
             // Every state layer adds — the conservative sum-all-state rule the
