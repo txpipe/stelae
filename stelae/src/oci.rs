@@ -1329,6 +1329,23 @@ fn is_absent(error: &oci_client::errors::OciDistributionError) -> bool {
     }
 }
 
+/// Whether a blob read failed because the repository holds no such blob.
+///
+/// `oci-client` reports a blob `GET`'s 404 as `reqwest`'s status error, a
+/// shape [`is_absent`] leaves out on purpose: [`Registry::latest`] reads only
+/// a missing manifest as a missing snapshot. Asked only of a linked
+/// inscription, where a missing blob is a document missing inside the chain.
+fn is_absent_blob(error: &Error) -> bool {
+    use oci_client::errors::OciDistributionError as E;
+
+    match error {
+        Error::Registry(E::RequestError(source)) => {
+            source.status().map(|status| status.as_u16()) == Some(404)
+        }
+        _ => false,
+    }
+}
+
 impl Error {
     /// Whether a pull failed because the repository holds no such manifest,
     /// rather than because the registry could not answer.
@@ -2484,7 +2501,7 @@ impl Shared {
 
             let raw = match raw {
                 Ok(raw) => raw,
-                Err(error) if error.is_absent() => return Ok(None),
+                Err(error) if is_absent_blob(&error) => return Ok(None),
                 Err(error) => return Err(error),
             };
 

@@ -459,6 +459,25 @@ mod tests {
         );
     }
 
+    /// A transport that cannot answer a link ends the walk with its own error,
+    /// not a missing link.
+    #[test]
+    fn a_failed_fetch_ends_the_walk_with_its_error() {
+        let chapters = lineage(1, 5);
+        let held = holding(&chapters);
+
+        let err = Chain::walk(&Toy, chapters[4].clone(), |link| match link.sequence {
+            2 => Err(std::io::Error::other("the transport could not answer").into()),
+            sequence => Ok(held.get(&sequence).cloned()),
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, Error::Io(io) if io.to_string() == "the transport could not answer"),
+            "{err:?}"
+        );
+    }
+
     /// A document missing inside the chain is its own error, and not absence.
     #[test]
     fn a_missing_link_names_both_sequences() {

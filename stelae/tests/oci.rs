@@ -3702,6 +3702,126 @@ fn a_document_missing_inside_the_chain_is_not_an_absent_snapshot() {
     assert_eq!(first.chain().unwrap().inscriptions().len(), 1);
 }
 
+/// A diff manifest whose inscription is gone is a document missing inside the
+/// chain as well. The head's own inscription gone is the registry's error, and
+/// not absence either: the repository holds a snapshot there.
+#[test]
+fn a_missing_inscription_inside_the_chain_is_a_missing_link() {
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/missing-inscription");
+    let published = publish_lineage(&registry, 1, 5);
+
+    fault.fail_always(
+        &published[1].digest().unwrap().to_string(),
+        Fault::Status(404),
+    );
+
+    let err = registry.resolve_latest(&ToyProfile).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::MissingLink {
+                from: 3,
+                sequence: 2
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(!err.is_absent());
+
+    fault.fail_always(
+        &published[4].digest().unwrap().to_string(),
+        Fault::Status(404),
+    );
+
+    let err = registry.latest(&ToyProfile).unwrap_err();
+    assert!(matches!(err, Error::Registry(_)), "{err:?}");
+    assert!(!err.is_absent(), "{err:?}");
+}
+
+/// A link the registry cannot read ends the resolve with the registry's own
+/// failure, never as a broken chain: a body cut off on every attempt, or a
+/// refusal, of the diff manifest or of the inscription.
+#[test]
+fn a_link_the_registry_cannot_read_is_not_a_missing_link() {
+    let unreadable = |key: fn(&[Inscription]) -> String, spoil: Fault| -> Error {
+        let fault = FaultRegistry::spawn();
+        let registry = faulty(&fault, "stelae/unreadable");
+        let published = publish_lineage(&registry, 1, 5);
+
+        let key = key(&published);
+        fault.fail_always(&key, spoil);
+
+        let err = registry.resolve_latest(&ToyProfile).unwrap_err();
+        assert!(!err.is_absent(), "{key}: {err:?}");
+        assert!(!matches!(err, Error::MissingLink { .. }), "{key}: {err:?}");
+        err
+    };
+    let keys: [fn(&[Inscription]) -> String; 2] = [
+        |_| "manifests/chapter-2".to_owned(),
+        |published| published[1].digest().unwrap().to_string(),
+    ];
+
+    for key in keys {
+        let err = unreadable(key, Fault::Truncate);
+        assert!(
+            matches!(&err, Error::RetriesExhausted { attempts, .. }
+                if *attempts == DEFAULT_READ_ATTEMPTS),
+            "{err:?}"
+        );
+
+        let err = unreadable(key, Fault::Status(403));
+        assert!(matches!(err, Error::Registry(_)), "{err:?}");
+    }
+}
+
+/// A profile refusing the tag of a sequence the chain needs ends the resolve
+/// with that refusal.
+#[test]
+fn a_linked_tag_the_profile_refuses_ends_the_resolve() {
+    struct Refusing;
+
+    impl Profile for Refusing {
+        fn name(&self) -> &str {
+            ToyProfile.name()
+        }
+
+        fn version(&self) -> u64 {
+            ToyProfile.version()
+        }
+
+        fn kinds(&self) -> &[&str] {
+            ToyProfile.kinds()
+        }
+
+        fn layer_media_type(&self, kind: &str) -> Result<String, Error> {
+            ToyProfile.layer_media_type(kind)
+        }
+
+        fn tag_for_sequence(&self, sequence: u64) -> Result<String, Error> {
+            match sequence {
+                2 => Err(Error::InvalidTag {
+                    value: "chapter-2".to_owned(),
+                    reason: "refused".to_owned(),
+                }),
+                _ => ToyProfile.tag_for_sequence(sequence),
+            }
+        }
+    }
+
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/refused");
+    publish_lineage(&registry, 1, 5);
+
+    let err = registry.resolve_latest(&Refusing).unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidTag { value, reason }
+            if value == "chapter-2" && reason == "refused"),
+        "{err:?}"
+    );
+    assert_eq!(fault.gets("manifests/chapter-2"), 0);
+}
+
 /// Done criterion 2, the second failure: a deleted tip refuses a restore at
 /// its own sequence and at no later one, because only the head's tip is read.
 #[test]
