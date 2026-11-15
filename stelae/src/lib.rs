@@ -114,10 +114,17 @@ pub const SCHEMA_VERSION: u64 = 1;
 pub const LAYER_FORMAT_VERSION: u64 = 1;
 
 /// The moving tag every profile is required to maintain alongside its immutable
-/// per-sequence tags.
+/// per-sequence tags. It names the newest sequence's diff manifest.
 pub const MOVING_TAG: &str = "latest";
 
-/// Ceiling on the size of a snapshot's OCI manifest.
+/// The suffix the protocol appends to a sequence's tag to name its tip
+/// manifest, as in `epoch-N.tip` beside `epoch-N` (decision 0080).
+///
+/// The protocol owns it: a profile renders only the sequence's tag, and a tag
+/// that already ends in it is refused (see [`profile::validate_tag`]).
+pub const TIP_SUFFIX: &str = ".tip";
+
+/// Ceiling on the size of each of a snapshot's OCI manifests.
 ///
 /// Not a spec limit — the OCI distribution specification sets none — but the
 /// figure registries converge on, and the one Dolos ADR-004 sized the format
@@ -320,6 +327,19 @@ pub enum Error {
          registries converge on; it describes {layers} layer(s)"
     )]
     ManifestTooLarge { size: usize, layers: usize },
+
+    /// A sequence whose diff manifest is in the repository and whose tip
+    /// manifest is not, though its inscription lists a `tip`.
+    ///
+    /// Not an absent sequence: the diff stays, every later snapshot is built on
+    /// it, and the chain still verifies through it. What is gone is the one
+    /// part only this sequence used, so the snapshot cannot be restored at this
+    /// sequence. `tag` is the tip manifest's.
+    #[error(
+        "the tip of snapshot {sequence} is gone: its diff is published and {tag:?} is not, \
+         so this sequence cannot be restored"
+    )]
+    TipGone { sequence: u64, tag: String },
 
     /// A seal asked again of a transport whose layers did not all land.
     ///

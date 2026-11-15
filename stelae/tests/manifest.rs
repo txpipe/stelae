@@ -1,10 +1,10 @@
-//! A snapshot's manifest, frozen without a network.
+//! A snapshot's manifests, frozen without a network.
 //!
 //! These tests need **no transport and no compressor**, and run without the
-//! `oci` feature: they build a manifest from fixed digests and compare the
-//! exact bytes, so a change to the manifest's shape is a deliberate re-pin in
-//! the same commit and never a silent drift. A registry and a directory hold
-//! this same document, so it is frozen once, here.
+//! `oci` feature: they build a sequence's diff and tip manifests from fixed
+//! digests and compare the exact bytes, so a change to their shape is a
+//! deliberate re-pin in the same commit and never a silent drift. A registry
+//! and a directory hold these same documents, so they are frozen once, here.
 
 use std::collections::BTreeMap;
 
@@ -13,8 +13,8 @@ use serde_json::json;
 use stelae::{
     inscription::LayerDescriptor,
     manifest::{
-        build_manifest, manifest_bytes, read_manifest, Manifest, DIFF_ID_ANNOTATION,
-        KIND_ANNOTATION, SCOPE_ANNOTATION,
+        build_manifests, manifest_bytes, read_manifest, Array, Manifest, Manifests,
+        DIFF_ID_ANNOTATION, KIND_ANNOTATION, SCOPE_ANNOTATION,
     },
     Compression, Digest, Error, Inscription, LayerDigests, Link, Profile, WrittenLayer,
 };
@@ -134,31 +134,41 @@ fn written(
     }
 }
 
-/// Done criterion 3: the manifest's shape is a re-pin, never a drift.
+/// The fixture's manifests, with the tip the fixture always has.
+fn manifests() -> (Inscription, Manifests, Manifest) {
+    let (inscription, layers) = fixture();
+    let (manifests, _) = build_manifests(&inscription, &layers).unwrap();
+    let tip = manifests.tip.clone().expect("the fixture lists a tip");
+
+    (inscription, manifests, tip)
+}
+
+/// Done criterion 3: the manifests' shape is a re-pin, never a drift.
 ///
 /// Every byte below is determined by the specification — the artifact type, the
 /// config media type, the profile's own layer media types, the annotation keys
-/// and the canonical JSON encoding. If any of them moves, this string moves
+/// and the canonical JSON encoding. If any of them moves, these strings move
 /// with it, in the same commit.
 #[test]
 fn the_manifest_shape_is_frozen() {
     let (inscription, layers) = fixture();
 
-    let (manifest, config) = build_manifest(&inscription, &layers).unwrap();
+    let (manifests, config) = build_manifests(&inscription, &layers).unwrap();
+    let tip = manifests.tip.as_ref().expect("the fixture lists a tip");
 
-    // The config blob is the canonical inscription, and the descriptor names it
-    // by its own digest — the one place identity and transport meet.
+    // The config blob is the canonical inscription, and both manifests name it
+    // by its own digest — the one place identity and transport meet, and one
+    // blob under two manifests.
     assert_eq!(config, inscription.canonicalize().unwrap());
     assert_eq!(
-        manifest.config.digest,
+        manifests.diff.config.digest,
         inscription.digest().unwrap().to_string()
     );
-    assert_eq!(manifest.config.size as usize, config.len());
-
-    let body = manifest_bytes(&manifest).unwrap();
+    assert_eq!(manifests.diff.config.size as usize, config.len());
+    assert_eq!(tip.config, manifests.diff.config);
 
     assert_eq!(
-        String::from_utf8(body).unwrap(),
+        String::from_utf8(manifest_bytes(&manifests.diff).unwrap()).unwrap(),
         concat!(
             r#"{"artifactType":"application/vnd.stelae.snapshot.v1","#,
             r#""config":{"digest":"sha256:486ad3376c0285ad01f99f147983050d8b664c9b76a2419d012f624cdae4d82e","#,
@@ -168,8 +178,19 @@ fn the_manifest_shape_is_frozen() {
             r#""store.stelae.layer.kind":"notes","#,
             r#""store.stelae.layer.scope":"{\"chapter\":3}"},"#,
             r#""digest":"sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","#,
-            r#""mediaType":"application/vnd.example.stelae.notes.v1+zstd","size":91},"#,
-            r#"{"annotations":{"#,
+            r#""mediaType":"application/vnd.example.stelae.notes.v1+zstd","size":91}],"#,
+            r#""mediaType":"application/vnd.oci.image.manifest.v1+json","schemaVersion":2}"#,
+        ),
+        "the diff manifest's shape drifted"
+    );
+
+    assert_eq!(
+        String::from_utf8(manifest_bytes(tip).unwrap()).unwrap(),
+        concat!(
+            r#"{"artifactType":"application/vnd.stelae.snapshot.v1","#,
+            r#""config":{"digest":"sha256:486ad3376c0285ad01f99f147983050d8b664c9b76a2419d012f624cdae4d82e","#,
+            r#""mediaType":"application/vnd.stelae.inscription.v1+json","size":771},"#,
+            r#""layers":[{"annotations":{"#,
             r#""store.stelae.layer.diffId":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","#,
             r#""store.stelae.layer.kind":"index","#,
             r#""store.stelae.layer.scope":"{\"chapter\":3,\"sortedBy\":\"title\"}"},"#,
@@ -177,22 +198,41 @@ fn the_manifest_shape_is_frozen() {
             r#""mediaType":"application/vnd.example.stelae.index.v1+zstd","size":60}],"#,
             r#""mediaType":"application/vnd.oci.image.manifest.v1+json","schemaVersion":2}"#,
         ),
-        "the manifest shape drifted"
+        "the tip manifest's shape drifted"
     );
 }
 
-/// The map a pull reads off the manifest is the map a directory rebuilds by
+/// A sequence whose tip is empty is published under one manifest.
+#[test]
+fn an_empty_tip_has_no_manifest() {
+    let (mut inscription, layers) = fixture();
+    inscription.tip.clear();
+
+    let (manifests, _) = build_manifests(&inscription, &layers[1..]).unwrap();
+
+    assert_eq!(manifests.tip, None);
+    assert_eq!(manifests.diff.layers.len(), 1);
+}
+
+/// The map a pull reads off the manifests is the map a directory rebuilds by
 /// decompressing everything, and this is where the two are held to be the same
-/// thing.
+/// thing. Each manifest yields its own array's half.
 #[test]
 fn a_manifest_yields_the_identity_to_blob_map() {
-    let (inscription, layers) = fixture();
-    let (manifest, _) = build_manifest(&inscription, &layers).unwrap();
+    let (inscription, manifests, tip) = manifests();
 
-    let blobs = read_manifest(&manifest, &inscription).unwrap();
+    let diff = read_manifest(&manifests.diff, &inscription, Array::Diff).unwrap();
+    let tip = read_manifest(&tip, &inscription, Array::Tip).unwrap();
+
+    assert_eq!(diff.len(), 1);
+    assert_eq!(diff.blob_for(&digest_of(0xaa)), Some(digest_of(0xa1)));
+    assert_eq!(tip.len(), 1);
+    assert_eq!(tip.blob_for(&digest_of(0xbb)), Some(digest_of(0xb1)));
+
+    let mut blobs = diff;
+    blobs.extend(tip);
 
     assert_eq!(blobs.len(), 2);
-    assert_eq!(blobs.blob_for(&digest_of(0xaa)), Some(digest_of(0xa1)));
     assert_eq!(blobs.blob_for(&digest_of(0xbb)), Some(digest_of(0xb1)));
     assert_eq!(blobs.blob_for(&digest_of(0xcc)), None);
 }
@@ -202,8 +242,8 @@ fn a_manifest_yields_the_identity_to_blob_map() {
 /// transport that parses the document itself reads what a registry serves.
 #[test]
 fn a_manifest_reads_back_from_its_bytes() {
-    let (inscription, layers) = fixture();
-    let (manifest, _) = build_manifest(&inscription, &layers).unwrap();
+    let (inscription, manifests, _) = manifests();
+    let manifest = manifests.diff;
     let body = manifest_bytes(&manifest).unwrap();
 
     let read: Manifest = serde_json::from_slice(&body).unwrap();
@@ -219,7 +259,7 @@ fn a_manifest_reads_back_from_its_bytes() {
     let read: Manifest = serde_json::from_value(extended).unwrap();
 
     assert_eq!(read, manifest);
-    assert!(read_manifest(&read, &inscription).is_ok());
+    assert!(read_manifest(&read, &inscription, Array::Diff).is_ok());
 
     // Every optional field the types carry, so none is dropped on the way in.
     let mut full = manifest.clone();
@@ -238,10 +278,11 @@ fn a_manifest_reads_back_from_its_bytes() {
 /// bytes, so a reader of this file can see what a generic OCI tool would find.
 #[test]
 fn every_layer_is_annotated_with_its_kind_diff_id_and_scope() {
-    let (inscription, layers) = fixture();
-    let (manifest, _) = build_manifest(&inscription, &layers).unwrap();
+    let (inscription, manifests, tip) = manifests();
 
-    for (oci, described) in manifest.layers.iter().zip(inscription.layers()) {
+    let listed = manifests.diff.layers.iter().chain(&tip.layers);
+
+    for (oci, described) in listed.zip(inscription.layers()) {
         let annotations = oci.annotations.as_ref().unwrap();
 
         assert_eq!(annotations[KIND_ANNOTATION], described.kind);
@@ -261,8 +302,8 @@ fn every_layer_is_annotated_with_its_kind_diff_id_and_scope() {
 fn a_manifest_that_disagrees_with_the_inscription_is_refused() {
     let (inscription, layers) = fixture();
 
-    // A layer the inscription describes and nobody wrote.
-    let err = build_manifest(&inscription, &layers[..1]).unwrap_err();
+    // A layer the inscription describes and nobody wrote: here the diff's.
+    let err = build_manifests(&inscription, &layers[..1]).unwrap_err();
     assert!(
         matches!(&err, Error::ManifestMismatch(m) if m.contains("never written")),
         "{err:?}"
@@ -272,28 +313,45 @@ fn a_manifest_that_disagrees_with_the_inscription_is_refused() {
     // nothing attests.
     let mut orphaned = layers.clone();
     orphaned.push(written(&layers[0].descriptor, digest_of(0xc1), 10, 20));
-    let err = build_manifest(&inscription, &orphaned).unwrap_err();
+    let err = build_manifests(&inscription, &orphaned).unwrap_err();
     assert!(
         matches!(&err, Error::ManifestMismatch(m) if m.contains("does not describe")),
         "{err:?}"
     );
 
-    let (manifest, _) = build_manifest(&inscription, &layers).unwrap();
+    let (_, manifests, tip) = manifests();
+    let manifest = manifests.diff;
 
     // Fewer layers than the document describes.
     let mut short = manifest.clone();
     short.layers.pop();
-    let err = read_manifest(&short, &inscription).unwrap_err();
+    let err = read_manifest(&short, &inscription, Array::Diff).unwrap_err();
     assert!(
         matches!(&err, Error::ManifestMismatch(m) if m.contains("layer(s)")),
         "{err:?}"
     );
 
+    // Each manifest is held to its own array: the tip manifest read as the
+    // diff, and the other way round.
+    let err = read_manifest(&tip, &inscription, Array::Diff).unwrap_err();
+    assert!(
+        matches!(&err, Error::ManifestMismatch(m) if m.contains("diff layer 0 is annotated")),
+        "{err:?}"
+    );
+    let err = read_manifest(&manifest, &inscription, Array::Tip).unwrap_err();
+    assert!(
+        matches!(&err, Error::ManifestMismatch(m) if m.contains("tip layer 0 is annotated")),
+        "{err:?}"
+    );
+
     // The right blobs in the wrong order. The `diffId` annotations still map
     // every layer to a real blob, so only the positional check catches this.
-    let mut reordered = manifest.clone();
+    let mut both = inscription.clone();
+    both.diff.append(&mut both.tip);
+    let (two, _) = build_manifests(&both, &layers).unwrap();
+    let mut reordered = two.diff;
     reordered.layers.reverse();
-    let err = read_manifest(&reordered, &inscription).unwrap_err();
+    let err = read_manifest(&reordered, &both, Array::Diff).unwrap_err();
     assert!(
         matches!(&err, Error::ManifestMismatch(m) if m.contains("annotated")),
         "{err:?}"
@@ -302,18 +360,37 @@ fn a_manifest_that_disagrees_with_the_inscription_is_refused() {
     // A layer with no annotation says nothing about which layer it holds.
     let mut unannotated = manifest.clone();
     unannotated.layers[0].annotations = None;
-    let err = read_manifest(&unannotated, &inscription).unwrap_err();
+    let err = read_manifest(&unannotated, &inscription, Array::Diff).unwrap_err();
     assert!(
         matches!(&err, Error::ManifestMismatch(m) if m.contains(DIFF_ID_ANNOTATION)),
         "{err:?}"
     );
 
     // A media type the inscription does not claim.
-    let mut mistyped = manifest.clone();
+    let mut mistyped = manifest;
     mistyped.layers[0].media_type = INDEX_MEDIA_TYPE.to_owned();
-    let err = read_manifest(&mistyped, &inscription).unwrap_err();
+    let err = read_manifest(&mistyped, &inscription, Array::Diff).unwrap_err();
     assert!(
         matches!(&err, Error::ManifestMismatch(m) if m.contains("in the manifest")),
+        "{err:?}"
+    );
+}
+
+/// A manifest whose config is another inscription is not this sequence's, even
+/// when every layer it lists matches: a tip manifest left over from another
+/// publish at the same tag is refused rather than read as this one's tip.
+#[test]
+fn a_manifest_of_another_inscription_is_refused() {
+    let (inscription, _, tip) = manifests();
+
+    let mut other = inscription.clone();
+    other.position = json!({"chapter": 3, "shelf": "west"});
+
+    let err = read_manifest(&tip, &other, Array::Tip).unwrap_err();
+    assert!(
+        matches!(&err, Error::ManifestMismatch(m)
+            if m.contains("the tip manifest's config is")
+                && m.contains(&other.digest().unwrap().to_string())),
         "{err:?}"
     );
 }
@@ -322,12 +399,12 @@ fn a_manifest_that_disagrees_with_the_inscription_is_refused() {
 /// `artifactType` fails closed.
 #[test]
 fn a_manifest_that_is_not_a_snapshots_own_is_refused() {
-    let (inscription, layers) = fixture();
-    let (manifest, _) = build_manifest(&inscription, &layers).unwrap();
+    let (inscription, manifests, _) = manifests();
+    let manifest = manifests.diff;
 
     let mut stripped = manifest.clone();
     stripped.artifact_type = None;
-    let err = read_manifest(&stripped, &inscription).unwrap_err();
+    let err = read_manifest(&stripped, &inscription, Array::Diff).unwrap_err();
     assert!(
         matches!(&err, Error::ManifestMismatch(m) if m.contains("no artifactType")),
         "{err:?}"
@@ -335,7 +412,7 @@ fn a_manifest_that_is_not_a_snapshots_own_is_refused() {
 
     let mut foreign = manifest.clone();
     foreign.artifact_type = Some("application/vnd.acme.thing.v1".to_owned());
-    let err = read_manifest(&foreign, &inscription).unwrap_err();
+    let err = read_manifest(&foreign, &inscription, Array::Diff).unwrap_err();
     assert!(
         matches!(&err, Error::ManifestMismatch(m) if m.contains("artifactType is")),
         "{err:?}"
@@ -344,7 +421,7 @@ fn a_manifest_that_is_not_a_snapshots_own_is_refused() {
     // The envelope earlier releases wrote is foreign now: no alias reads it.
     let mut retired = manifest.clone();
     retired.artifact_type = Some(RETIRED_ENVELOPE.to_owned());
-    let err = read_manifest(&retired, &inscription).unwrap_err();
+    let err = read_manifest(&retired, &inscription, Array::Diff).unwrap_err();
     assert!(
         matches!(&err, Error::ManifestMismatch(m)
             if m.contains("artifactType is") && m.contains(RETIRED_ENVELOPE)),
@@ -353,7 +430,7 @@ fn a_manifest_that_is_not_a_snapshots_own_is_refused() {
 
     let mut wrong_config = manifest;
     wrong_config.config.media_type = "application/vnd.oci.image.config.v1+json".to_owned();
-    let err = read_manifest(&wrong_config, &inscription).unwrap_err();
+    let err = read_manifest(&wrong_config, &inscription, Array::Diff).unwrap_err();
     assert!(
         matches!(&err, Error::ManifestMismatch(m) if m.contains("config blob is")),
         "{err:?}"
@@ -405,7 +482,7 @@ fn a_manifest_past_the_size_ceiling_is_refused() {
             layers.push(layer);
         }
 
-        build_manifest(&inscription, &layers).unwrap().0
+        build_manifests(&inscription, &layers).unwrap().0.diff
     };
 
     let err = manifest_bytes(&build(TOO_MANY)).unwrap_err();
@@ -439,8 +516,8 @@ fn a_manifest_past_the_size_ceiling_is_refused() {
 /// breaks in the diff of an unrelated change.
 #[test]
 fn annotation_keys_are_ordered() {
-    let (inscription, layers) = fixture();
-    let (manifest, _) = build_manifest(&inscription, &layers).unwrap();
+    let (_, manifests, _) = manifests();
+    let manifest = manifests.diff;
 
     let annotations: &BTreeMap<String, String> = manifest.layers[0].annotations.as_ref().unwrap();
     let keys: Vec<&str> = annotations.keys().map(String::as_str).collect();

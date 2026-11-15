@@ -162,6 +162,24 @@ impl FromIterator<(Digest, Digest)> for BlobIndex {
     }
 }
 
+/// Merging indexes, as a pull merges a sequence's diff and tip manifests. A
+/// `diffId` already present takes the later entry, as [`BlobIndex::insert`]
+/// does.
+impl Extend<(Digest, Digest)> for BlobIndex {
+    fn extend<I: IntoIterator<Item = (Digest, Digest)>>(&mut self, entries: I) {
+        self.0.extend(entries);
+    }
+}
+
+impl IntoIterator for BlobIndex {
+    type Item = (Digest, Digest);
+    type IntoIter = std::collections::btree_map::IntoIter<Digest, Digest>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 /// A layer being written, one record at a time.
 ///
 /// Push-style for the same reason a reader is pull-style: the party that owns
@@ -227,9 +245,9 @@ pub trait SnapshotWriter {
     ///
     /// The last thing a publish does, and the reason it is one call rather than
     /// a write followed by a flush: for a registry this is where the config
-    /// blob, the manifest and both tags land, in the one order that never
-    /// leaves a reader following the moving tag pointed at a snapshot whose
-    /// blobs are still uploading.
+    /// blob, the tip and diff manifests and their tags land, in the one order
+    /// that never leaves a reader following the moving tag pointed at a
+    /// snapshot whose blobs or tip are still uploading.
     ///
     /// `profile` is unused by a transport that does not name things — a
     /// directory has no tags — and load-bearing for one that does.

@@ -96,12 +96,12 @@ use stats_alloc::{StatsAlloc, INSTRUMENTED_SYSTEM};
 use stelae::{
     dir::SnapshotDir,
     frame::{encode, CanonicalCbor, Limits},
-    inscription::LayerDescriptor,
-    manifest::manifest_bytes,
+    inscription::{link_for, LayerDescriptor},
+    manifest::{manifest_bytes, Manifest, DIFF_ID_ANNOTATION},
     oci::{Auth, Options, Registry, DEFAULT_ATTEMPTS, DEFAULT_READ_ATTEMPTS, DEFAULT_READ_DELAY},
     progress::{Event, Observer, Progress},
     Compression, Digest, Error, Inscription, LayerReader, LayerSpec, Profile, RecordSink,
-    SnapshotReader, SnapshotWriter,
+    SnapshotReader, SnapshotWriter, TIP_SUFFIX,
 };
 
 mod fault_registry;
@@ -1027,6 +1027,120 @@ fn the_retired_envelope_is_refused_off_the_registry() {
         .pull_sequence(&ToyProfile, published.sequence)
         .unwrap();
     assert_eq!(by_sequence.read_inscription().unwrap(), published);
+}
+
+/// The `diffId` annotations of a manifest's layers, in order.
+fn annotated(manifest: &Manifest) -> Vec<String> {
+    manifest
+        .layers
+        .iter()
+        .map(|layer| layer.annotations.as_ref().unwrap()[DIFF_ID_ANNOTATION].clone())
+        .collect()
+}
+
+/// The `diffId`s of a layer array, in order, as the annotations spell them.
+fn diff_ids(layers: &[LayerDescriptor]) -> Vec<String> {
+    layers
+        .iter()
+        .map(|layer| layer.diff_id.to_string())
+        .collect()
+}
+
+/// A sequence is two manifests in the registry: the diff manifest under its
+/// tag and the tip manifest under that tag plus `.tip`, both carrying the one
+/// inscription blob as their config, and `latest` naming the diff manifest.
+///
+/// Read off the registry with its own client, so a registry that refused the
+/// `.tip` tag, or stored either document differently, fails here.
+#[test]
+#[ignore = "spawns a registry"]
+fn a_sequence_is_a_diff_and_a_tip_manifest_over_one_config() {
+    let _serial = exclusive();
+
+    let fixture = Fixture::spawn();
+    let registry = fixture.registry("stelae/pair");
+
+    let published = write_snapshot(&registry, 3);
+    let tag = ToyProfile.tag_for_sequence(3).unwrap();
+    let tip_tag = format!("{tag}{TIP_SUFFIX}");
+
+    let diff_bytes = fixture.manifest_raw("stelae/pair", &tag);
+    let tip_bytes = fixture.manifest_raw("stelae/pair", &tip_tag);
+
+    assert_eq!(
+        fixture.manifest_raw("stelae/pair", "latest"),
+        diff_bytes,
+        "latest is not the diff manifest"
+    );
+
+    let diff: Manifest = serde_json::from_slice(&diff_bytes).unwrap();
+    let tip: Manifest = serde_json::from_slice(&tip_bytes).unwrap();
+
+    // One config blob, the inscription, under both.
+    assert_eq!(diff.config, tip.config);
+    assert_eq!(diff.config.digest, published.digest().unwrap().to_string());
+    assert_eq!(diff.artifact_type.as_deref(), Some(SNAPSHOT_ENVELOPE));
+    assert_eq!(tip.artifact_type.as_deref(), Some(SNAPSHOT_ENVELOPE));
+
+    // Each lists exactly its own array.
+    assert_eq!(annotated(&diff), diff_ids(&published.diff));
+    assert_eq!(annotated(&tip), diff_ids(&published.tip));
+
+    // And the reader puts the two back together, by sequence and by latest.
+    for snapshot in [
+        registry.pull_sequence(&ToyProfile, 3).unwrap(),
+        registry.pull_latest(&ToyProfile).unwrap(),
+    ] {
+        assert_eq!(manifest_bytes(snapshot.manifest()).unwrap(), diff_bytes);
+        assert_eq!(
+            manifest_bytes(snapshot.tip_manifest().unwrap()).unwrap(),
+            tip_bytes
+        );
+        assert_eq!(snapshot.read_inscription().unwrap(), published);
+        records_of(&snapshot, &published);
+    }
+
+    // A tag ending in the suffix names a tip manifest, never a snapshot.
+    let err = registry.pull(&ToyProfile, &tip_tag).unwrap_err();
+    assert!(matches!(err, Error::InvalidTag { .. }), "{err:?}");
+}
+
+/// A repository nested under another is a repository of its own: each holds
+/// its own sequences, tips and moving tag, and reads back whole.
+///
+/// The layout decision 0080 publishes under, `cardano/<network>/<profile>`
+/// beside the older `cardano/<network>`, here as `stelae/nest/inner` beside
+/// `stelae/nest`.
+#[test]
+#[ignore = "spawns a registry"]
+fn a_nested_repository_is_a_repository_of_its_own() {
+    let _serial = exclusive();
+
+    let fixture = Fixture::spawn();
+    let outer = fixture.registry("stelae/nest");
+    let inner = fixture.registry("stelae/nest/inner");
+
+    let in_outer = write_snapshot(&outer, 3);
+    let in_inner = write_snapshot(&inner, 4);
+
+    for (registry, published) in [(&outer, &in_outer), (&inner, &in_inner)] {
+        for snapshot in [
+            registry.pull_latest(&ToyProfile).unwrap(),
+            registry
+                .pull_sequence(&ToyProfile, published.sequence)
+                .unwrap(),
+        ] {
+            assert_eq!(snapshot.read_inscription().unwrap(), *published);
+            assert!(snapshot.tip_manifest().is_some());
+            records_of(&snapshot, published);
+        }
+    }
+
+    // Neither holds the other's sequence, and each tells that from a fault.
+    let err = outer.pull_sequence(&ToyProfile, 4).unwrap_err();
+    assert!(err.is_absent(), "{err:?}");
+    let err = inner.pull_sequence(&ToyProfile, 3).unwrap_err();
+    assert!(err.is_absent(), "{err:?}");
 }
 
 /// Done criterion 2: the second push moves only what the registry lacks, and
@@ -2099,7 +2213,12 @@ fn concurrency_changes_the_cost_of_a_publish_and_not_the_snapshot() {
     assert_eq!(
         manifest_bytes(from_serial.manifest()).unwrap(),
         manifest_bytes(from_concurrent.manifest()).unwrap(),
-        "the manifests differ",
+        "the diff manifests differ",
+    );
+    assert_eq!(
+        from_serial.tip_manifest(),
+        from_concurrent.tip_manifest(),
+        "the tip manifests differ",
     );
 
     // The serial publish is the first into this registry, so nothing can have
@@ -2935,6 +3054,384 @@ fn a_resumed_publish_reuses_the_blobs_it_already_uploaded() {
     assert!(!empty.adopt_carried(recorded.clone()).unwrap());
     assert!(empty.carried(&recorded.descriptor.diff_id).is_none());
     assert_eq!(empty.transfer().layers_reused, 0);
+}
+
+// ---------------------------------------------------------------------------
+// A sequence's two manifests
+// ---------------------------------------------------------------------------
+
+/// Chapter 3 sealed as the first of a lineage, and chapter 4 linked to it,
+/// both through `registry`.
+fn publish_chapters(registry: &Registry) -> (Inscription, Inscription) {
+    let first = write_chapter_layers(registry, 3);
+    registry.seal(&ToyProfile, &first).unwrap();
+
+    let second = linked_chapter(registry, &first);
+    registry.seal(&ToyProfile, &second).unwrap();
+
+    (first, second)
+}
+
+/// Chapter 4's layers written, and its inscription linked to `first`. Nothing
+/// is sealed.
+fn linked_chapter(registry: &Registry, first: &Inscription) -> Inscription {
+    let mut second = write_chapter_layers(registry, 4);
+    second.previous = link_for(Some(first), 4).unwrap();
+    second
+}
+
+/// Every tag the fault registry holds, with the manifest under it.
+fn tagged(fault: &FaultRegistry) -> Vec<(String, Vec<u8>)> {
+    fault
+        .tags()
+        .into_iter()
+        .map(|tag| {
+            let body = fault.manifest(&tag).unwrap();
+            (tag, body)
+        })
+        .collect()
+}
+
+/// A seal writes the tip manifest, the diff manifest and the moving tag, and a
+/// pull reads the two manifests back as one snapshot. A sequence whose `tip`
+/// is empty is one manifest, and its pull never asks for a tip.
+#[test]
+fn a_seal_writes_a_tip_and_a_diff_manifest_and_a_pull_reads_both() {
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/pair");
+
+    let (_, second) = publish_chapters(&registry);
+
+    assert_eq!(
+        fault.tags(),
+        [
+            "chapter-3",
+            "chapter-3.tip",
+            "chapter-4",
+            "chapter-4.tip",
+            "latest"
+        ],
+    );
+    assert_eq!(fault.manifest("latest"), fault.manifest("chapter-4"));
+
+    let diff: Manifest = serde_json::from_slice(&fault.manifest("chapter-4").unwrap()).unwrap();
+    let tip: Manifest = serde_json::from_slice(&fault.manifest("chapter-4.tip").unwrap()).unwrap();
+
+    assert_eq!(diff.config, tip.config);
+    assert_eq!(diff.config.digest, second.digest().unwrap().to_string());
+    assert_eq!(annotated(&diff), diff_ids(&second.diff));
+    assert_eq!(annotated(&tip), diff_ids(&second.tip));
+
+    let snapshot = registry.pull_sequence(&ToyProfile, 4).unwrap();
+    assert_eq!(snapshot.manifest(), &diff);
+    assert_eq!(snapshot.tip_manifest(), Some(&tip));
+    assert_eq!(snapshot.blob_index().unwrap().len(), 2);
+    assert_eq!(
+        snapshot.total_compressed_size(),
+        (diff.layers[0].size + tip.layers[0].size) as u64,
+    );
+    records_of(&snapshot, &second);
+
+    // No tip: one manifest, and a pull that does not look for a second.
+    let bare = FaultRegistry::spawn();
+    let registry = faulty(&bare, "stelae/bare");
+    let only_diff = write_layers(&registry, 2);
+
+    assert_eq!(bare.tags(), ["chapter-2", "latest"]);
+
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    assert_eq!(snapshot.tip_manifest(), None);
+    assert_eq!(bare.gets("manifests/chapter-2.tip"), 0);
+    records_of(&snapshot, &only_diff);
+}
+
+/// A sequence whose tip manifest is gone is not an absent sequence: its pull
+/// says the tip is gone, and `latest` does not read as an empty repository.
+#[test]
+fn a_gone_tip_is_not_an_absent_sequence() {
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/gone");
+
+    publish_chapters(&registry);
+    fault.forget_manifest("chapter-4.tip");
+
+    for err in [
+        registry.pull_sequence(&ToyProfile, 4).unwrap_err(),
+        registry.pull_latest(&ToyProfile).unwrap_err(),
+        registry.latest(&ToyProfile).unwrap_err(),
+    ] {
+        assert!(
+            matches!(&err, Error::TipGone { sequence: 4, tag } if tag == "chapter-4.tip"),
+            "{err:?}"
+        );
+        assert!(!err.is_absent());
+    }
+
+    // The sequence before still has its tip, and one never published is absent.
+    registry.pull_sequence(&ToyProfile, 3).unwrap();
+
+    let err = registry.pull_sequence(&ToyProfile, 9).unwrap_err();
+    assert!(err.is_absent(), "{err:?}");
+}
+
+/// A tip manifest the registry fails to serve is not a gone tip. Its read has
+/// the diff manifest's budget: cut off once, it is read again; cut off every
+/// time, the budget runs out; a refusal other than a 404 is itself, once.
+#[test]
+fn a_tip_the_registry_cannot_serve_is_not_a_gone_tip() {
+    let _serial = exclusive();
+
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/flaky-tip");
+    publish_chapters(&registry);
+
+    let retries = Arc::new(Retries::default());
+    registry.observe(Observer::new(retries.clone()));
+    let key = "manifests/chapter-4.tip";
+
+    fault.fail_next(key, &[Fault::Truncate]);
+    let snapshot = registry.pull_sequence(&ToyProfile, 4).unwrap();
+    assert!(snapshot.tip_manifest().is_some());
+    assert_eq!(fault.gets(key), 2, "the tip manifest was not read again");
+    assert_eq!(retries.seen(), vec![(1, DEFAULT_READ_ATTEMPTS - 1)]);
+
+    fault.fail_always(key, Fault::Truncate);
+    let before = fault.gets(key);
+    let err = registry.pull_sequence(&ToyProfile, 4).unwrap_err();
+    assert!(
+        matches!(&err, Error::RetriesExhausted { attempts, .. } if *attempts == DEFAULT_READ_ATTEMPTS),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("chapter-4.tip"), "{err}");
+    assert!(!err.is_absent());
+    assert_eq!(fault.gets(key) - before, DEFAULT_READ_ATTEMPTS as usize);
+
+    for code in [403, 429] {
+        fault.fail_always(key, Fault::Status(code));
+        let before = fault.gets(key);
+        for err in [
+            registry.pull_sequence(&ToyProfile, 4).unwrap_err(),
+            registry.latest(&ToyProfile).unwrap_err(),
+        ] {
+            assert!(matches!(err, Error::Registry(_)), "a {code} became {err:?}");
+            assert!(!err.is_absent());
+        }
+        assert_eq!(fault.gets(key) - before, 2, "a {code} was retried");
+    }
+}
+
+/// A tip manifest of another inscription under this sequence's `.tip` tag is
+/// refused, rather than read as this sequence's tip.
+#[test]
+fn a_tip_manifest_of_another_inscription_is_refused() {
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/foreign");
+    write_snapshot(&registry, 3);
+
+    // Another sequence 3, with other layers, published elsewhere.
+    let elsewhere = FaultRegistry::spawn();
+    let other = faulty(&elsewhere, "stelae/foreign");
+    other
+        .seal(&ToyProfile, &write_chapter_layers(&other, 3))
+        .unwrap();
+
+    fault.put_manifest(
+        "chapter-3.tip",
+        elsewhere.manifest("chapter-3.tip").unwrap(),
+    );
+
+    let err = registry.pull_sequence(&ToyProfile, 3).unwrap_err();
+    assert!(
+        matches!(&err, Error::ManifestMismatch(m) if m.contains("the tip manifest's config is")),
+        "{err:?}"
+    );
+}
+
+/// A seal interrupted after each of its steps resumes to the same result.
+///
+/// The steps are the seal's own: the layer blobs, the config blob, the tip
+/// manifest, the diff manifest and the moving tag. Each case refuses one
+/// write, so the steps before it are done and none after it is. That leaves no
+/// sequence tag without its tip, and `latest` on the sequence before. Then the
+/// same transport seals again, or a new one publishes the sequence again, and
+/// the registry holds exactly what an uninterrupted publish leaves.
+///
+/// A refused layer upload is the one case only a new publish recovers, as
+/// [`Error::LayerNotWritten`] says.
+#[test]
+fn a_seal_interrupted_after_each_step_resumes_to_the_same_result() {
+    let clean = FaultRegistry::spawn();
+    let (_, second) = publish_chapters(&faulty(&clean, "stelae/steps"));
+    let expected = tagged(&clean);
+    let standing = clean.manifest("chapter-3").unwrap();
+
+    let notes_blob = clean.layers()[0].clone();
+    let config = second.digest().unwrap().to_string();
+
+    // The write refused, and the tags the interrupted seal leaves for 4.
+    let steps: [(&str, String, &[&str]); 5] = [
+        ("during the layers", notes_blob.clone(), &[]),
+        ("after the layers", config.clone(), &[]),
+        (
+            "after the config",
+            "manifests/chapter-4.tip".to_owned(),
+            &[],
+        ),
+        (
+            "after the tip manifest",
+            "manifests/chapter-4".to_owned(),
+            &["chapter-4.tip"],
+        ),
+        (
+            "after the diff manifest",
+            "manifests/latest".to_owned(),
+            &["chapter-4", "chapter-4.tip"],
+        ),
+    ];
+
+    for (index, (step, refused, left)) in steps.iter().enumerate() {
+        for again in ["sealing again", "publishing again"] {
+            if index == 0 && again == "sealing again" {
+                continue;
+            }
+
+            let fault = FaultRegistry::spawn();
+            let registry = faulty(&fault, "stelae/steps");
+
+            let first = write_chapter_layers(&registry, 3);
+            registry.seal(&ToyProfile, &first).unwrap();
+
+            fault.refuse_puts(refused, 400);
+
+            let interrupted = linked_chapter(&registry, &first);
+            registry
+                .seal(&ToyProfile, &interrupted)
+                .expect_err("a refused write was not the seal's failure");
+
+            let mut tags: Vec<String> = ["chapter-3", "chapter-3.tip", "latest"]
+                .into_iter()
+                .chain(left.iter().copied())
+                .map(str::to_owned)
+                .collect();
+            tags.sort();
+
+            assert_eq!(fault.tags(), tags, "{step}");
+            assert_eq!(fault.manifest("latest").unwrap(), standing, "{step}");
+            assert_eq!(fault.blob(&config).is_some(), index >= 2, "{step}");
+
+            fault.accept_puts();
+
+            if again == "sealing again" {
+                registry.seal(&ToyProfile, &interrupted).unwrap();
+            } else {
+                drop(registry);
+                let registry = faulty(&fault, "stelae/steps");
+                let resumed = linked_chapter(&registry, &first);
+                assert_eq!(resumed, interrupted);
+                registry.seal(&ToyProfile, &resumed).unwrap();
+            }
+
+            assert!(
+                tagged(&fault) == expected,
+                "{step}, {again}: the result differs"
+            );
+        }
+    }
+}
+
+/// Chapter `sequence`'s layers for the size test: three notes in `diff` and an
+/// index of three entries in `tip`, every number the same width at every
+/// sequence from 100 to 999. Nothing is sealed.
+fn sized_chapter<W: SnapshotWriter>(snapshot: &W, sequence: u64) -> Inscription {
+    let (notes_header, notes_scope) = notes_scope(sequence);
+    let (index_header, index_scope) = index_scope(sequence);
+
+    let records = |from: u64| -> Vec<CanonicalCbor> {
+        (from..from + 3)
+            .map(|n| note_record(sequence * 10 + n))
+            .collect()
+    };
+
+    let notes = snapshot
+        .write_layer(
+            &ToyProfile,
+            &LayerSpec::new("notes", notes_header, notes_scope),
+            COMPRESSION_LEVEL,
+            &records(1),
+        )
+        .unwrap();
+
+    let index = snapshot
+        .write_layer(
+            &ToyProfile,
+            &LayerSpec::new("index", index_header, index_scope),
+            COMPRESSION_LEVEL,
+            &records(4),
+        )
+        .unwrap();
+
+    let mut inscription = chapter_inscription(sequence);
+    inscription.diff = vec![notes.descriptor];
+    inscription.tip = vec![index.descriptor];
+
+    inscription
+}
+
+/// Done criterion 1: neither manifest nor the inscription grows with the
+/// chain.
+///
+/// Fifty sequences are published, each linked to the one before. Each adds one
+/// notes layer to `diff` and carries one index in `tip`. Every document of the
+/// fiftieth is exactly the size of the second's, the first with a link. What a
+/// publish writes depends on what its sequence adds, not on how many came
+/// before.
+///
+/// The lineage starts at 100 (a lineage may start at any sequence), so every
+/// number the documents carry has the same width throughout: sequences, links,
+/// scopes, record ids and sizes. That is what makes "the same size" exact.
+#[test]
+fn neither_manifest_nor_the_inscription_grows_with_the_chain() {
+    const FIRST: u64 = 100;
+    const SEQUENCES: u64 = 50;
+
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/sizes");
+
+    let mut previous: Option<Inscription> = None;
+    let mut sizes = Vec::new();
+
+    for sequence in FIRST..FIRST + SEQUENCES {
+        let mut inscription = sized_chapter(&registry, sequence);
+        inscription.previous = link_for(previous.as_ref(), sequence).unwrap();
+
+        let identity = registry.seal(&ToyProfile, &inscription).unwrap();
+
+        let tag = ToyProfile.tag_for_sequence(sequence).unwrap();
+        let diff = fault.manifest(&tag).unwrap().len();
+        let tip = fault.manifest(&format!("{tag}{TIP_SUFFIX}")).unwrap().len();
+        let config = fault.blob(&identity.to_string()).unwrap().len();
+
+        sizes.push((diff, tip, config));
+        previous = Some(inscription);
+    }
+
+    let last = previous.unwrap();
+    assert_eq!(last.sequence, FIRST + SEQUENCES - 1);
+    assert_eq!(last.previous.unwrap().sequence, FIRST + SEQUENCES - 2);
+    assert_eq!((last.diff.len(), last.tip.len()), (1, 1));
+
+    let (second, fiftieth) = (sizes[1], sizes[sizes.len() - 1]);
+
+    println!(
+        "diff manifest, tip manifest, inscription: {second:?} bytes at the second \
+         sequence, {fiftieth:?} at the fiftieth"
+    );
+
+    assert_eq!(fiftieth, second, "a document grew with the chain");
+
+    for (offset, size) in sizes.iter().enumerate().skip(1) {
+        assert_eq!(*size, second, "sequence {}", FIRST + offset as u64);
+    }
 }
 
 /// Layers come back in the order they were named when later downloads finish

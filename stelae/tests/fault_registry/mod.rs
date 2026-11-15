@@ -4,8 +4,11 @@
 //! snapshot and pull it back over plaintext HTTP — monolithic blob uploads,
 //! blob `HEAD`/`GET`, manifest `PUT`/`GET` — plus scripted faults on the reads:
 //! a body cut off partway, a body that is honestly short, or a status code, and
-//! a wait before a layer blob's first byte. No container, so the read-retry
-//! and read-ahead tests run under plain `cargo test`.
+//! a wait before a layer blob's first byte. A write can be refused with a
+//! status, and a stored manifest forgotten. No container, so the read-retry,
+//! read-ahead and interrupted-seal tests run under plain `cargo test`.
+//!
+//! Repositories are not kept apart: one instance serves one repository.
 //!
 //! Every response closes its connection, so each attempt the client makes is a
 //! fresh request that this server sees and counts.
@@ -47,9 +50,14 @@ impl Script {
 struct State {
     blobs: HashMap<String, Vec<u8>>,
     manifests: HashMap<String, (String, Vec<u8>)>,
-    /// Layer digests of the last manifest stored, in manifest order.
-    layers: Vec<String>,
+    /// Layer digests of the snapshot last published, in manifest order: its
+    /// diff manifest's, then its tip manifest's.
+    diff_layers: Vec<String>,
+    tip_layers: Vec<String>,
     config: Option<String>,
+    /// Statuses that answer every `PUT` of a key (a blob digest, or
+    /// `manifests/<reference>`).
+    refused: HashMap<String, u16>,
     /// Keyed by blob digest, or `manifests/<reference>`.
     faults: HashMap<String, Script>,
     /// Every blob `HEAD` answered with a fault.
@@ -104,9 +112,68 @@ impl FaultRegistry {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// The layer blob digests of the manifest last pushed.
+    /// The layer blob digests of the snapshot last published: those its diff
+    /// manifest lists, then those its tip manifest lists.
     pub fn layers(&self) -> Vec<String> {
-        self.state().layers.clone()
+        let state = self.state();
+        state
+            .diff_layers
+            .iter()
+            .chain(&state.tip_layers)
+            .cloned()
+            .collect()
+    }
+
+    /// The manifest stored under `reference` (a tag or a digest), as stored.
+    pub fn manifest(&self, reference: &str) -> Option<Vec<u8>> {
+        self.state()
+            .manifests
+            .get(reference)
+            .map(|(_, body)| body.clone())
+    }
+
+    /// Every tag a manifest is stored under, sorted.
+    pub fn tags(&self) -> Vec<String> {
+        let mut tags: Vec<String> = self
+            .state()
+            .manifests
+            .keys()
+            .filter(|reference| !reference.starts_with("sha256:"))
+            .cloned()
+            .collect();
+        tags.sort();
+        tags
+    }
+
+    /// The blob stored under `digest`.
+    pub fn blob(&self, digest: &str) -> Option<Vec<u8>> {
+        self.state().blobs.get(digest).cloned()
+    }
+
+    /// Store `body` under the tag `reference`, as a writer that skipped every
+    /// check would.
+    pub fn put_manifest(&self, reference: &str, body: Vec<u8>) {
+        let media_type = "application/vnd.oci.image.manifest.v1+json".to_owned();
+        self.state()
+            .manifests
+            .insert(reference.to_owned(), (media_type, body));
+    }
+
+    /// Drop the manifest stored under the tag `reference`, as a registry
+    /// deleting it would.
+    pub fn forget_manifest(&self, reference: &str) {
+        self.state().manifests.remove(reference);
+    }
+
+    /// Answer every `PUT` of `key` (a blob digest, or `manifests/<reference>`)
+    /// with `status`, storing nothing, until [`FaultRegistry::accept_puts`].
+    pub fn refuse_puts(&self, key: &str, status: u16) {
+        self.state().refused.insert(key.to_owned(), status);
+    }
+
+    /// Accept every `PUT` again.
+    pub fn accept_puts(&self) {
+        self.state().refused.clear();
     }
 
     /// Blob digests uploaded so far, layers and configs alike, in the order
@@ -302,6 +369,9 @@ fn handle(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
             }
             "PUT" => {
                 let digest = decode(&request.query, "digest").unwrap_or_default();
+                if let Some(status) = lock().refused.get(&digest).copied() {
+                    return respond(&stream, status, &[], 0, b"");
+                }
                 {
                     let mut state = lock();
                     state.blobs.insert(digest.clone(), request.body);
@@ -336,7 +406,10 @@ fn handle(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
 
         // Only layer `GET`s are logged and delayed, so a test reads the order a
         // restore fetched its layers in without the config blob in it.
-        let layer = !head && lock().layers.contains(&digest);
+        let layer = !head && {
+            let state = lock();
+            state.diff_layers.contains(&digest) || state.tip_layers.contains(&digest)
+        };
         if layer {
             let delay = {
                 let mut state = lock();
@@ -380,6 +453,10 @@ fn handle(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
         let key = format!("manifests/{reference}");
 
         if request.method == "PUT" {
+            if let Some(status) = lock().refused.get(&key).copied() {
+                return respond(&stream, status, &[], 0, b"");
+            }
+
             let media_type = request
                 .headers
                 .get("content-type")
@@ -388,14 +465,27 @@ fn handle(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
             let digest = sha256(&request.body);
             let parsed: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
 
-            let mut state = lock();
-            state.layers = parsed["layers"]
+            let layers: Vec<String> = parsed["layers"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .map(|layer| layer["digest"].as_str().unwrap().to_owned())
                 .collect();
-            state.config = parsed["config"]["digest"].as_str().map(str::to_owned);
+            let config = parsed["config"]["digest"].as_str().map(str::to_owned);
+
+            // A manifest of another inscription starts another snapshot. A tip
+            // manifest is pushed first, so its layers wait for the diff's.
+            let mut state = lock();
+            if state.config != config {
+                state.diff_layers.clear();
+                state.tip_layers.clear();
+            }
+            if reference.ends_with(stelae::TIP_SUFFIX) {
+                state.tip_layers = layers;
+            } else {
+                state.diff_layers = layers;
+            }
+            state.config = config;
             let entry = (media_type, request.body);
             state.manifests.insert(digest.clone(), entry.clone());
             state.manifests.insert(reference, entry);
