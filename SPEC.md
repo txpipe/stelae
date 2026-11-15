@@ -246,6 +246,20 @@ verification: the restore client expects the canonical blobs referenced by
 the OCI manifest, so re-encoded mirrors serve archival and verification, not
 direct restore.
 
+### What a publish writes
+
+A publish uploads and lists only the layers its profile assigns to its own
+sequence, each in the array the profile names for it at that sequence. It
+never re-lists a layer of an earlier inscription: that layer stays where the
+inscription that first listed it put it, and a later snapshot reaches it by
+following the links. So a publish's work and its documents grow with what one
+sequence adds, not with the length of the chain (decision 0080).
+
+A publish that resumes after an interruption may name a blob that an earlier
+attempt at the same sequence already uploaded, once the registry confirms it
+still holds that blob. It is reusing its own layer, not an earlier
+snapshot's.
+
 ## OCI layout
 
 - One repository per (profile, dataset). The protocol requires an immutable

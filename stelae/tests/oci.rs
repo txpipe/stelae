@@ -421,11 +421,8 @@ impl Fixture {
     /// The deployment the environment names, if it names one.
     ///
     /// A fresh namespace per fixture, because a deployment persists where a
-    /// container never does: two fixtures in one test are two namespaces —
-    /// which is what lets
-    /// [`a_layer_whose_blob_is_not_there_cannot_be_carried_forward`] keep
-    /// meaning "a place the blob is absent from" — and two runs never share
-    /// one.
+    /// container never does: two fixtures in one test are two namespaces, and
+    /// two runs never share one.
     fn remote() -> Option<Self> {
         let host = std::env::var("STELAE_TEST_REGISTRY_URL").ok()?;
 
@@ -610,11 +607,6 @@ impl Fixture {
     /// the deployment uses.
     fn registry_at(&self, repository: &str, concurrency: usize) -> Registry {
         self.options(repository, |options| options.concurrency = concurrency)
-    }
-
-    /// The same transport, re-proving every layer it carries forward.
-    fn verifying(&self, repository: &str) -> Registry {
-        self.options(repository, |options| options.verify_adopted = true)
     }
 
     /// Every transport in this file is built here, so that whether the fixture
@@ -1044,7 +1036,9 @@ fn the_retired_envelope_is_refused_off_the_registry() {
 /// same scope, so the same `diffId` and, at a pinned compression level, the
 /// same blob — and differ in their `index` layer. What the registry has to
 /// receive is therefore exactly one blob, and what it must be spared is exactly
-/// one.
+/// one. A publish no longer lists an earlier snapshot's layer (`SPEC.md`, "Diff
+/// and tip"); writing the same bytes twice is only the cheapest way to put a
+/// blob the registry already holds in front of the transport.
 #[test]
 #[ignore = "spawns a registry"]
 fn a_second_push_uploads_only_what_is_missing() {
@@ -2060,95 +2054,6 @@ fn the_read_only_pair_pulls_and_cannot_push() {
     println!("write through the pull-only pair: {refused}");
 }
 
-/// Carrying a layer forward costs nothing and asks nothing.
-///
-/// The default, and the reason the publish path stopped getting slower with
-/// every epoch behind it: `source` is a snapshot this transport pulled, its
-/// manifest is live under a tag, and a registry may not reclaim a blob in that
-/// position. So the layer is carried on the manifest's word — no round trip,
-/// no bytes — and only the counters move.
-#[test]
-#[ignore = "spawns a registry"]
-fn a_layer_is_carried_forward_on_the_manifest_that_names_it() {
-    let _serial = exclusive();
-
-    let fixture = Fixture::spawn();
-
-    let source = fixture.registry("stelae/source");
-    let published = write_snapshot(&source, 3);
-    let snapshot = source.latest(&ToyProfile).unwrap().unwrap();
-
-    // Reset first, so what is read back is this call's cost and not the two
-    // layers `write_snapshot` pushed through the same transport.
-    source.take_transfer();
-
-    source
-        .adopt_layer(&snapshot, published.diff[0].clone())
-        .unwrap();
-
-    let transfer = source.take_transfer();
-
-    assert_eq!(transfer.layers_reused, 1);
-    assert_eq!(transfer.layers_uploaded, 0);
-    assert!(transfer.bytes_reused > 0);
-}
-
-/// An operator who does not trust the repository's retention gets the check
-/// back, and it still lands before the manifest does.
-///
-/// This is the guarantee `verify_adopted` exists for, and the failure it
-/// prevents is invisible without it: a manifest pointing at a reclaimed blob is
-/// a perfectly well-formed snapshot that nobody can restore. What has moved is
-/// *when* the refusal is reported — the `HEAD` runs concurrently with the rest
-/// of the publish and is joined at the seal — and what has not moved is that
-/// the refusal comes before anything is tagged.
-///
-/// **Provoked with a second registry, not a second repository**, and the
-/// difference is a real one this test found. `zot` answers `HEAD` *and* `GET`
-/// for a blob under a repository it was never pushed to — its storage is
-/// content-addressed across the whole registry — while `distribution` 2.8 and
-/// 3.0 answer 404. So a sibling repository is not reliably a place a blob is
-/// absent from, and on `zot` it would not even be the wrong answer: a registry
-/// that will serve the blob is a registry where the manifest works. Only a
-/// separate server is absent everywhere.
-#[test]
-#[ignore = "spawns a registry"]
-fn a_verified_carry_refuses_a_blob_the_repository_does_not_hold() {
-    let _serial = exclusive();
-
-    let fixture = Fixture::spawn();
-
-    let source = fixture.registry("stelae/source");
-    let published = write_snapshot(&source, 3);
-    let snapshot = source.latest(&ToyProfile).unwrap().unwrap();
-
-    let somewhere_else = Fixture::spawn();
-    let elsewhere = somewhere_else.verifying("stelae/source");
-
-    // The descriptor is handed back: nothing has been asked yet, and what the
-    // caller holds is a fact about bytes rather than a promise about a
-    // registry.
-    elsewhere
-        .adopt_layer(&snapshot, published.diff[0].clone())
-        .unwrap();
-
-    // The seal is where the promise is collected, and it is refused.
-    let mut inscription = published.clone();
-    inscription.diff = vec![published.diff[0].clone()];
-    inscription.tip.clear();
-
-    let err = elsewhere.seal(&ToyProfile, &inscription).unwrap_err();
-
-    assert!(matches!(err, Error::BlobMissing { .. }), "{err:?}");
-
-    // And nothing was published: the moving tag in a repository that never had
-    // a snapshot still resolves to nothing.
-    assert!(
-        elsewhere.latest(&ToyProfile).unwrap().is_none(),
-        "a refused seal tagged a manifest anyway",
-    );
-}
-
 /// Concurrency changes what a publish costs and nothing about what it
 /// produces.
 ///
@@ -2161,12 +2066,13 @@ fn a_verified_carry_refuses_a_blob_the_repository_does_not_hold() {
 /// Two repositories in one registry rather than two registries, so the
 /// comparison is not also comparing two servers — with the one consequence
 /// that the *counters* cannot be compared to each other. `zot` addresses
-/// blobs across the whole registry rather than per repository, as
-/// [`a_verified_carry_refuses_a_blob_the_repository_does_not_hold`] documents
-/// at more length, so on that registry the second publish skips what the first
-/// one uploaded. What is asserted instead is the property that holds on either
-/// kind and is the one worth having: every layer and every byte the snapshot
-/// describes is accounted for, whichever way the registry answered.
+/// blobs across the whole registry rather than per repository — it answers
+/// `HEAD` for a blob under a repository it was never pushed to, where
+/// `distribution` answers 404 — so on that registry the second publish skips
+/// what the first one uploaded. What is asserted instead is the property that
+/// holds on either kind and is the one worth having: every layer and every byte
+/// the snapshot describes is accounted for, whichever way the registry
+/// answered.
 #[test]
 #[ignore = "spawns a registry"]
 fn concurrency_changes_the_cost_of_a_publish_and_not_the_snapshot() {
@@ -2848,6 +2754,184 @@ fn eventually(what: &str, done: impl Fn() -> bool) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+// ---------------------------------------------------------------------------
+// A publish writes only its own layers
+// ---------------------------------------------------------------------------
+
+/// Chapter `sequence`'s notes: three records no other chapter writes.
+fn chapter_notes(sequence: u64) -> Vec<CanonicalCbor> {
+    (1..=3).map(|n| note_record(sequence * 10 + n)).collect()
+}
+
+/// Write the layers of chapter `sequence` as the diff chain lists them: its
+/// notes, which are final, in `diff`, and an index rebuilt whole each time in
+/// `tip`. Nothing is sealed.
+fn write_chapter_layers<W: SnapshotWriter>(snapshot: &W, sequence: u64) -> Inscription {
+    let (notes_header, notes_scope) = notes_scope(sequence);
+    let (index_header, index_scope) = index_scope(sequence);
+
+    let notes = snapshot
+        .write_layer(
+            &ToyProfile,
+            &LayerSpec::new("notes", notes_header, notes_scope),
+            COMPRESSION_LEVEL,
+            &chapter_notes(sequence),
+        )
+        .unwrap();
+
+    let index: Vec<CanonicalCbor> = (1..=sequence).map(note_record).collect();
+    let index = snapshot
+        .write_layer(
+            &ToyProfile,
+            &LayerSpec::new("index", index_header, index_scope),
+            COMPRESSION_LEVEL,
+            &index,
+        )
+        .unwrap();
+
+    let mut inscription = chapter_inscription(sequence);
+    inscription.diff = vec![notes.descriptor];
+    inscription.tip = vec![index.descriptor];
+
+    inscription
+}
+
+/// Chapter `sequence`'s inscription, with no layers and no link.
+fn chapter_inscription(sequence: u64) -> Inscription {
+    Inscription::new(
+        &ToyProfile,
+        sequence,
+        json!({"chapter": sequence, "shelf": "east"}),
+        json!({"noteWidth": 40}),
+        Compression {
+            algo: "zstd".to_owned(),
+            level: COMPRESSION_LEVEL as i64,
+        },
+    )
+}
+
+/// An inscription that lists a layer of the snapshot before it is refused at
+/// the seal, and nothing is tagged.
+///
+/// No call carries an earlier snapshot's layer into a new one, so the only
+/// way to list it is to write it again. Refused before anything is pushed,
+/// as the manifest–inscription agreement in `SPEC.md` requires.
+#[test]
+fn a_seal_refuses_an_earlier_snapshots_layer() {
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/chain");
+
+    let mut first = write_chapter_layers(&registry, 3);
+    registry.seal(&ToyProfile, &first).unwrap();
+    let published = registry.pull_latest(&ToyProfile).unwrap();
+    first = published.read_inscription().unwrap();
+
+    let mut second = write_chapter_layers(&registry, 4);
+    second.previous = stelae::inscription::link_for(Some(&first), 4).unwrap();
+    second.diff.insert(0, first.diff[0].clone());
+
+    let err = registry.seal(&ToyProfile, &second).unwrap_err();
+
+    assert!(
+        matches!(&err, Error::ManifestMismatch(why) if why.contains("never written")),
+        "{err:?}"
+    );
+    assert_eq!(
+        registry
+            .pull_latest(&ToyProfile)
+            .unwrap()
+            .read_inscription()
+            .unwrap(),
+        first,
+        "a refused seal moved the moving tag",
+    );
+}
+
+/// A publish resuming after an interruption reuses a blob the interrupted
+/// attempt uploaded, and builds again one whose blob is gone.
+///
+/// The record a host keeps is the [`stelae::WrittenLayer`] the first attempt's
+/// sink returned. Carrying it costs one `HEAD` and no upload, and the counters
+/// call it reused rather than skipped.
+#[test]
+fn a_resumed_publish_reuses_the_blobs_it_already_uploaded() {
+    let fault = FaultRegistry::spawn();
+
+    // The interrupted attempt: one layer written and up, then the transport
+    // is dropped without a seal.
+    let recorded = {
+        let interrupted = faulty(&fault, "stelae/resume");
+        let (header, scope) = notes_scope(4);
+
+        let written = interrupted
+            .write_layer(
+                &ToyProfile,
+                &LayerSpec::new("notes", header, scope),
+                COMPRESSION_LEVEL,
+                &chapter_notes(4),
+            )
+            .unwrap();
+
+        let blob = written.digests.blob_digest.to_string();
+        eventually("the interrupted layer's upload", || {
+            fault.pushed().contains(&blob)
+        });
+
+        written
+    };
+
+    let registry = faulty(&fault, "stelae/resume");
+    let before = fault.pushed().len();
+
+    assert!(registry.adopt_carried(recorded.clone()).unwrap());
+
+    let (header, scope) = index_scope(4);
+    let index = registry
+        .write_layer(
+            &ToyProfile,
+            &LayerSpec::new("index", header, scope),
+            COMPRESSION_LEVEL,
+            &[note_record(1)],
+        )
+        .unwrap();
+
+    let mut inscription = chapter_inscription(4);
+    inscription.diff = vec![recorded.descriptor.clone()];
+    inscription.tip = vec![index.descriptor.clone()];
+
+    registry.seal(&ToyProfile, &inscription).unwrap();
+
+    let transfer = registry.take_transfer();
+    assert_eq!(transfer.layers_reused, 1);
+    assert_eq!(transfer.bytes_reused, recorded.digests.compressed_size);
+    assert_eq!(transfer.layers_uploaded, 1, "only the index went up");
+
+    let resumed = &fault.pushed()[before..];
+    assert!(
+        !resumed.contains(&recorded.digests.blob_digest.to_string()),
+        "the recorded layer was uploaded again: {resumed:?}"
+    );
+    assert_eq!(
+        fault.layers(),
+        vec![
+            recorded.digests.blob_digest.to_string(),
+            index.digests.blob_digest.to_string(),
+        ],
+    );
+
+    let snapshot = registry.pull_latest(&ToyProfile).unwrap();
+    records_of(&snapshot, &inscription);
+
+    // A record whose blob this repository never held carries nothing, and the
+    // transport has nothing pending for the next seal.
+    let elsewhere = FaultRegistry::spawn();
+    let empty = faulty(&elsewhere, "stelae/resume");
+
+    assert!(!empty.adopt_carried(recorded.clone()).unwrap());
+    assert!(empty.carried(&recorded.descriptor.diff_id).is_none());
+    assert_eq!(empty.transfer().layers_reused, 0);
 }
 
 /// Layers come back in the order they were named when later downloads finish

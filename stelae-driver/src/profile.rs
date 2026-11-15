@@ -4,16 +4,27 @@ use stelae::inscription::{Inscription, LayerDescriptor};
 
 use crate::Error;
 
+/// The array of its inscription a layer is listed in.
+///
+/// `Diff` is a layer whose content is final: every later snapshot of the
+/// lineage inherits it, and no later inscription lists it again. `Tip` is a
+/// layer that belongs to the snapshot being written alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Diff,
+    Tip,
+}
+
 /// The questions the publish and restore lifecycle asks of a profile.
 ///
 /// [`stelae::Profile`] answers what the *protocol* needs — naming, kinds, tags,
 /// the record ceiling — and deliberately has no hook for anything
 /// dataset-shaped. The lifecycle needs a little more than that and strictly
 /// less than a dataset: which kinds an epoch produces, which kinds carry the
-/// tip, whether a layer may be carried forward, and whether two documents
-/// describe the same dataset at all. None of those answers reaches into a
-/// store, a chain or a node, which is why they can live on a companion trait
-/// here rather than growing the protocol's.
+/// state, which array a layer is listed in, and whether two documents describe
+/// the same dataset at all. None of those answers reaches into a store, a chain
+/// or a node, which is why they can live on a companion trait here rather than
+/// growing the protocol's.
 ///
 /// Everything crossing this boundary in either direction is opaque: a `scope`
 /// and a `position` are [`serde_json::Value`], composed by the profile and
@@ -22,9 +33,6 @@ use crate::Error;
 pub trait DriverProfile: stelae::Profile {
     /// The kinds a closed window always produces a layer for, plus the sparse
     /// ones it may.
-    ///
-    /// The set a publish enumerates when it asks what it could carry forward
-    /// rather than build.
     fn epoch_kinds(&self) -> &[&str];
 
     /// The subset of [`DriverProfile::epoch_kinds`] a window produces
@@ -35,27 +43,24 @@ pub trait DriverProfile: stelae::Profile {
     /// sparse ones have to be counted against the data.
     fn dense_epoch_kinds(&self) -> &[&str];
 
-    /// Whether `kind` carries the dataset's tip rather than one window of its
+    /// Whether `kind` carries the dataset's state rather than one window of its
     /// history.
     ///
-    /// Kind classification like [`DriverProfile::epoch_kinds`], and asked for
-    /// one reason: the staging arithmetic sizes the two halves of a snapshot
-    /// differently. A tip is rewritten whole by every publish, so all of it is
-    /// staged together and every such layer sums; anything else is staged a few
-    /// at a time and only the largest few count. [`is_inheritable`] cannot
-    /// stand in for this — it answers a different question, and a snapshot has
-    /// layers that are neither inheritable nor tip.
-    ///
-    /// [`is_inheritable`]: DriverProfile::is_inheritable
+    /// Asked for one reason: the staging arithmetic sizes the two halves of a
+    /// snapshot differently. State is rewritten whole by every publish, so all
+    /// of it is staged together and every such layer sums; anything else is
+    /// staged a few at a time and only the largest few count.
+    /// [`DriverProfile::role`] cannot stand in for this: a tip may hold layers
+    /// that are not state.
     fn is_state_kind(&self, kind: &str) -> bool;
 
-    /// Whether a layer of `kind` at `scope` may be carried forward from an
-    /// earlier publish rather than built again.
+    /// The array a layer of `kind` at `scope` is listed in by the snapshot at
+    /// `sequence`, asked of a layer about to be written.
     ///
-    /// A question about the scope as well as the kind, and the one rule three
-    /// callers share: the predecessor's manifest, an interrupted publish's
-    /// record, and the note a landed layer leaves.
-    fn is_inheritable(&self, kind: &str, scope: &serde_json::Value) -> bool;
+    /// A layer goes to [`Role::Diff`] once its content is final, and until then
+    /// each snapshot carries its current form in [`Role::Tip`]. So the answer
+    /// may depend on the scope and the sequence as well as the kind.
+    fn role(&self, kind: &str, scope: &serde_json::Value, sequence: u64) -> Result<Role, Error>;
 
     /// Refuse a predecessor that describes a different dataset than the one
     /// being published.
@@ -72,22 +77,31 @@ pub trait DriverProfile: stelae::Profile {
     ) -> Result<(), Error>;
 }
 
-/// Put a snapshot's layers into its inscription: a state kind's layer into
-/// `tip`, every other layer into `diff`, each array in the order given.
+/// Put a snapshot's layers into its inscription, each in the array
+/// [`DriverProfile::role`] names at the inscription's sequence, each array in
+/// the order given.
 ///
-/// [`DriverProfile::is_state_kind`] is the whole rule, so the kind alone
-/// decides the array.
+/// A layer the profile cannot place fails the whole placement and leaves the
+/// inscription's arrays as they were.
 pub fn place_layers(
     profile: &dyn DriverProfile,
     inscription: &mut Inscription,
     layers: impl IntoIterator<Item = LayerDescriptor>,
-) {
-    let (tip, diff) = layers
-        .into_iter()
-        .partition(|layer| profile.is_state_kind(&layer.kind));
+) -> Result<(), Error> {
+    let mut diff = Vec::new();
+    let mut tip = Vec::new();
+
+    for layer in layers {
+        match profile.role(&layer.kind, &layer.scope, inscription.sequence)? {
+            Role::Diff => diff.push(layer),
+            Role::Tip => tip.push(layer),
+        }
+    }
 
     inscription.diff = diff;
     inscription.tip = tip;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -97,7 +111,8 @@ mod tests {
 
     use super::*;
 
-    /// A profile whose `state` kind is its tip.
+    /// A profile whose `state` kind is its tip, and whose `notes` for a shard
+    /// stay in the tip until a sequence after the shard's own.
     struct Shelf;
 
     impl stelae::Profile for Shelf {
@@ -135,8 +150,21 @@ mod tests {
             kind == "state"
         }
 
-        fn is_inheritable(&self, kind: &str, _scope: &serde_json::Value) -> bool {
-            kind == "notes"
+        fn role(
+            &self,
+            kind: &str,
+            scope: &serde_json::Value,
+            sequence: u64,
+        ) -> Result<Role, Error> {
+            match (kind, scope["shard"].as_u64()) {
+                ("state", _) => Ok(Role::Tip),
+                ("notes", Some(shard)) if shard < sequence => Ok(Role::Diff),
+                ("notes", Some(_)) => Ok(Role::Tip),
+                _ => Err(Error::Unplaced {
+                    kind: kind.to_owned(),
+                    reason: "its scope names no shard".to_owned(),
+                }),
+            }
         }
 
         fn check_same_dataset(
@@ -159,32 +187,58 @@ mod tests {
         }
     }
 
-    #[test]
-    fn state_kinds_go_to_the_tip_and_the_rest_to_the_diff_in_order() {
-        let mut inscription = Inscription::new(
+    fn inscription(sequence: u64) -> Inscription {
+        Inscription::new(
             &Shelf,
-            7,
+            sequence,
             json!({}),
             json!({}),
             Compression {
                 algo: "zstd".to_owned(),
                 level: 9,
             },
-        );
+        )
+    }
+
+    /// The role decides the array at the inscription's own sequence, so one
+    /// kind lands in either array depending on its scope.
+    #[test]
+    fn each_layer_goes_to_the_array_its_role_names_in_order() {
+        let mut inscription = inscription(7);
 
         place_layers(
             &Shelf,
             &mut inscription,
             [
-                layer("notes", 0),
+                layer("notes", 5),
                 layer("state", 0),
-                layer("notes", 1),
+                layer("notes", 7),
+                layer("notes", 6),
                 layer("state", 1),
             ],
-        );
+        )
+        .unwrap();
 
-        assert_eq!(inscription.diff, vec![layer("notes", 0), layer("notes", 1)]);
-        assert_eq!(inscription.tip, vec![layer("state", 0), layer("state", 1)]);
+        assert_eq!(inscription.diff, vec![layer("notes", 5), layer("notes", 6)]);
+        assert_eq!(
+            inscription.tip,
+            vec![layer("state", 0), layer("notes", 7), layer("state", 1)]
+        );
         inscription.validate().unwrap();
+    }
+
+    #[test]
+    fn a_layer_the_profile_cannot_place_is_refused() {
+        let mut inscription = inscription(7);
+
+        let mut unscoped = layer("notes", 0);
+        unscoped.scope = json!({});
+
+        let err =
+            place_layers(&Shelf, &mut inscription, [layer("notes", 1), unscoped]).unwrap_err();
+
+        assert!(matches!(err, Error::Unplaced { .. }), "{err:?}");
+        assert!(inscription.diff.is_empty());
+        assert!(inscription.tip.is_empty());
     }
 }

@@ -4873,9 +4873,12 @@ name = "stelae-driver"
 version = "0.6.0"
 dependencies = [
  "fs4",
+ "hex",
  "minicbor 0.26.5",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "stelae 0.6.0",
  "tempfile",
  "thiserror 2.0.21",

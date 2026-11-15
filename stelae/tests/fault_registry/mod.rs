@@ -58,6 +58,8 @@ struct State {
     gets: HashMap<String, usize>,
     heads: HashMap<String, usize>,
     uploads: usize,
+    /// Blob digests whose upload completed, in that order.
+    pushed: Vec<String>,
     /// The wait before a layer blob's first byte, by digest.
     delays: HashMap<String, Duration>,
     /// Layer blob `GET`s in the order they arrived, and in the order their
@@ -105,6 +107,12 @@ impl FaultRegistry {
     /// The layer blob digests of the manifest last pushed.
     pub fn layers(&self) -> Vec<String> {
         self.state().layers.clone()
+    }
+
+    /// Blob digests uploaded so far, layers and configs alike, in the order
+    /// their uploads completed.
+    pub fn pushed(&self) -> Vec<String> {
+        self.state().pushed.clone()
     }
 
     /// The config blob digest of the manifest last pushed.
@@ -294,7 +302,11 @@ fn handle(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
             }
             "PUT" => {
                 let digest = decode(&request.query, "digest").unwrap_or_default();
-                lock().blobs.insert(digest.clone(), request.body);
+                {
+                    let mut state = lock();
+                    state.blobs.insert(digest.clone(), request.body);
+                    state.pushed.push(digest.clone());
+                }
                 let location = format!("/v2/{repository}/blobs/{digest}");
                 respond(&stream, 201, &[("Location", location)], 0, b"")
             }

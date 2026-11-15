@@ -17,14 +17,10 @@
 //! - [`preflight`] — the free-space policy a publish and a restore share.
 //! - [`reporting`] — the layer and record arithmetic behind
 //!   [`stelae::progress`].
-//! - [`digests`] — the codec for the `digests` layer kind. Its records are
-//!   sha256 over immutable-database files, which is a Cardano shape described
-//!   in Cardano words; the code depends on nothing but this crate and the
-//!   protocol, which is why it sits here.
 //! - [`profile`] — [`DriverProfile`], the little a lifecycle has to ask a
 //!   profile that the protocol's own trait deliberately does not answer.
-//! - [`predecessor`] — the publish a publish follows, and what it may carry
-//!   forward from it.
+//! - [`predecessor`] — the publish a publish follows: the link to it, and the
+//!   layers an interrupted attempt of this publish already uploaded.
 //! - [`publish`] — the chained-publish lifecycle against a repository, behind
 //!   the `oci` feature because that is where a repository lives.
 //! - [`retry`] — the bounded patience a run spends on an external that fails in
@@ -32,7 +28,6 @@
 //! - [`Standing`] — where a node stands against a repository's latest snapshot.
 //! - [`scope_key`] — the pair that identifies one layer.
 
-pub mod digests;
 pub mod predecessor;
 pub mod preflight;
 pub mod profile;
@@ -43,7 +38,7 @@ pub mod restore;
 pub mod retry;
 
 pub use predecessor::{First, Predecessor};
-pub use profile::{place_layers, DriverProfile};
+pub use profile::{place_layers, DriverProfile, Role};
 
 /// Errors raised by the driver.
 ///
@@ -86,6 +81,11 @@ pub enum Error {
     /// every other shared refusal here does.
     #[error("this snapshot describes dataset {found}, but this node is configured for {expected}")]
     DatasetMismatch { expected: u64, found: u64 },
+
+    /// A layer the profile cannot assign to `diff` or `tip`, as
+    /// [`DriverProfile::role`] judged it.
+    #[error("a {kind} layer cannot be placed in diff or tip: {reason}")]
+    Unplaced { kind: String, reason: String },
 
     /// A publish that would not extend the repository's chain. Raised by
     /// [`stelae::inscription::link_for`] and carried here unchanged.
@@ -131,13 +131,6 @@ impl From<stelae::Error> for Error {
 }
 
 impl Error {
-    pub(crate) fn out_of_order(kind: &'static str, reason: impl Into<String>) -> Self {
-        Self::OutOfOrder {
-            kind,
-            reason: reason.into(),
-        }
-    }
-
     pub(crate) fn malformed_inscription(
         field: impl Into<String>,
         reason: impl Into<String>,
@@ -204,14 +197,13 @@ impl Standing {
 /// one layer exactly when they are the same bytes inside the canonical
 /// document — the only sense of "the same scope" the protocol has.
 ///
-/// One function rather than three, and that is the point of it being here
-/// instead of beside any one caller. Every table keyed this way is compared
-/// against another table keyed this way: the predecessor's inheritable layers
-/// against what a publish asks for, an interrupted publish's record against the
-/// same, a reproduction's layers against the published ones. Three copies of
-/// four lines would agree until one of them was corrected, and the failure that
-/// follows is silent — a layer rebuilt instead of inherited, or a divergence
-/// reported between two documents that say the same thing.
+/// One function rather than one per caller, and that is the point of it being
+/// here. Every table keyed this way is compared against another table keyed
+/// this way: an interrupted publish's record against what a publish asks for, a
+/// reproduction's layers against the published ones. Copies of four lines
+/// would agree until one of them was corrected, and the failure that follows is
+/// silent — a layer rebuilt instead of resumed, or a divergence reported
+/// between two documents that say the same thing.
 pub fn scope_key(kind: &str, scope: &serde_json::Value) -> Result<(String, String), Error> {
     let canonical = stelae::inscription::canonical_json(scope)?;
 
