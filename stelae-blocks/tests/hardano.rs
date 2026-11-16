@@ -25,9 +25,9 @@ use std::{
 
 use pallas_hardano::storage::immutable::secondary;
 use stelae::{
-    dir::{SnapshotDir, BLOBS_DIR},
+    dir::{Snapshot, SnapshotDir, WrittenLayer, BLOBS_DIR},
     inscription::{LayerDescriptor, Link},
-    Digest, SnapshotReader,
+    Digest, LayerDigests, SnapshotReader,
 };
 use stelae_blocks::{
     hardano::{block_record, export, Epoch, Sealed},
@@ -114,6 +114,16 @@ fn read_back<R: SnapshotReader>(snapshot: &R) -> Vec<BlockRecord> {
     blocks
 }
 
+/// The newest sequence a layout holds, read as one sequence.
+fn latest(dir: &SnapshotDir) -> Snapshot {
+    dir.pull_latest(&BlocksProfile).unwrap()
+}
+
+/// [`latest`] of the layout at `root`.
+fn latest_in(root: &Path) -> Snapshot {
+    latest(&SnapshotDir::open(root).unwrap())
+}
+
 fn export_to_dir(dir: &Path, predecessor: &dyn Predecessor, number: u64) -> Sealed {
     let fixture = fixture();
     let snapshot = SnapshotDir::create(dir).unwrap();
@@ -138,7 +148,7 @@ fn each_file_s_bodies_concatenate_to_its_chunk() {
         )
         .unwrap();
 
-        let blocks = read_back(&snapshot);
+        let blocks = read_back(&latest(&snapshot));
         let bodies: Vec<u8> = blocks.iter().flat_map(|b| b.body.clone()).collect();
 
         assert!(!blocks.is_empty());
@@ -242,7 +252,7 @@ fn an_epoch_over_several_files_takes_each_of_them() {
     let snapshot = SnapshotDir::create(out.path()).unwrap();
     export(&snapshot, &First, &over_two_files(&fixture)).unwrap();
 
-    let bodies: Vec<u8> = read_back(&snapshot)
+    let bodies: Vec<u8> = read_back(&latest(&snapshot))
         .into_iter()
         .flat_map(|b| b.body)
         .collect();
@@ -292,7 +302,7 @@ fn a_boundary_block_keeps_its_place_in_the_stream() {
     let fixture = fixture();
     let out = tempfile::tempdir().unwrap();
     export_to_dir(out.path(), &First, 0);
-    let blocks = read_back(&SnapshotDir::open(out.path()).unwrap());
+    let blocks = read_back(&latest_in(out.path()));
 
     // `[0, ebb]`: era tag 0 is a Byron epoch boundary block.
     let (boundary, rest) = blocks.split_first().unwrap();
@@ -405,12 +415,12 @@ struct Recording<'a> {
     landed: Mutex<Vec<LayerDescriptor>>,
 }
 
-/// A layer an earlier attempt uploaded: its descriptor, the snapshot that
-/// holds its blob, and the one the publish writes into.
+/// A layer an earlier attempt uploaded: the layer, the snapshot that holds
+/// its blob, and the layout the publish writes into.
 struct Interrupted<'a> {
-    descriptor: LayerDescriptor,
+    written: WrittenLayer,
     from: &'a Path,
-    into: &'a Path,
+    into: &'a SnapshotDir,
 }
 
 impl<'a> Recording<'a> {
@@ -450,10 +460,19 @@ impl Predecessor for Recording<'_> {
         let blobs = |root: &Path| root.join(BLOBS_DIR).join(Digest::ALGORITHM);
         for blob in fs::read_dir(blobs(interrupted.from)).unwrap() {
             let blob = blob.unwrap();
-            fs::copy(blob.path(), blobs(interrupted.into).join(blob.file_name())).unwrap();
+            fs::copy(
+                blob.path(),
+                blobs(interrupted.into.root()).join(blob.file_name()),
+            )
+            .unwrap();
         }
 
-        Ok(Some(interrupted.descriptor.clone()))
+        assert!(interrupted
+            .into
+            .adopt_carried(interrupted.written.clone())
+            .unwrap());
+
+        Ok(Some(interrupted.written.descriptor.clone()))
     }
 
     fn landed(&self, descriptor: &LayerDescriptor) -> Result<(), stelae_driver::Error> {
@@ -477,6 +496,26 @@ fn a_built_layer_is_noted_as_landed() {
 
 /// The directory of immutable files is empty: the layer comes only from the
 /// interrupted attempt.
+/// The layer `descriptor` names in the layout at `root`, as its writer
+/// recorded it.
+fn written_layer(root: &Path, descriptor: &LayerDescriptor) -> WrittenLayer {
+    let snapshot = latest_in(root);
+    let index = snapshot.blob_index().unwrap();
+
+    WrittenLayer {
+        descriptor: descriptor.clone(),
+        digests: LayerDigests {
+            diff_id: descriptor.diff_id,
+            blob_digest: index.blob_for(&descriptor.diff_id).unwrap(),
+            uncompressed_size: descriptor.uncompressed_size,
+            compressed_size: snapshot
+                .compressed_size(&index, descriptor)
+                .unwrap()
+                .unwrap(),
+        },
+    }
+}
+
 #[test]
 fn a_resumed_layer_is_not_read_again() {
     let first = tempfile::tempdir().unwrap();
@@ -489,9 +528,9 @@ fn a_resumed_layer_is_not_read_again() {
     let resuming = Recording::new(
         &epoch,
         Some(Interrupted {
-            descriptor: sealed.inscription.diff[0].clone(),
+            written: written_layer(first.path(), &sealed.inscription.diff[0]),
             from: first.path(),
-            into: out.path(),
+            into: &snapshot,
         }),
     );
 
@@ -500,8 +539,8 @@ fn a_resumed_layer_is_not_read_again() {
     assert_eq!(resumed.digest, sealed.digest);
     assert_eq!(resuming.landed(), sealed.inscription.diff);
     assert_eq!(
-        read_back(&SnapshotDir::open(out.path()).unwrap()),
-        read_back(&SnapshotDir::open(first.path()).unwrap())
+        read_back(&latest_in(out.path())),
+        read_back(&latest_in(first.path()))
     );
 }
 
@@ -560,10 +599,7 @@ fn two_sequences_chain_in_directories() {
     let first = export_to_dir(one.path(), &First, 0);
     let second = export_to_dir(two.path(), &Follows(link(&first)), 1);
 
-    let (one, two) = (
-        SnapshotDir::open(one.path()).unwrap(),
-        SnapshotDir::open(two.path()).unwrap(),
-    );
+    let (one, two) = (latest_in(one.path()), latest_in(two.path()));
 
     resolve(&[
         (&first, one.read_inscription().unwrap()),

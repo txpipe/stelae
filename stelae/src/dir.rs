@@ -528,6 +528,24 @@ impl SnapshotDir {
         self.blobs.blob_path(digest)
     }
 
+    /// Carry a layer whose blob this layout already holds into the next seal,
+    /// as a publish resuming an interrupted attempt does.
+    ///
+    /// `Ok(false)` when the blob is not here at the size `layer` records:
+    /// nothing is carried, and the caller builds the layer after all.
+    pub fn adopt_carried(&self, layer: WrittenLayer) -> Result<bool, Error> {
+        match fs::metadata(self.blob_path(&layer.digests.blob_digest)) {
+            Ok(metadata) if metadata.len() == layer.digests.compressed_size => {}
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+
+        lock(&self.pending).push(layer);
+
+        Ok(true)
+    }
+
     /// Every tag `index.json` holds, with the manifest descriptor it names.
     pub fn tags(&self) -> Result<BTreeMap<String, Descriptor>, Error> {
         read_index(self.root())

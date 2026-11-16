@@ -2403,3 +2403,41 @@ fn a_directory_that_is_not_an_image_layout_is_refused() {
     let err = layout.pull_latest(&ToyProfile).unwrap_err();
     assert!(matches!(err, Error::Layout(_)), "{err:?}");
 }
+
+/// A layer an earlier attempt wrote is carried into a seal by its blob, as a
+/// resumed publish carries it, and a blob that is not here is not carried.
+#[test]
+fn a_carried_layer_is_sealed_without_being_written_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let layout = SnapshotDir::create(temp.path()).unwrap();
+
+    // Written into the store alone, so no seal lists them yet.
+    let (notes, index) = write_layers(layout.blobs(), &ToyProfile);
+    let inscription = chapter_three(notes.descriptor.clone(), index.descriptor.clone());
+
+    let err = layout.seal(&ToyProfile, &inscription).unwrap_err();
+    assert!(matches!(err, Error::ManifestMismatch(_)), "{err:?}");
+
+    let mut absent = notes.clone();
+    absent.digests.blob_digest = Digest::from_bytes([0xee; 32]);
+    assert!(!layout.adopt_carried(absent).unwrap());
+
+    let mut resized = notes.clone();
+    resized.digests.compressed_size += 1;
+    assert!(!layout.adopt_carried(resized).unwrap());
+
+    assert!(layout.adopt_carried(notes).unwrap());
+    assert!(layout.adopt_carried(index).unwrap());
+
+    let digest = layout.seal(&ToyProfile, &inscription).unwrap();
+
+    let written = tempfile::tempdir().unwrap();
+    assert_eq!(digest, write_snapshot(written.path()).1);
+
+    let snapshot = layout.pull_latest(&ToyProfile).unwrap();
+    let index = snapshot.blob_index().unwrap();
+
+    for descriptor in inscription.layers() {
+        read_both_ways(&snapshot, &index, descriptor).unwrap();
+    }
+}
