@@ -192,8 +192,8 @@ impl Inscription {
     /// itself leaves undefined and `serde_json` resolves last-wins. That is not
     /// a hole in practice: canonicalizing the result yields different bytes
     /// from the input, so any check that compares an inscription against its
-    /// digest — which is every use of one — refuses it. `SnapshotDir` makes the
-    /// comparison explicit.
+    /// digest — which is every use of one — refuses it. Both transports make
+    /// the comparison explicit when they read an inscription.
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let value: serde_json::Value = serde_json::from_slice(bytes)?;
 

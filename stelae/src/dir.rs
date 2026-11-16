@@ -1,62 +1,34 @@
-//! A snapshot on a local filesystem.
+//! A directory as an OCI image layout.
 //!
 //! ```text
 //! <root>/
-//!   inscription.json          canonical JSON, byte-for-byte
-//!   blobs/sha256/<hex>        one compressed layer per file
+//!   oci-layout           {"imageLayoutVersion":"1.0.0"}
+//!   index.json           an OCI image index: one manifest descriptor per tag
+//!   blobs/sha256/<hex>   layers, manifests and inscriptions, by digest
 //! ```
 //!
-//! This is the smallest complete snapshot: enough to write one, read it back
-//! and verify it end to end without a registry. It exists for two reasons.
+//! A layout holds what a registry repository holds (decision 0080): the same
+//! manifests under the same tags, over one shared `blobs/`. So it holds many
+//! sequences, a seal appends one, and the two can be copied into each other
+//! blob for blob. [`SnapshotDir::pull`] reads one sequence and
+//! [`SnapshotDir::resolve`] walks its chain, as a registry's do.
 //!
-//! It is the **seam** OCI transport slots into. Blob paths are the OCI image
-//! layout's (`blobs/<algorithm>/<encoded>`, named by the digest of the stored
-//! bytes), so adding `oci-layout` and `index.json` later puts files *beside*
-//! these rather than moving them.
+//! [`BlobStore`] is the content-addressed half on its own, with no index: a
+//! blob is staged under a [`STAGING_PREFIX`] name and committed by its
+//! digest. A layout writes its layers through one.
 //!
-//! And it makes a snapshot **inspectable by hand** from the first commit of the
-//! format — `zstd -d < blobs/sha256/<hex> | cbor2diag` prints the records,
-//! which is worth a great deal while a spec is young.
-//!
-//! It is not `stelae-publisher publish --output-dir`: that command publishes
-//! the Dolos profile and carries its own layer-selection and progress
-//! semantics.
-//!
-//! ## The manifest a directory grew
-//!
-//! An inscription lists `diffId`s — identity — and deliberately not compressed
-//! digests, which are transport and live in the OCI manifest. With no map from
-//! a layer descriptor to the file holding it, [`SnapshotDir::blob_index`] has
-//! to rebuild one by scanning: every blob decompressed once, in full, before
-//! the restore goes on to read them all again. A directory restore therefore
-//! decompressed the whole snapshot twice.
-//!
-//! So [`SnapshotWriter::seal`] writes the map down beside the inscription —
-//! [`BLOB_INDEX_FILE`], `diffId` → blob digest, which is the one thing a
-//! registry's manifest supplies that this layout did not. A directory that
-//! carries it is a degenerate registry: the map is read, no blob is opened, and
-//! each blob is decompressed exactly once — by the restore that wanted it.
-//!
-//! The sidecar is **transport and never identity**. Nothing signs it, nothing
-//! hashes it into the snapshot's digest, and both halves of every entry are
-//! recoverable from the blobs themselves — which is exactly why a snapshot
-//! without one still reads, by the scan that was the only way before it.
-//! Absence is the older format; a file that does not parse is a fault and not
-//! an absence.
-//!
-//! ## Where the seam moved to
-//!
-//! [`LayerSpec`], [`WrittenLayer`] and [`BlobIndex`] are re-exports: they are
-//! the vocabulary of [`crate::transport`], which this module was the first and
-//! for a while the only implementation of. They keep their old paths so that
-//! `stelae::dir::BlobIndex` still resolves.
+//! Every blob decompresses with `zstd -d < blobs/sha256/<hex>` or reads as
+//! JSON, so a snapshot stays inspectable by hand.
 
 use std::{
     collections::BTreeMap,
     fs, io,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -64,24 +36,41 @@ use serde::{Deserialize, Serialize};
 pub use crate::transport::{BlobIndex, LayerSpec, WrittenLayer};
 
 use crate::{
-    digest::{digest_reader, read_blob, scan_blob, undecodable, LayerDigests, LayerWriter},
+    chain::Chain,
+    digest::{read_blob, undecodable, LayerDigests, LayerWriter},
     frame::{CanonicalCbor, LayerHeader, Limits, SeqReader, SeqWriter},
-    inscription::LayerDescriptor,
+    inscription::{canonical_json, LayerDescriptor},
     layer::{check_header, check_identity, check_record_count, LayerReader},
-    profile::Profile,
+    manifest::{
+        build_manifests, check_envelope, inscription_of, manifest_bytes, read_manifest, Array,
+        Descriptor, Manifest, Manifests, IMAGE_MANIFEST_MEDIA_TYPE,
+    },
+    profile::{checked_tag_for_sequence, tip_tag, validate_tag, Profile},
     transport::{open_layer, RecordSink, SnapshotReader, SnapshotWriter},
-    Digest, Error, Inscription,
+    Digest, Error, Inscription, ARTIFACT_TYPE,
 };
 
-/// File name of the inscription at the root of a snapshot directory.
-pub const INSCRIPTION_FILE: &str = "inscription.json";
+/// The file that marks a directory as an OCI image layout.
+pub const LAYOUT_FILE: &str = "oci-layout";
 
-/// Directory holding content-addressed blobs, in OCI image-layout shape.
+/// The `imageLayoutVersion` this implementation writes and reads.
+pub const LAYOUT_VERSION: &str = "1.0.0";
+
+/// The image index naming a layout's tags.
+pub const INDEX_FILE: &str = "index.json";
+
+/// Directory holding content-addressed blobs: `blobs/<algorithm>/<hex>`.
 pub const BLOBS_DIR: &str = "blobs";
 
-/// File name of the `diffId` → blob digest map at the root of a snapshot
-/// directory: what this layout has instead of a registry's manifest.
-pub const BLOB_INDEX_FILE: &str = "blobs.json";
+/// Prefix of a file being written before it has its name: a staged blob in
+/// `blobs/`, or a document at the root of a layout.
+pub const STAGING_PREFIX: &str = ".staging-";
+
+/// Media type of an OCI image index, the document `index.json` is.
+pub const IMAGE_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
+
+/// Annotation naming the tag of an `index.json` entry.
+pub const REF_NAME_ANNOTATION: &str = "org.opencontainers.image.ref.name";
 
 /// A layer read back from disk, verified against its descriptor.
 pub struct Layer {
@@ -127,39 +116,230 @@ impl Layer {
     }
 }
 
-/// A layer of a snapshot directory being written, one record at a time.
+/// A content-addressed blob store: `blobs/sha256/<hex>` under a root.
 ///
-/// The directory's implementation of [`RecordSink`], and the mirror of
-/// [`LayerReader`] on the write side. Nothing is buffered: records are framed,
-/// hashed and compressed on the way past — [`LayerWriter`] was always a
-/// one-pass writer — so a layer of any size costs the compressor's window and
-/// one record, whatever the profile is publishing.
-///
-/// A sink owns its staging file rather than borrowing the directory, so several
-/// can be open at once; the counter in [`SnapshotDir::layer_sink`] keeps their
-/// staging names apart.
-///
-/// ## Nothing exists until `finish`
-///
-/// A layer's name is the digest of its own compressed bytes, so it cannot be
-/// known before the last record is written. Until then the layer is a staging
-/// file, invisible to [`SnapshotDir::blob_index`], and a sink dropped without
-/// [`RecordSink::finish`] takes it with it — an export that fails halfway
-/// leaves no partial layer behind. Only `finish` puts a blob in the snapshot.
-pub struct LayerSink {
-    /// Declared before `staging` on purpose: fields drop in declaration order,
-    /// so the file handle is closed before the file it names is unlinked. On
-    /// Windows that is the difference between removing an abandoned staging
-    /// file and failing to.
-    sequence: SeqWriter<LayerWriter<fs::File>>,
-    staging: Staging,
+/// A blob is written to a [`Staged`] file and committed by its digest, so a
+/// digest's name never holds part of a blob. The store knows no tags;
+/// [`SnapshotDir`] is the layout over one. One writer at a time.
+#[derive(Debug, Clone)]
+pub struct BlobStore {
     root: PathBuf,
+}
+
+impl BlobStore {
+    /// Open `root` as a blob store, creating `blobs/sha256` if it is absent.
+    pub fn create(root: impl Into<PathBuf>) -> Result<Self, Error> {
+        let root = root.into();
+
+        fs::create_dir_all(root.join(BLOBS_DIR).join(Digest::ALGORITHM))?;
+
+        Ok(Self { root })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Where the blob of `digest` lives, whether or not it is there.
+    pub fn blob_path(&self, digest: &Digest) -> PathBuf {
+        self.blobs_dir().join(digest.to_hex())
+    }
+
+    fn blobs_dir(&self) -> PathBuf {
+        self.root.join(BLOBS_DIR).join(Digest::ALGORITHM)
+    }
+
+    /// A new staging file in `blobs/`, beside `sha256/` and never in it.
+    pub fn stage(&self) -> Result<Staged, Error> {
+        static STAGED: AtomicU64 = AtomicU64::new(0);
+
+        let path = self.root.join(BLOBS_DIR).join(format!(
+            "{STAGING_PREFIX}{}-{}",
+            std::process::id(),
+            STAGED.fetch_add(1, Ordering::Relaxed),
+        ));
+
+        Ok(Staged {
+            file: Some(fs::File::create(&path)?),
+            path,
+            blob_dir: self.blobs_dir(),
+            committed: false,
+        })
+    }
+
+    /// Store `bytes` and return their digest. A blob already there is kept.
+    pub fn put(&self, bytes: &[u8]) -> Result<Digest, Error> {
+        let digest = Digest::compute(bytes);
+
+        if !self.blob_path(&digest).exists() {
+            let mut staged = self.stage()?;
+            staged.write_all(bytes)?;
+            staged.commit(&digest)?;
+        }
+
+        Ok(digest)
+    }
+
+    /// The blob `descriptor` names, held to its digest and size, or `None`
+    /// when it is not here.
+    fn read(&self, descriptor: &Descriptor) -> Result<Option<Vec<u8>>, Error> {
+        let digest = descriptor.digest.parse::<Digest>()?;
+
+        let mut file = match fs::File::open(self.blob_path(&digest)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mismatch = |actual: String| Error::DigestMismatch {
+            subject: format!("blob {digest} ({} bytes claimed)", descriptor.size),
+            expected: digest.to_string(),
+            actual,
+        };
+
+        // The size is checked before anything is read.
+        let size = file.metadata()?.len();
+
+        if size as i64 != descriptor.size {
+            return Err(mismatch(format!("{size} bytes")));
+        }
+
+        let mut raw = Vec::with_capacity(size as usize);
+        io::Read::read_to_end(&mut file, &mut raw)?;
+
+        let actual = Digest::compute(&raw);
+
+        if actual != digest || raw.len() as u64 != size {
+            return Err(mismatch(format!("{actual} ({} bytes)", raw.len())));
+        }
+
+        Ok(Some(raw))
+    }
+
+    /// Open the blob holding a layer. A layer the index does not place and a
+    /// blob that is not here are one condition, [`Error::LayerNotFound`].
+    fn open_layer(
+        &self,
+        index: &BlobIndex,
+        descriptor: &LayerDescriptor,
+    ) -> Result<fs::File, Error> {
+        let missing = || Error::LayerNotFound {
+            kind: descriptor.kind.clone(),
+            diff_id: descriptor.diff_id.to_string(),
+        };
+
+        let blob = index.blob_for(&descriptor.diff_id).ok_or_else(missing)?;
+
+        fs::File::open(self.blob_path(&blob)).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => missing(),
+            _ => e.into(),
+        })
+    }
+
+    fn sink(
+        &self,
+        profile: &dyn Profile,
+        spec: &LayerSpec,
+        level: i32,
+        pending: Option<Pending>,
+    ) -> Result<LayerSink, Error> {
+        // The profile's media type is checked before the staging file exists.
+        let (sequence, media_type) = open_layer(profile, spec, level, || self.stage())?;
+
+        Ok(LayerSink {
+            sequence,
+            kind: spec.kind.clone(),
+            media_type,
+            scope: spec.scope.clone(),
+            pending,
+        })
+    }
+}
+
+/// A blob being written, before it has a name.
+///
+/// Dropped without [`Staged::commit`], it removes its file, so a write that
+/// fails part way leaves nothing behind.
+pub struct Staged {
+    /// Closed before the file is renamed or removed.
+    file: Option<fs::File>,
+    path: PathBuf,
+    blob_dir: PathBuf,
+    committed: bool,
+}
+
+impl Staged {
+    fn file(&mut self) -> &mut fs::File {
+        self.file
+            .as_mut()
+            .expect("a staged blob holds its file until it is committed")
+    }
+
+    /// Make the staged bytes durable and name them by `digest`, their sha256,
+    /// which the caller computed as it wrote them.
+    ///
+    /// A blob already under that name holds the same bytes: it is kept, and
+    /// the staging file is removed.
+    pub fn commit(mut self, digest: &Digest) -> Result<(), Error> {
+        if let Some(file) = self.file.take() {
+            file.sync_all()?;
+        }
+
+        let blob = self.blob_dir.join(digest.to_hex());
+
+        if !blob.exists() {
+            fs::rename(&self.path, &blob)?;
+            self.committed = true;
+        }
+
+        Ok(())
+    }
+}
+
+impl Write for Staged {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file().flush()
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        drop(self.file.take());
+
+        if !self.committed {
+            // Nobody is left to report a failure to, and the file is inert.
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// The layers a layout's sinks finished since its last seal.
+type Pending = Arc<Mutex<Vec<WrittenLayer>>>;
+
+/// A poisoned lock means a layer panicked mid-write; the list holds whole
+/// entries, and the failed layer reports its own error.
+fn lock(pending: &Pending) -> std::sync::MutexGuard<'_, Vec<WrittenLayer>> {
+    pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A layer of a blob store being written, one record at a time.
+///
+/// Records are framed, hashed and compressed on the way past into a
+/// [`Staged`] file, which [`RecordSink::finish`] commits by the blob's
+/// digest. A sink owns its staging file, so several can be open at once.
+pub struct LayerSink {
+    sequence: SeqWriter<LayerWriter<Staged>>,
     kind: String,
     media_type: String,
     scope: serde_json::Value,
-    /// Where [`LayerSink::finish`] leaves the pair the sidecar is made of, for
-    /// the seal that writes [`BLOB_INDEX_FILE`] out of them.
-    written: Written,
+    /// The layout's list the finished layer joins, when a layout opened it.
+    pending: Option<Pending>,
 }
 
 impl RecordSink for LayerSink {
@@ -171,650 +351,578 @@ impl RecordSink for LayerSink {
         self.sequence.count()
     }
 
-    /// Close the layer: finish the compressed frame, name the blob by its own
-    /// digest and hand back the descriptor to put in the inscription.
-    ///
-    /// The rename is what publishes the layer, and it is the last thing that
-    /// happens. A failure anywhere in here leaves the snapshot exactly as it
-    /// was: the staging file is removed on the way out, the same as for a
-    /// sink that was simply dropped.
-    ///
-    /// ## A blob that is already there is a success, not a rename
-    ///
-    /// The destination is named by the digest of the very bytes about to be
-    /// moved onto it, so a destination that already exists already holds those
-    /// bytes — that is what content addressing means. Renaming anyway rewrites
-    /// a file with its own contents: hundreds of megabytes of I/O for a mainnet
-    /// state shard, and on Windows a failure. Every reader here opens a blob
-    /// with a plain [`fs::File::open`], without `FILE_SHARE_DELETE`, so
-    /// replacing a blob that a concurrent [`SnapshotReader::stream_layer`]
-    /// holds open is a sharing violation there and silently fine on Unix.
-    /// So the blob on disk is kept, the staging file goes the way an
-    /// abandoned one does, and the caller gets exactly the [`WrittenLayer`]
-    /// it would have got had it been first: `descriptor` and `digests` are
-    /// computed from the record stream, never from the rename.
-    ///
-    /// The existing blob is **trusted on its name, not re-read**. This writer
-    /// computed that digest itself, out of the bytes it had just written, a
-    /// microsecond earlier, and re-reading a file that may be gigabytes to
-    /// confirm what content addressing already asserts would put a second full
-    /// pass on the write path. That is a deliberate divergence from the
-    /// neighbour: [`SnapshotDir::blob_index`] re-digests every blob it finds,
-    /// at a cost its own documentation calls out. It is a fixture scanner
-    /// rebuilding a map with no manifest to lean on and no knowledge of who
-    /// wrote what, which is not the position of a writer holding its own
-    /// digest.
-    ///
-    /// The window between the test and the rename is a TOCTOU, and an unguarded
-    /// one on purpose: the path *is* the digest, so the only racer that can
-    /// create it is another writer of byte-identical content, and both orders
-    /// leave the same blob. A lock here would serialize every layer write to
-    /// arbitrate between two callers who agree.
+    /// Close the frame and commit the blob by its digest. The descriptor and
+    /// digests come from the record stream, so a blob that was already there
+    /// gives the same answer.
     fn finish(self) -> Result<WrittenLayer, Error> {
-        let Self {
-            sequence,
-            mut staging,
-            root,
-            kind,
-            media_type,
-            scope,
-            written,
-        } = self;
+        let count = self.sequence.count();
+        let (staged, digests) = self.sequence.into_inner().finish()?;
 
-        let count = sequence.count();
-        let (file, digests) = sequence.into_inner().finish()?;
-        file.sync_all()?;
-        drop(file);
+        staged.commit(&digests.blob_digest)?;
 
-        // Named by the digest of the bytes stored, per the OCI image layout.
-        let blob = blob_path(&root, &digests.blob_digest);
-
-        // Already published, by this run or an earlier one: leave it alone and
-        // let `staging` take the duplicate with it on the way out.
-        if !blob.exists() {
-            fs::rename(&staging.path, &blob)?;
-            staging.published();
-        }
-
-        // The two names of one layer, caught here because this is the only
-        // place both are in hand: identity goes on to the inscription and
-        // transport does not, so a `seal` that wanted the pair back would have
-        // to recompute it — which is the scan this record exists to remove.
-        // Recorded whether or not the rename happened, since a destination that
-        // already existed already holds these very bytes.
-        lock(&written).insert(digests.diff_id, digests.blob_digest);
-
-        Ok(WrittenLayer {
+        let written = WrittenLayer {
             descriptor: LayerDescriptor {
-                kind,
-                media_type,
+                kind: self.kind,
+                media_type: self.media_type,
                 diff_id: digests.diff_id,
                 records: count,
                 uncompressed_size: digests.uncompressed_size,
-                scope,
+                scope: self.scope,
             },
             digests,
-        })
-    }
-}
-
-/// The staging file a layer is written into before it has a name.
-///
-/// Removing it is a `Drop` rather than a step in [`LayerSink::finish`] because
-/// the case that matters is the one nobody writes code for: a producer that
-/// hits an error mid-layer and returns. Nothing *reads* an abandoned staging
-/// file — it sits beside `sha256/` and [`SnapshotDir::blob_index`] only
-/// considers digest-named entries inside it — but a mainnet state shard is
-/// hundreds of megabytes, and a failed export leaving sixteen of them on the
-/// disk is its own incident.
-struct Staging {
-    path: PathBuf,
-    published: bool,
-}
-
-impl Staging {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            published: false,
-        }
-    }
-
-    /// The file has been renamed to its content-addressed name: nothing is left
-    /// at the staging path, and an unlink of it later could only ever hit
-    /// somebody else's.
-    fn published(&mut self) {
-        self.published = true;
-    }
-}
-
-impl Drop for Staging {
-    fn drop(&mut self) {
-        if !self.published {
-            // The sink has already failed or been abandoned; a failure to
-            // remove the file has nobody left to report it to, and the file is
-            // inert either way.
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// Where a blob of `digest` lives under `root`, per the OCI image layout.
-///
-/// One definition, used both to write a layer and to find it again — a snapshot
-/// whose writer and reader disagreed about the path would be unreadable by
-/// itself and perfectly readable by nobody.
-fn blob_path(root: &Path, digest: &Digest) -> PathBuf {
-    root.join(BLOBS_DIR)
-        .join(Digest::ALGORITHM)
-        .join(digest.to_hex())
-}
-
-/// Rebuild the `diffId` → blob map by scanning and verifying every blob.
-///
-/// What a directory did before it carried [`BLOB_INDEX_FILE`], and what one
-/// published before that file existed still does. Two distinct checks, in this
-/// order, because conflating them is how corruption gets skipped as "not a
-/// layer":
-///
-/// 1. **Content addressing** — a file named by a digest must hash to that
-///    digest. This holds for every blob in the directory, layer or not, and a
-///    mismatch is corruption and fails the whole index.
-/// 2. **Readability** — only then is the blob decompressed. A file that is not
-///    a zstd frame is simply not a layer and is skipped, which leaves room for
-///    a future OCI layout's manifest and config blobs beside these.
-///
-/// Costs one raw pass plus one decompressing pass per blob, over the whole
-/// snapshot, before the restore has read a record. That is what the sidecar
-/// removes; see the module documentation.
-fn scan_blobs(root: &Path) -> Result<BlobIndex, Error> {
-    let mut index = BTreeMap::new();
-    let dir = root.join(BLOBS_DIR).join(Digest::ALGORITHM);
-
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-
-        // A file whose name is not a digest was not put here by this
-        // protocol; leave it alone.
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
         };
 
-        let Ok(expected) = format!("{}:{name}", Digest::ALGORITHM).parse::<Digest>() else {
-            continue;
-        };
-
-        let (actual, _) = digest_reader(fs::File::open(&path)?)?;
-
-        if actual != expected {
-            return Err(Error::DigestMismatch {
-                subject: format!("blob {name}"),
-                expected: expected.to_string(),
-                actual: actual.to_string(),
-            });
+        if let Some(pending) = &self.pending {
+            lock(pending).push(written.clone());
         }
 
-        match scan_blob(fs::File::open(&path)?) {
-            Ok(digests) => {
-                index.insert(digests.diff_id, digests.blob_digest);
-            }
-            // Content-addressed and intact, but not a compressed layer.
-            //
-            // Only the decoder's verdict on the bytes counts as "not a
-            // layer". A `PermissionDenied`, a device error or a decoder that
-            // could not allocate is a real failure, and skipping on it would
-            // drop a blob that does exist from the index — resurfacing later
-            // as a `LayerNotFound` that points at the wrong problem.
-            Err(Error::Io(e)) if undecodable(&e).is_some() => continue,
-            Err(e) => return Err(e),
-        }
-    }
-
-    Ok(index.into_iter().collect())
-}
-
-/// The `diffId` → blob digest pairs a directory has learned by writing them.
-///
-/// Shared rather than owned because the sinks that fill it outlive the borrow
-/// that made them: several layers are open at once, on several threads, which
-/// is the normal case for a profile that shards.
-type Written = Arc<Mutex<BTreeMap<Digest, Digest>>>;
-
-/// A poisoned lock means a layer panicked mid-write. What is behind it is a map
-/// of pairs each written in one `insert`, so it is still coherent, and the
-/// failed layer is reported by the `?` that carried its error out — refusing to
-/// look would turn one failed layer into a snapshot that cannot be sealed.
-fn lock(written: &Written) -> std::sync::MutexGuard<'_, BTreeMap<Digest, Digest>> {
-    written
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// One layer's two names: its identity, and the blob that holds it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BlobRef {
-    diff_id: Digest,
-    blob: Digest,
-}
-
-/// [`BLOB_INDEX_FILE`]'s document.
-///
-/// An array of pairs rather than an object keyed by `diffId`, for the reason an
-/// OCI manifest's `layers` is one: this is a transport artifact nobody hashes,
-/// so it is shaped for a reader and not for a canonicalizer. The object wrapper
-/// is what leaves room to add a key later without every older reader having to
-/// be taught the difference.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BlobIndexFile {
-    layers: Vec<BlobRef>,
-}
-
-/// A snapshot directory.
-pub struct SnapshotDir {
-    root: PathBuf,
-    /// The pairs this directory's own [`LayerSink`]s produced, kept so
-    /// [`SnapshotWriter::seal`] can write [`BLOB_INDEX_FILE`] out of them.
-    ///
-    /// Empty on a directory that is only being read, which costs nothing: a
-    /// reader never seals.
-    written: Written,
-}
-
-impl SnapshotDir {
-    /// Create the directory skeleton, failing if a snapshot is already there.
-    pub fn create(root: impl Into<PathBuf>) -> Result<Self, Error> {
-        let root = root.into();
-
-        if root.join(INSCRIPTION_FILE).exists() {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!("{INSCRIPTION_FILE} already exists in {}", root.display()),
-            )));
-        }
-
-        fs::create_dir_all(root.join(BLOBS_DIR).join(Digest::ALGORITHM))?;
-
-        Ok(Self {
-            root,
-            written: Written::default(),
-        })
-    }
-
-    /// Open an existing snapshot directory.
-    pub fn open(root: impl Into<PathBuf>) -> Result<Self, Error> {
-        let root = root.into();
-
-        if !root.join(INSCRIPTION_FILE).is_file() {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("no {INSCRIPTION_FILE} in {}", root.display()),
-            )));
-        }
-
-        Ok(Self {
-            root,
-            written: Written::default(),
-        })
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub fn blob_path(&self, digest: &Digest) -> PathBuf {
-        blob_path(&self.root, digest)
-    }
-
-    /// Where [`BLOB_INDEX_FILE`] lives, and the staging name it is renamed
-    /// from.
-    fn blob_index_paths(&self) -> (PathBuf, PathBuf) {
-        (
-            self.root.join(format!(".{BLOB_INDEX_FILE}.staging")),
-            self.root.join(BLOB_INDEX_FILE),
-        )
-    }
-
-    /// Write the `diffId` → blob sidecar, if this directory wrote every layer
-    /// the inscription lists.
-    ///
-    /// That condition is the file's whole meaning. A reader that finds one uses
-    /// it *instead of* looking at the blobs, so a map missing an entry does not
-    /// read as an incomplete index — it reads as a snapshot missing a layer. A
-    /// directory whose blobs came from somewhere this writer never saw gets no
-    /// sidecar and keeps the scan it always had, which is the same fallback a
-    /// snapshot published before this file existed relies on.
-    ///
-    /// The map is keyed by identity, so the file lists each blob once even
-    /// where two descriptors name one `diffId`.
-    ///
-    /// Declining leaves the snapshot with no sidecar, which
-    /// [`SnapshotWriter::seal`] has already seen to: a directory sealed a
-    /// second time through a second handle — the first handle's layers
-    /// already on disk and unknown to this one — would otherwise keep a map
-    /// that is complete for a document nobody publishes any more.
-    ///
-    /// Written through a staging file and renamed, so the name never exists
-    /// over half a document: the reader's rule is that a file which is there
-    /// parses, and the only way to keep that promise across a crash is to
-    /// publish the name atomically. A failure to write it fails the seal — the
-    /// inscription is already down, and a snapshot whose sidecar quietly did
-    /// not land is one that quietly costs every later restore the scan.
-    fn write_blob_index(&self, inscription: &Inscription) -> Result<(), Error> {
-        let mut layers = BTreeMap::new();
-
-        {
-            let written = lock(&self.written);
-
-            for descriptor in inscription.layers() {
-                match written.get(&descriptor.diff_id) {
-                    Some(blob) => layers.insert(descriptor.diff_id, *blob),
-                    None => return self.remove_blob_index(),
-                };
-            }
-        }
-
-        let document = BlobIndexFile {
-            layers: layers
-                .into_iter()
-                .map(|(diff_id, blob)| BlobRef { diff_id, blob })
-                .collect(),
-        };
-
-        let (staging, path) = self.blob_index_paths();
-
-        let mut file = fs::File::create(&staging)?;
-        file.write_all(&serde_json::to_vec(&document)?)?;
-        file.sync_all()?;
-        drop(file);
-
-        fs::rename(&staging, &path)?;
-
-        Ok(())
-    }
-
-    /// Drop the sidecar, if there is one to drop.
-    fn remove_blob_index(&self) -> Result<(), Error> {
-        let (_, path) = self.blob_index_paths();
-
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Read the sidecar, or `None` if this snapshot does not carry one.
-    ///
-    /// Absence and corruption are deliberately not the same answer. Absence is
-    /// the format before [`BLOB_INDEX_FILE`] existed, and the scan reads those
-    /// snapshots correctly; a file that is there and does not parse is a fault
-    /// in something that wrote it, and falling back to the scan would
-    /// restore successfully while hiding it.
-    fn read_blob_index(&self) -> Result<Option<BlobIndex>, Error> {
-        let (_, path) = self.blob_index_paths();
-
-        let raw = match fs::read(&path) {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-
-        let document: BlobIndexFile = serde_json::from_slice(&raw)?;
-
-        let mut index = BlobIndex::default();
-
-        for entry in document.layers {
-            index.insert(entry.diff_id, entry.blob);
-        }
-
-        Ok(Some(index))
+        Ok(written)
     }
 }
 
-impl SnapshotWriter for SnapshotDir {
+/// A blob store on its own: layers go into it, and a seal stores the
+/// inscription as one more blob and tags nothing.
+impl SnapshotWriter for BlobStore {
     type Sink = LayerSink;
 
-    /// Open a layer and stream records into it.
-    ///
-    /// The header record is written here, before the handle is returned, so a
-    /// sink is always a well-formed layer in progress; the media type comes
-    /// from the profile and is validated against the naming rules first, so a
-    /// profile that claims a name it does not own is refused before anything is
-    /// created on disk.
-    ///
-    /// See [`LayerSink`] for what a sink that is never finished leaves behind.
     fn layer_sink(
         &self,
         profile: &dyn Profile,
         spec: &LayerSpec,
         level: i32,
     ) -> Result<LayerSink, Error> {
-        // A layer's file name is its digest, which is not known until the last
-        // byte is written, so it is staged first. The counter keeps two writers
-        // of the same kind apart — a profile sharding one logical layer into
-        // many is the normal case, not an edge one. Staging sits beside
-        // `sha256/` rather than in it, so a half-written layer is never mistaken
-        // for a blob.
-        static STAGING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-        let staging = Staging::new(self.root.join(BLOBS_DIR).join(format!(
-            ".staging-{}-{}",
-            std::process::id(),
-            STAGING.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        )));
-
-        // From here on every `?` unwinds through `staging`, which removes the
-        // file it named.
-        let (sequence, media_type) = open_layer(profile, spec, level, || {
-            Ok(fs::File::create(&staging.path)?)
-        })?;
-
-        Ok(LayerSink {
-            sequence,
-            staging,
-            root: self.root.clone(),
-            kind: spec.kind.clone(),
-            media_type,
-            scope: spec.scope.clone(),
-            written: Arc::clone(&self.written),
-        })
+        self.sink(profile, spec, level, None)
     }
 
-    /// Write the inscription in canonical form and return its digest — the
-    /// snapshot's identity.
-    ///
-    /// A directory names nothing, so the profile goes unused here: there are no
-    /// tags to render and the file has one name the layout fixes.
-    ///
-    /// The sidecar lands after it, and in that order on purpose: the
-    /// inscription is the snapshot and the sidecar is an index over it, so a
-    /// directory is never one without being the other first.
-    ///
-    /// Any sidecar already there is dropped before the inscription it indexes
-    /// is replaced, which is what makes "describes this inscription or is not
-    /// there" hold for a seal that *fails* as well as one that returns. Written
-    /// the other way round, a seal interrupted between the two writes would
-    /// leave the previous document's map over the new inscription — and a
-    /// reader that finds a map stops looking at blobs, so it would place layers
-    /// this snapshot no longer holds and report the ones it does as missing.
     fn seal(&self, _profile: &dyn Profile, inscription: &Inscription) -> Result<Digest, Error> {
-        let canonical = inscription.canonicalize()?;
-
-        self.remove_blob_index()?;
-
-        let mut file = fs::File::create(self.root.join(INSCRIPTION_FILE))?;
-        file.write_all(&canonical)?;
-        file.sync_all()?;
-
-        self.write_blob_index(inscription)?;
-
-        Ok(Digest::compute(&canonical))
+        self.put(&inscription.canonicalize()?)
     }
 }
 
-impl SnapshotReader for SnapshotDir {
-    type Blob = fs::File;
+/// `oci-layout`'s document.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LayoutFile {
+    image_layout_version: String,
+}
 
-    /// Read and verify the inscription.
-    ///
-    /// The stored bytes must *be* the canonical encoding, not merely parse to
-    /// the same content: the file is what a verifier hashes, so a re-indented
-    /// copy carries a digest nobody else computes and is rejected rather than
-    /// silently repaired.
-    fn read_inscription(&self) -> Result<Inscription, Error> {
-        let raw = fs::read(self.root.join(INSCRIPTION_FILE))?;
-        let inscription = Inscription::parse(&raw)?;
+/// `index.json`'s document: an OCI image index. Unknown fields are ignored.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageIndex {
+    schema_version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media_type: Option<String>,
+    manifests: Vec<Descriptor>,
+}
 
-        if inscription.canonicalize()? != raw {
-            return Err(Error::NonCanonicalInscription);
-        }
+/// The `index.json` entry of a manifest whose bytes are `body`, before its tag
+/// is set.
+fn manifest_entry(body: &[u8]) -> Descriptor {
+    Descriptor {
+        media_type: IMAGE_MANIFEST_MEDIA_TYPE.to_owned(),
+        digest: Digest::compute(body).to_string(),
+        size: body.len() as i64,
+        artifact_type: Some(ARTIFACT_TYPE.to_owned()),
+        ..Default::default()
+    }
+}
 
-        Ok(inscription)
+/// Write `name` under `dir` through a staging file and a rename, so the name
+/// never holds part of a document.
+fn replace(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Error> {
+    let staging = dir.join(format!("{STAGING_PREFIX}{name}-{}", std::process::id()));
+
+    let written = (|| {
+        let mut file = fs::File::create(&staging)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&staging, dir.join(name))
+    })();
+
+    if written.is_err() {
+        let _ = fs::remove_file(&staging);
     }
 
-    /// The `diffId` → blob map: read off [`BLOB_INDEX_FILE`] if this snapshot
-    /// carries one, and otherwise rebuilt by [`scan_blobs`].
-    ///
-    /// The sidecar is the whole difference between a restore that decompresses
-    /// this snapshot once and one that decompresses it twice, so it is
-    /// preferred wherever it exists — which, for anything
-    /// [`SnapshotWriter::seal`] wrote, is everywhere. What the scan checked
-    /// on the way past is not lost, only moved: a layer's identity, size
-    /// and record count are proven by [`LayerReader::finish`] as the
-    /// restore reads it, against the descriptor the signed inscription
-    /// carries. What a directory stops paying for is verifying blobs
-    /// *nobody asked for*, which is exactly the position a registry has
-    /// always been in.
-    fn blob_index(&self) -> Result<BlobIndex, Error> {
-        match self.read_blob_index()? {
-            Some(index) => Ok(index),
-            None => scan_blobs(&self.root),
-        }
-    }
+    Ok(written?)
+}
 
-    /// Ask the filesystem how big the blob holding this layer is.
-    ///
-    /// One `stat`, and deliberately not a read: the compressed size is the
-    /// length of the file the blob is stored in, and a directory needs no
-    /// manifest to learn it. This is *not* the double-read a directory pays for
-    /// [`SnapshotDir::blob_index`] — nothing is opened and nothing is
-    /// decompressed.
-    ///
-    /// A layer the index does not place is `None` rather than an error, because
-    /// the caller asking this is estimating a download and not performing one.
-    /// The refusal belongs to [`SnapshotDir::stream_layer`], which is where the
-    /// missing layer actually stops something.
-    fn compressed_size(
-        &self,
-        index: &BlobIndex,
-        descriptor: &LayerDescriptor,
-    ) -> Result<Option<u64>, Error> {
-        let Some(blob) = index.blob_for(&descriptor.diff_id) else {
-            return Ok(None);
-        };
+/// Make the entries of `dir` durable, so a document written next never names
+/// a blob a crash could lose.
+fn sync_dir(dir: &Path) -> Result<(), Error> {
+    #[cfg(unix)]
+    fs::File::open(dir)?.sync_all()?;
 
-        match fs::metadata(self.blob_path(&blob)) {
-            Ok(metadata) => Ok(Some(metadata.len())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
+    #[cfg(not(unix))]
+    let _ = dir;
 
-    /// Stream one layer's records without holding it.
-    ///
-    /// The same verification as [`SnapshotDir::read_layer`] — the checks are
-    /// one implementation, called from both — but spread across the read:
-    /// the header on construction, the decompression ceiling as the stream
-    /// advances, and the identity digest, size and record count in
-    /// [`LayerReader::finish`]. Records are therefore consumable *before* the
-    /// layer is proven; see the [`crate::layer`] module documentation for the
-    /// discipline that requires of a consumer.
-    fn stream_layer(
-        &self,
-        index: &BlobIndex,
-        profile: &dyn Profile,
-        descriptor: &LayerDescriptor,
-        limits: Limits,
-    ) -> Result<LayerReader<fs::File>, Error> {
-        LayerReader::new(
-            self.open_blob(index, descriptor)?,
-            profile,
-            descriptor,
-            limits,
-        )
-    }
+    Ok(())
+}
+
+/// A directory holding an OCI image layout: a snapshot repository on disk.
+///
+/// Layers go into its [`BlobStore`]. A seal writes the inscription and the
+/// manifests beside them and tags the sequence in `index.json`, so sealing
+/// sequence N into a layout that holds N − 1 appends to it. One writer at a
+/// time.
+#[derive(Debug)]
+pub struct SnapshotDir {
+    blobs: BlobStore,
+    pending: Pending,
 }
 
 impl SnapshotDir {
-    /// Locate the blob holding a layer, or say which layer is missing.
-    fn blob_of(&self, index: &BlobIndex, descriptor: &LayerDescriptor) -> Result<PathBuf, Error> {
-        let blob_digest =
-            index
-                .blob_for(&descriptor.diff_id)
-                .ok_or_else(|| Error::LayerNotFound {
-                    kind: descriptor.kind.clone(),
-                    diff_id: descriptor.diff_id.to_string(),
-                })?;
-
-        Ok(self.blob_path(&blob_digest))
-    }
-
-    /// Open the blob holding a layer.
+    /// Open the layout at `root` to write into it, creating it if absent.
     ///
-    /// A map that places the layer and a file that is not there are one
-    /// condition — the layer is not in this snapshot — and they report as one
-    /// [`Error::LayerNotFound`]. The two used to be indistinguishable because
-    /// the map was *built* by reading the directory, so a missing file was a
-    /// missing entry; a map stated by [`BLOB_INDEX_FILE`] can place a layer the
-    /// directory no longer holds, and an operator told `No such file or
-    /// directory` learns strictly less than one told which layer is gone.
-    fn open_blob(
-        &self,
-        index: &BlobIndex,
-        descriptor: &LayerDescriptor,
-    ) -> Result<fs::File, Error> {
-        let path = self.blob_of(index, descriptor)?;
+    /// A layout already there is kept as it is, and a seal appends to it.
+    pub fn create(root: impl Into<PathBuf>) -> Result<Self, Error> {
+        let root = root.into();
+        let existing = root.join(LAYOUT_FILE).try_exists()?;
 
-        fs::File::open(&path).map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => Error::LayerNotFound {
-                kind: descriptor.kind.clone(),
-                diff_id: descriptor.diff_id.to_string(),
-            },
-            _ => e.into(),
+        if existing {
+            check_layout(&root)?;
+        }
+
+        let blobs = BlobStore::create(root)?;
+
+        if !existing {
+            let layout = LayoutFile {
+                image_layout_version: LAYOUT_VERSION.to_owned(),
+            };
+            replace(&blobs.root, LAYOUT_FILE, &serde_json::to_vec(&layout)?)?;
+        }
+
+        if !blobs.root.join(INDEX_FILE).try_exists()? {
+            write_index(&blobs.root, &BTreeMap::new())?;
+        }
+
+        Ok(Self {
+            blobs,
+            pending: Pending::default(),
         })
     }
 
-    /// Read one layer, verifying it against its descriptor and its own header.
+    /// Open an existing layout.
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, Error> {
+        let blobs = BlobStore { root: root.into() };
+
+        check_layout(&blobs.root)?;
+
+        Ok(Self {
+            blobs,
+            pending: Pending::default(),
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.blobs.root
+    }
+
+    /// The content-addressed store under this layout.
+    pub fn blobs(&self) -> &BlobStore {
+        &self.blobs
+    }
+
+    pub fn blob_path(&self, digest: &Digest) -> PathBuf {
+        self.blobs.blob_path(digest)
+    }
+
+    /// Carry a layer whose blob this layout already holds into the next seal,
+    /// as a publish resuming an interrupted attempt does.
     ///
-    /// Everything the descriptor claims is checked: the identity digest, the
-    /// uncompressed size, the record count, and that the header record inside
-    /// the blob names the same profile and kind. A layer that disagrees with
-    /// the document that points at it is refused.
+    /// `Ok(false)` when the blob is not here at the size `layer` records:
+    /// nothing is carried, and the caller builds the layer after all.
+    pub fn adopt_carried(&self, layer: WrittenLayer) -> Result<bool, Error> {
+        match fs::metadata(self.blob_path(&layer.digests.blob_digest)) {
+            Ok(metadata) if metadata.len() == layer.digests.compressed_size => {}
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+
+        lock(&self.pending).push(layer);
+
+        Ok(true)
+    }
+
+    /// Every tag `index.json` holds, with the manifest descriptor it names.
+    pub fn tags(&self) -> Result<BTreeMap<String, Descriptor>, Error> {
+        read_index(self.root())
+    }
+
+    /// Read the sequence `tag` names: its manifests and inscription, and so
+    /// its own layers only. [`SnapshotDir::resolve`] reads the whole
+    /// snapshot.
     ///
-    /// The layer is held whole, which is what makes this a fixture: the
-    /// descriptor's `uncompressedSize` is allocated outright, and on a Dolos
-    /// state shard that is 402 MB. Callers that only need to walk the records
-    /// want [`SnapshotDir::stream_layer`], which checks exactly the same claims
-    /// out of a bounded window.
+    /// A tag the layout does not hold is [`Error::NoSuchTag`]. A head whose
+    /// tip manifest is not here is [`Error::TipGone`].
+    pub fn pull(&self, profile: &dyn Profile, tag: &str) -> Result<Snapshot, Error> {
+        validate_tag(tag)?;
+        self.pull_from(&self.tags()?, profile, tag)
+    }
+
+    /// Pull the immutable tag `profile` renders for `sequence`.
+    pub fn pull_sequence(&self, profile: &dyn Profile, sequence: u64) -> Result<Snapshot, Error> {
+        self.pull(profile, &checked_tag_for_sequence(profile, sequence)?)
+    }
+
+    /// Pull the profile's moving tag.
+    pub fn pull_latest(&self, profile: &dyn Profile) -> Result<Snapshot, Error> {
+        self.pull(profile, profile.moving_tag())
+    }
+
+    /// Resolve `tag` into the whole snapshot: the sequence it names, read as
+    /// [`SnapshotDir::pull`] reads it, and every inscription its links reach
+    /// ([`Chain::walk`]). A link whose diff manifest or inscription the
+    /// layout does not hold is [`Error::MissingLink`].
+    pub fn resolve(&self, profile: &dyn Profile, tag: &str) -> Result<Snapshot, Error> {
+        validate_tag(tag)?;
+
+        let tags = self.tags()?;
+        let mut snapshot = self.pull_from(&tags, profile, tag)?;
+        let mut linked_blobs = BlobIndex::default();
+
+        let chain = Chain::walk(profile, snapshot.inscription.clone(), |link| {
+            let tag = checked_tag_for_sequence(profile, link.sequence)?;
+
+            let Some(found) = tags.get(&tag) else {
+                return Ok(None);
+            };
+
+            let Some((manifest, inscription)) = self.linked(found)? else {
+                return Ok(None);
+            };
+
+            linked_blobs.extend(read_manifest(&manifest, &inscription, Array::Diff)?);
+
+            Ok(Some(inscription))
+        })?;
+
+        snapshot.index.extend(linked_blobs);
+        snapshot.chain = Some(chain);
+
+        Ok(snapshot)
+    }
+
+    /// Resolve the immutable tag `profile` renders for `sequence`.
+    pub fn resolve_sequence(
+        &self,
+        profile: &dyn Profile,
+        sequence: u64,
+    ) -> Result<Snapshot, Error> {
+        self.resolve(profile, &checked_tag_for_sequence(profile, sequence)?)
+    }
+
+    /// Resolve the profile's moving tag: the newest snapshot, whole.
+    pub fn resolve_latest(&self, profile: &dyn Profile) -> Result<Snapshot, Error> {
+        self.resolve(profile, profile.moving_tag())
+    }
+
+    fn pull_from(
+        &self,
+        tags: &BTreeMap<String, Descriptor>,
+        profile: &dyn Profile,
+        tag: &str,
+    ) -> Result<Snapshot, Error> {
+        let found = tags.get(tag).ok_or_else(|| Error::NoSuchTag {
+            tag: tag.to_owned(),
+        })?;
+
+        let (diff, inscription) = self.linked(found)?.ok_or_else(|| {
+            Error::Layout(format!(
+                "{INDEX_FILE} tags {tag:?} as {}, and its manifest or inscription is not in \
+                 {BLOBS_DIR}/",
+                found.digest,
+            ))
+        })?;
+
+        inscription.check_profile(profile)?;
+
+        let mut index = read_manifest(&diff, &inscription, Array::Diff)?;
+
+        let tip = if inscription.tip.is_empty() {
+            None
+        } else {
+            let tag = tip_tag(&checked_tag_for_sequence(profile, inscription.sequence)?)?;
+
+            let tip = match tags.get(&tag) {
+                Some(found) => self.manifest(found)?,
+                None => None,
+            };
+
+            let Some(tip) = tip else {
+                return Err(Error::TipGone {
+                    sequence: inscription.sequence,
+                    tag,
+                });
+            };
+
+            index.extend(read_manifest(&tip, &inscription, Array::Tip)?);
+
+            Some(tip)
+        };
+
+        Ok(Snapshot {
+            blobs: self.blobs.clone(),
+            manifests: Manifests { diff, tip },
+            inscription,
+            index,
+            chain: None,
+        })
+    }
+
+    /// The manifest an `index.json` entry names, or `None` when its blob is not
+    /// here.
+    fn manifest(&self, entry: &Descriptor) -> Result<Option<Manifest>, Error> {
+        if entry.media_type != IMAGE_MANIFEST_MEDIA_TYPE {
+            return Err(Error::Layout(format!(
+                "{INDEX_FILE} names {} as {:?}, not an image manifest",
+                entry.digest, entry.media_type,
+            )));
+        }
+
+        let Some(raw) = self.blobs.read(entry)? else {
+            return Ok(None);
+        };
+
+        let manifest: Manifest = serde_json::from_slice(&raw)?;
+
+        check_envelope(&manifest)?;
+
+        Ok(Some(manifest))
+    }
+
+    /// A diff manifest and the inscription it carries, held to each other, or
+    /// `None` when either blob is not here.
+    fn linked(&self, entry: &Descriptor) -> Result<Option<(Manifest, Inscription)>, Error> {
+        let Some(manifest) = self.manifest(entry)? else {
+            return Ok(None);
+        };
+
+        let Some(raw) = self.blobs.read(&manifest.config)? else {
+            return Ok(None);
+        };
+
+        let inscription = inscription_of(&manifest, &raw)?;
+
+        Ok(Some((manifest, inscription)))
+    }
+}
+
+/// Refuse a directory that is not a layout of the version this reads.
+fn check_layout(root: &Path) -> Result<(), Error> {
+    let raw = fs::read(root.join(LAYOUT_FILE)).map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => Error::Layout(format!(
+            "no {LAYOUT_FILE} in {}, so it is not an OCI image layout",
+            root.display()
+        )),
+        _ => e.into(),
+    })?;
+
+    let layout: LayoutFile = serde_json::from_slice(&raw)?;
+
+    if layout.image_layout_version != LAYOUT_VERSION {
+        return Err(Error::Layout(format!(
+            "{LAYOUT_FILE} declares imageLayoutVersion {:?}; this implementation reads \
+             {LAYOUT_VERSION:?}",
+            layout.image_layout_version,
+        )));
+    }
+
+    Ok(())
+}
+
+/// `index.json` as tag → manifest descriptor. Entries without a tag are
+/// skipped; a tag named twice is refused.
+fn read_index(root: &Path) -> Result<BTreeMap<String, Descriptor>, Error> {
+    let index: ImageIndex = serde_json::from_slice(&fs::read(root.join(INDEX_FILE))?)?;
+
+    if index.schema_version != 2 {
+        return Err(Error::Layout(format!(
+            "{INDEX_FILE} has schemaVersion {}, not 2",
+            index.schema_version,
+        )));
+    }
+
+    let mut tags = BTreeMap::new();
+
+    for entry in index.manifests {
+        let Some(tag) = entry
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(REF_NAME_ANNOTATION))
+            .cloned()
+        else {
+            continue;
+        };
+
+        if tags.insert(tag.clone(), entry).is_some() {
+            return Err(Error::Layout(format!("{INDEX_FILE} names {tag:?} twice")));
+        }
+    }
+
+    Ok(tags)
+}
+
+/// Write `tags` as `index.json`: canonical JSON, entries in tag order.
+fn write_index(root: &Path, tags: &BTreeMap<String, Descriptor>) -> Result<(), Error> {
+    let manifests = tags
+        .iter()
+        .map(|(tag, entry)| {
+            let mut entry = entry.clone();
+            entry
+                .annotations
+                .get_or_insert_with(BTreeMap::new)
+                .insert(REF_NAME_ANNOTATION.to_owned(), tag.clone());
+            entry
+        })
+        .collect();
+
+    let index = ImageIndex {
+        schema_version: 2,
+        media_type: Some(IMAGE_INDEX_MEDIA_TYPE.to_owned()),
+        manifests,
+    };
+
+    replace(
+        root,
+        INDEX_FILE,
+        &canonical_json(&serde_json::to_value(&index)?)?,
+    )
+}
+
+impl SnapshotWriter for SnapshotDir {
+    type Sink = LayerSink;
+
+    /// Open a layer in this layout's blob store. The next seal lists it.
+    fn layer_sink(
+        &self,
+        profile: &dyn Profile,
+        spec: &LayerSpec,
+        level: i32,
+    ) -> Result<LayerSink, Error> {
+        self.blobs
+            .sink(profile, spec, level, Some(Arc::clone(&self.pending)))
+    }
+
+    /// Write the inscription and manifests, then tag them, as a registry
+    /// publish does: the inscription blob, the tip manifest under
+    /// `<tag>.tip`, the diff manifest under `<tag>`, and `latest` moved to it.
+    ///
+    /// The three tags land in one rename of `index.json`, after every blob
+    /// they name is durable. A seal lists the layers finished since the last
+    /// one, and consumes them only when it succeeds. A sequence's tags are
+    /// written once: one that names another manifest is
+    /// [`Error::TagTaken`], and sealing the same manifests again leaves them
+    /// as they are. `latest` moves to the sealed diff manifest on every seal.
+    fn seal(&self, profile: &dyn Profile, inscription: &Inscription) -> Result<Digest, Error> {
+        let sequence_tag = checked_tag_for_sequence(profile, inscription.sequence)?;
+        let tip_tag = tip_tag(&sequence_tag)?;
+        let moving_tag = profile.moving_tag().to_owned();
+        validate_tag(&moving_tag)?;
+
+        let (manifests, config) = build_manifests(inscription, &lock(&self.pending))?;
+        let diff = manifest_bytes(&manifests.diff)?;
+        let tip = manifests.tip.as_ref().map(manifest_bytes).transpose()?;
+
+        let mut tags = self.tags()?;
+        let mut tagging = Vec::new();
+
+        if let Some(tip) = &tip {
+            tagging.push((tip_tag, manifest_entry(tip)));
+        }
+
+        tagging.push((sequence_tag, manifest_entry(&diff)));
+
+        for (tag, entry) in &tagging {
+            match tags.get(tag) {
+                Some(held) if held.digest != entry.digest => {
+                    return Err(Error::TagTaken {
+                        tag: tag.clone(),
+                        held: held.digest.clone(),
+                        sealing: entry.digest.clone(),
+                    })
+                }
+                _ => {}
+            }
+        }
+
+        let identity = self.blobs.put(&config)?;
+
+        if let Some(tip) = &tip {
+            self.blobs.put(tip)?;
+        }
+
+        self.blobs.put(&diff)?;
+        sync_dir(&self.blobs.blobs_dir())?;
+
+        let latest = manifest_entry(&diff);
+        tags.extend(tagging);
+        tags.insert(moving_tag, latest);
+
+        write_index(self.root(), &tags)?;
+        sync_dir(self.root())?;
+
+        lock(&self.pending).clear();
+
+        Ok(identity)
+    }
+}
+
+/// A snapshot read from a layout: one sequence after [`SnapshotDir::pull`],
+/// the whole chain after [`SnapshotDir::resolve`].
+///
+/// [`SnapshotReader::read_inscription`] is the head's inscription.
+pub struct Snapshot {
+    blobs: BlobStore,
+    manifests: Manifests,
+    inscription: Inscription,
+    index: BlobIndex,
+    chain: Option<Chain>,
+}
+
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("root", &self.blobs.root)
+            .field("sequence", &self.inscription.sequence)
+            .field("resolved", &self.chain.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Snapshot {
+    /// The head's diff manifest, the one its tag names.
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifests.diff
+    }
+
+    /// The head's tip manifest, or `None` when its `tip` is empty.
+    pub fn tip_manifest(&self) -> Option<&Manifest> {
+        self.manifests.tip.as_ref()
+    }
+
+    /// The chain this snapshot was resolved through, or `None` after a pull.
+    pub fn chain(&self) -> Option<&Chain> {
+        self.chain.as_ref()
+    }
+
+    /// Read one layer whole, verifying it against its descriptor and its own
+    /// header: identity, uncompressed size, record count, profile and kind.
+    ///
+    /// The layer is held in full, which makes this a fixture's read;
+    /// [`SnapshotReader::stream_layer`] checks the same claims out of a
+    /// bounded window.
     pub fn read_layer(
         &self,
         index: &BlobIndex,
         profile: &dyn Profile,
         descriptor: &LayerDescriptor,
     ) -> Result<Layer, Error> {
-        // The descriptor's claim doubles as the ceiling on decompression. A
-        // blob that expands past it is refused mid-stream instead of being
-        // buffered whole and rejected by the size check below — same verdict,
-        // bounded cost.
+        // The descriptor's claim is the ceiling on decompression.
         let (content, digests) = read_blob(
-            self.open_blob(index, descriptor)?,
+            self.blobs.open_layer(index, descriptor)?,
             descriptor.uncompressed_size,
         )
         .map_err(|error| match error {
@@ -843,11 +951,8 @@ impl SnapshotDir {
 
         check_header(&header, profile, descriptor)?;
 
-        // Counted by iterating rather than with `count()`: `SeqReader` reports a
-        // malformed record as one `Err` item and then ends, so counting items
-        // would tally the failure as a record and drop the error with it. A
-        // descriptor written to match that inflated number would then read back
-        // clean.
+        // Counted by iterating: `SeqReader` yields a malformed record as one
+        // `Err` and ends, which `count()` would tally as a record.
         let mut records = 1u64;
 
         for record in SeqReader::new(&content[header_len..]) {
@@ -863,5 +968,50 @@ impl SnapshotDir {
             header_len,
             digests,
         })
+    }
+}
+
+impl SnapshotReader for Snapshot {
+    type Blob = fs::File;
+
+    fn read_inscription(&self) -> Result<Inscription, Error> {
+        Ok(self.inscription.clone())
+    }
+
+    fn blob_index(&self) -> Result<BlobIndex, Error> {
+        Ok(self.index.clone())
+    }
+
+    /// The length of the blob file: one `stat`, nothing read. `None` for a
+    /// layer the index does not place or whose blob is not here.
+    fn compressed_size(
+        &self,
+        index: &BlobIndex,
+        descriptor: &LayerDescriptor,
+    ) -> Result<Option<u64>, Error> {
+        let Some(blob) = index.blob_for(&descriptor.diff_id) else {
+            return Ok(None);
+        };
+
+        match fs::metadata(self.blobs.blob_path(&blob)) {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn stream_layer(
+        &self,
+        index: &BlobIndex,
+        profile: &dyn Profile,
+        descriptor: &LayerDescriptor,
+        limits: Limits,
+    ) -> Result<LayerReader<fs::File>, Error> {
+        LayerReader::new(
+            self.blobs.open_layer(index, descriptor)?,
+            profile,
+            descriptor,
+            limits,
+        )
     }
 }

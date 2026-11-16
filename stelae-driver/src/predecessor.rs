@@ -43,9 +43,9 @@ pub trait Predecessor: Sync {
     /// rather than a boolean: an export that reused a descriptor whose blob
     /// nothing carried would publish a manifest with a hole in it.
     ///
-    /// The default resumes nothing, which is what makes [`First`] one line and
-    /// what a transport with no notion of "already there" — a directory —
-    /// wants.
+    /// The default resumes nothing, which is what makes [`First`] one line.
+    /// A registry carries a resumed blob with `Registry::adopt_carried`, and
+    /// a directory with `SnapshotDir::adopt_carried`.
     fn resume(
         &self,
         kind: &str,

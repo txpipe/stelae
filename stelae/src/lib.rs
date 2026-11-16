@@ -33,9 +33,9 @@
 //! - [`profile`] — the [`Profile`] trait plus the protocol's media-type,
 //!   profile name and tag naming rules.
 //! - [`transport`] — the seam a snapshot is written through and read back from:
-//!   the two halves a profile uses, the `diffId`→blob map both transports
-//!   answer differently, and the discarding writer that computes a snapshot's
-//!   identity without storing it.
+//!   the two halves a profile uses, the `diffId`→blob map every reader needs,
+//!   and the discarding writer that computes a snapshot's identity without
+//!   storing it.
 //! - [`plan`] — what a restore has already done and what it has left to fetch:
 //!   the progress file, the resume rule, and remaining-bytes accounting.
 //! - [`progress`] — the one seam a publish and a restore report through while
@@ -44,8 +44,8 @@
 //! - [`manifest`] — the OCI image manifest a snapshot is published under: its
 //!   types, its canonical bytes, and the identity→blob map read off it, for
 //!   every transport that holds one.
-//! - [`dir`] — a minimal on-disk snapshot: the first implementation of that
-//!   seam, and the one a snapshot is inspectable by hand through.
+//! - [`dir`] — a directory as an OCI image layout, holding what a registry
+//!   repository holds, and the content-addressed blob store under it.
 //! - [`oci`] — (feature `oci`) an OCI registry as the other implementation:
 //!   push with blob-skip, pull by manifest, resolve a chain.
 //!
@@ -338,7 +338,7 @@ pub enum Error {
     #[error("blob decompresses past the {limit}-byte ceiling set for it")]
     DecompressedTooLarge { limit: u64 },
 
-    #[error("inscription.json is not in canonical form; its bytes must be exactly the RFC 8785 encoding of its content")]
+    #[error("the inscription is not in canonical form; its bytes must be exactly the RFC 8785 encoding of its content")]
     NonCanonicalInscription,
 
     /// The manifest and the inscription describe different sets of layers.
@@ -371,6 +371,28 @@ pub enum Error {
          so this sequence cannot be restored"
     )]
     TipGone { sequence: u64, tag: String },
+
+    /// A tag a directory's `index.json` does not hold: the directory's
+    /// absence, as a registry's 404 is the registry's.
+    #[error("this layout holds no manifest tagged {tag:?}")]
+    NoSuchTag { tag: String },
+
+    /// A seal that would move a sequence's tag in a directory to another
+    /// manifest. A sequence is sealed once, and its tags are not moved.
+    #[error(
+        "tag {tag:?} names manifest {held} in this layout, and this seal would move it to \
+         {sealing}; a sequence's tags are written once"
+    )]
+    TagTaken {
+        tag: String,
+        held: String,
+        sealing: String,
+    },
+
+    /// A directory that is not an OCI image layout this implementation
+    /// reads, or whose `index.json` names what is not there.
+    #[error("not a Stelae image layout: {0}")]
+    Layout(String),
 
     /// A seal asked again of a transport whose layers did not all land.
     ///
@@ -453,6 +475,22 @@ pub enum Error {
 }
 
 impl Error {
+    /// Whether a read failed because the repository holds no manifest under
+    /// the tag a caller named, rather than because it could not answer.
+    ///
+    /// Only that tag counts. A gone tip ([`Error::TipGone`]) and a document
+    /// missing inside a chain ([`Error::MissingLink`]) are not absence.
+    pub fn is_absent(&self) -> bool {
+        match self {
+            Error::NoSuchTag { .. } => true,
+            #[cfg(feature = "oci")]
+            Error::Registry(error) => oci::is_absent(error),
+            #[cfg(feature = "oci")]
+            Error::RetriesExhausted { source, .. } => source.is_absent(),
+            _ => false,
+        }
+    }
+
     pub(crate) fn malformed(kind: &'static str, reason: impl Into<String>) -> Self {
         Self::MalformedRecord {
             kind,

@@ -116,6 +116,11 @@ impl FaultRegistry {
         format!("oci://{}/{repository}", self.address)
     }
 
+    /// Where this registry listens, as a registry client names it.
+    pub fn address(&self) -> String {
+        self.address.to_string()
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }

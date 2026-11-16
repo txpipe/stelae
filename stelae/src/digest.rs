@@ -628,8 +628,8 @@ mod tests {
         assert_eq!(read.blob_digest, Digest::compute(&blob));
     }
 
-    /// A directory scan skips a blob only on the decoder's verdict on its
-    /// bytes, so this is the line between "not a layer" and a failure.
+    /// Only the decoder's verdict on the bytes makes a blob undecodable, so
+    /// this is the line between a refused layer and a failure to read one.
     #[test]
     fn only_the_bytes_make_a_blob_undecodable() {
         let (blob, _) = write_layer(&sample_sequence(), 9);
