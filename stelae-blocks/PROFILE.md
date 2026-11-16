@@ -90,6 +90,23 @@ scope, and does not confirm a layer until every block has passed both checks.
 
 An epoch with no blocks is a layer holding its header record alone.
 
+### From immutable files
+
+The crate's `hardano` feature builds a layer from the node's immutable files.
+With `w` slots per file (ten times the security parameter in the network's
+genesis), file `n` covers the slots `n·w` to `(n+1)·w − 1`, so an epoch's
+bounds must fall on file boundaries. The epoch's files are read in order.
+Each block is decoded only as far as its header's slot and hash, and its body
+is the file's bytes for it, so one file's bodies, concatenated, are its
+`.chunk`.
+
+The build is refused when a file of the epoch, or one of its `.chunk`,
+`.primary` and `.secondary` parts, is missing, when the file numbers skip
+inside the epoch, and when no later file follows the epoch's last one, which
+a node may still be writing. The snapshot it seals is the one at sequence
+epoch + 1. Its only layer is in `diff`, its `tip` is empty, and only the
+snapshot at sequence 1 has no `previous`.
+
 ## Decided, not yet built
 
 Decision 0080 also gives this profile a `digests` layer per epoch: the three
