@@ -23,7 +23,7 @@ producer and consumer; it carries no Cardano assumption.
 | --- | --- |
 | [`stelae`](stelae/) | The wire protocol: framing, inscription, digests, plan/resume, the directory and OCI transports. The normative crate — a third party implements a profile against this and nothing else. |
 | [`stelae-driver`](stelae-driver/) | Profile-generic lifecycle machinery: the chained-publish lifecycle, restore budget/checkpoint, preflight, retry, reporting. A profile author's toolkit, never required for wire compatibility. |
-| [`stelae-blocks`](stelae-blocks/) | The `io.txpipe.cardano.blocks` profile: one layer of raw Cardano blocks per epoch, for any client. Its codec, a writer and a reader; no node dependency. Specified in [`stelae-blocks/PROFILE.md`](stelae-blocks/PROFILE.md). |
+| [`stelae-blocks`](stelae-blocks/) | The `io.txpipe.cardano.blocks` profile: one layer of raw Cardano blocks per epoch, for any client. Its codec, a writer and a reader; no node dependency. Behind its `hardano` feature, a blocks snapshot built from the Haskell node's immutable files, through pallas. Specified in [`stelae-blocks/PROFILE.md`](stelae-blocks/PROFILE.md). |
 | [`stelae-cardano`](stelae-cardano/) | Cardano application integration: cold-start restore, publication policy and the sequential Mithril backfill state machine. The only workspace crate allowed to depend on Dolos. |
 | [`stelae-publisher`](stelae-publisher/) | The `stelae-publisher` executable and its operator-facing commands. |
 
