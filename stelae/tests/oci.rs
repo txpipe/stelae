@@ -3645,6 +3645,8 @@ fn a_five_sequence_chain_restores_through_the_toy_profile() {
 /// every blob as it is stored, then every tag `index.json` holds, tips first
 /// and `latest` last, each manifest pushed as the bytes the layout stores.
 fn push_layout(registry: &str, repository: &str, auth: &Auth, tls: bool, root: &std::path::Path) {
+    install_crypto_provider();
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
