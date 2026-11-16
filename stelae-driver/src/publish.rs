@@ -98,6 +98,9 @@ fn options(insecure: bool, auth: Auth, scratch_dir: PathBuf, tuning: Tuning) -> 
         // memory — raising one does not raise the other.
         monolithic_max: stelae::oci::DEFAULT_MONOLITHIC_MAX,
         upload_memory: stelae::oci::DEFAULT_UPLOAD_MEMORY,
+        // A read knob: a publish reads its predecessor's head and walks no
+        // chain.
+        chain_window: stelae::oci::DEFAULT_CHAIN_WINDOW,
     }
 }
 

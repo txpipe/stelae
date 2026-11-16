@@ -19,8 +19,9 @@ version 1
 ([`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/main/crates/snapshot/PROFILE.md)).
 Decision 0080 changes the inscription in place before that release, at the
 same versions and with no compatibility path: its layer list becomes the
-`diff` and `tip` arrays, its `history` becomes the `previous` link, and a
-sequence is published under a diff manifest and a tip manifest. An
+`diff` and `tip` arrays, its `history` becomes the `previous` link, a
+sequence is published under a diff manifest and a tip manifest, and a reader
+resolves a snapshot by walking the links. An
 implementation of either form refuses the other's documents. Changes after it
 follow the [compatibility](#compatibility) rules: the inscription schema and
 the envelope media types stay fail-closed, so any change to them takes a
@@ -261,6 +262,34 @@ attempt at the same sequence already uploaded, once the registry confirms it
 still holds that blob. It is reusing its own layer, not an earlier
 snapshot's.
 
+### Resolving the chain
+
+Restore and verification read a snapshot whole, so they walk its chain. From
+the inscription at N, a reader follows `previous` to the inscription that has
+none, and refuses the snapshot at the first link that fails one of these, in
+order:
+
+1. the transport holds a document for the link;
+2. that document is not an inscription the walk already holds, which would
+   loop;
+3. its digest is the link's `inscriptionDigest`;
+4. its `sequence` is the link's, so sequences strictly descend;
+5. it is an inscription of the profile being read, at a major version the
+   reader implements.
+
+The walk ends at the first inscription without a link, at whatever sequence
+that is: a lineage may start late.
+
+The layer set is then the `diff` of every inscription of the chain in
+ascending sequence, then the `tip` of N, in each array's order. A `(kind,
+scope)` pair listed twice in that set is refused, naming both sequences. An
+earlier inscription's `tip` is not part of the set, so a layer that a tip
+carried while it was not final may appear later in a `diff`, final.
+
+Every layer belongs to the inscription that lists it. A reader interprets it
+under that inscription's `parameters` (its schema map included) and fetches
+it under that inscription's `compression`, never under the head's.
+
 ## OCI layout
 
 - One repository per (profile, dataset). Every manifest in it carries
@@ -306,12 +335,30 @@ it is repeated, so a publish that stopped part way is finished by sealing or
 publishing the same sequence again.
 
 A reader resolves `<tag>`, or `latest`, to the diff manifest and reads the
-inscription it names. When the inscription's `tip` is not empty, the reader
-also reads the tip manifest, under the tag the profile renders for the
-inscription's `sequence`, plus `.tip`. A tip manifest missing beside its diff
-manifest is its own failure, distinct from an absent sequence: the tip is
-gone, the diff stays, every later snapshot is built on it, and only a restore
-at this sequence is lost.
+inscription it names: the head. When the head's `tip` is not empty, the
+reader also reads the tip manifest, under the tag the profile renders for the
+head's `sequence`, plus `.tip`. To read the snapshot whole it then walks the
+chain ([resolving the chain](#resolving-the-chain)): for each link, the diff
+manifest under the tag the profile renders for the link's `sequence`, and the
+inscription that manifest names, each manifest held to its inscription's
+`diff`. It reads no tip manifest but the head's. The identity→blob maps and
+compressed sizes of every manifest read make up the snapshot's.
+
+Tags are predictable, so a reader need not wait on one link to ask for the
+next: it may read the sequences below a link together, and drop those the
+chain does not reach, absent or not.
+
+Three failures stay distinct:
+
+- **an absent head**: the repository holds no manifest under the tag asked
+  for. This alone is absence;
+- **a gone tip**: the head's tip manifest is missing beside its diff
+  manifest. The diff stays, every later snapshot is built on it, and only a
+  restore at this sequence is lost;
+- **a document missing inside the chain**: a link names a sequence whose
+  diff manifest or inscription the repository does not hold. The head is
+  published, and later snapshots may be, but none whose chain passes the gap
+  can be resolved.
 
 ### The manifest
 
@@ -433,21 +480,32 @@ own accounting lives in its half of the spec).
 ## Restore planning
 
 A client reads a snapshot in a fixed order, refusing early: resolve the tag to
-the sequence's diff manifest and, when its `tip` is not empty, its tip
-manifest, and refuse any manifest–inscription disagreement (above, before
-any layer blob is fetched); verify the inscription's digest, `schema`, profile
-name and major version, and signatures; plan; then fetch, verifying each
-blob's registry digest (transport integrity) and its `diffId` (canonical
-identity).
+the head's diff manifest and, when its `tip` is not empty, its tip manifest;
+walk the chain to its first inscription
+([resolving the chain](#resolving-the-chain)), reading each linked sequence's
+diff manifest and inscription; refuse any manifest–inscription disagreement
+(above, before any layer blob is fetched); verify each inscription's digest
+(the head's against its config descriptor, each linked one against its link
+as well), `schema`, profile name and major version, and signatures; plan over
+the layer set; then fetch, verifying each blob's registry digest (transport
+integrity) and its `diffId` (canonical identity).
 
 The protocol's half of a restore is planning and resume; layer selection is
 profile-side by necessity (a layer's `scope` is opaque, so only the profile
 can read a window out of one), and store writes are the host's.
 
-- No layer kind is mandatory for consumers: the inscription declares what the
-  snapshot contains, and the client selects which layers to fetch and which data
-  to source elsewhere. A kind the client does not implement is skipped and
-  reported, per rule 3 above.
+- No layer kind is mandatory for consumers: the chain's inscriptions declare
+  what the snapshot contains, and the client selects which layers of the set
+  to fetch, in the order it chooses, and which data to source elsewhere. A
+  kind the client does not implement is skipped and reported, per rule 3
+  above.
+- The namespace gate (see
+  [profiles, naming and media types](#profiles-naming-and-media-types)) reads
+  the head's schema map, which declares the namespaces the snapshot defines.
+  An earlier inscription's map describes only the layers that inscription
+  lists, and gates nothing: a lineage continues across a namespace the
+  profile adds, and an earlier inscription whose map lacks it is not
+  refused.
 - The progress file (`stelae::plan::RestoreProgress`) records the inscription
   digest and the diffIds of completed layers, at a path the host chooses. Its
   resume rule is content-based: a layer is done when its `diffId` is

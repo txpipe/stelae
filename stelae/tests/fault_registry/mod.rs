@@ -4,9 +4,10 @@
 //! snapshot and pull it back over plaintext HTTP — monolithic blob uploads,
 //! blob `HEAD`/`GET`, manifest `PUT`/`GET` — plus scripted faults on the reads:
 //! a body cut off partway, a body that is honestly short, or a status code, and
-//! a wait before a layer blob's first byte. A write can be refused with a
-//! status, and a stored manifest forgotten. No container, so the read-retry,
-//! read-ahead and interrupted-seal tests run under plain `cargo test`.
+//! a wait before a layer blob's or a manifest's first byte. A write can be
+//! refused with a status, and a stored manifest forgotten. No container, so the
+//! read-retry, read-ahead and interrupted-seal tests run under plain `cargo
+//! test`.
 //!
 //! Repositories are not kept apart: one instance serves one repository.
 //!
@@ -54,6 +55,9 @@ struct State {
     /// diff manifest's, then its tip manifest's.
     diff_layers: Vec<String>,
     tip_layers: Vec<String>,
+    /// Every layer digest a stored manifest has named, in the order first
+    /// named: a chain's layers, oldest sequence first.
+    listed: Vec<String>,
     config: Option<String>,
     /// Statuses that answer every `PUT` of a key (a blob digest, or
     /// `manifests/<reference>`).
@@ -68,7 +72,8 @@ struct State {
     uploads: usize,
     /// Blob digests whose upload completed, in that order.
     pushed: Vec<String>,
-    /// The wait before a layer blob's first byte, by digest.
+    /// The wait before a layer blob's first byte, by digest, or before a
+    /// manifest's, by `manifests/<reference>`.
     delays: HashMap<String, Duration>,
     /// Layer blob `GET`s in the order they arrived, and in the order their
     /// answers were done.
@@ -77,6 +82,9 @@ struct State {
     /// Layer blob `GET`s being answered now, and the most there were at once.
     active: usize,
     peak: usize,
+    /// Manifest `GET`s being answered now, and the most there were at once.
+    manifests_active: usize,
+    manifests_peak: usize,
 }
 
 pub struct FaultRegistry {
@@ -122,6 +130,13 @@ impl FaultRegistry {
             .chain(&state.tip_layers)
             .cloned()
             .collect()
+    }
+
+    /// Every layer blob digest a manifest stored here has named, in the order
+    /// first named. For a chain published in order, the layers of its oldest
+    /// sequence first.
+    pub fn listed(&self) -> Vec<String> {
+        self.state().listed.clone()
     }
 
     /// The manifest stored under `reference` (a tag or a digest), as stored.
@@ -218,7 +233,8 @@ impl FaultRegistry {
         self.state().heads.clone()
     }
 
-    /// Wait `delay` before the first byte of every `GET` of these blobs.
+    /// Wait `delay` before the first byte of every `GET` of these keys: blob
+    /// digests, or `manifests/<reference>`.
     pub fn delay(&self, digests: &[String], delay: Duration) {
         let mut state = self.state();
         for digest in digests {
@@ -241,12 +257,18 @@ impl FaultRegistry {
         self.state().peak
     }
 
+    /// The most manifest `GET`s answered at once.
+    pub fn manifests_peak(&self) -> usize {
+        self.state().manifests_peak
+    }
+
     /// Forget the layer `GET`s logged so far, and the peak.
     pub fn forget(&self) {
         let mut state = self.state();
         state.arrived.clear();
         state.served.clear();
         state.peak = state.active;
+        state.manifests_peak = state.manifests_active;
     }
 }
 
@@ -406,10 +428,7 @@ fn handle(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
 
         // Only layer `GET`s are logged and delayed, so a test reads the order a
         // restore fetched its layers in without the config blob in it.
-        let layer = !head && {
-            let state = lock();
-            state.diff_layers.contains(&digest) || state.tip_layers.contains(&digest)
-        };
+        let layer = !head && lock().listed.contains(&digest);
         if layer {
             let delay = {
                 let mut state = lock();
@@ -480,6 +499,11 @@ fn handle(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
                 state.diff_layers.clear();
                 state.tip_layers.clear();
             }
+            for layer in &layers {
+                if !state.listed.contains(layer) {
+                    state.listed.push(layer.clone());
+                }
+            }
             if reference.ends_with(stelae::TIP_SUFFIX) {
                 state.tip_layers = layers;
             } else {
@@ -501,14 +525,21 @@ fn handle(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
             );
         }
 
-        let (manifest, fault) = {
+        let (manifest, fault, delay) = {
             let mut state = lock();
             *state.gets.entry(key.clone()).or_default() += 1;
+            state.manifests_active += 1;
+            state.manifests_peak = state.manifests_peak.max(state.manifests_active);
             let fault = state.faults.get_mut(&key).and_then(Script::next);
-            (state.manifests.get(&reference).cloned(), fault)
+            let delay = state.delays.get(&key).copied();
+            (state.manifests.get(&reference).cloned(), fault, delay)
         };
 
-        return match (manifest, fault) {
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+        }
+
+        let answered = match (manifest, fault) {
             (_, Some(Fault::Status(code))) => respond(&stream, code, &[], 0, b""),
             (None, _) => {
                 let body = br#"{"errors":[{"code":"MANIFEST_UNKNOWN","message":"unknown"}]}"#;
@@ -522,6 +553,10 @@ fn handle(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
                 serve(&stream, &headers, &body, fault)
             }
         };
+
+        lock().manifests_active -= 1;
+
+        return answered;
     }
 
     respond(&stream, 404, &[], 0, b"")
