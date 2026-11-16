@@ -98,10 +98,7 @@ use stelae::{
     frame::{encode, CanonicalCbor, Limits},
     inscription::{link_for, LayerDescriptor},
     manifest::{manifest_bytes, Manifest, DIFF_ID_ANNOTATION},
-    oci::{
-        Auth, Options, Registry, Snapshot, DEFAULT_ATTEMPTS, DEFAULT_READ_ATTEMPTS,
-        DEFAULT_READ_DELAY,
-    },
+    oci::{Auth, Options, Registry, DEFAULT_ATTEMPTS, DEFAULT_READ_ATTEMPTS, DEFAULT_READ_DELAY},
     plan::Remaining,
     progress::{Event, Observer, Progress},
     Compression, Digest, Error, Inscription, LayerReader, LayerSpec, Profile, RecordSink,
@@ -871,6 +868,7 @@ fn a_snapshot_survives_the_round_trip() {
 
     let published = write_snapshot(&registry, 3);
     let on_disk = write_snapshot(&directory, 3);
+    let from_disk = directory.pull_latest(&ToyProfile).unwrap();
 
     assert_eq!(published, on_disk, "one snapshot, two transports");
     println!(
@@ -892,11 +890,10 @@ fn a_snapshot_survives_the_round_trip() {
         on_disk.digest().unwrap(),
     );
 
-    // The identity→blob map came off the manifest; the directory's came from
-    // decompressing everything. They agree blob for blob, which is what makes
-    // the manifest a shortcut rather than a second source of truth.
+    // Both identity→blob maps came off manifests, the registry's and the ones
+    // the directory holds. They agree blob for blob.
     let pulled_blobs = latest.blob_index().unwrap();
-    let disk_blobs = directory.blob_index().unwrap();
+    let disk_blobs = from_disk.blob_index().unwrap();
 
     assert_eq!(pulled_blobs.len(), disk_blobs.len());
 
@@ -912,7 +909,7 @@ fn a_snapshot_survives_the_round_trip() {
     // And the records themselves.
     assert_eq!(
         records_of(&latest, &published),
-        records_of(&directory, &on_disk),
+        records_of(&from_disk, &on_disk),
         "layers differ record for record",
     );
 
@@ -2510,7 +2507,7 @@ fn direct_s3_blobs_are_readable_through_zot() {
     let expected = write_snapshot(&disk, 3);
     assert_eq!(
         records_of(&latest, &inscription),
-        records_of(&disk, &expected)
+        records_of(&disk.pull_latest(&ToyProfile).unwrap(), &expected)
     );
     let again = write_snapshot(&registry, 3);
     assert_eq!(again, inscription);
@@ -3508,7 +3505,7 @@ fn neither_manifest_nor_the_inscription_grows_with_the_chain() {
 /// Chapters `first..=last` sealed in turn through `registry`, each linked to
 /// the one before: its notes in `diff`, its index in `tip`, and parameters of
 /// its own.
-fn publish_lineage(registry: &Registry, first: u64, last: u64) -> Vec<Inscription> {
+fn publish_lineage<W: SnapshotWriter>(registry: &W, first: u64, last: u64) -> Vec<Inscription> {
     let mut published: Vec<Inscription> = Vec::new();
 
     for sequence in first..=last {
@@ -3541,7 +3538,7 @@ fn walking(fault: &FaultRegistry, repository: &str, window: usize) -> Registry {
 
 /// The content records of each layer of `layers`, streamed from `snapshot`
 /// ahead of the caller and each proven against its descriptor.
-fn restored(snapshot: &Snapshot, layers: &[LayerDescriptor]) -> Vec<Vec<Vec<u8>>> {
+fn restored<R: SnapshotReader>(snapshot: &R, layers: &[LayerDescriptor]) -> Vec<Vec<Vec<u8>>> {
     let index = snapshot.blob_index().unwrap();
 
     snapshot
@@ -3642,6 +3639,174 @@ fn a_five_sequence_chain_restores_through_the_toy_profile() {
     let pulled = registry.pull_latest(&ToyProfile).unwrap();
     assert!(pulled.chain().is_none());
     assert_eq!(pulled.blob_index().unwrap().len(), 2);
+}
+
+/// Copy the layout at `root` into `repository` on `registry`, blob for blob:
+/// every blob as it is stored, then every tag `index.json` holds, tips first
+/// and `latest` last, each manifest pushed as the bytes the layout stores.
+fn push_layout(registry: &str, repository: &str, auth: &Auth, tls: bool, root: &std::path::Path) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let client = oci_client::Client::new(oci_client::client::ClientConfig {
+        protocol: if tls {
+            oci_client::client::ClientProtocol::Https
+        } else {
+            oci_client::client::ClientProtocol::Http
+        },
+        use_monolithic_push: true,
+        ..Default::default()
+    });
+
+    let auth = match auth {
+        Auth::Basic { user, password } => {
+            oci_client::secrets::RegistryAuth::Basic(user.clone(), password.clone())
+        }
+        Auth::Bearer(token) => oci_client::secrets::RegistryAuth::Bearer(token.clone()),
+        Auth::Anonymous => oci_client::secrets::RegistryAuth::Anonymous,
+    };
+
+    let reference = |tag: &str| {
+        oci_client::Reference::with_tag(registry.to_owned(), repository.to_owned(), tag.to_owned())
+    };
+
+    runtime.block_on(client.store_auth_if_needed(reference("latest").resolve_registry(), &auth));
+
+    for entry in std::fs::read_dir(root.join("blobs").join(Digest::ALGORITHM)).unwrap() {
+        let entry = entry.unwrap();
+        let digest = format!("sha256:{}", entry.file_name().to_string_lossy());
+
+        runtime
+            .block_on(client.push_blob(
+                &reference("latest"),
+                std::fs::read(entry.path()).unwrap(),
+                &digest,
+            ))
+            .unwrap();
+    }
+
+    let layout = SnapshotDir::open(root).unwrap();
+    let mut tags: Vec<_> = layout.tags().unwrap().into_iter().collect();
+    tags.sort_by_key(|(tag, _)| match tag.as_str() {
+        "latest" => 2,
+        tag if tag.ends_with(TIP_SUFFIX) => 0,
+        _ => 1,
+    });
+
+    for (tag, entry) in tags {
+        let body = std::fs::read(layout.blob_path(&entry.digest.parse().unwrap())).unwrap();
+
+        runtime
+            .block_on(client.push_manifest_raw(
+                &reference(&tag),
+                body,
+                http::HeaderValue::from_static(oci_client::manifest::OCI_IMAGE_MEDIA_TYPE),
+            ))
+            .unwrap();
+    }
+}
+
+/// The registry repository a layout was copied into holds the same snapshot:
+/// it serves the layout's own manifest bytes under every tag, and resolves to
+/// the same chain, blob map, compressed sizes and records.
+fn assert_parity(
+    layout: &SnapshotDir,
+    registry: &Registry,
+    served: impl Fn(&str) -> Vec<u8>,
+    published: &[Inscription],
+) {
+    for (tag, entry) in layout.tags().unwrap() {
+        let stored = std::fs::read(layout.blob_path(&entry.digest.parse().unwrap())).unwrap();
+        assert_eq!(served(&tag), stored, "{tag}");
+    }
+
+    let from_disk = layout.resolve_latest(&ToyProfile).unwrap();
+    let pulled = registry.resolve_latest(&ToyProfile).unwrap();
+
+    assert_eq!(pulled.chain().unwrap(), from_disk.chain().unwrap());
+    assert_eq!(pulled.chain().unwrap().inscriptions(), published);
+    assert_eq!(pulled.manifest(), from_disk.manifest());
+    assert_eq!(pulled.tip_manifest(), from_disk.tip_manifest());
+
+    let layers: Vec<LayerDescriptor> = from_disk.chain().unwrap().descriptors().cloned().collect();
+    let (pulled_index, disk_index) = (
+        pulled.blob_index().unwrap(),
+        from_disk.blob_index().unwrap(),
+    );
+
+    assert_eq!(pulled_index.len(), disk_index.len());
+
+    for layer in &layers {
+        assert_eq!(
+            pulled_index.blob_for(&layer.diff_id),
+            disk_index.blob_for(&layer.diff_id),
+            "{:?}",
+            layer.scope,
+        );
+        assert_eq!(
+            pulled.compressed_size(&pulled_index, layer).unwrap(),
+            from_disk.compressed_size(&disk_index, layer).unwrap(),
+            "{:?}",
+            layer.scope,
+        );
+    }
+
+    assert_eq!(restored(&pulled, &layers), restored(&from_disk, &layers));
+    assert_eq!(restored(&pulled, &layers), lineage_records(published));
+}
+
+/// Parity: a lineage sealed into a directory and pushed blob for blob to the
+/// in-process registry pulls back identical.
+#[test]
+fn a_layout_pushed_blob_for_blob_pulls_back_identical() {
+    let temp = tempfile::tempdir().unwrap();
+    let layout = SnapshotDir::create(temp.path()).unwrap();
+    let published = publish_lineage(&layout, 1, 3);
+
+    let fault = FaultRegistry::spawn();
+    push_layout(
+        &fault.address(),
+        "stelae/layout",
+        &Auth::Anonymous,
+        false,
+        temp.path(),
+    );
+
+    assert_parity(
+        &layout,
+        &faulty(&fault, "stelae/layout"),
+        |tag| fault.manifest(tag).unwrap(),
+        &published,
+    );
+}
+
+/// The same parity against a real registry.
+#[test]
+#[ignore = "spawns a registry"]
+fn a_layout_pushed_to_a_registry_pulls_back_identical() {
+    let _serial = exclusive();
+
+    let temp = tempfile::tempdir().unwrap();
+    let layout = SnapshotDir::create(temp.path()).unwrap();
+    let published = publish_lineage(&layout, 1, 3);
+
+    let fixture = Fixture::spawn();
+    push_layout(
+        &fixture.address(),
+        &fixture.path("stelae/layout"),
+        &fixture.credentials(),
+        fixture.tls,
+        temp.path(),
+    );
+
+    assert_parity(
+        &layout,
+        &fixture.registry("stelae/layout"),
+        |tag| fixture.manifest_raw("stelae/layout", tag),
+        &published,
+    );
 }
 
 /// A lineage may start at a later sequence. The walk ends at its first

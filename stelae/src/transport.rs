@@ -16,8 +16,8 @@
 //!   under [`Limits`] — or, through [`SnapshotReader::stream_layers`], the
 //!   layers a caller names, one after another in the order it named them.
 //!
-//! Both are exactly what a directory already did, so the directory keeps
-//! working unchanged and a registry lands beside it.
+//! A directory ([`crate::dir`]) and a registry ([`crate::oci`]) implement both
+//! over the same documents.
 //!
 //! ## An ordered read, fetched ahead by the transport that can
 //!
@@ -34,22 +34,10 @@
 //!
 //! An inscription lists `diffId`s — identity — and deliberately never the
 //! compressed digests that address a blob, because those are transport and
-//! vary with the compressor. So every reader needs a map from one to the other,
-//! and *how it obtains that map* is the sharpest difference between the two
-//! transports there is:
-//!
-//! - a registry has a manifest, and reads the map straight off it;
-//! - a directory has one too, now: [`crate::dir::BLOB_INDEX_FILE`], written
-//!   beside the inscription by the seal that closed the snapshot. Before it
-//!   existed — and for any snapshot published before it did —
-//!   [`crate::dir::SnapshotDir::blob_index`] rebuilds the map by decompressing
-//!   every blob, a full verification pass over the snapshot paid before the
-//!   restore reads any of it.
-//!
-//! Same type, same meaning, one file read versus one HTTP GET — and, for the
-//! snapshots that predate the sidecar, the scan. Keeping [`BlobIndex`] rather
-//! than parameterizing the reader on "how to find a blob" is what let a
-//! directory close that gap without a reader anywhere learning a new shape.
+//! vary with the compressor. So every reader needs a map from one to the other.
+//! Both transports read it off the snapshot's manifests
+//! ([`crate::manifest::read_manifest`]): a registry serves them, and a
+//! directory holds them as blobs of its image layout.
 //!
 //! ## A third implementation that stores nothing
 //!
@@ -125,9 +113,7 @@ pub struct WrittenLayer {
 
 /// Map from a layer's identity (`diffId`) to the blob that holds it.
 ///
-/// In a registry this comes from the manifest. In a directory it is recovered
-/// by [`crate::dir::SnapshotDir::blob_index`], which is the same map at a much
-/// higher price — see the module documentation.
+/// Read off a snapshot's manifests, whichever transport holds them.
 #[derive(Debug, Clone, Default)]
 pub struct BlobIndex(std::collections::BTreeMap<Digest, Digest>);
 
@@ -288,8 +274,8 @@ pub trait SnapshotWriter {
     /// attached.
     ///
     /// **The default body does nothing, and that is the point.** A transport
-    /// that has no bytes of its own to report — [`crate::dir::SnapshotDir`]
-    /// writes straight to files a caller can watch, [`Discarding`] moves
+    /// that has no bytes of its own to report — a directory writes straight
+    /// to files a caller can watch, [`Discarding`] moves
     /// nothing — implements nothing and loses nothing; only
     /// [`crate::oci::Registry`], whose uploads are the hours a publisher
     /// waits through, overrides it. A method every implementor must answer
@@ -346,8 +332,8 @@ where
 /// reads the descriptor off the digests the pipeline computed, and only *then*
 /// does a directory rename onto the content-addressed name — so a writer whose
 /// sinks discard their bytes hands back the same descriptors as one that keeps
-/// them. Sealing is the same identity a directory returns after writing
-/// `inscription.json`: the sha256 of the canonical document.
+/// them. Sealing is the same identity a directory returns after storing the
+/// inscription: the sha256 of the canonical document.
 ///
 /// That is the whole of `stelae-publisher digest`. A verifier reproduces a
 /// published snapshot's layers from its own stores and compares descriptors,

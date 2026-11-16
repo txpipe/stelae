@@ -20,8 +20,9 @@ version 1
 Decision 0080 changes the inscription in place before that release, at the
 same versions and with no compatibility path: its layer list becomes the
 `diff` and `tip` arrays, its `history` becomes the `previous` link, a
-sequence is published under a diff manifest and a tip manifest, and a reader
-resolves a snapshot by walking the links. An
+sequence is published under a diff manifest and a tip manifest, a reader
+resolves a snapshot by walking the links, and a directory is an OCI image
+layout. An
 implementation of either form refuses the other's documents. Changes after it
 follow the [compatibility](#compatibility) rules: the inscription schema and
 the envelope media types stay fail-closed, so any change to them takes a
@@ -393,13 +394,10 @@ TxPipe owns:
 | `store.stelae.layer.kind` | informational | the layer's profile-defined kind |
 | `store.stelae.layer.scope` | informational | the layer's scope object as stringified canonical JSON |
 
-`store.stelae.layer.diffId` is the identity→blob map — the thing a registry
-hands over for free. A directory has no manifest to carry it, so a publish
-writes the same map to a `blobs.json` sidecar beside `inscription.json`; it
-is transport and not identity — unsigned, outside the inscription digest, and
-fully recoverable from the blobs — so a snapshot without one still restores, by
-decompressing every blob to rebuild it. A client that does not read it cannot
-fetch a layer; it is the one annotation a reader must understand. The other
+`store.stelae.layer.diffId` is the identity→blob map, read off the manifests
+in a registry and in a [directory](#directory-transport) alike. A client that
+does not read it cannot fetch a layer; it is the one annotation a reader must
+understand. The other
 two exist so a human or a generic registry tool can see what a blob covers
 without fetching the config blob, and a client may ignore them.
 
@@ -476,6 +474,63 @@ own accounting lives in its half of the spec).
   Anonymous remains legitimate and is what a genuinely public repository
   wants. It is not the only legitimate deployment: read access to a
   repository can be free and identity-less and still credentialed.
+
+## Directory transport
+
+A directory holds a repository as an
+[OCI image layout](https://github.com/opencontainers/image-spec/blob/v1.1.0/image-layout.md):
+the manifests, tags and blobs a registry repository holds (decision 0080).
+A layout and a repository can be copied into each other blob for blob, and a
+reader reads both alike.
+
+```text
+<root>/
+  oci-layout           {"imageLayoutVersion":"1.0.0"}
+  index.json           an OCI image index: one manifest descriptor per tag
+  blobs/sha256/<hex>   layers, inscriptions and manifests, named by digest
+```
+
+- `oci-layout` declares layout version `1.0.0`. A reader refuses a directory
+  without it, or with another version.
+- `index.json` is an image index: `schemaVersion: 2` and `mediaType:
+  application/vnd.oci.image.index.v1+json`. Each entry of `manifests` is a
+  manifest blob's descriptor, with `mediaType:
+  application/vnd.oci.image.manifest.v1+json`, `artifactType:
+  application/vnd.stelae.snapshot.v1`, and its tag in the
+  `org.opencontainers.image.ref.name` annotation. There is one entry per tag
+  of [the tag table](#tags). A tag named twice is refused, and an entry
+  without a tag is ignored. A writer lists the entries in tag order, as
+  canonical JSON.
+- `blobs/sha256/<hex>` holds every blob, named by the sha256 of its bytes:
+  each layer, each inscription (a manifest's config) and each manifest. A
+  manifest blob is the exact bytes a registry serves under its tags.
+- Nothing else belongs to the layout. A file whose name starts with
+  `.staging-` is a write in progress, never a blob.
+
+A layout holds many sequences. A seal writes the layer blobs, the
+inscription, the tip manifest and the diff manifest, in that order, then
+replaces `index.json` once, adding `<tag>.tip` and `<tag>` and moving
+`latest` to the diff manifest. The replacement is atomic and comes after
+every blob it names is durable, so no tag names a missing blob and no `<tag>`
+exists without its tip. Sealing into an empty directory creates the layout,
+and sealing sequence N into a layout that holds N − 1 appends to it. A
+sequence's tags are written once: a seal that would move `<tag>` or
+`<tag>.tip` to another manifest is refused, and sealing the same manifests
+again changes nothing. A layout has one writer at a time.
+
+A reader finds a tag in `index.json`, then reads each manifest and
+inscription as a blob and holds it to the digest and size its descriptor
+names. From there it reads as from a registry: the
+[manifest–inscription agreement](#manifestinscription-agreement), the tip
+manifest and [the chain walk](#resolving-the-chain) apply unchanged, and so
+do the three failures under [Tags](#tags). A tag `index.json` does not hold
+is an absent head. A diff manifest or an inscription missing inside the
+chain, untagged or without its blob, is a document missing inside the chain.
+
+The content-addressed store under a layout may be used on its own, with no
+`index.json`: a writer stages a blob under a `.staging-` name in `blobs/`,
+and once its digest is known renames it to `blobs/sha256/<hex>`, keeping a
+blob that is already there.
 
 ## Restore planning
 

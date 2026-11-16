@@ -32,9 +32,8 @@ pub const IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.
 /// `stelae.store`, a domain TxPipe owns. They are transport metadata and sit
 /// outside the inscription, so they are outside a snapshot's identity — but
 /// only two of them are informational. [`DIFF_ID_ANNOTATION`] is normative,
-/// because it is load-bearing on the way back: it *is* the identity→blob map a
-/// directory has to rebuild by decompressing everything. The golden freezes
-/// all three.
+/// because it is load-bearing on the way back: it *is* the identity→blob map,
+/// in a registry and in a directory alike. The golden freezes all three.
 pub const KIND_ANNOTATION: &str = "store.stelae.layer.kind";
 
 /// Annotation carrying a layer's `diffId` — its identity, and the key of the
@@ -301,12 +300,39 @@ pub(crate) fn check_envelope(manifest: &Manifest) -> Result<(), Error> {
     Ok(())
 }
 
+/// The inscription a manifest's config blob holds, held to the digest the
+/// manifest addresses it by.
+///
+/// The bytes must be the canonical encoding, and the inscription's own digest
+/// must be the config digest: the one place identity and transport are held
+/// against each other, which stops a manifest from pointing at a document
+/// nobody signed.
+pub(crate) fn inscription_of(manifest: &Manifest, raw: &[u8]) -> Result<Inscription, Error> {
+    let inscription = Inscription::parse(raw)?;
+
+    if inscription.canonicalize()? != raw {
+        return Err(Error::NonCanonicalInscription);
+    }
+
+    let config_digest = manifest.config.digest.parse::<Digest>()?;
+    let identity = inscription.digest()?;
+
+    if identity != config_digest {
+        return Err(Error::DigestMismatch {
+            subject: "inscription".to_owned(),
+            expected: config_digest.to_string(),
+            actual: identity.to_string(),
+        });
+    }
+
+    Ok(inscription)
+}
+
 /// Read the identity→blob map off one manifest, holding it against the
 /// array of the inscription it lists.
 ///
-/// The registry's answer to the question [`crate::dir::BLOB_INDEX_FILE`]
-/// answers for a directory, and the reason a registry restore has always read
-/// every blob once instead of twice.
+/// The one source of that map, for a registry and a directory alike, so no
+/// reader has to decompress a blob to learn which layer it holds.
 ///
 /// Three correspondences are checked, and they are not the same check. The
 /// config names this inscription, so a tip manifest of another sequence is not

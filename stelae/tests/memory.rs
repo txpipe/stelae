@@ -45,6 +45,7 @@ use stats_alloc::{Region, StatsAlloc, INSTRUMENTED_SYSTEM};
 use stelae::{
     dir::{LayerSpec, SnapshotDir},
     frame::{encode, CanonicalCbor, Limits, RecordReader, SeqWriter},
+    inscription::link_for,
     Compression, Error, Inscription, Profile, RecordSink, SnapshotReader, SnapshotWriter,
 };
 
@@ -218,6 +219,10 @@ fn framing_a_large_sequence_costs_one_window() {
 /// The whole path, as a restore would use it: a compressed blob on disk,
 /// verified against its descriptor, records walked without ever holding the
 /// layer.
+///
+/// The layer is the last sequence's of a three-sequence chain in one
+/// directory, read through the resolved chain, so the walk and the merged
+/// index are on the path too.
 #[test]
 fn streaming_a_layer_does_not_scale_with_its_size() {
     let _serial = exclusive();
@@ -226,43 +231,63 @@ fn streaming_a_layer_does_not_scale_with_its_size() {
     let snapshot = SnapshotDir::create(temp.path()).unwrap();
 
     let records: Vec<CanonicalCbor> = (0..RECORDS).map(bulk_record).collect();
+    let mut previous: Option<Inscription> = None;
 
-    let written = snapshot
-        .write_layer(
+    for sequence in 1..=3u64 {
+        // The two earlier sequences carry a few records each, the last the
+        // bulk.
+        let at = sequence as usize;
+        let range = if sequence == 3 {
+            0..RECORDS as usize
+        } else {
+            at..at + 4
+        };
+
+        let written = snapshot
+            .write_layer(
+                &BulkProfile,
+                &LayerSpec::new("bulk", scope(), json!({"sequence": sequence})),
+                COMPRESSION_LEVEL,
+                &records[range],
+            )
+            .unwrap();
+
+        let mut inscription = Inscription::new(
             &BulkProfile,
-            &LayerSpec::new("bulk", scope(), json!({})),
-            COMPRESSION_LEVEL,
-            &records,
-        )
-        .unwrap();
+            sequence,
+            json!({}),
+            json!({}),
+            Compression {
+                algo: "zstd".to_owned(),
+                level: COMPRESSION_LEVEL as i64,
+            },
+        );
+        inscription.previous = link_for(previous.as_ref(), sequence).unwrap();
+        inscription.diff = vec![written.descriptor.clone()];
+        snapshot.seal(&BulkProfile, &inscription).unwrap();
 
-    let mut inscription = Inscription::new(
-        &BulkProfile,
-        0,
-        json!({}),
-        json!({}),
-        Compression {
-            algo: "zstd".to_owned(),
-            level: COMPRESSION_LEVEL as i64,
-        },
-    );
-    inscription.diff = vec![written.descriptor.clone()];
-    snapshot.seal(&BulkProfile, &inscription).unwrap();
+        previous = Some(inscription);
+    }
 
+    let resolved = snapshot.resolve_latest(&BulkProfile).unwrap();
+    let chain = resolved.chain().unwrap();
+    assert_eq!(chain.inscriptions().len(), 3);
+    assert_eq!(chain.layers().len(), 3);
+
+    let inscription = previous.unwrap();
     let descriptor = &inscription.diff[0];
     assert!(
         descriptor.uncompressed_size > (MINIMUM_WINDOWS * stelae::frame::DEFAULT_WINDOW) as u64,
         "the layer has to dwarf the window for this to prove anything"
     );
 
-    // Everything before the region is setup: building the index is a scan of
-    // the snapshot, and what it costs is not what is under test.
+    // Everything before the region is setup.
     drop(records);
-    let index = snapshot.blob_index().unwrap();
+    let index = resolved.blob_index().unwrap();
 
     let region = Region::new(GLOBAL);
 
-    let mut reader = snapshot
+    let mut reader = resolved
         .stream_layer(&index, &BulkProfile, descriptor, Limits::default())
         .unwrap();
 
@@ -290,7 +315,7 @@ fn streaming_a_layer_does_not_scale_with_its_size() {
     // size for it. If that ever stops being true the budget above has stopped
     // measuring the difference between the two paths.
     let region = Region::new(GLOBAL);
-    let layer = snapshot
+    let layer = resolved
         .read_layer(&index, &BulkProfile, descriptor)
         .unwrap();
     let buffered = region.change().bytes_allocated;

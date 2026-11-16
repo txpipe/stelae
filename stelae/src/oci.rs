@@ -8,7 +8,7 @@
 //!
 //! It is the second implementation of [`crate::transport`] and adds no
 //! vocabulary of its own: a registry is another place a
-//! [`crate::dir::SnapshotDir`] could have been, and a profile driving one
+//! [`crate::dir::SnapshotDir`] holds, and a profile driving one
 //! writes the same code.
 //!
 //! ## Two kinds of document, one snapshot
@@ -34,10 +34,9 @@
 //! reproducible by a publisher who compressed differently. The manifest holds
 //! **transport** — compressed digests and sizes, which are what a registry
 //! addresses a blob by and are not stable across zstd versions. Neither is
-//! derivable from the other, which is why [`crate::BlobIndex`] exists at all,
-//! and why a directory has to write the same map down for itself in
-//! [`crate::dir::BLOB_INDEX_FILE`] — or, lacking one, reconstruct by brute
-//! force what a manifest states.
+//! derivable from the other, which is why [`crate::BlobIndex`] exists at all.
+//! A directory holds the same manifests ([`crate::dir`]) and reads the map off
+//! them the same way.
 //!
 //! Because they are two views of one snapshot, **a disagreement between them is
 //! a refusal**, in either direction: a layer the inscription describes and its
@@ -300,8 +299,8 @@ use crate::{
     inscription::{Inscription, LayerDescriptor},
     layer::LayerReader,
     manifest::{
-        build_manifests, check_envelope, manifest_bytes, read_manifest, Array, Descriptor,
-        Manifest, Manifests, IMAGE_MANIFEST_MEDIA_TYPE,
+        build_manifests, check_envelope, inscription_of, manifest_bytes, read_manifest, Array,
+        Descriptor, Manifest, Manifests, IMAGE_MANIFEST_MEDIA_TYPE,
     },
     profile::{checked_tag_for_sequence, tip_tag, validate_tag, Profile},
     progress::{Event, Observer},
@@ -1313,7 +1312,7 @@ impl Registry {
 /// `NAME_UNKNOWN`, and some registries answer with a bare 404 that the client
 /// turns into `ImageManifestNotFoundError` or a `ServerError`. The client's own
 /// referrers fallback matches the same set, for the same reason.
-fn is_absent(error: &oci_client::errors::OciDistributionError) -> bool {
+pub(crate) fn is_absent(error: &oci_client::errors::OciDistributionError) -> bool {
     use oci_client::errors::{OciDistributionError as E, OciErrorCode};
 
     match error {
@@ -1347,20 +1346,6 @@ fn is_absent_blob(error: &Error) -> bool {
 }
 
 impl Error {
-    /// Whether a pull failed because the repository holds no such manifest,
-    /// rather than because the registry could not answer.
-    ///
-    /// Only the manifest a caller named counts. A gone tip
-    /// ([`Error::TipGone`]) and a document missing inside a chain
-    /// ([`Error::MissingLink`]) are not absence.
-    pub fn is_absent(&self) -> bool {
-        match self {
-            Error::Registry(error) => is_absent(error),
-            Error::RetriesExhausted { source, .. } => source.is_absent(),
-            _ => false,
-        }
-    }
-
     /// Whether a pull failed because the registry served a blob that is not the
     /// one its descriptor names: bytes that hash to another digest, or more of
     /// them than the descriptor claims.
@@ -2618,7 +2603,7 @@ impl RecordSink for RegistrySink {
 /// [`Registry::resolve`] the whole snapshot through its chain. Either way the
 /// cheap part is done by the time this exists: the manifests and the
 /// inscriptions are in hand, verified against each other, and the
-/// `diffId`→blob map came off the manifests rather than out of a scan. What
+/// `diffId`→blob map came off the manifests. What
 /// is left is the layers, fetched as [`SnapshotReader::stream_layer`] or
 /// [`SnapshotReader::stream_layers`] asks.
 ///
@@ -2649,34 +2634,6 @@ fn placed<'a>(layers: impl IntoIterator<Item = &'a Descriptor>) -> BTreeMap<Stri
         .into_iter()
         .map(|layer| (layer.digest.clone(), layer.clone()))
         .collect()
-}
-
-/// The inscription a manifest's config blob holds, held to the digest the
-/// manifest addresses it by.
-///
-/// The bytes must be the canonical encoding, and the inscription's own digest
-/// must be the config digest: the one place identity and transport are held
-/// against each other, which stops a manifest from pointing at a document
-/// nobody signed.
-fn inscription_of(manifest: &Manifest, raw: &[u8]) -> Result<Inscription, Error> {
-    let inscription = Inscription::parse(raw)?;
-
-    if inscription.canonicalize()? != raw {
-        return Err(Error::NonCanonicalInscription);
-    }
-
-    let config_digest = manifest.config.digest.parse::<Digest>()?;
-    let identity = inscription.digest()?;
-
-    if identity != config_digest {
-        return Err(Error::DigestMismatch {
-            subject: "inscription".to_owned(),
-            expected: config_digest.to_string(),
-            actual: identity.to_string(),
-        });
-    }
-
-    Ok(inscription)
 }
 
 /// What was resolved, and nothing about the connection that resolved it.
