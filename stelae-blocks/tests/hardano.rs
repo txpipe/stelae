@@ -494,8 +494,6 @@ fn a_built_layer_is_noted_as_landed() {
     assert_eq!(fresh.landed(), sealed.inscription.diff);
 }
 
-/// The directory of immutable files is empty: the layer comes only from the
-/// interrupted attempt.
 /// The layer `descriptor` names in the layout at `root`, as its writer
 /// recorded it.
 fn written_layer(root: &Path, descriptor: &LayerDescriptor) -> WrittenLayer {
@@ -516,6 +514,8 @@ fn written_layer(root: &Path, descriptor: &LayerDescriptor) -> WrittenLayer {
     }
 }
 
+/// The directory of immutable files is empty: the layer comes only from the
+/// interrupted attempt.
 #[test]
 fn a_resumed_layer_is_not_read_again() {
     let first = tempfile::tempdir().unwrap();

@@ -2179,7 +2179,7 @@ fn a_directory_is_an_oci_image_layout() {
 
 /// Sealing the next sequence into a layout that holds the one before it
 /// appends to it, through a handle opened afresh. A sequence's tags do not
-/// move, and sealing the same manifests again changes nothing.
+/// move, and sealing the head's manifests again changes nothing.
 #[test]
 fn a_seal_appends_and_never_moves_a_sequence_tag() {
     let temp = tempfile::tempdir().unwrap();

@@ -516,7 +516,8 @@ exists without its tip. Sealing into an empty directory creates the layout,
 and sealing sequence N into a layout that holds N − 1 appends to it. A
 sequence's tags are written once: a seal that would move `<tag>` or
 `<tag>.tip` to another manifest is refused, and sealing the same manifests
-again changes nothing. A layout has one writer at a time.
+again leaves them as they are. Every seal moves `latest`, as on a registry.
+A layout has one writer at a time.
 
 A reader finds a tag in `index.json`, then reads each manifest and
 inscription as a blob and holds it to the digest and size its descriptor

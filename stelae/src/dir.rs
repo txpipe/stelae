@@ -814,8 +814,8 @@ impl SnapshotWriter for SnapshotDir {
     /// they name is durable. A seal lists the layers finished since the last
     /// one, and consumes them only when it succeeds. A sequence's tags are
     /// written once: one that names another manifest is
-    /// [`Error::TagTaken`], and sealing the same manifests again changes
-    /// nothing.
+    /// [`Error::TagTaken`], and sealing the same manifests again leaves them
+    /// as they are. `latest` moves to the sealed diff manifest on every seal.
     fn seal(&self, profile: &dyn Profile, inscription: &Inscription) -> Result<Digest, Error> {
         let sequence_tag = checked_tag_for_sequence(profile, inscription.sequence)?;
         let tip_tag = tip_tag(&sequence_tag)?;
