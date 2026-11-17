@@ -6,22 +6,19 @@ publishes, prunes, and exits at the aggregator tip. The operator maintains
 network values and owns deployment, first publication and monitoring.
 
 The chart runs a publisher built on the Dolos v2 configuration: `dolosToml`
-is a v2 file keeping full history and the retained state epochs are their
-own value. There is no host selector. The directory and chart name stay
+is a v2 file keeping full history. There is no host selector. The directory and chart name stay
 `dolos-publisher` to preserve release and object naming.
 
 ## Rendered resources
 
 - ConfigMap `<release>-config`, mounted at `/etc/publisher`, carries
-  `dolos.toml` verbatim from `dolosToml` and `state-epochs`, one epoch per
-  line, from `stateEpochs`. No shell entrypoint is generated. The retained
-  epochs are signed input and must not change incidentally.
+  `dolos.toml` verbatim from `dolosToml`. No shell entrypoint is generated.
 - PersistentVolumeClaim `<release>-data`, only with `persistence.enabled`
   and no `persistence.existingClaim`. It carries
   `helm.sh/resource-policy: keep`, so `helm uninstall` leaves it.
 - Job `<network>-backfill-<run>` directly invokes
-  `/usr/local/bin/stelae-publisher --config /etc/publisher/dolos.toml run
-  --state-epochs-file /etc/publisher/state-epochs`. It mounts `/data` (see
+  `/usr/local/bin/stelae-publisher --config /etc/publisher/dolos.toml run`.
+  It mounts `/data` (see
   [Data volume](#data-volume)) and reads registry credentials from the existing Secret's
   `DOLOS_STELAE_REGISTRY_USER` and `DOLOS_STELAE_REGISTRY_PASSWORD` keys into
   the publisher's `DOLOS_STELAE_USER` and `DOLOS_STELAE_PASSWORD`.
@@ -132,10 +129,9 @@ adds another Job. To recover, delete the release's backfill Jobs with
 | --- | --- |
 | `network` | Job name prefix |
 | `run` | Deliberate re-run counter; bump when changing the Job |
-| `repo` | Network's `oci://` publication repository |
+| `repo` | Network root, `oci://`: steles go to its `dolos` repository, naming the snapshots its `blocks` repository holds |
 | `concurrency` | Measured upload concurrency, with no chart default |
 | `dolosToml` | Network's Dolos v2 configuration, verbatim |
-| `stateEpochs` | Retained state-dump epochs, ascending, with no chart default; `[]` retains the tip alone |
 | `image.repository` | Defaults to `ghcr.io/txpipe/stelae-publisher` |
 | `image.tag` | Tested version or `sha-<7>` tag, with no default |
 | `resources` | Network working set, with no default |
@@ -224,7 +220,7 @@ helm template stelae-publisher-preprod k8s/dolos-publisher/chart \
   --namespace stelae-publisher --values "$PUBLISHER_VALUES"
 ```
 
-The checks cover direct invocation, the state epochs file and argument,
+The checks cover direct invocation, the removed `stateEpochs` value refused,
 both `/data` modes, batching all or none, genesis opt-in, TLS selection, missing or invalid configuration and
 accidental use of the legacy Dolos image.
 

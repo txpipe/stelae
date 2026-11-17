@@ -20,9 +20,13 @@
 //! repository already holds at the next sequence is an upload whose
 //! acknowledgement was lost, or another writer's, and only its identity tells
 //! them apart: it is reproduced and compared, and a difference refuses.
+//!
+//! Every stele names the blocks snapshot of its own sequence, read from the
+//! blocks repository before the boundary is captured or published. A sequence
+//! the blocks repository does not hold yet is refused before anything is
+//! written for it.
 
 use std::{
-    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -35,20 +39,16 @@ use dolos_core::{
 use dolos_mithril as mithril;
 use dolos_mithril::{mithril_client::feedback::FeedbackReceiver, MithrilSource};
 use dolos_snapshot::{
-    export::{history_for, Plan, Predecessor, Settling},
+    export::{Following, Plan, Predecessor},
     node,
     prepare::{self, Bundle, Finalizing, IndexTail},
     registry::Auth,
     source::SnapshotSource,
     staging::Staged,
-    DolosProfile, RetainedEpochs,
 };
 use itertools::Itertools as _;
-use stelae::{
-    inscription::{HistoryEntry, Inscription, LayerDescriptor},
-    progress::Observer,
-};
-use stelae_driver::{publish::inheritable_layers, First, Standing};
+use stelae::{inscription::Inscription, progress::Observer, Digest};
+use stelae_driver::{First, Standing};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -169,6 +169,12 @@ pub enum Error {
          --batch-scratch-mib where that budget is what ran out, and rerun"
     )]
     FlushNoRoom(#[source] Box<dolos_snapshot::Error>),
+    #[error(
+        "the blocks repository holds no blocks snapshot at epoch-{sequence}: a Dolos snapshot \
+         names the blocks snapshot of its own sequence, so that one is published first. Nothing \
+         was prepared or published for this sequence, and a rerun once it is there continues"
+    )]
+    BlocksAbsent { sequence: u64 },
 }
 
 fn archive_end(tip: &Option<BlockSlot>) -> String {
@@ -334,6 +340,9 @@ pub trait Publish {
     fn latest(&self, plan: &Plan) -> Result<Option<Committed>, Error>;
     /// The stele the repository holds under `sequence`'s immutable tag.
     fn stele(&self, sequence: u64) -> Result<Option<Held>, Error>;
+    /// The inscription digest of the blocks snapshot the blocks repository
+    /// holds at `plan`'s sequence, which the stele there names.
+    fn blocks(&self, plan: &Plan) -> Result<Option<Digest>, Error>;
     /// Publish a prepared boundary, chained to the repository's latest stele,
     /// which has to be `predecessor`. Failures of the publication itself are
     /// [`Error::Finalizing`], which is what tells a damaged bundle from a
@@ -346,54 +355,19 @@ pub trait Publish {
     ) -> Result<Committed, Error>;
 }
 
-/// What a stele is chained to and carries forward, read from its predecessor's
-/// document by the rules a chained publish applies. It arranges no transport,
-/// so it serves a forecast and a reproduction, never a real upload.
-struct Carrying {
-    history: Vec<HistoryEntry>,
-    inheritable: BTreeMap<(String, String), LayerDescriptor>,
-}
-
-impl Predecessor for Carrying {
-    fn history(&self) -> &[HistoryEntry] {
-        &self.history
-    }
-
-    fn adopt(
-        &self,
-        kind: &str,
-        scope: &serde_json::Value,
-    ) -> Result<Option<LayerDescriptor>, stelae_driver::Error> {
-        let key = stelae_driver::scope_key(kind, scope)?;
-        Ok(self.inheritable.get(&key).cloned())
-    }
-
-    fn carried_forward(
-        &self,
-        kind: &str,
-        scope: &serde_json::Value,
-    ) -> Result<bool, stelae_driver::Error> {
-        let key = stelae_driver::scope_key(kind, scope)?;
-        Ok(self.inheritable.contains_key(&key))
-    }
-}
-
-/// What a publication at `sequence` following `previous` would inherit, without
-/// a transport to inherit it through.
+/// What a publication of `plan` following `previous` links to, without a
+/// transport. It resumes nothing, so it serves staging and a reproduction,
+/// never a real upload.
 pub fn following(
     previous: Option<&Inscription>,
-    sequence: u64,
+    plan: &Plan,
 ) -> Result<Box<dyn Predecessor>, Error> {
-    let Some(previous) = previous else {
-        return Ok(Box::new(First));
-    };
-    let planning = |error: dolos_snapshot::Error| Error::Planning(error);
-    let carrying = Carrying {
-        history: history_for(Some(previous), sequence).map_err(|e| planning(e.into()))?,
-        inheritable: inheritable_layers(previous, &DolosProfile).map_err(|e| planning(e.into()))?,
-    };
-    let settling = Settling::new(carrying, Some(previous)).map_err(planning)?;
-    Ok(Box::new(settling))
+    match previous {
+        None => Ok(Box::new(First)),
+        Some(previous) => Ok(Box::new(
+            Following::new(previous, plan).map_err(Error::Planning)?,
+        )),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -546,7 +520,6 @@ fn cleanup_consumed(immutable_dir: &Path, cursor_slot: u64, width: u64) -> Resul
 
 pub struct Driver<'a, W: Workspace> {
     pub genesis: &'a Genesis,
-    pub retained: &'a RetainedEpochs,
     pub mithril: &'a MithrilSource,
     pub download_dir: PathBuf,
     /// Where an export spools its index runs.
@@ -572,6 +545,7 @@ pub struct Driver<'a, W: Workspace> {
 pub struct Batching<'a> {
     pub limits: Limits,
     pub storage_path: PathBuf,
+    /// The Dolos repository, which a batch is bound to.
     pub repository: String,
     /// Whether the batch's volume has this many bytes free.
     pub room: &'a dyn Fn(&Path, u64) -> bool,
@@ -581,18 +555,17 @@ pub struct Batching<'a> {
 #[derive(Debug, Clone)]
 pub struct Options {
     pub direct_s3: Option<Box<stelae::oci::s3_upload::Config>>,
+    /// The network root, which holds the Dolos and the blocks repositories.
     pub repository: dolos_snapshot::registry::Repository,
     pub auth: Auth,
     pub insecure: bool,
     pub scratch_dir: Option<PathBuf>,
     pub concurrency: Option<std::num::NonZeroUsize>,
-    pub verify_carried: bool,
     pub download_dir: Option<PathBuf>,
     pub window: u64,
     pub until_epoch: Option<u64>,
     pub skip_validation: bool,
     pub mithril: MithrilSource,
-    pub retained: RetainedEpochs,
     pub limits: Limits,
 }
 
@@ -630,16 +603,16 @@ pub fn run(
         .unwrap_or_else(|| config.storage.path.join("mithril"));
     std::fs::create_dir_all(&download_dir).map_err(Error::caller)?;
     let runtime = tokio::runtime::Runtime::new().map_err(Error::caller)?;
+    let dolos_repository =
+        crate::publisher::dolos_repository(&options.repository).map_err(Error::caller)?;
     let settings = RepositoryPublish {
         repo: &options.repository,
         auth: options.auth.clone(),
         insecure: options.insecure,
         scratch_dir: options.scratch_dir.as_deref(),
-        rebuild: false,
         tuning: dolos_snapshot::registry::Tuning {
             direct_s3: options.direct_s3.clone(),
             concurrency: options.concurrency,
-            verify_adopted: options.verify_carried,
         },
     };
     let publisher = BackfillPublisher {
@@ -670,7 +643,6 @@ pub fn run(
     };
     let driver = Driver::<ReplayWorkspace> {
         genesis: &genesis,
-        retained: &options.retained,
         mithril: &options.mithril,
         download_dir,
         scratch: options.spool(&config.storage),
@@ -688,7 +660,7 @@ pub fn run(
         batching: Batching {
             limits: options.limits,
             storage_path: config.storage.path.clone(),
-            repository: options.repository.to_string(),
+            repository: dolos_repository.to_string(),
             room: &batch::volume_has_room,
             observer,
         },
@@ -921,7 +893,6 @@ impl<W: Workspace> Driver<'_, W> {
             network_magic: u64::from(self.genesis.network_magic()),
             store_contract: dolos_core::compat::SUPPORTED_CONTRACTS[0].to_owned(),
             mutable_slots: dolos_cardano::mutable_slots(self.genesis),
-            retained: self.retained.as_slice().to_vec(),
             dolos_revision: crate::DOLOS_REVISION.to_owned(),
         };
         let dir = batch::dir_in(&self.batching.storage_path);
@@ -961,7 +932,10 @@ impl<W: Workspace> Driver<'_, W> {
     fn stage(&self, source: &dyn SnapshotSource, batch: &mut Batch) -> Result<Staged, Error> {
         let next = batch.prepared().first().map_or(0, |next| next.sequence);
         let followed = self.followed(batch)?;
-        let previous = following(followed.as_ref(), next)?;
+        let previous = match batch.bundles()?.first() {
+            Some(first) => following(followed.as_ref(), &first.plan())?,
+            None => Box::new(First),
+        };
         let staged = batch.stage(source, &*previous, self.batching.observer);
         self.report(batch);
         staged.map_err(|error| match error {
@@ -1021,6 +995,13 @@ impl<W: Workspace> Driver<'_, W> {
 
     /// Bring the repository to hold `bundle`'s sequence on exactly what the
     /// journal says it follows.
+    ///
+    /// A seal writes three tags in turn: the sequence's tip, the sequence, and
+    /// `latest`. A seal stopped after the first leaves the sequence absent, and
+    /// sealing again writes the same tip. One stopped after the second leaves
+    /// the sequence held under a `latest` that still follows the journal, and
+    /// one stopped after the third leaves `latest` at the sequence: each of
+    /// those is reproduced and compared before it counts as this batch's.
     fn commit_next(
         &self,
         source: &dyn SnapshotSource,
@@ -1046,9 +1027,9 @@ impl<W: Workspace> Driver<'_, W> {
                 found => Err(batch.moved(found).into()),
             };
         }
-        // A seal writes the immutable tag before it moves the latest one, so a
-        // tag here is a seal that stopped half way, or another writer's. Sealing
-        // again only repeats what this batch would write.
+        // A seal writes the sequence's tags before it moves the latest one, so
+        // a tag here is a seal that stopped half way, or another writer's.
+        // Sealing again only repeats what this batch would write.
         if let Some(held) = self.publish.stele(sequence)? {
             let expected = self.reproduce(source, batch, &finalizing, sequence)?;
             if expected != held.committed.identity {
@@ -1091,7 +1072,7 @@ impl<W: Workspace> Driver<'_, W> {
         sequence: u64,
     ) -> Result<String, Error> {
         let followed = self.followed(batch)?;
-        let previous = following(followed.as_ref(), sequence)?;
+        let previous = following(followed.as_ref(), &finalizing.bundle.plan())?;
         warn!(
             sequence,
             "the repository already holds this sequence: reproducing it to compare"
@@ -1126,11 +1107,24 @@ impl<W: Workspace> Driver<'_, W> {
 
     fn plan(&self, source: &dyn SnapshotSource) -> Result<Plan, Error> {
         source
-            .plan(
-                u64::from(self.genesis.network_magic()),
-                self.retained.clone(),
-            )
+            .plan(u64::from(self.genesis.network_magic()))
             .map_err(Error::Planning)
+    }
+
+    /// `plan` naming the blocks snapshot at its sequence, refused when the
+    /// blocks repository holds none there.
+    fn name_blocks(&self, plan: Plan) -> Result<Plan, Error> {
+        let found = stelae_driver::retry::transient(
+            "reading the blocks snapshot a stele names",
+            &|| self.aborted(),
+            || self.publish.blocks(&plan),
+        )?;
+        match found {
+            Some(blocks) => Ok(plan.with_blocks(blocks)),
+            None => Err(Error::BlocksAbsent {
+                sequence: plan.sequence,
+            }),
+        }
     }
 
     fn latest(&self, plan: &Plan) -> Result<Option<Committed>, Error> {
@@ -1264,13 +1258,18 @@ impl<W: Workspace> Driver<'_, W> {
         tail: IndexTail<'_>,
     ) -> Result<Capture, Error> {
         let plan = self.plan(source)?;
-        if batch.is_empty() {
-            match self.unpublished(&plan, plan.sequence)? {
+        let begins = match batch.is_empty() {
+            true => match self.unpublished(&plan, plan.sequence)? {
                 None => return Ok(Capture::AlreadyPublished),
-                Some(Latest(latest)) => {
-                    batch.begin(&self.batching.storage_path, plan.sequence, latest)?
-                }
-            }
+                Some(Latest(latest)) => Some(latest),
+            },
+            false => None,
+        };
+        // Before anything is written for the boundary, so a sequence with no
+        // blocks snapshot leaves the batch as it was.
+        let plan = self.name_blocks(plan)?;
+        if let Some(latest) = begins {
+            batch.begin(&self.batching.storage_path, plan.sequence, latest)?;
         }
         let request = prepare::Request {
             store_contract: batch.source().store_contract.clone(),
@@ -1340,6 +1339,7 @@ impl<W: Workspace> Driver<'_, W> {
         }
         let plan = self.plan(source)?.with_scratch(self.scratch.clone());
         self.refuse_lost_history(&plan)?;
+        let plan = self.name_blocks(plan)?;
         self.publish.announce(&plan)?;
         stelae_driver::retry::transient(
             "publishing the pending sequence",
@@ -1780,7 +1780,6 @@ mod tests {
             insecure: false,
             scratch_dir: scratch_dir.map(PathBuf::from),
             concurrency: None,
-            verify_carried: false,
             download_dir: None,
             window: 1,
             until_epoch: None,
@@ -1789,7 +1788,6 @@ mod tests {
                 aggregator: String::new(),
                 genesis_vkey: String::new(),
             },
-            retained: dolos_snapshot::planning::retained_epochs(&[1]).unwrap(),
             limits: Limits::ONE,
         };
         assert_eq!(options(Some("/spool")).spool(storage), Path::new("/spool"));

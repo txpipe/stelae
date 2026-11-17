@@ -11,8 +11,7 @@ name = "stelae-publisher"
 path = "src/main.rs"
 
 [dependencies]
-# The revision stelae-cardano pins, so the host shares the profile's types.
-stelae = { git = "https://github.com/txpipe/stelae", rev = "cdcf27134f574b522bb454ff5ee9f6a2adf0e353", features = ["oci"] }
+stelae = { path = "../stelae", version = "=0.6.0", features = ["oci"] }
 stelae-cardano = { path = "../stelae-cardano", version = "=0.6.0" }
 
 clap = { version = "4.5.37", features = ["derive"] }

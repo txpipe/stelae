@@ -20,13 +20,16 @@ use dolos_core::ChainPoint;
 use dolos_snapshot::{export::Following, source::SnapshotSource};
 use pallas::ledger::traverse::MultiEraBlock;
 use serde_json::Value;
-use stelae::{inscription::Inscription, progress::Observer};
+use stelae::{
+    inscription::{Inscription, LayerDescriptor},
+    progress::Observer,
+};
 use stelae_cardano::{
     backfill::{self, Options, Outcome},
     batch::{self, Limits},
     initialize,
-    testing::{chain::Chain, loopback::Loopback, Node},
-    Auth, MithrilSource, Point, RestoreSource, RetainedEpochs,
+    testing::{chain::Chain, loopback::Loopback, open_repository, Node},
+    Auth, MithrilSource, Point, RestoreSource,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{
@@ -35,8 +38,6 @@ use tracing::{
 };
 
 const UNTIL: u64 = 8;
-/// Retained dumps fall on either side of most windows' batch boundaries.
-const RETAINED: [u64; 2] = [3, 7];
 /// The epoch no new asset appears in, which leaves a hole in `entity-asset`.
 const HOLE: u64 = 2;
 /// The first window whose account rows take rewards: Dolos pays none for the
@@ -48,10 +49,6 @@ fn provider() {
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
-}
-
-fn retained() -> RetainedEpochs {
-    dolos_snapshot::planning::retained_epochs(&RETAINED).unwrap()
 }
 
 fn limits(max_epochs: u64) -> Limits {
@@ -118,6 +115,22 @@ fn known_genesis_vkey() -> String {
     source.genesis_vkey
 }
 
+/// The Dolos repository under the network root `name`.
+fn dolos(name: &str) -> String {
+    format!("{name}/dolos")
+}
+
+/// Seal the chain's blocks lineage under the network root `name`, through
+/// `through`: what a publisher of it finds there.
+fn seed_blocks(chain: &Chain, loopback: &Loopback, name: &str, through: u64) {
+    let scratch = tempfile::tempdir().unwrap();
+    let blocks = open_repository(
+        &loopback.repository(&format!("{name}/blocks")),
+        scratch.path(),
+    );
+    chain.seal_blocks(&blocks, through);
+}
+
 /// One run of the publisher, and every store traversal it started by kind.
 fn publish(
     chain: &Chain,
@@ -127,6 +140,8 @@ fn publish(
     until: Option<u64>,
 ) -> (Node, Outcome, BTreeMap<String, u64>) {
     provider();
+    let closed = chain.closed_epochs().len() as u64;
+    seed_blocks(chain, loopback, name, until.unwrap_or(closed).min(closed));
     let node = chain.node();
     let download = chain.write_immutable(&node);
     let options = Options {
@@ -136,7 +151,6 @@ fn publish(
         insecure: true,
         scratch_dir: None,
         concurrency: None,
-        verify_carried: false,
         download_dir: Some(download),
         window: 1,
         until_epoch: until,
@@ -146,7 +160,6 @@ fn publish(
             // A listing builds a verifier from this, though it checks nothing.
             genesis_vkey: known_genesis_vkey(),
         },
-        retained: retained(),
         limits,
     };
     let traversals = Arc::new(Traversals::default());
@@ -178,8 +191,10 @@ fn canonical(root: &std::path::Path, name: &str, sequence: u64) -> Vec<u8> {
     std::fs::read(root.join(name).join("blobs/sha256").join(hex)).unwrap()
 }
 
-/// A repository holds exactly what another does, down to what it took to fill.
+/// A network root's Dolos repository holds exactly what another's does, down to
+/// what it took to fill.
 fn assert_same_repository(loopback: &Loopback, found: &str, expected: &str) {
+    let (found, expected) = (&dolos(found), &dolos(expected));
     let (found_tags, expected_tags) = (loopback.manifests(found), loopback.manifests(expected));
     assert_eq!(
         found_tags.keys().collect::<Vec<_>>(),
@@ -260,22 +275,29 @@ impl Reference {
     }
 
     fn canonical(&self, name: &str, sequence: u64) -> Vec<u8> {
-        canonical(self.root.path(), name, sequence)
+        canonical(self.root.path(), &dolos(name), sequence)
     }
 
-    /// The window `(kind, epoch)`'s layer in a stele, if it has one.
+    /// The layer set of the snapshot at `sequence`: every `diff` up to it, and
+    /// its `tip`.
+    fn layer_set(&self, sequence: u64) -> Vec<LayerDescriptor> {
+        let mut layers: Vec<_> = (1..=sequence)
+            .flat_map(|sequence| self.inscription(ONE, sequence).diff)
+            .collect();
+        layers.extend(self.inscription(ONE, sequence).tip);
+        layers
+    }
+
+    /// The window `(kind, epoch)`'s layer in a snapshot, if it has one.
     fn window(&self, sequence: u64, kind: &str, epoch: u64) -> Option<String> {
-        let inscription = self.inscription(ONE, sequence);
-        let layer = inscription.layers.into_iter().find(|layer| {
+        let layer = self.layer_set(sequence).into_iter().find(|layer| {
             layer.kind == kind && layer.scope.get("epoch") == Some(&Value::from(epoch))
         })?;
         Some(layer.diff_id.to_hex())
     }
 
     fn epochs_of(&self, sequence: u64, kind: &str) -> BTreeSet<u64> {
-        let inscription = self.inscription(ONE, sequence);
-        inscription
-            .layers
+        self.layer_set(sequence)
             .iter()
             .filter(|layer| layer.kind == kind)
             .filter_map(|layer| layer.scope.get("epoch")?.as_u64())
@@ -294,20 +316,23 @@ fn the_reference_holds_every_case_the_comparisons_are_about() {
     assert_eq!(reference.traversals["exact"], UNTIL);
     assert!(reference.traversals["entity"] >= 1);
 
-    // Retained dumps: from their boundary on, carried by each later stele.
-    let dumps = |sequence: u64, epoch: u64| {
+    // A chain: each stele follows the one before, and names the blocks
+    // snapshot of its own sequence.
+    for sequence in 1..=UNTIL {
         let inscription = reference.inscription(ONE, sequence);
-        inscription
-            .layers
-            .iter()
-            .filter(|layer| layer.kind.starts_with("state-"))
-            .filter(|layer| layer.scope.get("epoch").and_then(Value::as_u64) == Some(epoch))
-            .count()
-    };
-    assert_eq!(dumps(2, 3), 0);
-    assert!(dumps(3, 3) > 0);
-    assert_eq!(dumps(3, 3), dumps(UNTIL, 3));
-    assert!(dumps(7, 7) > 0);
+        assert_eq!(
+            inscription.previous.map(|link| link.sequence),
+            sequence.checked_sub(1).filter(|before| *before > 0),
+        );
+        let position = dolos_snapshot::read_position(&inscription.position).unwrap();
+        assert_eq!(
+            position.blocks,
+            Some(reference.chain.blocks_digest(sequence))
+        );
+        assert!(inscription
+            .layers()
+            .all(|layer| layer.kind != "blocks" || layer.scope["epoch"] == sequence));
+    }
 
     // Delayed seals: a window closes at the next boundary, and its entities
     // arrive at the one after, whatever a later view shows of them.
@@ -346,10 +371,20 @@ fn the_reference_holds_every_case_the_comparisons_are_about() {
         assert_eq!(row(epoch + 2), row(epoch + 3), "window {epoch} moved twice");
     }
 
-    // Inherited layers: a closed window is carried, not uploaded again.
-    let closed = reference.window(2, "blocks", 1).unwrap();
-    assert_eq!(reference.window(UNTIL, "blocks", 1).unwrap(), closed);
-    let accounting = reference.loopback.accounting(ONE);
+    // A diff is listed once, by the stele that sealed it, and never uploaded
+    // again.
+    let sealed = reference.inscription(ONE, 3);
+    assert!(sealed
+        .diff
+        .iter()
+        .any(|layer| layer.kind == "entity-asset" && layer.scope["epoch"] == 1));
+    for sequence in 4..=UNTIL {
+        let later = reference.inscription(ONE, sequence);
+        assert!(later
+            .layers()
+            .all(|layer| sealed.diff.iter().all(|diff| diff.diff_id != layer.diff_id)));
+    }
+    let accounting = reference.loopback.accounting(&dolos(ONE));
     let repeated: Vec<_> = accounting
         .uploads
         .iter()
@@ -399,8 +434,8 @@ fn the_end_of_the_source_publishes_what_one_boundary_at_a_time_would() {
     assert_eq!(batched, Outcome::UpToDate);
     assert_same_repository(&loopback, "cardano/batched", ONE);
     assert_eq!(
-        loopback.manifests(ONE).get("latest"),
-        loopback.manifests(ONE).get("epoch-4"),
+        loopback.manifests(&dolos(ONE)).get("latest"),
+        loopback.manifests(&dolos(ONE)).get("epoch-4"),
         "epoch 4 is the last with a boundary"
     );
 }
@@ -412,9 +447,7 @@ fn every_publication_is_what_stores_frozen_at_its_boundary_publish() {
     let reference = &*SHELLEY;
     let mut previous = None;
     for sequence in 1..=UNTIL {
-        let frozen = reference
-            .chain
-            .frozen(sequence, &retained(), previous.as_ref());
+        let frozen = reference.chain.frozen(sequence, previous.as_ref());
         assert_eq!(
             frozen.canonical,
             reference.canonical(ONE, sequence),
@@ -451,7 +484,7 @@ fn restores_and_continues(reference: &Reference, name: &str, sequence: u64, next
     let workspace = ReplayWorkspace::open(&node.config, chain.genesis.clone()).unwrap();
     let cursor = {
         let snapshot = workspace.snapshot();
-        let plan = snapshot.plan(chain.magic(), retained()).unwrap();
+        let plan = snapshot.plan(chain.magic()).unwrap();
         let inscription = Inscription::parse(&published).unwrap();
         let reproduced = snapshot.verify_reproduction(&inscription, &plan).unwrap();
         assert_eq!(reproduced, inscription, "reproducing {sequence}");
@@ -467,7 +500,8 @@ fn restores_and_continues(reference: &Reference, name: &str, sequence: u64, next
     let progress = session.import_blocks(blocks_after(chain, &cursor)).unwrap();
     assert!(progress.is_boundary(), "{progress:?}");
     let snapshot = session.snapshot();
-    let plan = snapshot.plan(chain.magic(), retained()).unwrap();
+    let plan = snapshot.plan(chain.magic()).unwrap();
+    let plan = plan.clone().with_blocks(chain.blocks_digest(plan.sequence));
     let following = Following::read(&published, &plan).unwrap();
     let document = snapshot.digest_document(&plan, &following).unwrap();
     assert_eq!(document.canonical, next, "the stele after {sequence}");
@@ -547,15 +581,14 @@ fn a_byron_boundary_holds_its_boundary_block_and_not_the_main_block_beside_it() 
 
         // The header record and the boundary block, and no main block.
         let own = inscription
-            .layers
-            .iter()
+            .layers()
             .find(|layer| {
                 layer.kind == "blocks" && layer.scope.get("epoch") == Some(&Value::from(sequence))
             })
             .expect("the boundary's own blocks window");
         assert_eq!(own.records, 2, "at sequence {sequence}");
 
-        let frozen = chain.frozen(sequence, &retained(), previous.as_ref());
+        let frozen = chain.frozen(sequence, previous.as_ref());
         assert_eq!(frozen.canonical, reference.canonical(ONE, sequence));
         previous = Some(frozen);
     }

@@ -26,12 +26,12 @@ use dolos_testing::{
     synthetic::{build_synthetic_blocks, SyntheticBlockConfig},
 };
 use pallas::ledger::traverse::MultiEraBlock;
-use stelae::{inscription::Inscription, progress::Observer};
+use stelae::{inscription::Inscription, progress::Observer, Digest};
 use stelae_cardano::{
     backfill::{self, Batching, Driver, Outcome, Session, Workspace},
     batch::{self, Batch, Committed, Flush, Frontiers, Held, Limits},
     testing::{empty_registry, Node},
-    MithrilSource, RetainedEpochs,
+    MithrilSource,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -40,8 +40,12 @@ const MAGIC: u32 = 2;
 const REPOSITORY: &str = "oci://registry.invalid/cardano/test";
 /// Preview's: `k * 10`.
 const SLOTS_PER_FILE: u64 = 4_320;
-/// A retained dump falls inside the batch, at its second boundary.
-const RETAINED: [u64; 1] = [2];
+
+/// The blocks snapshot the fake repository holds at `sequence`, which every
+/// stele here names. Nothing reads it back, so any digest serves.
+fn blocks_at(sequence: u64) -> Digest {
+    Digest::compute(format!("the blocks snapshot at {sequence}").as_bytes())
+}
 
 /// Blocks half an epoch apart from slot 0: an epoch boundary every second
 /// block.
@@ -121,7 +125,8 @@ impl Chain {
         let progress = session.import_blocks(self.blocks.clone()).unwrap();
         assert!(progress.is_boundary(), "stop {stop}: {progress:?}");
         let snapshot = session.snapshot();
-        let plan = snapshot.plan(MAGIC.into(), retained()).unwrap();
+        let plan = snapshot.plan(MAGIC.into()).unwrap();
+        let plan = plan.clone().with_blocks(blocks_at(plan.sequence));
         let document = match previous {
             None => snapshot.digest_document(&plan, &First).unwrap(),
             Some(previous) => snapshot
@@ -132,10 +137,6 @@ impl Chain {
         session.finish().unwrap();
         document
     }
-}
-
-fn retained() -> RetainedEpochs {
-    dolos_snapshot::planning::retained_epochs(&RETAINED).unwrap()
 }
 
 fn limits(max_epochs: u64) -> Limits {
@@ -266,8 +267,8 @@ impl<S: SnapshotSource> SnapshotSource for Counted<'_, S> {
         }
         self.inner.epoch()
     }
-    fn plan(&self, magic: u64, retained: RetainedEpochs) -> Result<Plan, dolos_snapshot::Error> {
-        self.inner.plan(magic, retained)
+    fn plan(&self, magic: u64) -> Result<Plan, dolos_snapshot::Error> {
+        self.inner.plan(magic)
     }
     fn boundary(
         &self,
@@ -555,6 +556,8 @@ struct Repository {
     keep_singles: Cell<bool>,
     /// The sequence whose immutable tag can't be read.
     unreadable_tag: Cell<Option<u64>>,
+    /// The first sequence the blocks repository holds no snapshot at.
+    absent_blocks: Cell<Option<u64>>,
     /// The payloads the batch held as each sequence was published.
     payloads: RefCell<Vec<(u64, usize)>>,
     batch_dir: PathBuf,
@@ -599,7 +602,7 @@ impl backfill::Publish for Repository {
         self.calls.published.set(self.calls.published.get() + 1);
         if self.keep_singles.get() {
             let previous = self.followed();
-            let following = backfill::following(previous.as_ref(), plan.sequence)?;
+            let following = backfill::following(previous.as_ref(), plan)?;
             let document = source
                 .digest_document(plan, &*following)
                 .map_err(backfill::Error::caller)?;
@@ -611,6 +614,14 @@ impl backfill::Publish for Repository {
 
     fn latest(&self, _: &Plan) -> Result<Option<Committed>, backfill::Error> {
         Ok(self.latest.borrow().clone())
+    }
+
+    fn blocks(&self, plan: &Plan) -> Result<Option<Digest>, backfill::Error> {
+        let absent = self
+            .absent_blocks
+            .get()
+            .is_some_and(|from| plan.sequence >= from);
+        Ok((!absent).then(|| blocks_at(plan.sequence)))
     }
 
     fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
@@ -667,7 +678,7 @@ impl backfill::Publish for Repository {
         }
 
         let previous = self.followed();
-        let following = backfill::following(previous.as_ref(), sequence)?;
+        let following = backfill::following(previous.as_ref(), &finalizing.bundle.plan())?;
         let document = source
             .finalize_document(finalizing, &*following)
             .map_err(|error| backfill::Error::Finalizing(Box::new(error)))?;
@@ -726,6 +737,10 @@ impl backfill::Publish for Around<'_> {
         self.inner.stele(sequence)
     }
 
+    fn blocks(&self, plan: &Plan) -> Result<Option<Digest>, backfill::Error> {
+        self.inner.blocks(plan)
+    }
+
     fn finalize(
         &self,
         finalizing: &Finalizing<'_>,
@@ -759,7 +774,6 @@ struct Rig<'a> {
     named: RefCell<String>,
     /// The genesis the driver reads, which the stores' own replay doesn't.
     driver_genesis: RefCell<Arc<Genesis>>,
-    retained: RefCell<RetainedEpochs>,
 }
 
 impl<'a> Rig<'a> {
@@ -780,6 +794,7 @@ impl<'a> Rig<'a> {
                 fault: Cell::new(None),
                 keep_singles: Cell::new(false),
                 unreadable_tag: Cell::new(None),
+                absent_blocks: Cell::new(None),
                 payloads: RefCell::default(),
                 batch_dir,
             },
@@ -791,7 +806,6 @@ impl<'a> Rig<'a> {
             room: Box::new(|_, _| true),
             named: RefCell::new(REPOSITORY.to_owned()),
             driver_genesis: RefCell::new(chain.genesis.clone()),
-            retained: RefCell::new(retained()),
         }
     }
 
@@ -819,7 +833,6 @@ impl<'a> Rig<'a> {
         publish: &dyn backfill::Publish,
     ) -> Result<Outcome, backfill::Error> {
         let calls = &*self.calls;
-        let retained = self.retained.borrow().clone();
         let mithril = MithrilSource {
             aggregator: "http://unused.invalid".to_owned(),
             genesis_vkey: String::new(),
@@ -856,7 +869,6 @@ impl<'a> Rig<'a> {
         let driver_genesis = self.driver_genesis.borrow().clone();
         let driver = Driver {
             genesis: &driver_genesis,
-            retained: &retained,
             mithril: &mithril,
             download_dir: self.download.clone(),
             scratch: self.node.path().join("spool"),
@@ -922,7 +934,6 @@ impl<'a> Rig<'a> {
             network_magic: MAGIC.into(),
             store_contract: dolos_core::compat::SUPPORTED_CONTRACTS[0].to_owned(),
             mutable_slots: dolos_cardano::mutable_slots(&self.driver_genesis.borrow()),
-            retained: RETAINED.to_vec(),
             dolos_revision: stelae_cardano::DOLOS_REVISION.to_owned(),
         };
         let dir = batch::dir_in(&self.node.config.storage.path);
@@ -1017,7 +1028,6 @@ fn four_boundaries_prepare_once_each_and_finish_as_frozen_stores_publish() {
     let mut batch = rig.batch();
     let bundles = batch.bundles().unwrap();
     assert_eq!(bundles.len(), 4);
-    assert!(frontiers.horizon.is_some(), "the journal names the horizon");
 
     let workspace = ReplayWorkspace::open(&rig.node.config, chain.genesis.clone()).unwrap();
     let snapshot = workspace.snapshot();
@@ -1050,14 +1060,11 @@ fn four_boundaries_prepare_once_each_and_finish_as_frozen_stores_publish() {
         let frozen = chain.frozen(stop, previous.as_ref());
         assert_eq!(finished.canonical, frozen.canonical, "at sequence {stop}");
 
-        // The retained boundary carries its dump, and so does what follows it:
-        // the equality above is not over an empty list.
-        let carries_dump = Inscription::parse(&finished.canonical)
-            .unwrap()
-            .layers
-            .iter()
-            .any(|layer| layer.kind.starts_with("state-") && layer.scope["epoch"] == RETAINED[0]);
-        assert_eq!(carries_dump, stop >= RETAINED[0], "at sequence {stop}");
+        // Each names the blocks snapshot of its own sequence, which the bundle
+        // carried from its capture.
+        let position = Inscription::parse(&finished.canonical).unwrap().position;
+        let position = dolos_snapshot::read_position(&position).unwrap();
+        assert_eq!(position.blocks, Some(blocks_at(stop)), "at sequence {stop}");
         previous = Some(finished);
     }
     drop(snapshot);
@@ -1538,7 +1545,6 @@ fn a_changed_source_refuses_the_batch() {
         network_magic: MAGIC.into(),
         store_contract: dolos_core::compat::SUPPORTED_CONTRACTS[0].to_owned(),
         mutable_slots: dolos_cardano::mutable_slots(&chain.genesis),
-        retained: RETAINED.to_vec(),
         dolos_revision: stelae_cardano::DOLOS_REVISION.to_owned(),
     };
     assert!(matches!(
@@ -1571,7 +1577,6 @@ fn a_batch_of_one_refuses_a_pending_batch() {
     let error = stelae_cardano::publisher::publish_once(
         &rig.node.config,
         &chain.genesis,
-        &retained(),
         stelae_cardano::Selection::default(),
         stelae_cardano::publisher::Destination::Repository {
             direct_s3: None,
@@ -1579,9 +1584,7 @@ fn a_batch_of_one_refuses_a_pending_batch() {
             auth: stelae_cardano::Auth::Anonymous,
             insecure: false,
             scratch_dir: None,
-            rebuild: false,
             concurrency: None,
-            verify_carried: false,
             require_new: false,
         },
         false,
@@ -1605,6 +1608,54 @@ fn a_batch_of_one_publishes_each_boundary_and_keeps_no_journal() {
     assert_eq!(rig.calls.published.get(), 2);
     assert_eq!(rig.calls.pruned.get(), 1, "after the publish of 1");
     assert!(!batch::dir_in(&rig.node.config.storage.path).exists());
+}
+
+/// A boundary whose blocks snapshot isn't there yet is refused before its
+/// capture: the batch keeps what came before it, and a rerun once the blocks
+/// snapshot is there captures it from the stores.
+#[test]
+fn a_boundary_without_its_blocks_snapshot_is_refused_before_its_capture() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    rig.repository.absent_blocks.set(Some(3));
+
+    let error = rig.run(limits(4), None).unwrap_err();
+    assert!(
+        matches!(error, backfill::Error::BlocksAbsent { sequence: 3 }),
+        "{error}"
+    );
+    assert_eq!(rig.sequences(), [1, 2]);
+    assert_eq!(*rig.calls.prepared.borrow(), [1, 2]);
+    assert!(rig.repository.uploaded.borrow().is_empty());
+
+    rig.repository.absent_blocks.set(None);
+    rig.calls.cancel.restart();
+    let (_, frontiers) = ready(rig.run(limits(4), None));
+    assert_eq!(frontiers.prepared, Some(4));
+    assert_eq!(rig.sequences(), [1, 2, 3, 4]);
+}
+
+/// The one-boundary path asks the same before it publishes.
+#[test]
+fn a_batch_of_one_refuses_a_boundary_without_its_blocks_snapshot() {
+    let chain = Chain::spanning(6);
+    let rig = Rig::new(&chain);
+    rig.repository.absent_blocks.set(Some(2));
+
+    let error = rig.run(Limits::ONE, Some(2)).unwrap_err();
+    assert!(
+        matches!(error, backfill::Error::BlocksAbsent { sequence: 2 }),
+        "{error}"
+    );
+    assert_eq!(rig.calls.published.get(), 1, "sequence 1 alone");
+
+    rig.repository.absent_blocks.set(None);
+    rig.calls.cancel.restart();
+    assert_eq!(
+        rig.run(Limits::ONE, Some(2)).unwrap(),
+        Outcome::UntilEpoch { sequence: 2 }
+    );
+    assert_eq!(rig.calls.published.get(), 2);
 }
 
 /// Input behind a boundary goes only once the journal names that boundary.
@@ -1784,7 +1835,6 @@ fn a_repository_publish_after_a_deleted_batch_publishes_nothing() {
         stelae_cardano::publisher::publish_once(
             &rig.node.config,
             &chain.genesis,
-            &retained(),
             stelae_cardano::Selection::default(),
             stelae_cardano::publisher::Destination::Repository {
                 direct_s3: None,
@@ -1792,9 +1842,7 @@ fn a_repository_publish_after_a_deleted_batch_publishes_nothing() {
                 auth: stelae_cardano::Auth::Anonymous,
                 insecure: true,
                 scratch_dir: None,
-                rebuild: false,
                 concurrency: None,
-                verify_carried: false,
                 require_new: false,
             },
             dry_run,
@@ -1974,7 +2022,6 @@ fn the_recovery_over_a_held_repository_works_as_written() {
     stelae_cardano::publisher::publish_once(
         &rig.node.config,
         &chain.genesis,
-        &retained(),
         stelae_cardano::Selection::default(),
         stelae_cardano::publisher::Destination::Directory {
             path: stele.clone(),
@@ -2689,7 +2736,7 @@ fn an_archive_past_the_next_boundary_refuses_the_publish() {
 
     let workspace = ReplayWorkspace::open(&rig.node.config, chain.genesis.clone()).unwrap();
     let snapshot = workspace.snapshot();
-    let plan = snapshot.plan(MAGIC.into(), retained()).unwrap();
+    let plan = snapshot.plan(MAGIC.into()).unwrap();
     let error = snapshot.digest_document(&plan, &First).unwrap_err();
     drop(snapshot);
     workspace.finish().unwrap();
@@ -2728,8 +2775,10 @@ fn an_archive_ahead_of_the_state_heals_on_replay() {
 
     let workspace = ReplayWorkspace::open(&rig.node.config, chain.genesis.clone()).unwrap();
     let snapshot = workspace.snapshot();
-    let plan = snapshot.plan(MAGIC.into(), retained()).unwrap();
-    let healed = snapshot.digest_document(&plan, &First).unwrap();
+    let plan = snapshot.plan(MAGIC.into()).unwrap();
+    let healed = snapshot
+        .digest_document(&plan.with_blocks(blocks_at(1)), &First)
+        .unwrap();
     drop(snapshot);
     workspace.finish().unwrap();
     assert_eq!(healed.canonical, chain.frozen(1, None).canonical);
@@ -2859,7 +2908,7 @@ fn a_sound_bundle_with_other_layers_on_the_same_boundary_is_refused() {
 
     let workspace = ReplayWorkspace::open(&rig.node.config, chain.genesis.clone()).unwrap();
     let snapshot = workspace.snapshot();
-    let mut plan = snapshot.plan(MAGIC.into(), retained()).unwrap();
+    let mut plan = snapshot.plan(MAGIC.into()).unwrap();
     plan.epochs.retain(|window| window.epoch == 3);
     let request = prepare::Request {
         store_contract: batch.source().store_contract.clone(),
@@ -3022,10 +3071,7 @@ fn a_batch_publishes_in_order_as_frozen_stores_do_from_one_staging() {
         assert_eq!(tags[&sequence], frozen.canonical, "at sequence {sequence}");
 
         let inscription = rig.repository.inscription(sequence).unwrap();
-        let chained = inscription
-            .history
-            .last()
-            .map(|entry| entry.inscription_digest);
+        let chained = inscription.previous.map(|link| link.inscription_digest);
         assert_eq!(
             chained,
             previous.as_ref().map(|previous| previous.identity),
@@ -4061,7 +4107,7 @@ fn rewrite_latest(repository: &Repository, sequence: u64) -> Committed {
     let document = Document {
         canonical: theirs.canonicalize().unwrap(),
         identity: theirs.digest().unwrap(),
-        layers: theirs.layers.len(),
+        layers: theirs.layers().count(),
         uncompressed_size: theirs.uncompressed_size(),
     };
     let committed = Repository::committed(sequence, &document);
@@ -4393,10 +4439,10 @@ fn a_damaged_payload_stops_at_its_sequence_with_its_recovery() {
 fn stores_that_cant_serve_the_batch_stop_with_its_recovery() {
     let refusals: [fn() -> dolos_snapshot::Error; 2] = [
         || {
-            prepare::Refusal::HorizonLost {
+            prepare::Refusal::PrunedArchive {
                 sequence: 2,
-                horizon: 1,
                 first: 9,
+                number: 1,
             }
             .into()
         },
@@ -4657,28 +4703,41 @@ mod over_a_registry {
             (status, answer[start + 4..].to_vec())
         }
 
-        /// Point `to`'s `latest` at what `from`'s names, as another writer's
-        /// push would: its blobs mounted, then its manifest. Nothing
-        /// else in the transport writes a stele under a number the
+        /// Point `to`'s `latest` at what `from`'s names, its stele at
+        /// `sequence`, as another writer's push would: the blobs of its tip
+        /// and its diff mounted, then its tip manifest and the moved tag.
+        /// Nothing else in the transport writes a stele under a number the
         /// repository already holds.
-        fn move_latest(&self, from: &str, to: &str) {
+        fn move_latest(&self, from: &str, to: &str, sequence: u64) {
             const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 
-            let path = format!("/v2/cardano/{from}/manifests/latest");
-            let (status, manifest) = self.request("GET", &path, MANIFEST, &[]);
-            assert_eq!(status, 200);
-            let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
-            let layers = parsed["layers"].as_array().unwrap();
-            for blob in layers.iter().chain([&parsed["config"]]) {
-                let digest = blob["digest"].as_str().unwrap();
-                let path =
-                    format!("/v2/cardano/{to}/blobs/uploads/?mount={digest}&from=cardano/{from}");
-                let (status, _) = self.request("POST", &path, MANIFEST, &[]);
-                assert_eq!(status, 201, "{digest}");
+            let (from, to) = (
+                format!("cardano/{from}/dolos"),
+                format!("cardano/{to}/dolos"),
+            );
+            let mut pushes = Vec::new();
+            for (read, write) in [
+                (format!("epoch-{sequence}.tip"), None),
+                ("latest".into(), None),
+            ] {
+                let path = format!("/v2/{from}/manifests/{read}");
+                let (status, manifest) = self.request("GET", &path, MANIFEST, &[]);
+                assert_eq!(status, 200, "{read}");
+                let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+                let layers = parsed["layers"].as_array().unwrap();
+                for blob in layers.iter().chain([&parsed["config"]]) {
+                    let digest = blob["digest"].as_str().unwrap();
+                    let path = format!("/v2/{to}/blobs/uploads/?mount={digest}&from={from}");
+                    let (status, _) = self.request("POST", &path, MANIFEST, &[]);
+                    assert_eq!(status, 201, "{digest}");
+                }
+                pushes.push((write.unwrap_or(read), manifest));
             }
-            let path = format!("/v2/cardano/{to}/manifests/latest");
-            let (status, _) = self.request("PUT", &path, MANIFEST, &manifest);
-            assert_eq!(status, 201);
+            for (tag, manifest) in pushes {
+                let path = format!("/v2/{to}/manifests/{tag}");
+                let (status, _) = self.request("PUT", &path, MANIFEST, &manifest);
+                assert_eq!(status, 201, "{tag}");
+            }
         }
     }
 
@@ -4696,8 +4755,38 @@ mod over_a_registry {
             auth: Auth::Anonymous,
             insecure: true,
             scratch_dir: None,
-            rebuild: false,
             tuning: Tuning::default(),
+        }
+    }
+
+    /// The width of an epoch on the chain these tests run, which starts in
+    /// Shelley at slot 0.
+    fn epoch_length() -> u64 {
+        dolos_cardano::include::preview::load()
+            .shelley
+            .epoch_length
+            .unwrap() as u64
+    }
+
+    /// Seal a blank blocks snapshot at every sequence through `until` under the
+    /// network root `repo`, for its steles to name.
+    fn seed_blocks(repo: &Repository, until: u64) {
+        let scratch = tempfile::tempdir().unwrap();
+        let blocks = stelae_cardano::testing::open_repository(
+            &stelae_cardano::publisher::blocks_repository(repo)
+                .unwrap()
+                .to_string(),
+            scratch.path(),
+        );
+        let width = epoch_length();
+        for sequence in 1..=until {
+            let epoch = sequence - 1;
+            stelae_cardano::testing::seal_blank_blocks(
+                &blocks,
+                MAGIC.into(),
+                sequence,
+                (epoch, epoch * width, (epoch + 1) * width - 1),
+            );
         }
     }
 
@@ -4707,6 +4796,7 @@ mod over_a_registry {
         limits: Limits,
         until: u64,
     ) -> Result<Outcome, backfill::Error> {
+        seed_blocks(repo, until);
         let observer = Observer::silent();
         let publisher = BackfillPublisher {
             config: &rig.node.config,
@@ -4716,10 +4806,57 @@ mod over_a_registry {
         rig.drive(limits, Some(until), true, &publisher)
     }
 
+    /// Another writer over the same chain: its steles name other blocks
+    /// snapshots, which their identities state.
+    struct NamesOtherBlocks<'a>(BackfillPublisher<'a>);
+
+    impl backfill::Publish for NamesOtherBlocks<'_> {
+        fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {
+            self.0.publish(plan, source)
+        }
+
+        fn latest(&self, plan: &Plan) -> Result<Option<Committed>, backfill::Error> {
+            self.0.latest(plan)
+        }
+
+        fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+            self.0.stele(sequence)
+        }
+
+        fn blocks(&self, plan: &Plan) -> Result<Option<Digest>, backfill::Error> {
+            let other = format!("another writer's blocks snapshot at {}", plan.sequence);
+            Ok(Some(Digest::compute(other.as_bytes())))
+        }
+
+        fn finalize(
+            &self,
+            finalizing: &Finalizing<'_>,
+            predecessor: Option<&Committed>,
+            source: &dyn SnapshotSource,
+        ) -> Result<Committed, backfill::Error> {
+            self.0.finalize(finalizing, predecessor, source)
+        }
+    }
+
+    /// Another writer's steles through `until`, one boundary at a time.
+    fn another_writer_on(rig: &Rig<'_>, repo: &Repository, until: u64) {
+        let observer = Observer::silent();
+        let publisher = NamesOtherBlocks(BackfillPublisher {
+            config: &rig.node.config,
+            settings: settings(repo),
+            observer: &observer,
+        });
+        assert_eq!(
+            rig.drive(Limits::ONE, Some(until), true, &publisher)
+                .unwrap(),
+            Outcome::UntilEpoch { sequence: until }
+        );
+    }
+
     fn inspect(repo: &Repository, point: Point) -> Inspected {
         let scratch = tempfile::tempdir().unwrap();
         SnapshotRepository::open(
-            repo,
+            &stelae_cardano::publisher::dolos_repository(repo).unwrap(),
             true,
             Auth::Anonymous,
             scratch.path().to_owned(),
@@ -4783,7 +4920,7 @@ mod over_a_registry {
 
         let scratch = tempfile::tempdir().unwrap();
         SnapshotRepository::open(
-            &batched,
+            &stelae_cardano::publisher::dolos_repository(&batched).unwrap(),
             true,
             Auth::Anonymous,
             scratch.path().to_owned(),
@@ -4815,6 +4952,10 @@ mod over_a_registry {
             self.inner.stele(sequence)
         }
 
+        fn blocks(&self, plan: &Plan) -> Result<Option<Digest>, backfill::Error> {
+            self.inner.blocks(plan)
+        }
+
         fn finalize(
             &self,
             finalizing: &Finalizing<'_>,
@@ -4842,6 +4983,7 @@ mod over_a_registry {
         one_at_a_time(&chain, &single, 4);
 
         let rig = Rig::new(&chain);
+        seed_blocks(&batched, 4);
         let observer = Observer::silent();
         let publisher = LosesAnAnswer {
             inner: BackfillPublisher {
@@ -4877,10 +5019,9 @@ mod over_a_registry {
         let rig = Rig::new(&chain);
         ready(rig.run(limits(2), None));
 
-        // The same chain under another retained list, which its identity states.
-        let theirs = Rig::new(&chain);
-        *theirs.retained.borrow_mut() = dolos_snapshot::planning::retained_epochs(&[3]).unwrap();
-        one_at_a_time_on(&theirs, &repo, 1);
+        // The same chain naming other blocks snapshots, which its identity
+        // states.
+        another_writer_on(&Rig::new(&chain), &repo, 1);
         let before = inspect(&repo, Point::Epoch(1)).identity;
 
         let error = publish_through(&rig, &repo, limits(2), 2).unwrap_err();
@@ -4911,14 +5052,13 @@ mod over_a_registry {
         let chain = Chain::spanning(12);
         let registry = LocalRegistry::spawn();
         let theirs = registry.repository("theirs");
-        let other = Rig::new(&chain);
-        *other.retained.borrow_mut() = dolos_snapshot::planning::retained_epochs(&[3]).unwrap();
-        one_at_a_time_on(&other, &theirs, 1);
+        another_writer_on(&Rig::new(&chain), &theirs, 1);
         let their_identity = inspect(&theirs, Point::Latest).identity;
 
         for at in [1, 2] {
             let name = format!("moved-at-{at}");
             let repo = registry.repository(&name);
+            seed_blocks(&repo, 4);
             let rig = Rig::new(&chain);
             let observer = Observer::silent();
             let inner = BackfillPublisher {
@@ -4932,7 +5072,7 @@ mod over_a_registry {
                 finalize: &|finalizing, predecessor, source| {
                     let moved = finalizing.bundle.sequence() == at && !fired.replace(true);
                     if moved {
-                        registry.move_latest("theirs", &name);
+                        registry.move_latest("theirs", &name, 1);
                     }
                     let answer =
                         backfill::Publish::finalize(&inner, finalizing, predecessor, source);
@@ -4996,6 +5136,7 @@ mod over_a_registry {
 
         let rig = Rig::new(&chain);
         let late = Rig::new(&chain);
+        seed_blocks(&batched, 2);
         let observer = Observer::silent();
         let inner = BackfillPublisher {
             config: &rig.node.config,
@@ -5026,61 +5167,16 @@ mod over_a_registry {
     fn held_at(repo: &Repository, sequence: u64) -> Option<Held> {
         let scratch = tempfile::tempdir().unwrap();
         Publisher::open_explicit(
-            repo,
+            &stelae_cardano::publisher::dolos_repository(repo).unwrap(),
             true,
             Auth::Anonymous,
             scratch.path().join("scratch"),
             scratch.path().join("record"),
-            false,
             Tuning::default(),
         )
         .unwrap()
         .stele(sequence)
         .unwrap()
-    }
-
-    /// `adopt` keeps a layer that is already there from being built and
-    /// uploaded again. Dropping it still produces the same bytes, so only
-    /// the count tells.
-    #[test]
-    #[ignore = "spawns a registry"]
-    fn a_stele_that_inherits_carries_its_layers_forward() {
-        let chain = Chain::spanning(12);
-        let registry = LocalRegistry::spawn();
-        let repo = registry.repository("reuse");
-        let rig = Rig::new(&chain);
-        let observer = Observer::silent();
-        let inner = BackfillPublisher {
-            config: &rig.node.config,
-            settings: settings(&repo),
-            observer: &observer,
-        };
-        let reused = RefCell::new(BTreeMap::new());
-        let publisher = Around {
-            inner: &inner,
-            finalize: &|finalizing, predecessor, source| {
-                let published = Publisher::open(&rig.node.config, &settings(&repo))
-                    .and_then(|publisher| {
-                        publisher.finalize(finalizing, predecessor, source, &observer)
-                    })
-                    .map_err(|error| backfill::Error::Finalizing(Box::new(error)))?;
-                let sequence = published.inscription.sequence;
-                reused
-                    .borrow_mut()
-                    .insert(sequence, published.layers_reused);
-                Ok(Committed {
-                    sequence,
-                    identity: published.identity.to_string(),
-                })
-            },
-        };
-
-        rig.drive(limits(4), Some(4), true, &publisher).unwrap();
-        let reused = reused.into_inner();
-        assert_eq!(reused[&1], 0, "{reused:?}");
-        for sequence in 2..=4 {
-            assert!(reused[&sequence] > 0, "{reused:?}");
-        }
     }
 
     /// A port nothing listens on.
@@ -5107,7 +5203,6 @@ mod over_a_registry {
                 Auth::Anonymous,
                 scratch.path().join("scratch"),
                 scratch.path().join("record"),
-                false,
                 Tuning::default(),
             )
             .unwrap()
@@ -5164,7 +5259,7 @@ mod over_a_registry {
         let origin = Origin {
             repository: dead.to_string(),
             dataset_id: MAGIC.into(),
-            parameters: dolos_snapshot::parameters(&retained()),
+            parameters: dolos_snapshot::parameters(),
             compression: dolos_snapshot::compression(),
         };
         let chained = |publishing| {
@@ -5213,17 +5308,24 @@ mod over_a_registry {
 
         let storage = &rig.node.config.storage.path;
         let record = dolos_snapshot::registry::record_path_in(storage);
+        // A layer sequence 2 lists in its diff, which a record offers.
         let closed = inspect(&single, Point::Epoch(2))
             .inscription
-            .layers
+            .diff
             .into_iter()
-            .find(|layer| layer.kind == "blocks" && layer.scope["epoch"] == 1)
+            .next()
             .unwrap();
+        // The record revision is the profile's, which a record filed before
+        // the diff chain lacks.
+        let mut parameters = dolos_snapshot::parameters();
+        parameters["recordRevision"] = serde_json::json!(2);
         PublishRecord {
             origin: Origin {
-                repository: batched.to_string(),
+                repository: stelae_cardano::publisher::dolos_repository(&batched)
+                    .unwrap()
+                    .to_string(),
                 dataset_id: MAGIC.into(),
-                parameters: dolos_snapshot::parameters(&retained()),
+                parameters,
                 compression: dolos_snapshot::compression(),
             },
             layers: vec![WrittenLayer {

@@ -13,10 +13,15 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/txpipe/stelae"
 
-# The publisher host (stelae-cardano, stelae-publisher) does not build against
-# the workspace `stelae` and `stelae-driver`: it takes them by git at the exact
-# revision its pinned Dolos uses, so the profile and the host share one set of
-# protocol types while the workspace crates change freely.
+# The pinned Dolos revision (stelae-cardano/Cargo.toml) pins the Stelae crates
+# by git. The publisher is built in this workspace, so patch every name back to
+# these paths: this is what makes the profile's trait and registry types
+# identical to the host's, rather than two same-version crates from different
+# sources.
+[patch."https://github.com/txpipe/stelae"]
+stelae = { path = "stelae" }
+stelae-driver = { path = "stelae-driver" }
+stelae-blocks = { path = "stelae-blocks" }
 
 # Same release flow as dolos: `cargo release` bumps the lockstep workspace
 # version, regenerates the root CHANGELOG.md through git-cliff, commits and

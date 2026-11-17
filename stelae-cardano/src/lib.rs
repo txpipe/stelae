@@ -19,17 +19,14 @@ pub use dolos_mithril::MithrilSource;
 pub use dolos_snapshot::{
     facade::{Point, Repository, RestoreInput, Selection, SnapshotRepository, SnapshotSource},
     node::{registry_auth, RegistryAuth},
-    planning::EpochRange,
     registry::Auth,
     restore::Source as RestoreSource,
-    RetainedEpochs,
 };
 
 /// The Dolos revision this publisher reads its configuration and stores with:
-/// the build of fjall from the txpipe fork (txpipe/dolos PR #1599), over the
-/// boundary preparation facade of PR #1564. The v2 profile was frozen earlier,
-/// at e39a38a3 (PR #1548).
-pub const DOLOS_REVISION: &str = "a95ecdebe8666ddde29578d7a734af5ce8f16375";
+/// the profile that exports the diff chain and names its blocks snapshot
+/// (txpipe/dolos PR #1610 through PR #1625).
+pub const DOLOS_REVISION: &str = "e52f2cf8f7d25870fac712fd85a31b4545c42acf";
 
 #[cfg(test)]
 mod dependency_identity {
@@ -59,17 +56,17 @@ mod dependency_identity {
         }
     }
 
-    // The host's `stelae` and `stelae-driver` must be the ones the Dolos profile
-    // was built against, or these would not compile.
+    // The workspace's `stelae` and `stelae-driver` must be the ones the Dolos
+    // profile was built against, or these would not compile.
     fn accepts_host_profile<P: stelae_driver::DriverProfile>() {}
 
     #[test]
-    fn dolos_profile_implements_the_host_driver_trait() {
+    fn dolos_profile_implements_the_workspace_driver_trait() {
         accepts_host_profile::<dolos_snapshot::DolosProfile>();
     }
 
     #[test]
-    fn facade_registry_types_are_the_protocol_types_used_by_this_host() {
+    fn facade_registry_types_are_the_protocol_types_used_by_this_workspace() {
         fn accepts_repository(_: &stelae::oci::Repository) {}
         let repository: Repository = "oci://example.invalid/cardano/preview".parse().unwrap();
         accepts_repository(&repository);

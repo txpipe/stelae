@@ -1,6 +1,9 @@
 //! Chains a real replay imports, written as the immutable db a publisher reads.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 
 use dolos::engine::BulkReplaySession;
 use dolos_core::{
@@ -8,9 +11,8 @@ use dolos_core::{
     Genesis, RawBlock, TxoRef,
 };
 use dolos_snapshot::{
-    export::{Document, First, Following},
+    export::{Document, EpochWindow, First, Following},
     source::SnapshotSource,
-    RetainedEpochs,
 };
 use dolos_testing::{
     blocks::{make_byron_block, make_byron_ebb, write_immutable_chunks},
@@ -28,6 +30,9 @@ use pallas::{
         traverse::MultiEraBlock,
     },
 };
+
+use stelae::{inscription::Inscription, Digest, SnapshotWriter};
+use stelae_blocks::{BlockRecord, BlocksProfile, EpochScope};
 
 use super::Node;
 
@@ -47,6 +52,10 @@ pub struct Chain {
     /// Slots per immutable file, as the genesis's own geometry numbers them.
     width: u64,
     network: Network,
+    /// The epochs the chain closes, read once from a replay of all of it.
+    closed: OnceLock<Vec<EpochWindow>>,
+    /// The blocks lineage's inscription digests, from `epoch-1` on.
+    lineage: OnceLock<Vec<Digest>>,
 }
 
 /// What [`delegation_certificates`] take in deposits on the preview genesis.
@@ -137,6 +146,8 @@ impl Chain {
             genesis: Arc::new(genesis),
             width,
             network: Network::Custom(built.custom_utxos),
+            closed: OnceLock::new(),
+            lineage: OnceLock::new(),
         }
     }
 
@@ -189,6 +200,8 @@ impl Chain {
             genesis: Arc::new(genesis),
             width,
             network: Network::Preprod,
+            closed: OnceLock::new(),
+            lineage: OnceLock::new(),
         }
     }
 
@@ -249,20 +262,17 @@ impl Chain {
     }
 
     /// What an independent replay stopped at `stop` publishes, knowing nothing
-    /// of a batch.
-    pub fn frozen(
-        &self,
-        stop: u64,
-        retained: &RetainedEpochs,
-        previous: Option<&Document>,
-    ) -> Document {
+    /// of a batch: chained to `previous` and naming the blocks snapshot of its
+    /// sequence in [`Self::seal_blocks`]'s lineage.
+    pub fn frozen(&self, stop: u64, previous: Option<&Document>) -> Document {
         let node = self.node();
         let mut session =
             BulkReplaySession::open(&node.config, self.genesis.clone(), Some(stop)).unwrap();
         let progress = session.import_blocks(self.blocks.clone()).unwrap();
         assert!(progress.is_boundary(), "stop {stop}: {progress:?}");
         let snapshot = session.snapshot();
-        let plan = snapshot.plan(self.magic(), retained.clone()).unwrap();
+        let plan = snapshot.plan(self.magic()).unwrap();
+        let plan = plan.clone().with_blocks(self.blocks_digest(plan.sequence));
         let document = match previous {
             None => snapshot.digest_document(&plan, &First).unwrap(),
             Some(previous) => snapshot
@@ -272,5 +282,98 @@ impl Chain {
         drop(snapshot);
         session.finish().unwrap();
         document
+    }
+
+    /// The windows of the epochs this chain closes, ascending from epoch 0, as
+    /// a plan at its last block numbers them.
+    pub fn closed_epochs(&self) -> &[EpochWindow] {
+        self.closed.get_or_init(|| {
+            let node = self.node();
+            let mut session =
+                BulkReplaySession::open(&node.config, self.genesis.clone(), None).unwrap();
+            session.import_blocks(self.blocks.clone()).unwrap();
+            let snapshot = session.snapshot();
+            let mut epochs = snapshot.plan(self.magic()).unwrap().epochs;
+            drop(snapshot);
+            session.finish().unwrap();
+            // The epoch the chain ends in isn't closed.
+            epochs.pop();
+            epochs
+        })
+    }
+
+    /// The blocks of `window`, as the blocks profile records them.
+    fn blocks_of(&self, window: &EpochWindow) -> Vec<BlockRecord> {
+        self.blocks
+            .iter()
+            .filter_map(|raw| {
+                let block = MultiEraBlock::decode(raw).unwrap();
+                let slot = block.slot();
+                (window.start_slot..=window.end_slot)
+                    .contains(&slot)
+                    .then(|| BlockRecord::new(slot, *block.hash(), raw.to_vec()))
+            })
+            .collect()
+    }
+
+    /// Seal the blocks snapshots at sequences 1 through `through` into
+    /// `writer`: a lineage from `epoch-1`, each adding the epoch its cut
+    /// closes, by the blocks profile's plain writer. Their inscription digests,
+    /// in order.
+    pub fn seal_blocks<W: SnapshotWriter>(&self, writer: &W, through: u64) -> Vec<Digest> {
+        let closed = self.closed_epochs();
+        assert!(
+            through as usize <= closed.len(),
+            "the chain closes {} epochs, and a blocks snapshot at {through} needs epoch {}",
+            closed.len(),
+            through.saturating_sub(1),
+        );
+        let mut previous: Option<Inscription> = None;
+        let mut digests = Vec::new();
+        for sequence in 1..=through {
+            let window = &closed[sequence as usize - 1];
+            let scope = EpochScope::new(
+                self.magic(),
+                window.epoch,
+                window.start_slot,
+                window.end_slot,
+            )
+            .unwrap();
+            let layer = stelae_blocks::write_layer(
+                writer,
+                scope,
+                stelae_blocks::COMPRESSION_LEVEL,
+                self.blocks_of(window),
+            )
+            .unwrap();
+            let mut inscription = Inscription::new(
+                &BlocksProfile,
+                sequence,
+                stelae_blocks::position(&stelae_blocks::Position {
+                    network_magic: self.magic(),
+                    epoch: sequence,
+                }),
+                stelae_blocks::parameters(),
+                stelae_blocks::compression(),
+            );
+            inscription.previous =
+                stelae::inscription::link_for(previous.as_ref(), sequence).unwrap();
+            stelae_driver::place_layers(&BlocksProfile, &mut inscription, [layer.descriptor])
+                .unwrap();
+            inscription.validate().unwrap();
+            digests.push(writer.seal(&BlocksProfile, &inscription).unwrap());
+            previous = Some(inscription);
+        }
+        digests
+    }
+
+    /// The inscription digest of [`Self::seal_blocks`]'s snapshot at
+    /// `sequence`.
+    pub fn blocks_digest(&self, sequence: u64) -> Digest {
+        let digests = self.lineage.get_or_init(|| {
+            let closed = self.closed_epochs().len() as u64;
+            self.seal_blocks(&stelae::Discarding, closed)
+        });
+        digests[sequence as usize - 1]
     }
 }

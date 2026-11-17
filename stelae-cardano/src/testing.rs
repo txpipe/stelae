@@ -35,6 +35,49 @@ pub fn empty_registry() -> String {
     format!("oci://127.0.0.1:{port}/cardano/test")
 }
 
+/// A repository opened as a test writes into it: plaintext and anonymous,
+/// staging under `scratch`.
+pub fn open_repository(repository: &str, scratch: &Path) -> stelae::oci::Registry {
+    stelae_driver::publish::open(
+        &repository.parse().unwrap(),
+        true,
+        stelae::oci::Auth::Anonymous,
+        scratch.to_owned(),
+        Default::default(),
+    )
+    .unwrap()
+}
+
+/// Seal into `writer` the blocks snapshot at `sequence` of a lineage starting
+/// there, with one layer over `start..=end` of `epoch` that holds no block:
+/// enough for a host that only names it, on a node with no chain to build one
+/// from. Its inscription digest.
+pub fn seal_blank_blocks<W: stelae::SnapshotWriter>(
+    writer: &W,
+    magic: u64,
+    sequence: u64,
+    (epoch, start, end): (u64, u64, u64),
+) -> stelae::Digest {
+    use stelae_blocks::BlocksProfile;
+
+    let scope = stelae_blocks::EpochScope::new(magic, epoch, start, end).unwrap();
+    let layer =
+        stelae_blocks::write_layer(writer, scope, stelae_blocks::COMPRESSION_LEVEL, []).unwrap();
+    let mut inscription = stelae::inscription::Inscription::new(
+        &BlocksProfile,
+        sequence,
+        stelae_blocks::position(&stelae_blocks::Position {
+            network_magic: magic,
+            epoch: sequence,
+        }),
+        stelae_blocks::parameters(),
+        stelae_blocks::compression(),
+    );
+    stelae_driver::place_layers(&BlocksProfile, &mut inscription, [layer.descriptor]).unwrap();
+    inscription.validate().unwrap();
+    writer.seal(&BlocksProfile, &inscription).unwrap()
+}
+
 /// A preview node whose stores live in a temporary directory.
 pub struct Node {
     pub root: tempfile::TempDir,

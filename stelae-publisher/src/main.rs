@@ -8,15 +8,18 @@ use std::{
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use miette::{Context as _, IntoDiagnostic as _};
-use stelae::progress::{Event, Observer, Progress};
+use stelae::{
+    inscription::Link,
+    progress::{Event, Observer, Progress},
+    Digest,
+};
 use stelae_cardano::{
     backfill,
     batch::Limits,
     config, initialize,
     publisher::{self, Destination, PublishOutcome},
-    snapshot::{self, Boundary, PlanReport, Published, Verified},
-    Auth, EpochRange, Genesis, Point, RegistryAuth, Repository, RestoreSource, RetainedEpochs,
-    RootConfig, Selection,
+    snapshot::{self, Boundary, Inputs, PlanReport, Published, Verified},
+    Auth, Genesis, Point, RegistryAuth, Repository, RestoreSource, RootConfig, Selection,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -128,25 +131,6 @@ fn read_secrets(path: &Path) -> miette::Result<Secrets> {
         })
 }
 
-/// The epochs this publisher retains a state dump of: signed input, so every
-/// command that plans a publish requires it.
-#[derive(Debug, Args, Clone)]
-struct StateEpochsArgs {
-    /// File listing the retained state-dump epochs, one per line, ascending.
-    #[arg(long, value_name = "PATH")]
-    state_epochs_file: PathBuf,
-}
-
-impl StateEpochsArgs {
-    fn read(&self) -> miette::Result<RetainedEpochs> {
-        read_state_epochs(&self.state_epochs_file)
-    }
-}
-
-fn read_state_epochs(path: &Path) -> miette::Result<RetainedEpochs> {
-    config::read_state_epochs(path).into_diagnostic()
-}
-
 /// How a command writes its result to stdout; progress and logs go to stderr.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 enum Format {
@@ -177,7 +161,8 @@ enum Command {
 
 #[derive(Debug, Args, Clone)]
 struct InitializeArgs {
-    /// Own stele to restore: file://DIR or oci://HOST/PATH.
+    /// Network root to restore from: file://DIR or oci://HOST/PATH, holding
+    /// the `dolos` and `blocks` repositories.
     #[arg(long)]
     source: RestoreSource,
     #[arg(long, default_value = "latest")]
@@ -221,11 +206,10 @@ struct BackfillArgs {
     /// credentials.
     #[arg(long, value_name = "PATH")]
     direct_s3_config: Option<PathBuf>,
-    /// OCI repository to extend.
+    /// Network root to extend: its `dolos` repository, naming the snapshots
+    /// its `blocks` repository holds.
     #[arg(long, value_name = "OCI_URL")]
     repo: Repository,
-    #[command(flatten)]
-    state_epochs: StateEpochsArgs,
     /// The Mithril aggregator to replay from; defaults to the configured
     /// network's, and is required for a custom network.
     #[arg(long, env = "DOLOS_MITHRIL_AGGREGATOR", value_name = "URL")]
@@ -240,8 +224,6 @@ struct BackfillArgs {
     scratch_dir: Option<PathBuf>,
     #[arg(long)]
     concurrency: Option<NonZeroUsize>,
-    #[arg(long, action)]
-    verify_carried: bool,
     #[arg(long)]
     download_dir: Option<PathBuf>,
     #[arg(long, default_value = "40")]
@@ -307,13 +289,11 @@ impl BackfillArgs {
             insecure: self.insecure,
             scratch_dir: self.scratch_dir.clone(),
             concurrency: self.concurrency,
-            verify_carried: self.verify_carried,
             download_dir: self.download_dir.clone(),
             window: self.window,
             until_epoch: self.until_epoch,
             skip_validation: self.skip_validation,
             mithril,
-            retained: self.state_epochs.read()?,
             limits: self.limits()?,
         })
     }
@@ -382,26 +362,22 @@ struct PublishArgs {
     /// credentials.
     #[arg(long, value_name = "PATH", requires = "repo")]
     direct_s3_config: Option<PathBuf>,
+    /// Network root on disk: the blocks snapshot goes to its `blocks` image
+    /// layout and the Dolos snapshot to its `dolos` one.
     #[arg(long)]
     output_dir: Option<PathBuf>,
+    /// Network root in a registry: the Dolos snapshot goes to its `dolos`
+    /// repository, naming the one its `blocks` repository holds.
     #[arg(long, value_name = "OCI_URL")]
     repo: Option<Repository>,
-    #[command(flatten)]
-    state_epochs: StateEpochsArgs,
-    #[arg(long)]
-    epochs: Option<EpochRange>,
     #[arg(long)]
     producers: Option<NonZeroUsize>,
-    #[arg(long, action, conflicts_with = "output_dir")]
-    rebuild: bool,
     #[arg(long, action, conflicts_with = "output_dir")]
     insecure: bool,
     #[arg(long)]
     scratch_dir: Option<PathBuf>,
     #[arg(long, conflicts_with = "output_dir")]
     concurrency: Option<NonZeroUsize>,
-    #[arg(long, action, conflicts_with = "output_dir")]
-    verify_carried: bool,
     #[arg(long, action)]
     dry_run: bool,
     #[arg(long, action, conflicts_with = "output_dir")]
@@ -410,11 +386,20 @@ struct PublishArgs {
 
 #[derive(Debug, Args)]
 struct DigestArgs {
-    /// Epochs to build layers for, e.g. `500..520`, `500..=520`, `500..`,
-    /// `..520` or `500`; defaults to every epoch below the cursor, and must
-    /// match what the stele being reproduced was published with.
-    #[arg(long, value_name = "RANGE")]
-    epochs: Option<EpochRange>,
+    /// Network root to read the stele before this one and the blocks snapshot
+    /// at this sequence from: file://DIR or oci://HOST/PATH.
+    #[arg(long, value_name = "URL")]
+    repo: Option<RestoreSource>,
+    #[arg(long, action, requires = "repo")]
+    insecure: bool,
+    /// Inscription digest of the stele before this one, in place of the one
+    /// --repo holds; without either the reproduction starts a lineage.
+    #[arg(long, value_name = "DIGEST")]
+    previous: Option<Digest>,
+    /// Inscription digest of the blocks snapshot at this sequence, in place of
+    /// the one --repo holds; without either the stele names none.
+    #[arg(long, value_name = "DIGEST")]
+    blocks: Option<Digest>,
     /// Layer producers run at once; changes nothing about the digest.
     #[arg(long, value_name = "N")]
     producers: Option<NonZeroUsize>,
@@ -422,16 +407,9 @@ struct DigestArgs {
     /// the storage path's `scratch` directory.
     #[arg(long, value_name = "PATH")]
     scratch_dir: Option<PathBuf>,
-    /// Canonical inscription of the stele this one follows, as `inspect
-    /// --format json` or a published `inscription.json` holds it; without it
-    /// the reproduction carries no history, which is a different digest.
-    #[arg(long, value_name = "FILE")]
-    chain_from: Option<PathBuf>,
     /// Write the canonical inscription to FILE instead of to stdout.
     #[arg(long, value_name = "FILE")]
     output: Option<PathBuf>,
-    #[command(flatten)]
-    state_epochs: StateEpochsArgs,
     /// The inscription is JSON in either format.
     #[arg(long, value_enum, default_value_t)]
     format: Format,
@@ -439,7 +417,8 @@ struct DigestArgs {
 
 #[derive(Debug, Args)]
 struct VerifyArgs {
-    /// Stele to verify: oci://HOST/PATH, or file://DIR for a directory stele.
+    /// Network root whose `dolos` repository holds the stele: oci://HOST/PATH,
+    /// or file://DIR for image layouts on disk.
     #[arg(long, value_name = "URL")]
     repo: RestoreSource,
     /// `latest`, or `epoch-N` for the stele published at the end of epoch N.
@@ -458,26 +437,18 @@ struct VerifyArgs {
     /// the storage path's `scratch` directory.
     #[arg(long, value_name = "PATH", requires = "reproduce")]
     scratch_dir: Option<PathBuf>,
-    /// Epochs the reproduction builds layers for; must match what the stele
-    /// was published with.
-    #[arg(long, value_name = "RANGE", requires = "reproduce")]
-    epochs: Option<EpochRange>,
-    /// File listing the retained state-dump epochs the reproduction plans
-    /// with, one per line, ascending; required by --reproduce.
-    #[arg(
-        long,
-        value_name = "PATH",
-        requires = "reproduce",
-        required_if_eq("reproduce", "true")
-    )]
-    state_epochs_file: Option<PathBuf>,
+    /// Inscription digest of the stele before this one, which the published
+    /// one must follow; the repository's own is held to it in any case.
+    #[arg(long, value_name = "DIGEST", requires = "reproduce")]
+    previous: Option<Digest>,
     #[arg(long, value_enum, default_value_t)]
     format: Format,
 }
 
 #[derive(Debug, Args)]
 struct InspectArgs {
-    /// Stele to inspect: oci://HOST/PATH, or file://DIR for a directory stele.
+    /// Network root whose `dolos` repository holds the stele: oci://HOST/PATH,
+    /// or file://DIR for image layouts on disk.
     #[arg(long, value_name = "URL")]
     repo: RestoreSource,
     /// `latest`, or `epoch-N` for the stele published at the end of epoch N.
@@ -486,7 +457,7 @@ struct InspectArgs {
     #[arg(long, action)]
     insecure: bool,
     /// `json` emits the canonical inscription verbatim, the bytes the identity
-    /// is the sha256 of and what `digest --chain-from` takes.
+    /// is the sha256 of.
     #[arg(long, value_enum, default_value_t)]
     format: Format,
 }
@@ -599,9 +570,7 @@ fn run_publish(
     if args.output_dir.is_some() && args.direct_s3_config.is_some() {
         return Err(miette::miette!("--direct-s3-config requires --repo"));
     }
-    let retained = args.state_epochs.read()?;
     let selection = Selection {
-        epochs: args.epochs,
         producers: args.producers,
     };
     let destination = match (&args.output_dir, &args.repo) {
@@ -615,9 +584,7 @@ fn run_publish(
             auth: auth()?,
             insecure: args.insecure,
             scratch_dir: args.scratch_dir.clone(),
-            rebuild: args.rebuild,
             concurrency: args.concurrency,
-            verify_carried: args.verify_carried,
             require_new: args.require_new,
         },
         _ => unreachable!("clap enforces exactly one destination"),
@@ -625,7 +592,6 @@ fn run_publish(
     let (report, outcome) = publisher::publish_once(
         config,
         genesis,
-        &retained,
         selection,
         destination,
         args.dry_run,
@@ -738,33 +704,67 @@ fn report_plan(report: &PlanReport, boundary: &Boundary) {
             "epochs:   {}..={} ({} of them, slots {}..={})",
             span.first, span.last, span.count, span.start_slot, span.end_slot,
         ),
-        None => eprintln!("epochs:   none selected; the state tip only"),
+        None => eprintln!("epochs:   none; the state tip only"),
     }
-    eprintln!(
-        "dumps:    {:?} retained ({} due at this sequence)",
-        report.retained, report.dumps_due,
-    );
 }
 
-fn run_digest(config: &RootConfig, genesis: &Genesis, args: &DigestArgs) -> miette::Result<()> {
+/// A link as the reports print it.
+fn link_text(link: Option<Link>, none: &str) -> String {
+    match link {
+        Some(link) => format!("sequence {} ({})", link.sequence, link.inscription_digest),
+        None => none.to_owned(),
+    }
+}
+
+fn run_digest(
+    config: &RootConfig,
+    genesis: &Genesis,
+    args: &DigestArgs,
+    auth: ResolveReadAuth,
+) -> miette::Result<()> {
     let selection = Selection {
-        epochs: args.epochs,
         producers: args.producers,
     };
+    // Before a store opens, so a source that can't be read costs no walk.
+    let published = args
+        .repo
+        .as_ref()
+        .map(|source| open_stele(config, source, args.insecure, auth))
+        .transpose()?;
     let digested = snapshot::with_plan(
         config,
         genesis,
-        args.state_epochs.read()?,
         selection,
         args.scratch_dir.as_deref(),
         &report_plan,
-        |source, plan| snapshot::digest(source, plan, args.chain_from.as_deref()),
+        |source, plan| {
+            let held = match &published {
+                Some(published) => published.inputs(config, plan)?,
+                None => Inputs::default(),
+            };
+            let previous = match args.previous {
+                Some(digest) => Some(snapshot::previous_at(plan.sequence, digest)?),
+                None => held.previous,
+            };
+            let inputs = Inputs {
+                previous,
+                blocks: args.blocks.or(held.blocks),
+            };
+            snapshot::digest(source, plan, inputs)
+        },
     )
     .map_err(diagnose)?;
     let document = &digested.document;
-    match digested.history {
-        Some(entries) => eprintln!("history:  {entries} entries"),
-        None => eprintln!("history:  none; this reproduction starts a chain"),
+    eprintln!(
+        "previous: {}",
+        link_text(
+            digested.inputs.previous,
+            "none; this reproduction starts a lineage"
+        )
+    );
+    match digested.inputs.blocks {
+        Some(blocks) => eprintln!("blocks:   {blocks}"),
+        None => eprintln!("blocks:   none named"),
     }
     eprintln!("layers:   {}", document.layers);
     eprintln!(
@@ -792,17 +792,18 @@ fn print_verified(name: &str, point: Point, verified: &Verified) {
     let inscription = &verified.inscription;
     println!("verified {name} at {point}");
     println!("sequence: {}", inscription.sequence);
-    match inscription.history.as_slice() {
-        [] => println!("history:  none; this stele starts a chain"),
-        [first, ..] => println!(
-            "history:  {} entries, contiguous back to sequence {}",
-            inscription.history.len(),
-            first.sequence,
-        ),
-    }
+    println!(
+        "previous: {}",
+        link_text(inscription.previous, "none; this stele starts a lineage")
+    );
+    println!(
+        "chain:    {} inscriptions, back to sequence {}",
+        verified.chain.inscriptions().len(),
+        verified.chain.first().sequence,
+    );
     println!(
         "layers:   {} streamed and checked ({} compressed bytes)",
-        inscription.layers.len(),
+        verified.chain.descriptors().count(),
         verified.compressed_bytes,
     );
     println!("identity: {}", verified.identity);
@@ -826,38 +827,41 @@ fn run_verify(
         Ok(verified)
     };
 
-    let (verified, reproduced) = match &args.state_epochs_file {
-        Some(path) if args.reproduce => {
+    let (verified, reproduced) = match args.reproduce {
+        true => {
             let selection = Selection {
-                epochs: args.epochs,
                 producers: args.producers,
             };
-            // Planned before the transport check, so a selection these stores
-            // cannot plan is refused before every blob has been streamed.
+            // Planned before the transport check, so stores that cannot plan a
+            // reproduction are refused before every blob has been streamed.
             snapshot::with_plan(
                 config,
                 genesis,
-                read_state_epochs(path)?,
                 selection,
                 args.scratch_dir.as_deref(),
                 &report_plan,
                 |source, plan| {
+                    let previous = args
+                        .previous
+                        .map(|digest| snapshot::previous_at(plan.sequence, digest))
+                        .transpose()?;
                     let verified = transport()?;
-                    let reproduced = snapshot::reproduce(source, plan, &verified.inscription)?;
+                    let reproduced =
+                        snapshot::reproduce(source, plan, &verified.inscription, previous)?;
+                    let layers = reproduced.layers().count();
                     if text {
                         println!(
-                            "reproduced: {} layers rebuilt from the local stores; the documents \
-                             are byte-identical ({})",
-                            reproduced.layers.len(),
+                            "reproduced: {layers} layers rebuilt from the local stores; the \
+                             documents are byte-identical ({})",
                             verified.identity,
                         );
                     }
-                    Ok((verified, Some(reproduced.layers.len())))
+                    Ok((verified, Some(layers)))
                 },
             )
             .map_err(diagnose)?
         }
-        _ => (transport().map_err(diagnose)?, None),
+        false => (transport().map_err(diagnose)?, None),
     };
 
     if !text {
@@ -867,11 +871,15 @@ fn run_verify(
             "point": args.point.to_string(),
             "sequence": inscription.sequence,
             "identity": verified.identity.to_string(),
-            "history": inscription.history.first().map(|first| serde_json::json!({
-                "entries": inscription.history.len(),
-                "first_sequence": first.sequence,
+            "previous": inscription.previous.map(|link| serde_json::json!({
+                "sequence": link.sequence,
+                "inscription_digest": link.inscription_digest.to_string(),
             })),
-            "layers": inscription.layers.len(),
+            "chain": serde_json::json!({
+                "inscriptions": verified.chain.inscriptions().len(),
+                "first_sequence": verified.chain.first().sequence,
+            }),
+            "layers": verified.chain.descriptors().count(),
             "compressed_bytes": verified.compressed_bytes,
             "checked": "digests",
             "reproduced": reproduced.map(|layers| serde_json::json!({ "layers": layers })),
@@ -918,24 +926,23 @@ fn run_inspect(
         "compression: {} level {}",
         inscription.compression.algo, inscription.compression.level
     );
-    match (inscription.history.first(), inscription.history.last()) {
-        (Some(first), Some(last)) if first.sequence != last.sequence => println!(
-            "history:  {} entries, sequence {} ({}) through sequence {} ({})",
-            inscription.history.len(),
-            first.sequence,
-            first.inscription_digest,
-            last.sequence,
-            last.inscription_digest,
-        ),
-        (Some(only), _) => println!(
-            "history:  1 entry, sequence {} ({})",
-            only.sequence, only.inscription_digest,
-        ),
-        _ => println!("history:  none; this stele starts a chain"),
-    }
-    println!("layers:   {}", inscription.layers.len());
+    println!(
+        "previous: {}",
+        link_text(inscription.previous, "none; this stele starts a lineage")
+    );
+    println!(
+        "own:      {} diff and {} tip layers",
+        inscription.diff.len(),
+        inscription.tip.len(),
+    );
+    println!(
+        "chain:    {} inscriptions, back to sequence {}",
+        inspected.chain.inscriptions().len(),
+        inspected.chain.first().sequence,
+    );
+    println!("layers:   {}", inspected.chain.descriptors().count());
     let mut records = 0u64;
-    for (descriptor, compressed) in inscription.layers.iter().zip(&inspected.compressed) {
+    for (descriptor, compressed) in inspected.chain.descriptors().zip(&inspected.compressed) {
         records += descriptor.records;
         // A size the manifest cannot state prints as unknown.
         let compressed = match compressed {
@@ -959,7 +966,7 @@ fn run_inspect(
     println!(
         "totals:   {} records, {} uncompressed bytes, {} compressed bytes",
         records,
-        inscription.uncompressed_size(),
+        inspected.chain.uncompressed_size(),
         total_compressed,
     );
     Ok(())
@@ -1009,7 +1016,7 @@ fn execute(cli: Cli, env: Env) -> miette::Result<()> {
             run_initialize(&config, &genesis, &initialize, &observer)?;
             run_backfill(&config, &genesis, &backfill, &observer)
         }
-        Command::Digest(args) => run_digest(&config, &genesis, &args),
+        Command::Digest(args) => run_digest(&config, &genesis, &args, &read_auth),
         Command::Verify(args) => run_verify(&config, &genesis, &args, &read_auth),
         Command::Inspect(args) => run_inspect(&config, &args, &read_auth),
     }
@@ -1050,8 +1057,6 @@ mod tests {
             "backfill",
             "--repo",
             "oci://registry.invalid/cardano/preview",
-            "--state-epochs-file",
-            "unused",
         ];
         args.extend_from_slice(flags);
         match parse(&args).unwrap().command {
@@ -1111,14 +1116,7 @@ mod tests {
 
     #[test]
     fn digest_and_reproduction_take_a_scratch_directory() {
-        let cli = parse(&[
-            "digest",
-            "--state-epochs-file",
-            "unused",
-            "--scratch-dir",
-            "/spool",
-        ])
-        .unwrap();
+        let cli = parse(&["digest", "--scratch-dir", "/spool"]).unwrap();
         let Command::Digest(digest) = cli.command else {
             unreachable!("parsed a digest")
         };
@@ -1135,26 +1133,83 @@ mod tests {
         assert!(plain.is_err());
     }
 
+    /// Each named what a stele inherited or retained, which the diff chain no
+    /// longer has.
     #[test]
-    fn backfill_options_carry_the_state_epochs_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = config::load(Some(Path::new(&node(dir.path())))).unwrap();
-        let epochs = dir.path().join("state-epochs");
-        std::fs::write(&epochs, "1\n200\n").unwrap();
+    fn the_flags_that_lost_their_meaning_are_gone() {
+        let repo = ["--repo", "oci://registry.invalid/cardano/preview"];
+        let removed: [(&str, &[&str]); 9] = [
+            ("publish", &["--state-epochs-file", "/epochs"]),
+            ("publish", &["--epochs", "1..2"]),
+            ("publish", &["--rebuild"]),
+            ("publish", &["--verify-carried"]),
+            ("backfill", &["--state-epochs-file", "/epochs"]),
+            ("backfill", &["--verify-carried"]),
+            ("run", &["--state-epochs-file", "/epochs"]),
+            ("verify", &["--reproduce", "--epochs", "1..2"]),
+            ("verify", &["--reproduce", "--state-epochs-file", "/epochs"]),
+        ];
+        for (command, flags) in removed {
+            let args: Vec<&str> = std::iter::once(command)
+                .chain(repo)
+                .chain(flags.iter().copied())
+                .collect();
+            let error = parse(&args).err().unwrap();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{command} {flags:?}"
+            );
+            parse(&args[..3]).unwrap();
+        }
+        for flags in [
+            ["--chain-from", "/inscription.json"].as_slice(),
+            ["--epochs", "1..2"].as_slice(),
+            ["--state-epochs-file", "/epochs"].as_slice(),
+        ] {
+            let args: Vec<&str> = std::iter::once("digest")
+                .chain(flags.iter().copied())
+                .collect();
+            let error = parse(&args).err().unwrap();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "digest {flags:?}"
+            );
+        }
+        parse(&["initialize", "--source", "file:///stele"]).unwrap();
+    }
 
-        let cli = parse(&[
-            "backfill",
+    /// A digest's link and blocks come from a network root, a digest given in
+    /// their place, or neither; a verification's link only with --reproduce.
+    #[test]
+    fn digest_and_reproduction_take_their_previous_link() {
+        const DIGEST: &str =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+        let Command::Digest(digest) = parse(&[
+            "digest",
             "--repo",
-            "oci://registry.invalid/cardano/preview",
-            "--state-epochs-file",
-            epochs.to_str().unwrap(),
+            "file:///root",
+            "--previous",
+            DIGEST,
+            "--blocks",
+            DIGEST,
         ])
-        .unwrap();
-        let Command::Backfill(args) = cli.command else {
-            panic!("parsed another command");
+        .unwrap()
+        .command
+        else {
+            unreachable!("parsed a digest")
         };
-        let options = args.options(&config, &|| Ok(Auth::Anonymous)).unwrap();
-        assert_eq!(options.retained.as_slice(), &[1, 200]);
+        assert!(digest.repo.is_some());
+        assert_eq!(digest.previous, Some(DIGEST.parse().unwrap()));
+        assert_eq!(digest.blocks, Some(DIGEST.parse().unwrap()));
+        assert!(parse(&["digest", "--previous", "not-a-digest"]).is_err());
+        assert!(parse(&["digest", "--insecure"]).is_err());
+
+        let repo = ["verify", "--repo", "file:///root", "--previous", DIGEST];
+        assert!(parse(&repo).is_err());
+        let reproduce: Vec<&str> = repo.into_iter().chain(["--reproduce"]).collect();
+        parse(&reproduce).unwrap();
     }
 
     /// Dropped on the way to the driver, these would silently publish one
@@ -1163,15 +1218,11 @@ mod tests {
     fn backfill_options_carry_the_batch_limits() {
         let dir = tempfile::tempdir().unwrap();
         let config = config::load(Some(Path::new(&node(dir.path())))).unwrap();
-        let epochs = dir.path().join("state-epochs");
-        std::fs::write(&epochs, "1\n").unwrap();
 
         let cli = parse(&[
             "backfill",
             "--repo",
             "oci://registry.invalid/cardano/preview",
-            "--state-epochs-file",
-            epochs.to_str().unwrap(),
             "--batch-epochs",
             "4",
             "--batch-scratch-mib",
@@ -1192,8 +1243,6 @@ mod tests {
     fn run_restores_with_its_inputs_and_the_registry_credentials() {
         let dir = tempfile::tempdir().unwrap();
         let config = config::load(Some(Path::new(&node(dir.path())))).unwrap();
-        let epochs = dir.path().join("state-epochs");
-        std::fs::write(&epochs, "1\n").unwrap();
         let scratch = dir.path().join("scratch");
         let basic = Auth::Basic {
             user: "publisher".to_owned(),
@@ -1202,7 +1251,6 @@ mod tests {
         let auth = || Ok(basic.clone());
 
         let repo = ["--repo", "oci://registry.invalid/cardano/preview"];
-        let epochs = ["--state-epochs-file", epochs.to_str().unwrap()];
         // One input per row, so a field read from another input's flag fails.
         let rows: [&[&str]; 8] = [
             &[],
@@ -1217,7 +1265,6 @@ mod tests {
         for restore in rows {
             let args: Vec<&str> = std::iter::once("run")
                 .chain(repo)
-                .chain(epochs)
                 .chain(restore.iter().copied())
                 .collect();
             let Command::Run(args) = parse(&args).unwrap().command else {
@@ -1271,8 +1318,6 @@ mod tests {
     fn run_checks_its_backfill_inputs_before_restoring() {
         let dir = tempfile::tempdir().unwrap();
         let config = node(dir.path());
-        let epochs = dir.path().join("state-epochs");
-        std::fs::write(&epochs, "four\n").unwrap();
 
         let cli = parse(&[
             "--config",
@@ -1280,14 +1325,14 @@ mod tests {
             "run",
             "--repo",
             "oci://registry.invalid/cardano/preview",
-            "--state-epochs-file",
-            epochs.to_str().unwrap(),
+            "--window",
+            "0",
             "--restore-source",
             "file:///missing-stele",
         ])
         .unwrap();
         let error = format!("{:?}", execute(cli, &|_| None).unwrap_err());
-        assert!(error.contains("state epochs file"), "{error}");
+        assert!(error.contains("--window must be at least 1"), "{error}");
         assert!(!dir.path().join("data").exists());
     }
 
@@ -1295,8 +1340,6 @@ mod tests {
     fn a_command_off_the_registry_ignores_its_credentials() {
         let dir = tempfile::tempdir().unwrap();
         let config = node(dir.path());
-        let epochs = dir.path().join("state-epochs");
-        std::fs::write(&epochs, "1\n").unwrap();
         let output = dir.path().join("stele");
 
         let from_directory = parse(&[
@@ -1316,8 +1359,6 @@ mod tests {
             "publish",
             "--output-dir",
             output.to_str().unwrap(),
-            "--state-epochs-file",
-            epochs.to_str().unwrap(),
         ])
         .unwrap();
         // Past the credentials, publishing reaches the store, empty since the
@@ -1330,23 +1371,19 @@ mod tests {
     fn every_registry_command_refuses_bad_credentials_before_a_store_opens() {
         let dir = tempfile::tempdir().unwrap();
         let config = node(dir.path());
-        let epochs = dir.path().join("state-epochs");
-        std::fs::write(&epochs, "1\n").unwrap();
-        let epochs = epochs.to_str().unwrap();
         let repo = "oci://registry.invalid/cardano/preview";
 
-        let commands: [&[&str]; 6] = [
+        let commands: [&[&str]; 7] = [
             &["initialize", "--source", repo],
             &["verify", "--repo", repo],
             &["inspect", "--repo", repo],
-            &["publish", "--repo", repo, "--state-epochs-file", epochs],
-            &["backfill", "--repo", repo, "--state-epochs-file", epochs],
+            &["digest", "--repo", repo],
+            &["publish", "--repo", repo],
+            &["backfill", "--repo", repo],
             &[
                 "run",
                 "--repo",
                 repo,
-                "--state-epochs-file",
-                epochs,
                 "--restore-source",
                 "file:///missing-stele",
             ],
@@ -1402,23 +1439,6 @@ mod tests {
                 "job.yaml does not set {name}"
             );
         }
-    }
-
-    #[test]
-    fn every_publishing_command_requires_the_state_epochs_file() {
-        let repo = ["--repo", "oci://registry.invalid/cardano/preview"];
-        for command in ["publish", "backfill", "run"] {
-            let args: Vec<&str> = std::iter::once(command).chain(repo).collect();
-            let error = parse(&args).unwrap_err().to_string();
-            assert!(error.contains("--state-epochs-file"), "{command}: {error}");
-
-            let args: Vec<&str> = args
-                .into_iter()
-                .chain(["--state-epochs-file", "/etc/publisher/state-epochs"])
-                .collect();
-            parse(&args).unwrap();
-        }
-        parse(&["initialize", "--source", "file:///stele"]).unwrap();
     }
 
     #[test]

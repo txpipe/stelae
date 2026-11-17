@@ -7,21 +7,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# The Stelae revision the Dolos commit below pins (crates/snapshot/Cargo.toml),
-# never the workspace crates or a tag: any other source would make the
-# profile's protocol types distinct from these.
-stelae = { git = "https://github.com/txpipe/stelae", rev = "cdcf27134f574b522bb454ff5ee9f6a2adf0e353", features = ["oci"] }
-stelae-driver = { git = "https://github.com/txpipe/stelae", rev = "cdcf27134f574b522bb454ff5ee9f6a2adf0e353", features = ["oci"] }
+stelae = { path = "../stelae", version = "=0.6.0", features = ["oci"] }
+stelae-driver = { path = "../stelae-driver", version = "=0.6.0", features = ["oci"] }
+stelae-blocks = { path = "../stelae-blocks", version = "=0.6.0" }
 
-# The Dolos commit that builds fjall from the txpipe fork (txpipe/dolos PR
-# #1599). Boundary preparation and staged export came earlier (PR #1564), and
-# the v2 profile was frozen at e39a38a3 (PR #1548); see docs/publisher.md.
+# The Dolos commit whose profile exports the diff chain and names its blocks
+# snapshot (txpipe/dolos PR #1610 through PR #1625); see docs/publisher.md.
 # DOLOS_REVISION in src/lib.rs names the same commit.
-dolos = { git = "https://github.com/txpipe/dolos", rev = "a95ecdebe8666ddde29578d7a734af5ce8f16375", default-features = false }
-dolos-cardano = { git = "https://github.com/txpipe/dolos", rev = "a95ecdebe8666ddde29578d7a734af5ce8f16375" }
-dolos-core = { git = "https://github.com/txpipe/dolos", rev = "a95ecdebe8666ddde29578d7a734af5ce8f16375" }
-dolos-mithril = { git = "https://github.com/txpipe/dolos", rev = "a95ecdebe8666ddde29578d7a734af5ce8f16375" }
-dolos-snapshot = { git = "https://github.com/txpipe/dolos", rev = "a95ecdebe8666ddde29578d7a734af5ce8f16375" }
+dolos = { git = "https://github.com/txpipe/dolos", rev = "e52f2cf8f7d25870fac712fd85a31b4545c42acf", default-features = false }
+dolos-cardano = { git = "https://github.com/txpipe/dolos", rev = "e52f2cf8f7d25870fac712fd85a31b4545c42acf" }
+dolos-core = { git = "https://github.com/txpipe/dolos", rev = "e52f2cf8f7d25870fac712fd85a31b4545c42acf" }
+dolos-mithril = { git = "https://github.com/txpipe/dolos", rev = "e52f2cf8f7d25870fac712fd85a31b4545c42acf" }
+dolos-snapshot = { git = "https://github.com/txpipe/dolos", rev = "e52f2cf8f7d25870fac712fd85a31b4545c42acf" }
 
 itertools = "0.14.0"
 pallas = { version = "1.4.0", features = ["hardano", "phase2", "unstable"] }
@@ -33,7 +30,7 @@ tokio-util = { version = "0.7.11", features = ["rt"] }
 tracing = "0.1.37"
 
 # The `testing` fixture's, which the publisher's binary tests build stores with.
-dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "a95ecdebe8666ddde29578d7a734af5ce8f16375", optional = true }
+dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "e52f2cf8f7d25870fac712fd85a31b4545c42acf", optional = true }
 tempfile = { version = "3.20.0", optional = true }
 toml = { version = "0.8.13", optional = true }
 
@@ -46,8 +43,8 @@ required-features = ["testing"]
 
 [dev-dependencies]
 stelae-cardano = { path = ".", features = ["testing"] }
-dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "a95ecdebe8666ddde29578d7a734af5ce8f16375" }
-dolos-fjall = { git = "https://github.com/txpipe/dolos", rev = "a95ecdebe8666ddde29578d7a734af5ce8f16375" }
+dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "e52f2cf8f7d25870fac712fd85a31b4545c42acf" }
+dolos-fjall = { git = "https://github.com/txpipe/dolos", rev = "e52f2cf8f7d25870fac712fd85a31b4545c42acf" }
 # The tests build fjall errors directly, so this must be the fork revision
 # dolos-fjall pins at the Dolos commit above, or two fjall crates would resolve.
 fjall = { git = "https://github.com/txpipe/fjall", rev = "ae794ad448d90214c3491df4c50f59f0fe15cf90" }

@@ -9,10 +9,15 @@ No command starts or shells out to a Dolos executable.
 ## Source and dependency identity
 
 Every Dolos crate in the publisher's dependency graph, normal and dev, is
-pinned to `a95ecdebe8666ddde29578d7a734af5ce8f16375`, the merge of
-[PR 1599](https://github.com/txpipe/dolos/pull/1599), which builds fjall from
-the [txpipe fork](https://github.com/txpipe/fjall) at
-`ae794ad448d90214c3491df4c50f59f0fe15cf90` (fjall 3.1.13 on lsm-tree 3.1.10).
+pinned to `e52f2cf8f7d25870fac712fd85a31b4545c42acf`, the merge of
+[PR 1625](https://github.com/txpipe/dolos/pull/1625). Its profile exports the
+diff chain ([PR 1610](https://github.com/txpipe/dolos/pull/1610)), leaves
+closed epochs' blocks to the blocks profile
+([PR 1619](https://github.com/txpipe/dolos/pull/1619)) and names the blocks
+snapshot of its sequence in `position`. It builds fjall from the
+[txpipe fork](https://github.com/txpipe/fjall) at
+`ae794ad448d90214c3491df4c50f59f0fe15cf90` (fjall 3.1.13 on lsm-tree 3.1.10),
+as [PR 1599](https://github.com/txpipe/dolos/pull/1599) set it.
 The publisher's own `fjall` dependency names the same fork revision, so the
 graph holds one fjall. The fork lets a write at the L0 halt, or one waiting on
 a worker that has died, return instead of waiting forever (see
@@ -39,9 +44,9 @@ Initialization does not refuse stores synced at an earlier pin (opening them
 only wipes their WAL), so delete a kept claim before the upgrade, as for any
 storage pin change (see
 [publisher-packaging.md](publisher-packaging.md)). The normative profile is
-[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/a95ecdebe8666ddde29578d7a734af5ce8f16375/crates/snapshot/PROFILE.md)
+[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/e52f2cf8f7d25870fac712fd85a31b4545c42acf/crates/snapshot/PROFILE.md)
 at the pinned commit, and the preparation contract this host consumes is
-[`docs/contracts/export-preparation.md`](https://github.com/txpipe/dolos/blob/a95ecdebe8666ddde29578d7a734af5ce8f16375/docs/contracts/export-preparation.md).
+[`docs/contracts/export-preparation.md`](https://github.com/txpipe/dolos/blob/e52f2cf8f7d25870fac712fd85a31b4545c42acf/docs/contracts/export-preparation.md).
 
 Like every revision since the publisher retirement of
 [PR 1335](https://github.com/txpipe/dolos/pull/1335), the pin retains the
@@ -50,20 +55,21 @@ contains no publisher command, backfill loop or publisher policy module. The
 root `dolos` package is imported with default features disabled, so its
 service features are absent from the publisher graph.
 
-The pinned profile depends on Stelae at `cdcf271`, the main commit after
-v0.5.2 that streams a restore's layers in order
-([PR 24](https://github.com/txpipe/stelae/pull/24)). The host (`stelae-cardano`
-and `stelae-publisher`) takes `stelae` and `stelae-driver` by git at that same
-revision, so the profile and the publisher share one set of protocol types.
-The workspace `stelae` and `stelae-driver` are built and tested from their
-paths and may move ahead of it; the host follows them only when the Dolos pin
-moves to a Dolos built against the newer revision.
+The pinned profile depends on Stelae at `b2735ed`, which holds a repository
+in a directory as an OCI image layout
+([PR 36](https://github.com/txpipe/stelae/pull/36)), over the diff chain and
+the blocks profile. The workspace patch for `https://github.com/txpipe/stelae`
+resolves `stelae`, `stelae-driver` and `stelae-blocks` back to the workspace
+packages, so the profile and the publisher share one set of protocol types
+instead of two of the same version. A Dolos pin whose Stelae reference carries
+a different protocol from this workspace needs that skew resolved before it is
+pinned; the patch would otherwise hide it.
 
 Snapshots cut against an earlier pin are not part of this lineage: the frozen
 profile renamed its payload media types and reset every schema revision to
-1, and restoring or
-chaining onto an older snapshot is unsupported. A repository that holds one
-starts over (see [First publication](#first-publication)).
+1, and the diff chain changed every document in place, at the same versions.
+Restoring or chaining onto an older snapshot is unsupported. A repository that
+holds one starts over (see [First publication](#first-publication)).
 
 The lockfile is committed. These commands verify the intended graph:
 
@@ -106,17 +112,18 @@ takes the same way:
 
 | Input | Source | Default |
 | --- | --- | --- |
-| Retained state-dump epochs | `--state-epochs-file PATH`, one epoch per line, ascending | none: `publish`, `backfill`, `run`, `digest` and `verify --reproduce` require it; an empty file retains the tip alone |
 | Mithril aggregator | `--mithril-aggregator` or `DOLOS_MITHRIL_AGGREGATOR` | the known network's; required for `custom` |
 | Mithril genesis key | `--mithril-genesis-vkey` or `DOLOS_MITHRIL_GENESIS_VKEY` | the known network's; required for `custom` |
 | Registry user | global `--registry-user` or `DOLOS_STELAE_USER` | anonymous; `verify` and `inspect` with no user or token read the configured network's official repository as its published read-only user, as Dolos does |
 | Registry secret | `DOLOS_STELAE_PASSWORD` or `DOLOS_STELAE_TOKEN`, or global `--registry-credentials-file PATH` (a TOML file naming only `password` or `token`, in their place); never an argument | none; a user with no secret takes the official registry's read-only password |
 
-The retained epochs are echoed into every inscription's parameters as signed
-input (decision 0026), so they are validated (ascending, no repeats, no epoch
-0) before any store opens. A command that touches no registry (`publish
---output-dir`, `initialize --source file://…`, `digest`, `verify` or
-`inspect` of a `file://` snapshot) reads no registry credentials. A token and user together, or a password with no
+Every source and destination a command names is a network root, such as
+`oci://registry.example/cardano/preview`: the snapshots live in its `dolos`
+repository, and the blocks snapshots they name in its `blocks` repository. A
+`file://` root, and `publish --output-dir`, hold `dolos/` and `blocks/` OCI
+image layouts. A command that touches no registry (`publish --output-dir`,
+`initialize --source file://…`, `digest` without an `oci://` `--repo`,
+`verify` or `inspect` of a `file://` root) reads no registry credentials. A token and user together, or a password with no
 user, fail through the shared profile credential policy. CLI command names
 belong to this executable; profile names, media types, tags and repository
 identities remain the existing wire values.
@@ -126,8 +133,7 @@ identities remain the existing wire values.
 Publish the committed stores once to a directory:
 
 ```sh
-stelae-publisher --config dolos.toml publish --output-dir ./snapshot \
-  --state-epochs-file state-epochs
+stelae-publisher --config dolos.toml publish --output-dir ./preview
 ```
 
 Publish once to a repository:
@@ -135,25 +141,28 @@ Publish once to a repository:
 ```sh
 stelae-publisher --config dolos.toml publish \
   --repo oci://registry.example/cardano/preview \
-  --state-epochs-file state-epochs \
   --concurrency 4
 ```
 
-`publish` preserves epoch selection and producer tuning, `--rebuild`,
-`--verify-carried`, `--dry-run`, and `--require-new`. An up-to-date repository
-is a successful no-op unless `--require-new` is set. `--index-band` is gone:
-staging fills every window from one traversal.
+`publish` takes producer tuning, `--dry-run` and `--require-new`. An up-to-date
+repository is a successful no-op unless `--require-new` is set. A repository
+publish names the blocks snapshot the root's `blocks` repository holds at the
+same sequence, and refuses, writing nothing, when there is none; a directory
+publish writes that blocks snapshot itself, from the archive. `--index-band` is
+gone: staging fills every window from one traversal. So are `--epochs`,
+`--rebuild`, `--verify-carried` and `--state-epochs-file`: a snapshot lists
+only its own layers, so nothing is selected, carried or retained.
 
 Initialize empty stores and then backfill:
 
 ```sh
 stelae-publisher --config dolos.toml run \
   --repo oci://registry.example/cardano/preview \
-  --state-epochs-file state-epochs \
   --concurrency 4
 ```
 
-`run` restores `latest` from the publication repository before replay. Use
+`run` restores `latest` from the root's `dolos` repository before replay, with
+the closed epochs' blocks from its `blocks` repository. Use
 `--restore-source` to restore elsewhere. Restore failure is fatal and partial
 stores are cleared. `--allow-genesis` is the only genesis fallback and is for
 a deliberately verified first publication. `initialize`, `publish`, and
@@ -162,33 +171,39 @@ a deliberately verified first publication. `initialize`, `publish`, and
 ### Reading and reproducing snapshots
 
 `digest`, `verify` and `inspect` replace Dolos's former `snapshot` commands
-over the same profile entry points. `--repo` takes `oci://HOST/PATH` or
-`file://DIR`; registry credentials are resolved only for an `oci://` source.
+over the same profile entry points. `--repo` takes a network root,
+`oci://HOST/PATH` or `file://DIR`; registry credentials are resolved only for
+an `oci://` source.
 
 Compute what the committed stores would publish, writing nothing. The stores
-must stand on the first block of an epoch. The plan is reported on stderr and
-the canonical inscription goes to stdout (or `--output FILE`), so it hashes to
-the identity reported; `--chain-from FILE` extends a predecessor's history:
+must stand on the first block of an epoch, sequence N. The plan is reported on
+stderr and the canonical inscription goes to stdout (or `--output FILE`), so it
+hashes to the identity reported. Two inputs are part of the document and so of
+its digest: the snapshot at N−1 it follows, and the blocks snapshot at N it
+names. `--repo` reads both from a root, and `--previous DIGEST` and
+`--blocks DIGEST` give either one instead. With neither, the reproduction
+starts a lineage and names no blocks snapshot. Stderr says which it used:
 
 ```sh
 stelae-publisher --config dolos.toml digest \
-  --state-epochs-file state-epochs > snapshot.json
+  --repo oci://registry.example/cardano/preview > snapshot.json
 ```
 
-Check a published snapshot's digests, every layer streamed against both of its
-digests; `--reproduce` also rebuilds every layer from the committed stores and
-requires a byte-identical inscription, taking `--epochs`, `--producers` and
-the `--state-epochs-file` the snapshot was published with:
+Check a published snapshot's digests: its chain back to the first snapshot of
+its lineage, then every layer of its layer set streamed against both of its
+digests. `--reproduce` also rebuilds every layer the snapshot lists from the
+committed stores and requires a byte-identical inscription, taking
+`--producers`. The chain walk has already held the published `previous` to the
+snapshot the repository holds at N−1, and `--previous DIGEST` holds it to that
+digest as well:
 
 ```sh
 stelae-publisher --config dolos.toml verify \
-  --repo oci://registry.example/cardano/preview --point epoch-1200 \
-  --reproduce --state-epochs-file state-epochs
+  --repo oci://registry.example/cardano/preview --point epoch-1200 --reproduce
 ```
 
-Print a snapshot's table of contents without pulling a layer. A directory snapshot
-published before `blobs.json` existed reports its compressed sizes as unknown
-rather than reading every blob to find them:
+Print a snapshot's table of contents without pulling a layer: its own `diff`
+and `tip`, its chain, and every layer of the set they make:
 
 ```sh
 stelae-publisher --config dolos.toml inspect \
@@ -204,19 +219,18 @@ user running the command. A larger batch's runs stay with the batch, under
 
 All three take `--format text|json` (default `text`): data on stdout,
 progress and logs on stderr. `inspect --format json` is the canonical
-inscription verbatim, what `digest --chain-from` takes; `digest` writes the
-inscription in either format; `verify --format json` is one report object.
+inscription verbatim; `digest` writes the inscription in either format; `verify --format json` is one report object.
 They exit 0 on success, 1 on an error, 2 on a usage error and 3 when `verify`
 refused the snapshot: a document or layer whose bytes, digests, names or
 encoding disagree, including a blob a registry serves under another digest
 or past its descriptor's size and a blob that does not decompress,
-an inscription of another profile or schema, a broken history, or, under
+an inscription of another profile or schema, a broken chain, or, under
 `--reproduce`, a snapshot of another network or sequence than the stores or a
 reproduction that differs. A check that could not run, because the registry,
 the disk, the credentials, the configuration or the local stores failed,
 exits 1, including a record the local stores hold out of order or malformed
-under `--reproduce`, as does a `--point` a directory snapshot does not hold and
-any refusal by `inspect` or `digest`.
+under `--reproduce`, as does a `--point` the source does not hold, a tip the
+registry no longer keeps, and any refusal by `inspect` or `digest`.
 
 OCI operations run synchronously on the process thread. Mithril calls have a
 separate Tokio runtime. SIGINT and SIGTERM cancel acquisition and are observed
@@ -254,7 +268,10 @@ The backfill state machine preserves these rules from the accepted Dolos host:
 - retain two immutable files of cleanup/download margin using the configured
   network's genesis chunk geometry;
 - retry transient repository work in place using the publication journal;
-- retain the `--state-epochs-file` epochs, and the plan, schema, media-type,
+- name the blocks snapshot of each sequence, read from the blocks repository
+  before the boundary is captured or published, and refuse a sequence the
+  blocks repository holds none at;
+- keep the plan, schema, media-type,
   compression and journal identities of the pinned profile.
 
 ### Stores whose state passed the archive
@@ -387,12 +404,10 @@ files, the stores at their highest stood 0.86 GiB up over 4 epochs, 1.06 over 16
 up to about 1 GiB, whatever the window.
 
 Each publication also checks first that its volume can stage what it stages at once, and
-refuses a shortfall. That is every state layer of the latest snapshot, retained dumps included,
-and its largest other layers, as many as `--concurrency`. At this height, on a lineage with
-no dump yet, it takes 0.65 GiB at `--concurrency 4`, which these runs used, and 0.79 at the
-default of 8. At epoch 300, with one dump, it takes 1.04 and 1.17. A lineage from genesis
-holds 11 dumps at this height, which wasn't measured, so add yours up from the sizes in its
-`latest` manifest.
+refuses a shortfall. That is every state layer of the latest snapshot and its largest other
+layers, as many as `--concurrency`. At this height it took 0.65 GiB at `--concurrency 4`,
+which these runs used, and 0.79 at the default of 8, measured before the diff chain on a
+lineage holding no retained dump, which the state layers alone now are.
 
 Layers staged for upload are unlinked files, so they show only as the volume's free
 space falling. On these runs it fell 4 to 5 GiB past the batch's own high-water, with
@@ -493,8 +508,7 @@ during a backfill costs one smaller batch, and one more index traversal for the 
 Each journal write logs and reports the frontiers: `published`, the snapshot the next
 publication follows, which moves with each commit; `prepared`, the last journaled
 sequence;
-`staged`, where the runs were staged from; `replay`, the slot the stores reached;
-and `horizon`, the oldest slot the archive has to keep for the batch.
+`staged`, where the runs were staged from; and `replay`, the slot the stores reached.
 
 ### What a restart does
 
@@ -507,8 +521,8 @@ and `horizon`, the oldest slot the archive has to keep for the batch.
 
 These refuse too, and none is repaired automatically: a repository whose latest
 snapshot is not the one the batch follows, a journal or bundle that is missing or
-damaged, and another repository, network, store contract, retained list or Dolos
-revision than the batch was prepared from. A batch of one and a repository
+damaged, and another repository, network, store contract or Dolos revision than the
+batch was prepared from. A batch of one and a repository
 `publish` refuse to run past a pending batch, and the refusal names the flags that
 publish it. A bundle the machine can't read right now, through permissions or a
 failing disk, may be intact: that refusal says so, and a rerun goes on once it is
@@ -520,7 +534,8 @@ from the sequence the journal names:
 | The repository holds | The run |
 | --- | --- |
 | the snapshot the journal says comes before this sequence, and nothing under this sequence | publishes it |
-| this sequence under its immutable tag only: a seal that stopped half way | reproduces it, compares identities and seals again |
+| this sequence's tip, under its `.tip` tag only: a seal that stopped after its first tag | seals again, which writes the same tip |
+| this sequence under its immutable tag, and `latest` behind it: a seal that stopped before its last tag | reproduces it, compares identities and seals again |
 | this sequence as `latest`: an upload whose answer was lost | reproduces it, compares identities, journals it and doesn't upload it again |
 | this sequence as `latest` with another identity | refuses, and overwrites nothing: another writer published it, or these stores aren't what the batch was prepared from. The recovery below applies |
 | this sequence with another identity under its immutable tag only | refuses, and overwrites nothing: another writer stopped before moving `latest`, or this publisher did and these stores aren't what the batch was prepared from. If you know that tag is another writer's, stop that writer, delete the tag and rerun. Otherwise leave the tag and treat the stores as wrong, because deleting it publishes from them unchecked: the recovery below applies |
@@ -536,7 +551,7 @@ answer was lost: the next try compares it as the table says.
 
 The registry has no compare-and-set, so nothing guards the upload that follows that
 read. Another writer's seal landing during the upload is overwritten by this batch's
-at both tags and never found, on a batch's last sequence as on any other. While a
+at its tags and never found, on a batch's last sequence as on any other. While a
 later sequence is left to publish, a `latest` landing after this batch's own refuses
 at that sequence's read, and a tag that writer left at that sequence refuses as the
 table says. So keep to one publisher per repository.
@@ -545,7 +560,7 @@ Reproducing a sequence costs what assembling its layers costs, without the uploa
 Staged runs are disposable. Missing, damaged or staged for something else, they are
 staged again from the stores, once in a run, under the checks a first staging makes
 (the store contract, the network and how far back the archive reaches). A bundle
-isn't: damage to it, or an archive pruned past its horizon, stops at that sequence
+isn't: damage to it, or an archive pruned past the first block it needs, stops at that sequence
 with the recovery below, and the earlier sequences stay published.
 
 A publication that runs out of room stops without moving the journal: make room and
@@ -563,8 +578,8 @@ so drain a pending batch with the image that prepared it before upgrading. See
 
 An interrupted single publish leaves `<storage.path>/.snapshot-publish.json`. A batch
 reads it as a batch of one would: whatever it names under this repository and these
-parameters is carried forward if the repository still holds the blob, and rebuilt if
-not. A record that doesn't parse stops the publication: delete the file and rerun,
+parameters, of the layers this sequence adds, is resumed if the repository still holds
+the blob, and rebuilt if not. A record that doesn't parse stops the publication: delete the file and rerun,
 which costs only re-uploading what it named.
 
 The recovery starts the stores over from what the repository holds, which after a
@@ -601,6 +616,13 @@ process, which a rerun resumes. Not even one boundary fitting is a recoverable s
 too: make room or raise the budget and rerun.
 
 ### Upgrade and rollback
+
+**The diff chain.** A build from before the diff chain wrote its batch journal in
+format 1, which held bundles this build can't publish. This one refuses it, saying to
+reset: clear the storage path and any store configured outside it, then restore from
+the network root's latest snapshot, or run with `--allow-genesis` where it holds none.
+The snapshots that build published can't be continued either, so a network moves to
+its new repositories with [First publication](#first-publication).
 
 **Upgrade.** The last release before batches, on the `1db3e41f` pin, can be stopped by a
 signal at any point, or killed during a publication, and this one takes over its stores:
@@ -672,16 +694,16 @@ store configured outside the storage path and runs with `--allow-genesis`
 ## First publication
 
 A fresh lineage starts from an empty repository and replays from genesis.
-Every inscription after the first names its predecessor and carries its
-history forward, so the first snapshot is the only one published without a
-predecessor.
+Every inscription after the first names its predecessor, so the first snapshot
+is the only one published without a predecessor.
 
 1. Stop every other writer to the repository and wait for it to exit.
    Configure the node with full history (see
    [Configuration](#configuration)); its stores grow with the chain, to
    about 250 GiB on mainnet.
-2. Delete every tag in the repository, `latest` first, so no earlier pin's
-   snapshot is restored or chained onto.
+2. Delete every tag in the root's `dolos` repository, `latest` first, so no
+   earlier pin's snapshot is restored or chained onto. Its `blocks` repository
+   holds the blocks snapshots each boundary names.
 3. Clear the storage path and any store configured outside it, since an
    earlier attempt can leave stores and a batch there, then start the first
    run with `--allow-genesis`. Initialization finds no `latest`, opts into
@@ -735,7 +757,6 @@ A wrong mapping makes manifest validation fail; there is no automatic fallback.
 ```text
 stelae-publisher --config dolos.toml run \
   --repo oci://registry.example/cardano/preprod \
-  --state-epochs-file state-epochs \
   --direct-s3-config /run/secrets/direct-s3.json --concurrency 4
 ```
 
@@ -747,8 +768,8 @@ size before reuse. Multipart ETags are not treated as SHA256 digests. S3 request
 retries are handled by the storage client; publication failures still prevent
 sealing and remain eligible for the host's existing retry/resume behavior.
 
-The registry still handles predecessor reads, carried-layer verification,
-manifest validation, immutable epoch tags and `latest`. A failed blob upload
+The registry still handles predecessor reads, manifest validation, immutable
+epoch tags and `latest`. A failed blob upload
 never reaches manifest sealing. This preserves the snapshot/manifest format,
 profile identity, lineage and ordinary OCI readers. Because Zot commits the
 metadata through its API, this hybrid mode needs no out-of-band index writes

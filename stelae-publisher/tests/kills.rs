@@ -23,13 +23,16 @@ use stelae_cardano::{
     testing::{
         chain::Chain,
         loopback::{Loopback, Seen, Verdict},
-        Node,
+        open_repository, Node,
     },
 };
 
 const UNTIL: u64 = 6;
 const WINDOW: u64 = 3;
-const NAME: &str = "cardano/killed";
+/// The network root the process publishes under.
+const ROOT: &str = "cardano/killed";
+/// Its Dolos repository, which the kills are about.
+const NAME: &str = "cardano/killed/dolos";
 const PATIENCE: Duration = Duration::from_secs(900);
 const SIGKILL: i32 = 9;
 
@@ -40,7 +43,8 @@ static UNINTERRUPTED: LazyLock<(BTreeMap<String, Vec<u8>>, String)> = LazyLock::
     let run = Run::new();
     let mut child = run.spawn();
     run.finishes(&mut child);
-    assert_eq!(run.loopback.accounting(NAME).tags.len() as u64, UNTIL * 2);
+    // Each sequence's tip, the sequence, then `latest`.
+    assert_eq!(run.loopback.accounting(NAME).tags.len() as u64, UNTIL * 3);
     (run.loopback.manifests(NAME), run.log())
 });
 
@@ -49,7 +53,6 @@ struct Run {
     node: Node,
     download: PathBuf,
     config: PathBuf,
-    epochs: PathBuf,
     loopback: Loopback,
     /// The registry's files, kept for as long as it serves them.
     _registry: tempfile::TempDir,
@@ -61,16 +64,18 @@ impl Run {
         let node = CHAIN.node();
         let download = CHAIN.write_immutable(&node);
         let config = node.write_config();
-        let epochs = node.path().join("state-epochs");
-        std::fs::write(&epochs, "2\n").unwrap();
         let registry = tempfile::tempdir().unwrap();
         let loopback = Loopback::serve(registry.path()).unwrap();
+        // The blocks snapshots every stele names, there before the process.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let scratch = tempfile::tempdir().unwrap();
+        let blocks = loopback.repository(&format!("{ROOT}/blocks"));
+        CHAIN.seal_blocks(&open_repository(&blocks, scratch.path()), UNTIL);
         let log = node.path().join("publisher.log");
         Self {
             node,
             download,
             config,
-            epochs,
             loopback,
             _registry: registry,
             log,
@@ -93,9 +98,7 @@ impl Run {
             .arg("--config")
             .arg(&self.config)
             .arg("backfill")
-            .args(["--repo", &self.loopback.repository(NAME), "--insecure"])
-            .arg("--state-epochs-file")
-            .arg(&self.epochs)
+            .args(["--repo", &self.loopback.repository(ROOT), "--insecure"])
             .args(["--mithril-aggregator", &self.loopback.aggregator()])
             .args(["--mithril-genesis-vkey", &known.genesis_vkey])
             .arg("--download-dir")
@@ -216,7 +219,8 @@ impl Run {
                 );
                 latest = sequence;
             } else {
-                let sequence: u64 = tag.strip_prefix("epoch-").unwrap().parse().unwrap();
+                let sequence = tag.strip_prefix("epoch-").unwrap();
+                let sequence: u64 = sequence.trim_end_matches(".tip").parse().unwrap();
                 assert!(sequence > latest, "{tag} rewritten with latest at {latest}");
             }
         }
@@ -231,6 +235,11 @@ impl Run {
 
     fn tag_exists(&self, sequence: u64) -> bool {
         let tag = format!("epoch-{sequence}");
+        self.loopback.manifest(NAME, &tag).is_some()
+    }
+
+    fn tip_exists(&self, sequence: u64) -> bool {
+        let tag = format!("epoch-{sequence}.tip");
         self.loopback.manifest(NAME, &tag).is_some()
     }
 }
@@ -255,6 +264,15 @@ fn from_the_nth(
 
 fn sets_latest(request: &Seen<'_>) -> bool {
     request.method == "PUT" && request.path.ends_with("/manifests/latest")
+}
+
+/// The second step of a seal: the sequence's own tag, after its tip's.
+fn sets_a_sequence(request: &Seen<'_>) -> bool {
+    request.method == "PUT"
+        && request
+            .path
+            .rsplit_once("/manifests/")
+            .is_some_and(|(_, tag)| tag.starts_with("epoch-") && !tag.ends_with(".tip"))
 }
 
 /// One traversal of each family per batch, counted in the log of the whole
@@ -325,8 +343,25 @@ fn a_kill_during_an_upload_converges() {
     run.rerun_converges();
 }
 
+/// A seal stopped after its first tag: the tip is there, and nothing names it.
 #[test]
-fn a_kill_between_a_seals_two_tags_converges() {
+fn a_kill_between_a_tip_and_its_sequence_converges() {
+    let run = Run::new();
+    run.loopback
+        .rule(from_the_nth(sets_a_sequence, 2, Verdict::HoldUnserved));
+    let mut child = run.spawn();
+    run.kill_on_hold(&mut child);
+    assert!(
+        run.tip_exists(2) && !run.tag_exists(2) && run.latest_is(1),
+        "not a seal stopped at its tip"
+    );
+    run.rerun_converges();
+}
+
+/// A seal stopped after its second tag: the sequence is there, and `latest`
+/// still follows the one before.
+#[test]
+fn a_kill_between_a_sequence_and_latest_converges() {
     let run = Run::new();
     run.loopback
         .rule(from_the_nth(sets_latest, 2, Verdict::HoldUnserved));

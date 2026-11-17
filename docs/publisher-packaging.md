@@ -33,8 +33,8 @@ and image platform must match the native binary.
 
 The `Publisher image` workflow builds with Rust 1.93.0 and the committed
 `Cargo.lock` on native amd64 and arm64 runners. Each runner builds its image
-and checks executable startup, a v2 configuration with its state epochs file,
-a mounted data volume and SIGTERM delivery. The smoke check runs `run` with networking
+and checks executable startup, a v2 configuration, a mounted data volume and
+SIGTERM delivery. The smoke check runs `run` with networking
 disabled, opts into genesis against a missing local restore source, waits
 for the acquisition loop and stops the process. It needs no chain fixture or
 registry. Replay, restore policy and OCI correctness remain covered by the
@@ -108,8 +108,8 @@ naming.
    `Delete` the volume goes with the claim, and under `Retain` the volume and
    its data stay until someone removes them.
 3. Install or upgrade with the candidate's image, the network's v2
-   `dolosToml` with full history (no `[history]` window), its retained epochs in `stateEpochs`,
-   `allowGenesisFallback: true` and a bumped `run`. From an emptyDir or a fresh
+   `dolosToml` with full history (no `[history]` window), `allowGenesisFallback: true`
+   and a bumped `run`. From an emptyDir or a fresh
    claim, the Job replays from genesis and publishes every epoch boundary on the way.
 4. Set `allowGenesisFallback: false` for every later run. Initialization
    then restores the published `latest`, or resumes the kept stores on a
