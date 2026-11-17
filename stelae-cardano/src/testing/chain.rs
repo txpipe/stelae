@@ -172,9 +172,21 @@ impl Chain {
     /// pool minting every block, and a new asset each epoch but for the epochs
     /// in `no_new_assets`, whose entity layers don't exist.
     pub fn delegating(epochs: usize, no_new_assets: &[usize]) -> Self {
-        let per_epoch = Self::blocks_per_epoch();
+        Self::delegating_by(epochs, no_new_assets, Self::blocks_per_epoch())
+    }
+
+    /// [`Self::delegating`] as release v0.6.0's tests built it: two blocks an
+    /// epoch, half an epoch apart, so most immutable files hold none. A
+    /// lineage that release published from it reads as its own chain.
+    pub fn delegating_sparse(epochs: usize, no_new_assets: &[usize]) -> Self {
+        Self::delegating_by(epochs, no_new_assets, 2)
+    }
+
+    fn delegating_by(epochs: usize, no_new_assets: &[usize], per_epoch: usize) -> Self {
+        let epoch_length = shelley_genesis().shelley.epoch_length.unwrap() as u64;
         let blocks = epochs * per_epoch;
         Self::shelley(blocks, |config| {
+            config.slot_step = epoch_length / per_epoch as u64;
             config.lovelace = DELEGATED_LOVELACE;
             config.seed_amount = DELEGATED_LOVELACE + 7;
             let mut certificates = vec![Vec::new(); blocks];

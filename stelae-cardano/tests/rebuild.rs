@@ -58,7 +58,8 @@ struct Reference {
 }
 
 static REFERENCE: LazyLock<Reference> = LazyLock::new(|| {
-    let chain = Chain::delegating(UNTIL as usize + 2, &[HOLE]);
+    // The chain v0.6.0 published the fixture from.
+    let chain = Chain::delegating_sparse(UNTIL as usize + 2, &[HOLE]);
     let (mut native, mut digests, mut previous) = (Vec::new(), Vec::new(), None);
     for sequence in 1..=UNTIL {
         let document = chain.frozen(sequence, previous.as_ref());
