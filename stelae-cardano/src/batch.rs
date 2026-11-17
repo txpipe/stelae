@@ -423,6 +423,13 @@ pub fn refuse_after_the_first(sequence: u64) -> Result<(), Error> {
     }
 }
 
+/// What starting a published lineage at `sequence`, over an empty repository,
+/// refuses: a history a batch already passed, then a start past `epoch-1`.
+pub fn refuse_beginning(storage_path: &Path, sequence: u64) -> Result<(), Error> {
+    refuse_lost_history(storage_path, sequence)?;
+    refuse_after_the_first(sequence)
+}
+
 /// Finish cleaning up a batch every sequence of which committed, so a run that
 /// won't open a batch doesn't leave its runs on the volume.
 pub fn clear_if_drained(storage_path: &Path) -> Result<(), Error> {
@@ -633,8 +640,7 @@ impl Batch {
         predecessor: Option<Committed>,
     ) -> Result<(), Error> {
         if predecessor.is_none() {
-            refuse_lost_history(storage_path, sequence)?;
-            refuse_after_the_first(sequence)?;
+            refuse_beginning(storage_path, sequence)?;
             let path = storage_path.join(BEGAN_FILE);
             if read_began(&path)? != Some(sequence) {
                 let began = Began {

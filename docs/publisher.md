@@ -258,7 +258,7 @@ The following paths are part of restart compatibility:
 | `<storage.path>/.stelae-publisher-initialized.json` | source, storage path, network magic and restore/genesis decision for cold start |
 | `<storage.path>/scratch` | default OCI staging directory |
 | `<storage.path>/mithril/immutable` | default bounded Mithril download window |
-| `<storage.path>/mithril/blocks-refetch/immutable` | one epoch's immutable files downloaded again for its blocks snapshot, beside the default window; removed once the snapshot is named (see [Blocks snapshots](#blocks-snapshots)) |
+| `<storage.path>/mithril/blocks-refetch/immutable` | one epoch's immutable files downloaded again for its blocks snapshot, beside the default window; used only once a `downloaded` marker beside them records that the download finished, and removed once the snapshot is named or when its download fails or stops (see [Blocks snapshots](#blocks-snapshots)) |
 | `<storage.path>/.stelae-batch/` | a prepared batch's journal, bundles and staged runs; see [Prepared batches](#prepared-batches) |
 | `<storage.path>/.stelae-batch-began.json` | the sequence a batch over an empty repository began at, kept outside the batch; see [What a restart does](#what-a-restart-does) |
 
@@ -275,7 +275,8 @@ The backfill state machine preserves these rules from the accepted Dolos host:
 - prune history only after that publication succeeds, and on a larger batch only
   after its last sequence commits;
 - retain two immutable files of cleanup/download margin using the configured
-  network's genesis chunk geometry;
+  network's genesis chunk geometry, and on a batch of one, every file of the
+  epoch the stores stand in;
 - retry transient repository work in place using the publication journal;
 - publish the blocks snapshot of each sequence into the blocks repository,
   from the immutable files of the epoch its boundary closes, before the
@@ -363,11 +364,14 @@ tagged `epoch-N` at the boundary that opens epoch N, and both lineages start at
 
 At the boundary that opens epoch N, the host exports epoch N−1 from its
 immutable files with the blocks profile, one `blocks` layer for the whole
-epoch, and seals it at sequence N after the blocks repository's
-`epoch-(N−1)`:
+epoch, and seals it at sequence N after the blocks repository's `latest`,
+which has to be `epoch-(N−1)`:
 
 - A batch of one does this before it publishes the stele, and removes the
-  immutable files the boundary consumed only once the stele is published.
+  immutable files the boundary consumed only once the stele is published. It
+  keeps every file of the epoch the stores stand in, which the next
+  boundary's blocks snapshot reads, so a run that ends part way through an
+  epoch leaves its files to the next run.
 - A larger batch does it when it captures the boundary, before the consumed
   files go. The bundle, which the journal names, carries the reference, so the
   flush publishes the stele later without reading the blocks repository.
@@ -375,8 +379,11 @@ epoch, and seals it at sequence N after the blocks repository's
 A blocks snapshot already at N, which a run killed between the two snapshots
 leaves, is reproduced from the same files, following the repository's
 `epoch-(N−1)`, and compared by inscription digest, as a stele already at its
-sequence is. These refuse, with nothing of the stele at N written and no
-retry:
+sequence is. A seal writes `epoch-N` before it moves `latest`, so one held
+under a `latest` still at N−1 is a seal that stopped between the two: it is
+reproduced following that `latest` and, once it compares, sealed again, which
+writes the same tag and moves `latest`. A `latest` past N never moves. These
+refuse, with nothing of the stele at N written and no retry:
 
 - a blocks snapshot at N that the files do not reproduce;
 - one that is another sequence's or another network's;
@@ -388,8 +395,13 @@ on a volume that came back empty. The host then downloads that epoch's files
 again from Mithril, with the window's validation setting, plus the file after
 them, which shows the epoch's last file is closed. They go to
 `blocks-refetch/` under the download directory, apart from the replay's
-window, and are removed once the blocks snapshot is named. A boundary whose
-stele the `dolos` repository already holds reads no blocks snapshot.
+window, and are removed once the blocks snapshot is named. Only a download
+that finished, with its files all there, is used: a `downloaded` marker
+beside them records it, and a retry or a rerun seals from it without
+downloading again. One that Mithril rejected, or that was stopped, is
+removed, and the run ends on that failure, which the download has already
+retried. A boundary whose stele the `dolos` repository already holds reads no
+blocks snapshot.
 
 The blocks upload goes through the same transport settings as the stele's:
 registry credentials, `--concurrency` and `--direct-s3-config`.
@@ -772,8 +784,9 @@ published without a predecessor.
 
 A published lineage starts at `epoch-1`. Stores at a later sequence publish
 only onto a `dolos` repository that holds the sequence before theirs: over an
-empty one, `backfill` and `run` refuse before the stele, so stores restored
-from another lineage never start one part way along it.
+empty one, `backfill` and `run` refuse before anything is downloaded or
+written for either repository, so stores restored from another lineage never
+start one part way along it.
 
 On the chart these are `allowGenesisFallback: true` for the first run and
 `false` from the next one on; see

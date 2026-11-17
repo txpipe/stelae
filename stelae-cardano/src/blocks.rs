@@ -5,15 +5,16 @@
 //! network root's `blocks` repository, before the Dolos snapshot there is
 //! prepared or published. A blocks snapshot the repository already holds at N
 //! is reproduced from the same files and compared by inscription digest, as a
-//! Dolos snapshot is, and a difference refuses.
+//! Dolos snapshot is, and a difference refuses. One a seal left under a
+//! `latest` it never moved is sealed again once it compares.
 
 use std::path::PathBuf;
 
 use dolos_snapshot::export::Plan;
 use stelae::{
     inscription::{link_for, Link},
-    oci::Registry,
-    Digest,
+    oci::{Registry, Snapshot},
+    Digest, SnapshotReader as _,
 };
 use stelae_blocks::{
     hardano::{self, Epoch},
@@ -145,10 +146,14 @@ impl Predecessor for Follows {
 /// The inscription digest of the blocks snapshot at `plan`'s sequence in
 /// `registry`, which the Dolos snapshot there names.
 ///
-/// One the repository holds is reproduced from `files`, following the
-/// repository's sequence before it, and kept only when the digests agree.
-/// Otherwise one is exported from `files` and sealed after the repository's
-/// latest, which has to be the sequence before.
+/// One the repository holds is reproduced from `files` and kept only when the
+/// digests agree. Otherwise one is exported from `files` and sealed after the
+/// repository's latest, which has to be the sequence before.
+///
+/// A seal writes the sequence's tag before `latest`, so one held under a
+/// `latest` still at the sequence before is a seal that stopped between the
+/// two. It is reproduced following that `latest` and sealed again, which
+/// writes the same tag and moves `latest`. A `latest` past it never moves.
 pub fn ensure(
     registry: &Registry,
     plan: &Plan,
@@ -172,50 +177,41 @@ pub fn ensure(
         Err(error) if error.is_absent() => None,
         Err(error) => return Err(read(error).into()),
     };
+    let latest = registry.latest(&BlocksProfile).map_err(read)?;
+    let latest_inscription = latest
+        .as_ref()
+        .map(|latest| latest.read_inscription())
+        .transpose()
+        .map_err(read)?;
     let files = files()?;
     let epoch = files.epoch();
 
     let Some(held) = held else {
-        let latest = registry.latest(&BlocksProfile).map_err(read)?;
-        let magic = plan.network.magic();
-        let position = stelae_blocks::position(&Position {
-            network_magic: magic,
-            epoch: sequence,
-        });
-        let origin = Origin::of(
-            registry,
-            magic,
-            stelae_blocks::parameters(),
-            stelae_blocks::compression(),
-        );
-        let chained = Chained::new(
-            &BlocksProfile,
-            Publishing::new(registry),
-            latest.as_ref(),
-            sequence,
-            &position,
-            origin,
-        )
-        .map_err(|error| build(error.into()))?;
-        let sealed = hardano::export(registry, &chained, &epoch).map_err(build)?;
-        info!(sequence, digest = %sealed.digest, %repository, "published the blocks snapshot");
-        return Ok(sealed.digest);
+        let sealed = seal(registry, plan, latest.as_ref(), &epoch).map_err(build)?;
+        info!(sequence, digest = %sealed, %repository, "published the blocks snapshot");
+        return Ok(sealed);
     };
 
-    let previous = match sequence.checked_sub(1).filter(|before| *before > 0) {
+    let latest_sequence = latest_inscription
+        .as_ref()
+        .map_or(0, |latest| latest.sequence);
+    let stopped = latest_sequence + 1 == sequence;
+    let followed = match sequence.checked_sub(1).filter(|before| *before > 0) {
+        _ if stopped => latest_inscription,
         None => None,
         Some(before) => match registry.pull_inscription(&BlocksProfile, before) {
-            // A tag at `before` naming another sequence is no link to follow.
-            Ok(previous) => link_for(Some(&previous), sequence).map_err(|error| {
-                build(stelae_blocks::Error::Lineage {
-                    sequence,
-                    reason: error.to_string(),
-                })
-            })?,
+            Ok(previous) => Some(previous),
             Err(error) if error.is_absent() => None,
             Err(error) => return Err(read(error).into()),
         },
     };
+    // A tag at the sequence before naming another sequence is no link to follow.
+    let previous = link_for(followed.as_ref(), sequence).map_err(|error| {
+        build(stelae_blocks::Error::Lineage {
+            sequence,
+            reason: error.to_string(),
+        })
+    })?;
     warn!(
         sequence,
         %held,
@@ -234,5 +230,48 @@ pub fn ensure(
         }
         .into());
     }
+    if stopped {
+        warn!(
+            sequence,
+            "the blocks repository's latest is the sequence before this one: sealing it again"
+        );
+        seal(registry, plan, latest.as_ref(), &epoch).map_err(build)?;
+    }
     Ok(held)
+}
+
+/// Export `epoch` into `registry` and seal it at `plan`'s sequence after
+/// `latest`. A `latest` it can't follow is a refusal: `latest` is already
+/// read, and reading it again gives the same.
+fn seal(
+    registry: &Registry,
+    plan: &Plan,
+    latest: Option<&Snapshot>,
+    epoch: &Epoch<'_>,
+) -> Result<Digest, stelae_blocks::Error> {
+    let sequence = plan.sequence;
+    let magic = plan.network.magic();
+    let position = stelae_blocks::position(&Position {
+        network_magic: magic,
+        epoch: sequence,
+    });
+    let origin = Origin::of(
+        registry,
+        magic,
+        stelae_blocks::parameters(),
+        stelae_blocks::compression(),
+    );
+    let chained = Chained::new(
+        &BlocksProfile,
+        Publishing::new(registry),
+        latest,
+        sequence,
+        &position,
+        origin,
+    )
+    .map_err(|error| stelae_blocks::Error::Lineage {
+        sequence,
+        reason: error.to_string(),
+    })?;
+    Ok(hardano::export(registry, &chained, epoch)?.digest)
 }

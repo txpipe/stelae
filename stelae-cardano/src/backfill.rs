@@ -70,6 +70,8 @@ const FALLBACK_SLOTS_PER_IMMUTABLE_FILE: u64 = 21_600;
 /// Under the download directory: an epoch's immutable files downloaded again
 /// for its blocks snapshot, apart from the replay's window.
 const REFETCH_DIR: &str = "blocks-refetch";
+/// In the refetch directory once its download finished: the files it holds.
+const REFETCHED_FILE: &str = "downloaded";
 
 const IF_THE_STATE_PASSED: &str =
     "If the state passed the archive on the way, the rerun refuses and says how to recover";
@@ -504,8 +506,19 @@ fn dir_contents(immutable_dir: &Path) -> String {
     }
 }
 
+/// The first immutable file of the epoch after the one `plan` closes: the
+/// epoch the stores stand in, whose files the next blocks snapshot reads.
+fn epoch_first_file(plan: &Plan, width: u64) -> Result<u64, Error> {
+    let closed = blocks::closed_epoch(plan).map_err(Error::caller)?;
+    Ok((closed.end_slot + 1) / width)
+}
+
 fn cleanup_consumed(immutable_dir: &Path, cursor_slot: u64, width: u64) -> Result<(), Error> {
-    let threshold = consumed_below(cursor_slot, width);
+    cleanup_below(immutable_dir, consumed_below(cursor_slot, width))
+}
+
+/// Remove the numbered immutable files below `threshold`.
+fn cleanup_below(immutable_dir: &Path, threshold: u64) -> Result<(), Error> {
     if threshold == 0 {
         return Ok(());
     }
@@ -1163,7 +1176,8 @@ impl<W: Workspace> Driver<'_, W> {
 
     /// `plan` naming the blocks snapshot at its sequence, which the blocks
     /// repository holds or this publishes there first, from the files of the
-    /// epoch its cut closes. A refusal is not tried again.
+    /// epoch its cut closes. A refusal is not tried again, and neither is a
+    /// download that failed: it has had its own retries.
     fn name_blocks(&self, plan: Plan) -> Result<Plan, Error> {
         let scope = blocks::closed_epoch(&plan).map_err(Error::caller)?;
         let files = || self.epoch_files(scope);
@@ -1171,7 +1185,7 @@ impl<W: Workspace> Driver<'_, W> {
             "publishing the blocks snapshot a stele names",
             &|| self.aborted(),
             || match self.publish.blocks(&plan, &files) {
-                Err(error) if error.is_refusal() => Ok(Err(error)),
+                Err(error) if error.is_refusal() || error.is_source_failure() => Ok(Err(error)),
                 other => other.map(Ok),
             },
         )??;
@@ -1182,6 +1196,9 @@ impl<W: Workspace> Driver<'_, W> {
     /// The immutable files of the epoch `scope` covers: the window's while it
     /// holds them, or else downloaded again apart from it, which a restart
     /// after they were removed needs.
+    ///
+    /// A download is used only once it finished and its files checked, which
+    /// a marker beside them records. One that failed or stopped is removed.
     fn epoch_files(&self, scope: EpochScope) -> Result<EpochFiles, Error> {
         let own = EpochFiles {
             dir: self.immutable_dir(),
@@ -1190,13 +1207,6 @@ impl<W: Workspace> Driver<'_, W> {
         };
         if own.epoch().check_files().is_ok() {
             return Ok(own);
-        }
-        let again = EpochFiles {
-            dir: self.download_dir.join(REFETCH_DIR).join("immutable"),
-            ..own.clone()
-        };
-        if again.epoch().check_files().is_ok() {
-            return Ok(again);
         }
         let refused = |dir: &Path, source| blocks::Error::Files {
             epoch: scope.epoch,
@@ -1209,18 +1219,38 @@ impl<W: Workspace> Driver<'_, W> {
             .map_err(|error| refused(&own.dir, error))?;
         // One file past the epoch, which shows its last one closed.
         let (start, end) = (*files.start(), files.end() + 1);
+        let refetch = self.download_dir.join(REFETCH_DIR);
+        let again = EpochFiles {
+            dir: refetch.join("immutable"),
+            ..own.clone()
+        };
+        let marker = refetch.join(REFETCHED_FILE);
+        let downloaded = format!("{start}..={end}");
+        if std::fs::read_to_string(&marker).is_ok_and(|held| held == downloaded)
+            && again.epoch().check_files().is_ok()
+        {
+            return Ok(again);
+        }
         warn!(
             epoch = scope.epoch,
             start, end, "the epoch's immutable files are gone: downloading them again"
         );
         self.remove_refetched()?;
-        if (self.fetch)(&self.download_dir.join(REFETCH_DIR), Some(start), end)?.is_none() {
-            return Err(Error::Interrupted);
+        let fetched = match (self.fetch)(&refetch, Some(start), end) {
+            Ok(Some(())) => again
+                .epoch()
+                .check_files()
+                .map_err(|error| refused(&again.dir, error).into())
+                .and_then(|()| std::fs::write(&marker, &downloaded).map_err(Error::caller)),
+            Ok(None) => Err(Error::Interrupted),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = fetched {
+            if let Err(removing) = self.remove_refetched() {
+                warn!(%removing, "removing a download that did not finish");
+            }
+            return Err(error);
         }
-        again
-            .epoch()
-            .check_files()
-            .map_err(|error| refused(&again.dir, error))?;
         Ok(again)
     }
 
@@ -1375,6 +1405,10 @@ impl<W: Workspace> Driver<'_, W> {
             },
             false => None,
         };
+        // Before anything is downloaded or written for either repository.
+        if let Some(None) = begins {
+            batch::refuse_beginning(&self.batching.storage_path, plan.sequence)?;
+        }
         // Before anything is written for the boundary, so a blocks snapshot
         // that can't be named leaves the batch as it was.
         let plan = self.name_blocks(plan)?;
@@ -1434,7 +1468,8 @@ impl<W: Workspace> Driver<'_, W> {
     }
 
     /// Publish the boundary the stores stand on, unless the repository holds
-    /// it, then remove the immutable files it consumed.
+    /// it, then remove the immutable files it consumed. The files of the epoch
+    /// the stores stand in stay, for the next boundary's blocks snapshot.
     fn plan_pending(&self, source: &dyn SnapshotSource, width: u64) -> Result<Step, Error> {
         let Some(cursor) = source.committed_position().map_err(Error::Planning)? else {
             return Ok(Step::Extend {
@@ -1451,10 +1486,13 @@ impl<W: Workspace> Driver<'_, W> {
         }
         let plan = self.plan(source)?.with_scratch(self.scratch.clone());
         let sequence = plan.sequence;
+        let consumed = consumed_below(cursor.slot(), width).min(epoch_first_file(&plan, width)?);
         // Standing first: a sequence the repository holds or can't take asks
         // nothing of the blocks repository.
-        if self.unpublished(&plan, sequence)?.is_some() {
-            self.refuse_lost_history(&plan)?;
+        if let Some(Latest(latest)) = self.unpublished(&plan, sequence)? {
+            if latest.is_none() {
+                batch::refuse_beginning(&self.batching.storage_path, sequence)?;
+            }
             let plan = self.name_blocks(plan)?;
             self.publish.announce(&plan)?;
             stelae_driver::retry::transient(
@@ -1466,7 +1504,7 @@ impl<W: Workspace> Driver<'_, W> {
                 },
             )??;
         }
-        cleanup_consumed(&self.immutable_dir(), cursor.slot(), width)?;
+        cleanup_below(&self.immutable_dir(), consumed)?;
         if self.until_epoch.is_some_and(|until| sequence >= until) {
             return Ok(Step::Done { sequence });
         }
@@ -1474,16 +1512,6 @@ impl<W: Workspace> Driver<'_, W> {
             target: target_epoch(Some(epoch)),
             prune: true,
         })
-    }
-
-    /// Over an empty repository, a stele here would start a history. Refuse if
-    /// a batch passed sequences before it. Only that reads the repository,
-    /// and a repository holding anything refuses a gap itself.
-    fn refuse_lost_history(&self, plan: &Plan) -> Result<(), Error> {
-        match batch::refuse_lost_history(&self.batching.storage_path, plan.sequence) {
-            Err(error) if self.latest(plan)?.is_none() => Err(error.into()),
-            _ => Ok(()),
-        }
     }
 
     fn extend(
