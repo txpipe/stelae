@@ -10,7 +10,10 @@ use stelae_cardano::{
     batch, initialize,
     publisher::{publish_once, BackfillPublisher, Destination, PublishOutcome, RepositoryPublish},
     snapshot::BlocksRefusal,
-    testing::{loopback::Loopback, open_repository, seal_blank_blocks, Node},
+    testing::{
+        loopback::{Loopback, Verdict},
+        open_repository, seal_blank_blocks, Node,
+    },
     Auth, MithrilSource, Point, Repository, RestoreSource, Selection,
 };
 
@@ -587,9 +590,10 @@ fn an_aggregator_that_doesnt_answer_fails_a_batched_run_as_the_source() {
 }
 
 /// A back-fill names the blocks snapshot at a boundary through the refusals a
-/// publish makes: one of another sequence or network is refused, whatever tag
-/// the root holds it under. Called on the publisher itself, short of the
-/// driver's retries.
+/// publish makes: one of another sequence, above or below, or of another
+/// network is refused, whatever tag the root holds it under, and a read the
+/// registry refuses fails rather than reading as absent. Called on the
+/// publisher itself, short of the driver's retries.
 #[test]
 fn a_backfill_names_no_blocks_snapshot_of_another_sequence_or_network() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -605,7 +609,7 @@ fn a_backfill_names_no_blocks_snapshot_of_another_sequence_or_network() {
     };
     assert_eq!(plan.sequence, 1);
 
-    let named = |seed: &dyn Fn(&Loopback, &std::path::Path) -> Option<Digest>| {
+    let named = |plan: &Plan, seed: &dyn Fn(&Loopback, &std::path::Path) -> Option<Digest>| {
         let registry = tempfile::tempdir().unwrap();
         let loopback = Loopback::serve(registry.path()).unwrap();
         let sealed = seed(&loopback, registry.path());
@@ -622,7 +626,7 @@ fn a_backfill_names_no_blocks_snapshot_of_another_sequence_or_network() {
             },
             observer: &observer,
         };
-        (sealed, backfill::Publish::blocks(&publisher, &plan))
+        (sealed, backfill::Publish::blocks(&publisher, plan))
     };
     let seal = |loopback: &Loopback, magic: u64, sequence: u64| {
         let scratch = tempfile::tempdir().unwrap();
@@ -635,13 +639,13 @@ fn a_backfill_names_no_blocks_snapshot_of_another_sequence_or_network() {
         )
     };
 
-    let (sealed, found) = named(&|loopback, _| Some(seal(loopback, magic, 1)));
+    let (sealed, found) = named(&plan, &|loopback, _| Some(seal(loopback, magic, 1)));
     assert_eq!(found.unwrap(), sealed);
 
-    let (_, found) = named(&|_, _| None);
+    let (_, found) = named(&plan, &|_, _| None);
     assert_eq!(found.unwrap(), None);
 
-    let (_, found) = named(&|loopback, registry| {
+    let (_, found) = named(&plan, &|loopback, registry| {
         // Sequence 2's snapshot, tagged as sequence 1's too.
         seal(loopback, magic, 2);
         let tags = registry.join("cardano/test/blocks/manifests/tags");
@@ -661,7 +665,31 @@ fn a_backfill_names_no_blocks_snapshot_of_another_sequence_or_network() {
         "{refused:?}"
     );
 
-    let (_, found) = named(&|loopback, _| {
+    let second = Plan {
+        sequence: 2,
+        ..plan.clone()
+    };
+    let (_, found) = named(&second, &|loopback, registry| {
+        // Sequence 1's snapshot, tagged as sequence 2's too.
+        seal(loopback, magic, 1);
+        let tags = registry.join("cardano/test/blocks/manifests/tags");
+        std::fs::copy(tags.join("epoch-1"), tags.join("epoch-2")).unwrap();
+        None
+    });
+    let refused = refusal(found);
+    assert!(
+        matches!(
+            refused,
+            BlocksRefusal::OtherSequence {
+                sequence: 2,
+                found: 1,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+
+    let (_, found) = named(&plan, &|loopback, _| {
         seal(loopback, magic + 1, 1);
         None
     });
@@ -670,6 +698,24 @@ fn a_backfill_names_no_blocks_snapshot_of_another_sequence_or_network() {
         matches!(refused, BlocksRefusal::OtherNetwork { found, .. } if found == magic + 1),
         "{refused:?}"
     );
+
+    // A 403 ends the read on its first attempt, and is no absence.
+    let (_, found) = named(&plan, &|loopback, _| {
+        seal(loopback, magic, 1);
+        loopback.rule(|seen| {
+            match seen.method == "GET" && seen.path.ends_with("/blocks/manifests/epoch-1") {
+                true => Verdict::Refuse(403),
+                false => Verdict::Proceed,
+            }
+        });
+        None
+    });
+    match found {
+        Err(backfill::Error::Caller(source)) => {
+            assert!(!source.is::<BlocksRefusal>(), "{source}")
+        }
+        other => panic!("not a failed read: {other:?}"),
+    }
 }
 
 /// The blocks refusal a back-fill's publisher gave.
