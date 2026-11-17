@@ -1183,6 +1183,75 @@ impl Registry {
         Ok(inscription)
     }
 
+    /// Every tag this repository holds, in the order the registry lists them.
+    ///
+    /// Read page by page, each page asked for after the last tag of the one
+    /// before, until a page adds nothing.
+    pub fn tags(&self) -> Result<Vec<String>, Error> {
+        const PAGE: usize = 1000;
+
+        let reference = &self.shared.repository;
+        let mut tags: Vec<String> = Vec::new();
+
+        loop {
+            let last = tags.last().cloned();
+            let page = self.shared.reading(&format!("tags of {reference}"), || {
+                Ok(self.shared.runtime.block_on(self.shared.client.list_tags(
+                    reference,
+                    &self.shared.auth,
+                    Some(PAGE),
+                    last.as_deref(),
+                ))?)
+            })?;
+
+            // A registry that ignores `last` serves the first page again.
+            let fresh: Vec<String> = page
+                .tags
+                .into_iter()
+                .filter(|tag| last.as_ref().is_none_or(|last| tag > last))
+                .collect();
+
+            let full = fresh.len() >= PAGE;
+            tags.extend(fresh);
+
+            if !full {
+                return Ok(tags);
+            }
+        }
+    }
+
+    /// The manifest under `tag` and the config blob it names, read without
+    /// taking either as a snapshot of this format.
+    ///
+    /// For a reader of documents this crate no longer parses: only the
+    /// envelope is read, and each byte string is held to its digest.
+    pub fn pull_raw(&self, tag: &str) -> Result<RawDocument, Error> {
+        validate_tag(tag)?;
+
+        let reference = self.shared.tagged(tag);
+        let (bytes, _) = self.shared.reading(&format!("manifest {reference}"), || {
+            Ok(self
+                .shared
+                .runtime
+                .block_on(self.shared.client.pull_manifest_raw(
+                    &reference,
+                    &self.shared.auth,
+                    &[IMAGE_MANIFEST_MEDIA_TYPE],
+                ))?)
+        })?;
+
+        let manifest: Manifest = serde_json::from_slice(&bytes)?;
+        let config = self
+            .shared
+            .pull_blob_bytes(&reference, &to_oci(&manifest.config))?;
+
+        Ok(RawDocument {
+            digest: Digest::compute(&bytes),
+            manifest,
+            config,
+        })
+    }
+
     /// Pull the profile's moving tag — the most recent sequence, by its diff
     /// manifest, and its tip.
     pub fn pull_latest(&self, profile: &dyn Profile) -> Result<Snapshot, Error> {
@@ -2647,6 +2716,16 @@ pub struct Snapshot {
     /// Every layer descriptor of the manifests read, by blob digest.
     placed: BTreeMap<String, Descriptor>,
     chain: Option<Chain>,
+}
+
+/// A tag's manifest and its config blob, as [`Registry::pull_raw`] reads them.
+#[derive(Debug, Clone)]
+pub struct RawDocument {
+    /// The sha256 of the manifest's bytes as the registry served them.
+    pub digest: Digest,
+    pub manifest: Manifest,
+    /// The config blob's bytes, held to the digest the manifest names.
+    pub config: Vec<u8>,
 }
 
 /// A sequence of a chain as a walk reads it: its diff manifest, its
