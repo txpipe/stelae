@@ -15,7 +15,12 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use stelae::{inscription::Inscription, manifest::Manifest, oci::RawDocument, Digest};
+use stelae::{
+    inscription::Inscription,
+    manifest::{Descriptor, Manifest, DIFF_ID_ANNOTATION},
+    oci::RawDocument,
+    Digest,
+};
 use stelae_cardano::{
     rebuild::{self, Error, OldSequence, PlanHeader, Planned, Rebuild, Summary},
     testing::{
@@ -331,6 +336,57 @@ fn kept_tips_and_the_newest_are_published_with_their_blobs() {
             .collect();
         assert_eq!(blobs, layers, "sequence {}", planned.sequence);
         assert_eq!(tip.config, planned.diff_manifest.config);
+    }
+}
+
+/// Each layer the plan's manifests name is the blob the old repository holds
+/// for it: the digest and size its old manifest gives the same `diffId`, read
+/// from the raw manifest rather than through the reader under test.
+#[test]
+fn the_plans_manifests_name_the_old_blobs_by_digest_and_size() {
+    let served = serve();
+    let (_, plan) = run(&served, true, &RETAINED);
+    let (_, planned) = read_plan(&plan);
+
+    let diff_id = |layer: &Descriptor| {
+        layer
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(DIFF_ID_ANNOTATION))
+            .cloned()
+            .unwrap()
+    };
+
+    for planned in &planned {
+        let old = document(planned.sequence).manifest;
+        let tip = planned.tip_manifest.as_ref().unwrap();
+        for layer in planned.diff_manifest.layers.iter().chain(&tip.layers) {
+            let held = old.layers.iter().any(|old| {
+                diff_id(old) == diff_id(layer)
+                    && old.digest == layer.digest
+                    && old.size == layer.size
+            });
+            assert!(
+                held,
+                "sequence {}: {} names {} of {} bytes",
+                planned.sequence,
+                diff_id(layer),
+                layer.digest,
+                layer.size
+            );
+        }
+
+        let published: Vec<(String, u64)> = std::iter::once(&planned.diff_manifest)
+            .chain(planned.kept_tip.then_some(tip))
+            .flat_map(|manifest| &manifest.layers)
+            .map(|layer| (layer.digest.clone(), layer.size as u64))
+            .collect();
+        let blobs: Vec<(String, u64)> = planned
+            .blobs
+            .iter()
+            .map(|blob| (blob.digest.to_string(), blob.size))
+            .collect();
+        assert_eq!(blobs, published, "sequence {}", planned.sequence);
     }
 }
 
