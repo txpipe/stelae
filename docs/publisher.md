@@ -237,6 +237,52 @@ exits 1, including a record the local stores hold out of order or malformed
 under `--reproduce`, as does a `--point` the source does not hold, a tip the
 registry no longer keeps, and any refusal by `inspect` or `digest`.
 
+### Rebuilding a lineage from before the diff chain
+
+`rebuild` plans how a Dolos lineage published before the diff chain becomes
+one, from the documents its repository holds and with no chain replay.
+`--source` names that repository, the network root the old lineage was
+published at. The command reads each `epoch-N` tag's manifest and
+inscription, never a layer, and writes nothing to a registry.
+
+Sequence by sequence in ascending order, the Dolos profile's rule lists the
+old snapshot's layers in the new `diff` and `tip`, as a native publish at that
+boundary lists them. Closed epochs' `blocks` layers, which belong to the
+blocks profile now, and retained state dumps are dropped, and so is
+`parameters.stateEpochs`. Then the self-check: the diffs up to the sequence
+plus its tip must be its old layer set less those, by `diffId`. A difference
+refuses the rebuild and names the layers. So does a lineage that skips a
+sequence, starts after one the repository no longer holds, or whose history
+does not end at the inscription read before it. The epoch geometry comes from
+the newest inscription's `indexes` scopes, and the stability window from the
+configured genesis, whose network the lineage must be on.
+
+```sh
+stelae-publisher --config dolos.toml rebuild \
+  --source oci://registry.example/cardano/preview \
+  --blocks-journal blocks.journal --kept-tips-file kept-tips \
+  --plan rebuild.plan --print-digests > digests
+```
+
+A new inscription names the blocks snapshot at its sequence, so it needs the
+blocks lineage's journal, `--blocks-journal`: a line per sequence, its number
+and the blocks inscription digest, apart by a space. Without it the command
+runs the assignment and the self-check only. With it, `--plan FILE` writes the
+plan. Its first line is a header (`rebuildPlan`, the format, then `source`,
+`first` and `last`). Each line after it is one sequence as JSON: its
+`inscription` and `inscriptionDigest`, its `diffManifest` and `tipManifest`,
+`keptTip`, and the `blobs` the published manifests name, by their digest and
+size in the old repository. The plan is written beside its name and moved
+there once whole, so a refused rebuild leaves none.
+
+`--kept-tips-file` names the epochs whose tips the registry keeps, one per
+line as the retained-epochs file was. The newest tip is always kept, and a
+tip's blobs are listed only where it is kept. `--print-digests` prints each
+sequence and its new inscription digest, `N sha256:…`, on stdout, and moves
+the summary to stderr. `rebuild` exits 0 on success, 1 on an error or a
+refused lineage, 2 on a usage error and 3 when the self-check refused a
+sequence.
+
 OCI operations run synchronously on the process thread. Mithril calls have a
 separate Tokio runtime. SIGINT and SIGTERM cancel acquisition and are observed
 between import chunks and retry attempts; an in-flight OCI publication still

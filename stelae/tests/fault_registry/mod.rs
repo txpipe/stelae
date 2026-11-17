@@ -85,6 +85,8 @@ struct State {
     /// Manifest `GET`s being answered now, and the most there were at once.
     manifests_active: usize,
     manifests_peak: usize,
+    /// Every tag listing answered whole, whatever its `n` and `last` say.
+    unpaged: bool,
 }
 
 pub struct FaultRegistry {
@@ -177,6 +179,11 @@ impl FaultRegistry {
         self.state()
             .manifests
             .insert(reference.to_owned(), (media_type, body));
+    }
+
+    /// Answer every tag listing with every tag, ignoring `n` and `last`.
+    pub fn list_tags_unpaged(&self) {
+        self.state().unpaged = true;
     }
 
     /// Drop the manifest stored under the tag `reference`, as a registry
@@ -381,6 +388,33 @@ fn handle(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
     let Some(rest) = path.strip_prefix("/v2/") else {
         return respond(&stream, 404, &[], 0, b"");
     };
+
+    if rest.ends_with("/tags/list") {
+        let (unpaged, tags) = {
+            let state = lock();
+            let mut tags: Vec<String> = state
+                .manifests
+                .keys()
+                .filter(|reference| !reference.starts_with("sha256:"))
+                .cloned()
+                .collect();
+            tags.sort();
+            (state.unpaged, tags)
+        };
+        let page: Vec<String> = match unpaged {
+            true => tags,
+            false => {
+                let last = decode(&request.query, "last").unwrap_or_default();
+                let n = decode(&request.query, "n").and_then(|n| n.parse().ok());
+                tags.into_iter()
+                    .filter(|tag| *tag > last)
+                    .take(n.unwrap_or(usize::MAX))
+                    .collect()
+            }
+        };
+        let body = serde_json::to_vec(&serde_json::json!({ "name": "", "tags": page })).unwrap();
+        return respond(&stream, 200, &[], body.len(), &body);
+    }
 
     if let Some(index) = rest.find("/blobs/uploads/") {
         let repository = &rest[..index];

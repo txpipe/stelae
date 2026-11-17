@@ -18,6 +18,7 @@ use stelae_cardano::{
     batch::Limits,
     config, initialize,
     publisher::{self, Destination, PublishOutcome},
+    rebuild,
     snapshot::{self, Boundary, Inputs, PlanReport, Published, Verified},
     Auth, Genesis, Point, RegistryAuth, Repository, RestoreSource, RootConfig, Selection,
 };
@@ -157,6 +158,35 @@ enum Command {
     Verify(VerifyArgs),
     /// Print what a published stele contains, without pulling a layer.
     Inspect(InspectArgs),
+    /// Plan the rebuild of a lineage published before the diff chain from
+    /// its documents, self-checking every sequence and writing nothing to a
+    /// registry.
+    Rebuild(RebuildArgs),
+}
+
+#[derive(Debug, Args)]
+struct RebuildArgs {
+    /// The repository of the lineage before the diff chain:
+    /// oci://HOST/cardano/NETWORK.
+    #[arg(long, value_name = "OCI_URL")]
+    source: Repository,
+    #[arg(long, action)]
+    insecure: bool,
+    /// The blocks lineage's journal: a line per sequence, its number and the
+    /// blocks inscription digest. Without it only the assignment and the
+    /// self-check run.
+    #[arg(long, value_name = "PATH")]
+    blocks_journal: Option<PathBuf>,
+    /// Write the plan here, a JSON line per sequence after a header line.
+    #[arg(long, value_name = "PATH", requires = "blocks_journal")]
+    plan: Option<PathBuf>,
+    /// The epochs whose tips the registry keeps, one per line. The newest
+    /// tip is always kept.
+    #[arg(long, value_name = "PATH")]
+    kept_tips_file: Option<PathBuf>,
+    /// Print each sequence with its new inscription digest.
+    #[arg(long, action, requires = "blocks_journal")]
+    print_digests: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -628,9 +658,10 @@ fn run_publish(
     Ok(())
 }
 
-/// The stele failed a verification that ran.
+/// A check that ran and failed: a stele's verification, or a rebuild's
+/// self-check.
 #[derive(Debug)]
-struct Mismatch(snapshot::Error);
+struct Mismatch(Box<dyn std::error::Error + Send + Sync>);
 
 impl std::fmt::Display for Mismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -640,7 +671,7 @@ impl std::fmt::Display for Mismatch {
 
 impl std::error::Error for Mismatch {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        std::error::Error::source(&self.0)
+        self.0.source()
     }
 }
 
@@ -652,7 +683,7 @@ const MISMATCH_EXIT: u8 = 3;
 
 fn diagnose(error: snapshot::Error) -> miette::Report {
     if error.is_mismatch() {
-        miette::Report::new(Mismatch(error))
+        miette::Report::new(Mismatch(Box::new(error)))
     } else {
         miette::Report::from_err(error)
     }
@@ -974,6 +1005,103 @@ fn run_inspect(
     Ok(())
 }
 
+fn run_rebuild(genesis: &Genesis, args: &RebuildArgs, auth: ResolveReadAuth) -> miette::Result<()> {
+    let read = |path: &Path| {
+        std::fs::read_to_string(path)
+            .into_diagnostic()
+            .with_context(|| format!("reading {}", path.display()))
+    };
+    let blocks = match &args.blocks_journal {
+        Some(path) => Some(rebuild::read_journal(&read(path)?).into_diagnostic()?),
+        None => None,
+    };
+    let kept = match &args.kept_tips_file {
+        Some(path) => rebuild::read_epochs(&read(path)?).into_diagnostic()?,
+        None => Default::default(),
+    };
+    let options = rebuild::Options {
+        source: args.source.clone(),
+        insecure: args.insecure,
+        auth: auth(&args.source)?,
+        blocks,
+        kept,
+    };
+
+    // Written beside its name and moved there once whole, so a refused run
+    // leaves no plan to execute.
+    let partial = args
+        .plan
+        .as_ref()
+        .map(|path| path.with_extension("partial"));
+    let mut file = match &partial {
+        Some(path) => Some(std::io::BufWriter::new(
+            std::fs::File::create(path)
+                .into_diagnostic()
+                .with_context(|| format!("creating {}", path.display()))?,
+        )),
+        None => None,
+    };
+    let outcome = rebuild::run(
+        &options,
+        genesis,
+        file.as_mut().map(|file| file as &mut dyn std::io::Write),
+    )
+    .and_then(|summary| {
+        file.take()
+            .map(|mut file| file.flush())
+            .transpose()
+            .map_err(rebuild::Error::Write)?;
+        Ok(summary)
+    });
+    let summary = match (outcome, &partial, &args.plan) {
+        (Ok(summary), Some(partial), Some(plan)) => {
+            std::fs::rename(partial, plan)
+                .into_diagnostic()
+                .with_context(|| format!("moving the plan to {}", plan.display()))?;
+            summary
+        }
+        (Ok(summary), _, _) => summary,
+        (Err(error), partial, _) => {
+            if let Some(partial) = partial {
+                let _ = std::fs::remove_file(partial);
+            }
+            return Err(match error {
+                rebuild::Error::SelfCheck { .. } => miette::Report::new(Mismatch(Box::new(error))),
+                error => miette::Report::from_err(error),
+            });
+        }
+    };
+
+    // With the digests on stdout, the rest goes to stderr.
+    let say = |line: String| match args.print_digests {
+        true => eprintln!("{line}"),
+        false => println!("{line}"),
+    };
+    say(format!(
+        "{}: epoch-{} to epoch-{}, every sequence self-checked",
+        args.source, summary.first, summary.last
+    ));
+    say(format!(
+        "layers: {} diff and {} tip; dropped {} closed-epoch blocks and {} retained dumps",
+        summary.diff_layers, summary.tip_layers, summary.dropped_blocks, summary.dropped_dumps
+    ));
+    let kept: Vec<String> = summary.kept.iter().map(u64::to_string).collect();
+    say(format!("kept tips: {}", kept.join(", ")));
+    say(match &args.plan {
+        Some(plan) => format!("plan: {}", plan.display()),
+        None if args.blocks_journal.is_none() => {
+            "no blocks journal: the assignment and the self-check only".to_owned()
+        }
+        None => "no plan written".to_owned(),
+    });
+    if args.print_digests {
+        for (sequence, digest) in &summary.digests {
+            println!("{sequence} {digest}");
+        }
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
@@ -1021,6 +1149,7 @@ fn execute(cli: Cli, env: Env) -> miette::Result<()> {
         Command::Digest(args) => run_digest(&config, &genesis, &args, &read_auth),
         Command::Verify(args) => run_verify(&config, &genesis, &args, &read_auth),
         Command::Inspect(args) => run_inspect(&config, &args, &read_auth),
+        Command::Rebuild(args) => run_rebuild(&genesis, &args, &read_auth),
     }
 }
 
