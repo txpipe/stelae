@@ -27,9 +27,9 @@ producer and consumer; it carries no Cardano assumption.
 | [`stelae-cardano`](stelae-cardano/) | Cardano application integration: cold-start restore, publication policy and the sequential Mithril backfill state machine. The only workspace crate allowed to depend on Dolos. |
 | [`stelae-publisher`](stelae-publisher/) | The `stelae-publisher` executable and its operator-facing commands. |
 
-Publisher commands (`initialize`, `publish`, `backfill`, `run`, and `digest`,
-`verify` and `inspect` for reading and reproducing published snapshots),
-configuration precedence and persisted-state contracts are documented in
+Publisher commands (`initialize`, `publish`, `backfill`, `run`, `digest`,
+`verify` and `inspect` for reading and reproducing published snapshots, and
+`rebuild` for planning a lineage from before the diff chain), configuration precedence and persisted-state contracts are documented in
 [docs/publisher.md](docs/publisher.md). Reproducible image inputs,
 release provenance and a fresh lineage's first publication on the chart are in
 [docs/publisher-packaging.md](docs/publisher-packaging.md).

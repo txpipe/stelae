@@ -3247,6 +3247,52 @@ fn a_gone_tip_is_not_an_absent_sequence() {
     assert!(err.is_absent(), "{err:?}");
 }
 
+/// A repository's tags are listed whole, page after page, and a registry that
+/// ignores the paging is listed whole too, without repeats.
+#[test]
+fn every_tag_is_listed_across_pages() {
+    // Thousands of tags: kept off the timing tests' turns.
+    let _serial = exclusive();
+
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/tags");
+    publish_chapters(&registry);
+    let manifest = fault.manifest("chapter-4").unwrap();
+    for n in 0..2500 {
+        fault.put_manifest(&format!("extra-{n:04}"), manifest.clone());
+    }
+
+    let expected = fault.tags();
+    assert!(expected.len() > 2000);
+    assert_eq!(registry.tags().unwrap(), expected);
+
+    fault.list_tags_unpaged();
+    assert_eq!(registry.tags().unwrap(), expected);
+}
+
+/// A raw pull reads a tag's manifest as stored and the config blob it names,
+/// whatever the document holds; an absent tag is the registry's absence.
+#[test]
+fn a_raw_pull_is_the_stored_manifest_and_its_config() {
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/raw");
+    let (_, second) = publish_chapters(&registry);
+
+    let tag = ToyProfile.tag_for_sequence(second.sequence).unwrap();
+    let raw = registry.pull_raw(&tag).unwrap();
+    let stored = fault.manifest(&tag).unwrap();
+    assert_eq!(raw.digest, Digest::compute(&stored));
+    assert_eq!(
+        raw.manifest,
+        serde_json::from_slice::<Manifest>(&stored).unwrap()
+    );
+    assert_eq!(raw.config, second.canonicalize().unwrap());
+
+    let err = registry.pull_raw("chapter-9").unwrap_err();
+    assert!(err.is_absent(), "{err:?}");
+    assert!(registry.pull_raw("not a tag").is_err());
+}
+
 /// A tip manifest the registry fails to serve is not a gone tip. Its read has
 /// the diff manifest's budget: cut off once, it is read again; cut off every
 /// time, the budget runs out; a refusal other than a 404 is itself, once.

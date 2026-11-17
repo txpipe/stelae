@@ -570,6 +570,13 @@ fn route(head: &Head, reader: &mut impl BufRead, shared: &Shared) -> io::Result<
         }
         return blob(head, shared, name, digest);
     }
+    if let Some(name) = rest.strip_suffix("/tags/list") {
+        if !confined(name) {
+            return refuse_outside(head, reader);
+        }
+        copy_body(reader, head, &mut io::sink())?;
+        return tags(head, shared, name);
+    }
     if let Some((name, reference)) = rest.rsplit_once("/manifests/") {
         let named = match reference.strip_prefix("sha256:") {
             Some(_) => digest_hex(reference).is_some(),
@@ -790,6 +797,31 @@ fn manifest(
         ],
         body: Payload::Bytes(body),
     })
+}
+
+/// A repository's tags in lexical order, as the distribution API pages them:
+/// at most `n`, after `last`.
+fn tags(head: &Head, shared: &Shared, name: &str) -> io::Result<Answer> {
+    let Ok(entries) = fs::read_dir(shared.root.join(name).join("manifests/tags")) else {
+        return Ok(Answer::absent("NAME_UNKNOWN"));
+    };
+    let mut tags: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .collect();
+    tags.sort();
+    let last = head.query("last").unwrap_or_default();
+    let n = head
+        .query("n")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(usize::MAX);
+    let page: Vec<String> = tags
+        .into_iter()
+        .filter(|tag| tag.as_str() > last)
+        .take(n)
+        .collect();
+    let body = serde_json::json!({ "name": name, "tags": page });
+    Ok(Answer::json(200, serde_json::to_vec(&body)?))
 }
 
 #[cfg(test)]

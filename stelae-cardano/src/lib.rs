@@ -10,6 +10,7 @@ pub mod batch;
 pub mod config;
 pub mod initialize;
 pub mod publisher;
+pub mod rebuild;
 pub mod snapshot;
 #[cfg(feature = "testing")]
 pub mod testing;
