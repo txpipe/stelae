@@ -6,22 +6,19 @@ publishes, prunes, and exits at the aggregator tip. The operator maintains
 network values and owns deployment, first publication and monitoring.
 
 The chart runs a publisher built on the Dolos v2 configuration: `dolosToml`
-is a v2 file keeping full history and the retained state epochs are their
-own value. There is no host selector. The directory and chart name stay
+is a v2 file keeping full history. There is no host selector. The directory and chart name stay
 `dolos-publisher` to preserve release and object naming.
 
 ## Rendered resources
 
 - ConfigMap `<release>-config`, mounted at `/etc/publisher`, carries
-  `dolos.toml` verbatim from `dolosToml` and `state-epochs`, one epoch per
-  line, from `stateEpochs`. No shell entrypoint is generated. The retained
-  epochs are signed input and must not change incidentally.
+  `dolos.toml` verbatim from `dolosToml`. No shell entrypoint is generated.
 - PersistentVolumeClaim `<release>-data`, only with `persistence.enabled`
   and no `persistence.existingClaim`. It carries
   `helm.sh/resource-policy: keep`, so `helm uninstall` leaves it.
 - Job `<network>-backfill-<run>` directly invokes
-  `/usr/local/bin/stelae-publisher --config /etc/publisher/dolos.toml run
-  --state-epochs-file /etc/publisher/state-epochs`. It mounts `/data` (see
+  `/usr/local/bin/stelae-publisher --config /etc/publisher/dolos.toml run`.
+  It mounts `/data` (see
   [Data volume](#data-volume)) and reads registry credentials from the existing Secret's
   `DOLOS_STELAE_REGISTRY_USER` and `DOLOS_STELAE_REGISTRY_PASSWORD` keys into
   the publisher's `DOLOS_STELAE_USER` and `DOLOS_STELAE_PASSWORD`.
@@ -132,10 +129,9 @@ adds another Job. To recover, delete the release's backfill Jobs with
 | --- | --- |
 | `network` | Job name prefix |
 | `run` | Deliberate re-run counter; bump when changing the Job |
-| `repo` | Network's `oci://` publication repository |
+| `repo` | Network root, `oci://`: steles go to its `dolos` repository, naming the snapshots its `blocks` repository holds |
 | `concurrency` | Measured upload concurrency, with no chart default |
 | `dolosToml` | Network's Dolos v2 configuration, verbatim |
-| `stateEpochs` | Retained state-dump epochs, ascending, with no chart default; `[]` retains the tip alone |
 | `image.repository` | Defaults to `ghcr.io/txpipe/stelae-publisher` |
 | `image.tag` | Tested version or `sha-<7>` tag, with no default |
 | `resources` | Network working set, with no default |
@@ -181,8 +177,7 @@ about 158 to 175 MiB with the download on the same volume, so a window of 4
 needs a `scratchMib` of about 2.3 GiB and at least 4 GiB free beyond the
 stores and their growth over the run, with the stores growing about 0.1 GiB an
 epoch. That 4 GiB is a floor, measured on a lineage with no dump at a
-`concurrency` of 4: the default of 8 adds about 0.13 GiB, each dump the
-lineage holds adds its size from the `latest` manifest, and a run that held
+`concurrency` of 4: the default of 8 adds about 0.13 GiB, and a run that held
 its window was seen to use 6.2 GiB. Size the persistent claim, or the
 emptyDir's `ephemeral-storage`, for that free space on top of the stores, with
 margin. A bundle follows the network's state,
@@ -224,7 +219,7 @@ helm template stelae-publisher-preprod k8s/dolos-publisher/chart \
   --namespace stelae-publisher --values "$PUBLISHER_VALUES"
 ```
 
-The checks cover direct invocation, the state epochs file and argument,
+The checks cover direct invocation, the removed `stateEpochs` value refused,
 both `/data` modes, batching all or none, genesis opt-in, TLS selection, missing or invalid configuration and
 accidental use of the legacy Dolos image.
 
@@ -245,13 +240,15 @@ Rolling back to chart 0.3 drops the claim from the Job: 0.3 accepts the
 restores all of history into ephemeral storage. The claim stays, and a
 later 0.4 install with persistence adopts it again.
 
-An image on a new Dolos profile pin cannot continue a repository cut by an
+An image on a new Dolos profile pin cannot continue a lineage cut by an
 earlier one: restoring or chaining onto an older stele is unsupported, so the
-move starts a fresh lineage in an emptied repository, as
+move starts a fresh lineage in the root's emptied `dolos` repository, as
 [First publication on the chart](../../docs/publisher-packaging.md#first-publication-on-the-chart)
-describes. Rollback to the earlier image works only while the repository
-still holds its lineage, that is, before its tags are deleted. Never reuse
-incompatible persistent scratch or an unpublished checkpoint across images.
+describes. A lineage from before the diff chain sits at the root itself and
+is left alone. Rollback to the earlier image works only while its lineage is
+still held: at the root for an image from before the diff chain, in `dolos`
+before its tags are deleted for a later one. Never reuse incompatible
+persistent scratch or an unpublished checkpoint across images.
 
 Full build and release details, and the first publication of a fresh
 lineage, are in

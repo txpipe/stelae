@@ -17,4 +17,6 @@ only for a verified first publication.
 
 Before an upgrade or rollback, stop the previous writer and wait for its pod
 to terminate. Bump run for the new Job. An image on a new Dolos profile pin
-starts a fresh lineage in an emptied repository (see the chart README).
+starts a fresh lineage in the root's emptied dolos repository, and leaves a
+lineage from before the diff chain, at the root itself, alone (see the chart
+README).

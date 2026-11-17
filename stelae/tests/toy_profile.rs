@@ -2268,6 +2268,11 @@ fn a_directory_tells_absence_a_gone_tip_and_a_broken_chain_apart() {
         assert!(!err.is_absent());
     }
 
+    // Its inscription is still there, read without the tip.
+    assert_eq!(layout.pull_inscription(&ToyProfile, 3).unwrap().sequence, 3);
+    let err = layout.pull_inscription(&ToyProfile, 4).unwrap_err();
+    assert!(err.is_absent(), "{err:?}");
+
     layout.resolve_sequence(&ToyProfile, 2).unwrap();
 
     // An inscription gone inside the chain.

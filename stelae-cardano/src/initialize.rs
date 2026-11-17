@@ -8,6 +8,7 @@ use std::{
 use dolos::engine::ReplayWorkspace;
 use dolos_core::{seed_wal_from_state, Genesis, WalSeed};
 use dolos_snapshot::{
+    export::{BLOCKS_REPOSITORY, DOLOS_REPOSITORY},
     facade::{self, Point, RestoreInput, SnapshotRepository},
     node,
     registry::{self, Auth, Repository},
@@ -22,6 +23,8 @@ type AnyError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Debug, Clone)]
 pub struct Options {
+    /// The network root: the stele is restored from its `dolos` repository,
+    /// and the blocks it names from its `blocks` repository.
     pub source: Source,
     pub point: Point,
     /// What a registry source is read with; unused for a directory.
@@ -182,25 +185,32 @@ fn restore(
     let target = Target::new(&archive, &state);
 
     let outcome = match &options.source {
-        Source::Dir(path) => facade::restore(
-            RestoreInput::Directory(path),
+        Source::Dir(root) => facade::restore(
+            RestoreInput::Directory {
+                path: &root.join(DOLOS_REPOSITORY),
+                blocks: Some(&root.join(BLOCKS_REPOSITORY)),
+            },
             restoring,
             target,
             Some(observer),
         ),
-        Source::Repo(repository) => {
-            let scratch = node::scratch_dir(&config.storage, options.scratch_dir.as_deref());
-            let repository = SnapshotRepository::open(
-                repository,
-                options.insecure,
-                options.auth.clone(),
-                scratch,
-                registry::Tuning::default(),
-            )?;
+        Source::Repo(root) => {
+            let open = |name| -> Result<SnapshotRepository, AnyError> {
+                let scratch = node::scratch_dir(&config.storage, options.scratch_dir.as_deref());
+                Ok(SnapshotRepository::open(
+                    &dolos_snapshot::restore::profile_repository(root, name)?,
+                    options.insecure,
+                    options.auth.clone(),
+                    scratch,
+                    registry::Tuning::default(),
+                )?)
+            };
+            let (repository, blocks) = (open(DOLOS_REPOSITORY)?, open(BLOCKS_REPOSITORY)?);
             facade::restore(
                 RestoreInput::Repository {
                     repository: &repository,
                     point: options.point,
+                    blocks: Some(&blocks),
                 },
                 restoring,
                 target,

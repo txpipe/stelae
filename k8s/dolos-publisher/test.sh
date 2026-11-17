@@ -54,10 +54,10 @@ grep -F -- '- /etc/publisher/dolos.toml' "$OUT/default.yaml"
 grep -Fx '            - run' "$OUT/default.yaml"
 grep -Fx '        runAsNonRoot: true' "$OUT/default.yaml"
 grep -Fx '        fsGroup: 65532' "$OUT/default.yaml"
-grep -F -- '- --state-epochs-file' "$OUT/default.yaml"
-grep -F -- '- /etc/publisher/state-epochs' "$OUT/default.yaml"
-grep -Fx '  state-epochs: |' "$OUT/default.yaml"
-grep -Fx '    646' "$OUT/default.yaml"
+if grep -Fq 'state-epochs' "$OUT/default.yaml"; then
+    echo "the chart still renders retained state epochs" >&2
+    exit 1
+fi
 grep -F 'name: DOLOS_STELAE_USER' "$OUT/default.yaml"
 grep -F 'name: DOLOS_STELAE_PASSWORD' "$OUT/default.yaml"
 if grep -Eq -- 'entrypoint.sh|--allow-genesis' "$OUT/default.yaml"; then
@@ -194,11 +194,12 @@ helm template publisher "$CHART" --values "$VALUES" \
     --set-string run=8 >"$OUT/counter.yaml"
 grep -Fx '  name: preview-backfill-8' "$OUT/counter.yaml"
 
-# The retained epochs are signed input: absent, zero or repeated fails.
-for invalid in stateEpochs=null 'stateEpochs={0}' 'stateEpochs={3,3}'; do
+# A values file from before the diff chain names the retained epochs, which
+# are gone: refused rather than read past.
+for removed in 'stateEpochs={3,200}' 'stateEpochs={}'; do
     if helm template publisher "$CHART" --values "$VALUES" \
-        --set "$invalid" >"$OUT/invalid.yaml" 2>&1; then
-        echo "invalid state epochs accepted: $invalid" >&2
+        --set "$removed" >"$OUT/invalid.yaml" 2>&1; then
+        echo "a removed value was accepted: $removed" >&2
         exit 1
     fi
 done

@@ -41,8 +41,6 @@ spec:
             - --config
             - /etc/publisher/dolos.toml
             - run
-            - --state-epochs-file
-            - /etc/publisher/state-epochs
             - --repo
             - {{ required "repo is required" .Values.repo | quote }}
             {{- if .Values.insecure }}

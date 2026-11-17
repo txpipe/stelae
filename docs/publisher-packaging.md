@@ -33,8 +33,8 @@ and image platform must match the native binary.
 
 The `Publisher image` workflow builds with Rust 1.93.0 and the committed
 `Cargo.lock` on native amd64 and arm64 runners. Each runner builds its image
-and checks executable startup, a v2 configuration with its state epochs file,
-a mounted data volume and SIGTERM delivery. The smoke check runs `run` with networking
+and checks executable startup, a v2 configuration, a mounted data volume and
+SIGTERM delivery. The smoke check runs `run` with networking
 disabled, opts into genesis against a missing local restore source, waits
 for the acquisition loop and stops the process. It needs no chain fixture or
 registry. Replay, restore policy and OCI correctness remain covered by the
@@ -49,7 +49,7 @@ custom provenance files.
 ## Candidate identity
 
 A candidate is the tuple of the full Stelae commit, committed `Cargo.lock`,
-Dolos revision `a95ecdebe8666ddde29578d7a734af5ce8f16375` (fjall built from the
+Dolos revision `e52f2cf8f7d25870fac712fd85a31b4545c42acf` (fjall built from the
 txpipe fork, see
 [publisher.md](publisher.md#source-and-dependency-identity)),
 chart source at that same Stelae
@@ -93,14 +93,17 @@ the order in [publisher.md](publisher.md#first-publication). The chart
 directory and name remain `dolos-publisher` to preserve release and object
 naming.
 
-1. Stop every other writer to the repository and wait for its pod to
+1. Stop every other writer to the network root and wait for its pod to
    terminate. Helm's resource replacement order does not guarantee a single
    writer.
-2. Delete every tag in the repository, `latest` first. The first run must
-   find it empty. With `persistence.enabled: true`, also delete any claim an
-   earlier attempt left, because initialization resumes kept stores. A
-   deleted `persistence.existingClaim` must be created again, empty, before
-   step 3: until it exists the pod stays Pending (see the chart README's
+2. Delete every tag in the root's `dolos` repository, `latest` first. The
+   first run must find it empty. A lineage published before the diff chain
+   sits at the root itself, not under `dolos`: leave it alone, since a
+   rollback to its image restores from it. With `persistence.enabled: true`,
+   also delete any claim an earlier attempt left, because initialization
+   resumes kept stores. A deleted `persistence.existingClaim` must be created
+   again, empty, before step 3: until it exists the pod stays Pending (see the
+   chart README's
    [Data volume](../k8s/dolos-publisher/README.md#data-volume)). Delete only a
    claim that holds nothing but the publisher's stores: point
    `persistence.existingClaim` at a new, empty claim instead of deleting one
@@ -108,8 +111,8 @@ naming.
    `Delete` the volume goes with the claim, and under `Retain` the volume and
    its data stay until someone removes them.
 3. Install or upgrade with the candidate's image, the network's v2
-   `dolosToml` with full history (no `[history]` window), its retained epochs in `stateEpochs`,
-   `allowGenesisFallback: true` and a bumped `run`. From an emptyDir or a fresh
+   `dolosToml` with full history (no `[history]` window), `allowGenesisFallback: true`
+   and a bumped `run`. From an emptyDir or a fresh
    claim, the Job replays from genesis and publishes every epoch boundary on the way.
 4. Set `allowGenesisFallback: false` for every later run. Initialization
    then restores the published `latest`, or resumes the kept stores on a

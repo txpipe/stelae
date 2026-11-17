@@ -1,6 +1,5 @@
 # One Stelae publisher Job per network, built on the Dolos v2 configuration:
-# dolosToml is a v2 file keeping full history, and the retained state epochs
-# are a value of their own.
+# dolosToml is a v2 file keeping full history.
 #
 # These defaults are instance-agnostic — no network, registry, image pin or
 # credential is assumed. Everything a network must supply is empty here and
@@ -8,10 +7,8 @@
 # than starting a half-configured publisher. The operator supplies one values
 # file per network.
 #
-# Two values are deliberately without a default. `concurrency` was measured
-# per network against the registry it writes to. `stateEpochs` is signed
-# input frozen at the network's first publish. Neither may be inherited from
-# a chart.
+# `concurrency` is deliberately without a default: it was measured per network
+# against the registry it writes to, and may not be inherited from a chart.
 
 # The network name. Prefixes the Job name and labels the pod.
 network: ""
@@ -26,8 +23,9 @@ network: ""
 # against re-running by accident. See README.md.
 run: ""
 
-# Where the publisher writes: an oci:// URL to the network's stele
-# repository.
+# Where the publisher writes: an oci:// URL to the network root. Steles go to
+# its `dolos` repository, naming the blocks snapshots its `blocks` repository
+# holds.
 repo: ""
 
 # Uploads in flight during a publish. Measured per network against the
@@ -37,14 +35,6 @@ concurrency: ""
 # The network's Dolos v2 dolos.toml, carried verbatim into the ConfigMap,
 # comments included.
 dolosToml: ""
-
-# The epochs whose state the publisher retains a dump of, ascending, each at
-# least 1. Echoed into every inscription's parameters as signed input
-# (decision 0026), so it is frozen at the network's first publish: additions
-# above the then-current tip only. Rendered one per line into the ConfigMap
-# and passed as --state-epochs-file. An empty list retains the tip alone; an
-# absent one fails the render.
-stateEpochs: null
 
 image:
   repository: ghcr.io/txpipe/stelae-publisher

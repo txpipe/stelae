@@ -4,32 +4,43 @@ use std::path::{Path, PathBuf};
 
 use dolos_core::config::{RootConfig, StorageConfig};
 use dolos_snapshot::{
-    export::Plan,
+    export::{Plan, BLOCKS_REPOSITORY, DOLOS_REPOSITORY},
     facade::SnapshotSource,
     node,
     planning::PlanReport,
     prepare::Finalizing,
-    registry::{
-        self, Auth, Point, Preview, Published, Publishing, Repository, SnapshotRepository, Tuning,
-    },
-    RetainedEpochs,
+    registry::{self, Auth, Point, Preview, Published, Publishing, Registry, Repository, Tuning},
+    restore::profile_repository,
+    DolosProfile,
 };
-use stelae::progress::Observer;
+use stelae::{progress::Observer, Digest, SnapshotReader as _};
+use stelae_blocks::BlocksProfile;
 use stelae_driver::Standing;
 
 use crate::{
     backfill,
     batch::{self, Committed, Held},
+    snapshot,
 };
 
-/// Resolved repository publication settings.
+/// Resolved repository publication settings. `repo` is the network root,
+/// which holds the Dolos repository and the blocks repository beside it.
 pub struct RepositoryPublish<'a> {
     pub repo: &'a Repository,
     pub auth: Auth,
     pub insecure: bool,
     pub scratch_dir: Option<&'a Path>,
-    pub rebuild: bool,
     pub tuning: Tuning,
+}
+
+/// The Dolos repository under the network root `root`.
+pub fn dolos_repository(root: &Repository) -> Result<Repository, dolos_snapshot::Error> {
+    profile_repository(root, DOLOS_REPOSITORY)
+}
+
+/// The blocks repository under the network root `root`.
+pub fn blocks_repository(root: &Repository) -> Result<Repository, dolos_snapshot::Error> {
+    profile_repository(root, BLOCKS_REPOSITORY)
 }
 
 /// The policy decision made from the repository's current standing.
@@ -80,13 +91,21 @@ pub enum PolicyError {
         sequence: u64,
         distance: u64,
     },
+
+    #[error(
+        "the blocks repository {repository} holds no blocks snapshot at epoch-{sequence}: a Dolos \
+         snapshot names the blocks snapshot of its own sequence, so that one is published first"
+    )]
+    BlocksAbsent { repository: String, sequence: u64 },
 }
 
-/// An opened repository plus the journal and reuse policy of this publisher.
+/// An opened Dolos repository plus the journal of this publisher.
+///
+/// It reads one sequence at a time, as a publisher reads its predecessor: its
+/// manifests and inscription, never the chain behind them.
 pub struct Publisher {
-    repository: SnapshotRepository,
+    registry: Registry,
     record_path: PathBuf,
-    rebuild: bool,
 }
 
 impl Publisher {
@@ -96,37 +115,33 @@ impl Publisher {
     ) -> Result<Self, dolos_snapshot::Error> {
         let scratch = node::scratch_dir(&config.storage, publish.scratch_dir);
         Self::open_explicit(
-            publish.repo,
+            &dolos_repository(publish.repo)?,
             publish.insecure,
             publish.auth.clone(),
             scratch,
             registry::record_path_in(&config.storage.path),
-            publish.rebuild,
             publish.tuning.clone(),
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn open_explicit(
         repository: &Repository,
         insecure: bool,
         auth: Auth,
         scratch_dir: PathBuf,
         record_path: PathBuf,
-        rebuild: bool,
         tuning: Tuning,
     ) -> Result<Self, dolos_snapshot::Error> {
-        let repository = SnapshotRepository::open(repository, insecure, auth, scratch_dir, tuning)?;
+        let registry = registry::open(repository, insecure, auth, scratch_dir, tuning)?;
 
         Ok(Self {
-            repository,
+            registry,
             record_path,
-            rebuild,
         })
     }
 
     pub fn standing(&self, plan: &Plan) -> Result<Standing, dolos_snapshot::Error> {
-        self.repository.standing(plan)
+        registry::standing(&self.registry, plan)
     }
 
     /// What the repository really holds, as a stele that follows it would name
@@ -135,30 +150,24 @@ impl Publisher {
         if self.standing(plan)? == Standing::Empty {
             return Ok(None);
         }
-        let latest = self.repository.inspect(Point::Latest)?;
-        Ok(Some(Committed {
-            sequence: latest.inscription.sequence,
-            identity: latest.identity.to_string(),
-        }))
+        Ok(Some(held(&Point::Latest.pull(&self.registry)?)?.committed))
     }
 
     /// The stele under `sequence`'s immutable tag, if the repository holds one.
+    ///
+    /// A seal tags a sequence's tip before the sequence itself, so a sequence
+    /// held here has its tip too, and one tagged only at its tip is absent:
+    /// sealing it again writes the same tip.
     pub fn stele(&self, sequence: u64) -> Result<Option<Held>, dolos_snapshot::Error> {
-        match self.repository.inspect(Point::Epoch(sequence)) {
-            Ok(held) => Ok(Some(Held {
-                committed: Committed {
-                    sequence: held.inscription.sequence,
-                    identity: held.identity.to_string(),
-                },
-                inscription: held.inscription,
-            })),
+        match Point::Epoch(sequence).pull(&self.registry) {
+            Ok(snapshot) => Ok(Some(held(&snapshot)?)),
             Err(dolos_snapshot::Error::Stelae(error)) if error.is_absent() => Ok(None),
             Err(error) => Err(error),
         }
     }
 
     pub fn preflight(&self) -> Result<(), dolos_snapshot::Error> {
-        self.repository.preflight()
+        Ok(registry::preflight(&self.registry, &DolosProfile)?)
     }
 
     pub fn preview(
@@ -195,10 +204,80 @@ impl Publisher {
     }
 
     fn publishing(&self) -> Publishing<'_> {
-        self.repository
-            .publishing()
-            .recording_in(self.record_path.clone())
-            .rebuilding(self.rebuild)
+        Publishing::new(&self.registry).recording_in(self.record_path.clone())
+    }
+}
+
+/// A sequence as the repository holds it.
+fn held(snapshot: &stelae::oci::Snapshot) -> Result<Held, dolos_snapshot::Error> {
+    let inscription = snapshot.read_inscription()?;
+    Ok(Held {
+        committed: Committed {
+            sequence: inscription.sequence,
+            identity: inscription.digest()?.to_string(),
+        },
+        inscription,
+    })
+}
+
+/// The blocks repository beside a Dolos repository, which a Dolos snapshot
+/// names its blocks in.
+pub struct Blocks {
+    registry: Registry,
+}
+
+impl Blocks {
+    pub fn open(
+        config: &RootConfig,
+        publish: &RepositoryPublish<'_>,
+    ) -> Result<Self, dolos_snapshot::Error> {
+        let registry = registry::open(
+            &blocks_repository(publish.repo)?,
+            publish.insecure,
+            publish.auth.clone(),
+            node::scratch_dir(&config.storage, publish.scratch_dir),
+            Tuning::default(),
+        )?;
+        Ok(Self { registry })
+    }
+
+    pub fn repository(&self) -> String {
+        self.registry.repository().to_string()
+    }
+
+    /// The inscription digest of the blocks snapshot at `plan`'s sequence,
+    /// which the Dolos snapshot there names, or `None` when the repository
+    /// holds none. One of another sequence or network is refused.
+    pub fn reference(
+        &self,
+        plan: &Plan,
+    ) -> Result<Option<Digest>, Box<dyn std::error::Error + Send + Sync>> {
+        let held = match self.registry.pull_sequence(&BlocksProfile, plan.sequence) {
+            Ok(held) => held,
+            Err(error) if error.is_absent() => return Ok(None),
+            Err(error) => return Err(dolos_snapshot::Error::from(error).into()),
+        };
+        let inscription = held
+            .read_inscription()
+            .map_err(dolos_snapshot::Error::from)?;
+        Ok(Some(snapshot::blocks_reference(
+            &self.repository(),
+            &inscription,
+            plan,
+        )?))
+    }
+
+    /// `plan` naming the blocks snapshot at its sequence, refused when there
+    /// is none to name.
+    pub fn name_in(&self, plan: Plan) -> Result<Plan, Box<dyn std::error::Error + Send + Sync>> {
+        match self.reference(&plan)? {
+            Some(blocks) => Ok(plan.with_blocks(blocks)),
+            None => Err(PolicyError::BlocksAbsent {
+                repository: self.repository(),
+                sequence: plan.sequence,
+            }
+            .into()),
+        }
     }
 }
 
@@ -230,6 +309,13 @@ impl backfill::Publish for BackfillPublisher<'_> {
         Publisher::open(self.config, &self.settings)
             .and_then(|publisher| publisher.stele(sequence))
             .map_err(backfill::Error::caller)
+    }
+
+    fn blocks(&self, plan: &Plan) -> Result<Option<Digest>, backfill::Error> {
+        Blocks::open(self.config, &self.settings)
+            .map_err(backfill::Error::caller)?
+            .reference(plan)
+            .map_err(backfill::Error::Caller)
     }
 
     fn finalize(
@@ -285,19 +371,21 @@ impl backfill::Publish for BackfillPublisher<'_> {
 
 #[derive(Debug, Clone)]
 pub enum Destination {
+    /// A network root on disk: Dolos writes the blocks snapshot into its
+    /// `blocks` layout and the Dolos snapshot naming it into its `dolos` one.
     Directory {
         path: PathBuf,
         scratch_dir: Option<PathBuf>,
     },
+    /// A network root: the Dolos snapshot goes to its `dolos` repository and
+    /// names the one its `blocks` repository holds at the same sequence.
     Repository {
         direct_s3: Option<Box<stelae::oci::s3_upload::Config>>,
         repository: Repository,
         auth: Auth,
         insecure: bool,
         scratch_dir: Option<PathBuf>,
-        rebuild: bool,
         concurrency: Option<std::num::NonZeroUsize>,
-        verify_carried: bool,
         require_new: bool,
     },
 }
@@ -348,7 +436,6 @@ fn refuse_lost_history(
 pub fn publish_once(
     config: &RootConfig,
     genesis: &dolos_core::Genesis,
-    retained: &RetainedEpochs,
     selection: dolos_snapshot::facade::Selection,
     destination: Destination,
     dry_run: bool,
@@ -363,11 +450,7 @@ pub fn publish_once(
         let snapshot = workspace.snapshot();
         let spool = destination.spool(&config.storage);
         let plan = snapshot
-            .selected_plan(
-                u64::from(genesis.network_magic()),
-                retained.clone(),
-                selection,
-            )?
+            .selected_plan(u64::from(genesis.network_magic()), selection)?
             .with_scratch(spool);
         let report = PlanReport::read(&plan)?;
         let outcome = match destination {
@@ -381,7 +464,7 @@ pub fn publish_once(
                     PublishOutcome::Directory {
                         sequence: plan.sequence,
                         identity: inscription.digest()?.to_string(),
-                        layers: inscription.layers.len(),
+                        layers: inscription.layers().count(),
                     }
                 }
             }
@@ -391,9 +474,7 @@ pub fn publish_once(
                 auth,
                 insecure,
                 scratch_dir,
-                rebuild,
                 concurrency,
-                verify_carried,
                 require_new,
             } => {
                 let settings = RepositoryPublish {
@@ -401,11 +482,9 @@ pub fn publish_once(
                     auth,
                     insecure,
                     scratch_dir: scratch_dir.as_deref(),
-                    rebuild,
                     tuning: Tuning {
                         direct_s3,
                         concurrency,
-                        verify_adopted: verify_carried,
                     },
                 };
                 let publisher = Publisher::open(config, &settings)?;
@@ -414,6 +493,7 @@ pub fn publish_once(
                     Next::Nothing(message) => PublishOutcome::Nothing(message),
                     next @ (Next::First | Next::After { .. }) => {
                         refuse_lost_history(&next, dry_run, &config.storage.path, plan.sequence)?;
+                        let plan = Blocks::open(config, &settings)?.name_in(plan)?;
                         publisher.preflight()?;
                         if dry_run {
                             let _preview = publisher.preview(&plan, &snapshot)?;
@@ -466,9 +546,7 @@ mod tests {
             auth: Auth::Anonymous,
             insecure: false,
             scratch_dir: scratch_dir.map(PathBuf::from),
-            rebuild: false,
             concurrency: None,
-            verify_carried: false,
             require_new: false,
         };
         let directory = |scratch_dir: Option<&str>| Destination::Directory {
@@ -499,7 +577,6 @@ mod tests {
             network_magic: 2,
             store_contract: "contract".to_owned(),
             mutable_slots: 129_600,
-            retained: vec![1],
             dolos_revision: "revision".to_owned(),
         };
         let dir = batch::dir_in(storage.path());

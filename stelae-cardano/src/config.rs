@@ -2,8 +2,8 @@
 //!
 //! The node's lasting description is Dolos's own configuration file, read by
 //! Dolos's own loader. What Dolos takes from an invocation instead — the
-//! Mithril aggregator to trust and the epochs a publisher retains state dumps
-//! of — arrives here as values and is resolved the way Dolos resolves it.
+//! Mithril aggregator to trust — arrives here as values and is resolved the
+//! way Dolos resolves it.
 
 use std::path::Path;
 
@@ -13,7 +13,6 @@ use dolos_core::{
     ChainError, Genesis,
 };
 use dolos_mithril::MithrilSource;
-use dolos_snapshot::{planning, RetainedEpochs};
 
 /// Load the configuration as Dolos does — `path`, else `./dolos.toml`, with
 /// `DOLOS_` and `__` environment overrides — and refuse a network name the
@@ -34,16 +33,13 @@ pub fn load(path: Option<&Path>) -> Result<RootConfig, ConfigError> {
     })
 }
 
-/// Where the publisher takes each section Dolos moved out of the file.
-const MOVED_TO_ARGUMENTS: [(&str, &str); 3] = [
+/// Where the publisher takes each section Dolos moved out of the file. A
+/// section Dolos removed outright keeps Dolos's words.
+const MOVED_TO_ARGUMENTS: [(&str, &str); 2] = [
     (
         "mithril",
         "`--mithril-aggregator` / `DOLOS_MITHRIL_AGGREGATOR` and `--mithril-genesis-vkey` / \
          `DOLOS_MITHRIL_GENESIS_VKEY`",
-    ),
-    (
-        "snapshot",
-        "`--state-epochs-file` (the chart's `stateEpochs`)",
     ),
     (
         "stelae",
@@ -104,24 +100,6 @@ pub enum InputError {
         flag: &'static str,
         env: &'static str,
     },
-    #[error("reading the state epochs file {path}")]
-    ReadStateEpochs {
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("line {line} of the state epochs file {path} is not an epoch number: {text:?}")]
-    MalformedStateEpoch {
-        path: String,
-        line: usize,
-        text: String,
-    },
-    #[error("the state epochs file {path} is not a list of retained epochs")]
-    InvalidStateEpochs {
-        path: String,
-        #[source]
-        source: dolos_snapshot::Error,
-    },
 }
 
 /// The aggregator a backfill trusts: what the invocation names, else the
@@ -156,41 +134,6 @@ pub fn mithril_source(
         aggregator,
         genesis_vkey,
     })
-}
-
-/// The epochs this publisher retains a state dump of, one per line.
-///
-/// Signed input (decision 0026): the list is echoed into every inscription's
-/// parameters, so it is validated before any store opens. Blank lines are
-/// skipped; an empty file is a publisher that retains the tip alone.
-pub fn read_state_epochs(path: &Path) -> Result<RetainedEpochs, InputError> {
-    let name = || path.display().to_string();
-
-    let text = std::fs::read_to_string(path).map_err(|source| InputError::ReadStateEpochs {
-        path: name(),
-        source,
-    })?;
-
-    let epochs =
-        parse_state_epochs(&text).map_err(|(line, text)| InputError::MalformedStateEpoch {
-            path: name(),
-            line,
-            text,
-        })?;
-
-    planning::retained_epochs(&epochs).map_err(|source| InputError::InvalidStateEpochs {
-        path: name(),
-        source,
-    })
-}
-
-fn parse_state_epochs(text: &str) -> Result<Vec<u64>, (usize, String)> {
-    text.lines()
-        .enumerate()
-        .map(|(index, line)| (index + 1, line.trim()))
-        .filter(|(_, line)| !line.is_empty())
-        .map(|(number, line)| line.parse().map_err(|_| (number, line.to_owned())))
-        .collect()
 }
 
 #[cfg(test)]
@@ -255,7 +198,7 @@ mod tests {
             "compatibility = \"v2-alpha.2\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"preview\"\n[snapshot]\nstate_epochs = [1]\n[mithril]\naggregator = \"http://aggregator\"\n[stelae]\nuser = \"publisher\"\n",
         );
         let error = loaded.unwrap_err().to_string();
-        assert!(error.contains("--state-epochs-file"), "{error}");
+        assert!(error.contains("[snapshot] is gone"), "{error}");
         assert!(error.contains("--mithril-aggregator"), "{error}");
         for input in [
             "--registry-user",
@@ -274,8 +217,6 @@ mod tests {
         let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/image");
         let config = load(Some(&image.join("preview-smoke.toml"))).unwrap();
         assert_eq!(genesis(&config).unwrap().network_magic(), 2);
-        let retained = read_state_epochs(&image.join("preview-smoke.state-epochs")).unwrap();
-        assert_eq!(retained.as_slice(), &[1]);
     }
 
     #[test]
@@ -304,33 +245,5 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("--mithril-genesis-vkey"), "{error}");
-    }
-
-    #[test]
-    fn state_epochs_are_one_per_line_and_validated() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state-epochs");
-
-        std::fs::write(&path, "3\n200\n\n646\n").unwrap();
-        assert_eq!(read_state_epochs(&path).unwrap().as_slice(), &[3, 200, 646]);
-
-        std::fs::write(&path, "").unwrap();
-        assert!(read_state_epochs(&path).unwrap().as_slice().is_empty());
-
-        std::fs::write(&path, "3\nfour\n").unwrap();
-        let error = read_state_epochs(&path).unwrap_err().to_string();
-        assert!(error.contains("line 2"), "{error}");
-
-        std::fs::write(&path, "200\n3\n").unwrap();
-        assert!(matches!(
-            read_state_epochs(&path),
-            Err(InputError::InvalidStateEpochs { .. })
-        ));
-
-        let missing = dir.path().join("missing");
-        assert!(matches!(
-            read_state_epochs(&missing),
-            Err(InputError::ReadStateEpochs { .. })
-        ));
     }
 }

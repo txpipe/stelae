@@ -31,8 +31,9 @@ use stelae::{inscription::Inscription, progress::Observer, Digest};
 use stelae_driver::preflight::Need;
 use tracing::warn;
 
-/// Version of the journal's layout.
-pub const JOURNAL_FORMAT: u32 = 1;
+/// Version of the journal's layout. Format 1 held bundles of the format
+/// before the diff chain, which this build can't publish.
+pub const JOURNAL_FORMAT: u32 = 2;
 
 const BATCH_DIR: &str = ".stelae-batch";
 const JOURNAL_FILE: &str = "journal.json";
@@ -93,7 +94,6 @@ pub struct Source {
     pub network_magic: u64,
     pub store_contract: String,
     pub mutable_slots: u64,
-    pub retained: Vec<u64>,
     pub dolos_revision: String,
 }
 
@@ -137,7 +137,6 @@ pub struct Prepared {
     /// What the bundle holds, stable across a recapture of the same rows.
     pub bundle: String,
     pub bytes: u64,
-    pub horizon: Option<BlockSlot>,
 }
 
 /// Why a batch stopped growing. Only captured boundaries are flushed: none of
@@ -164,8 +163,6 @@ struct Journal {
     prepared: Vec<Prepared>,
     replay: Point,
     staged: Option<Point>,
-    /// The oldest slot any bundle needs the archive to keep.
-    horizon: Option<BlockSlot>,
     ready: Option<Flush>,
 }
 
@@ -176,8 +173,6 @@ pub struct Frontiers {
     pub prepared: Option<u64>,
     pub staged: Option<Point>,
     pub replay: Option<Point>,
-    /// The oldest slot the archive still has to hold for this batch.
-    pub horizon: Option<BlockSlot>,
 }
 
 /// What may happen next, before replay advances.
@@ -213,6 +208,12 @@ pub enum Error {
     },
     #[error("the batch record at {path} is unreadable ({reason}). {REPLAY}")]
     Corrupt { path: PathBuf, reason: String },
+    #[error(
+        "the batch record at {path} is in format {found}, and this build reads format \
+         {JOURNAL_FORMAT}: an earlier publisher wrote it, and what it prepared can't be published \
+         in this one's format. {RESET}"
+    )]
+    OldFormat { path: PathBuf, found: u32 },
     #[error(
         "the batch at {path} was prepared from another {what}: run the build and configuration \
          that prepared it. {REPLAY}"
@@ -341,6 +342,12 @@ const REPLAY: &str = "Nothing else holds those boundaries: clear the storage pat
                       repository's latest stele to replay them. A repository with no stele has \
                       nothing to restore, so clear them the same way and run with --allow-genesis";
 
+/// The recovery from a batch an earlier format left. The lineage it followed
+/// is not this build's, so its stores are reset rather than continued.
+const RESET: &str = "Reset the publisher: clear the storage path and any store configured outside \
+                     it, then restore the stores from the repository's latest snapshot, or run \
+                     with --allow-genesis where it holds none";
+
 const REPLAY_FROM_GENESIS: &str =
     "clear the storage path and any store configured outside it, and run with --allow-genesis";
 
@@ -367,14 +374,9 @@ fn read_journal(path: &Path) -> Result<Option<Journal>, Error> {
         path: path.to_owned(),
         reason,
     };
+    check_format(path, &bytes)?;
     let journal: Journal =
         serde_json::from_slice(&bytes).map_err(|error| corrupt(error.to_string()))?;
-    if journal.format != JOURNAL_FORMAT {
-        return Err(corrupt(format!(
-            "format {}, this build reads {JOURNAL_FORMAT}",
-            journal.format
-        )));
-    }
     Ok(Some(journal))
 }
 
@@ -443,15 +445,40 @@ fn read_began(path: &Path) -> Result<Option<u64>, Error> {
         path: path.to_owned(),
         reason,
     };
+    check_format(path, &bytes)?;
     let began: Began =
         serde_json::from_slice(&bytes).map_err(|error| corrupt(error.to_string()))?;
-    if began.format != JOURNAL_FORMAT {
-        return Err(corrupt(format!(
-            "format {}, this build reads {JOURNAL_FORMAT}",
-            began.format
-        )));
-    }
     Ok(Some(began.first))
+}
+
+/// Refuse a record of another format before its shape is read: an older one
+/// has fields this build no longer knows, and is a reset rather than damage.
+fn check_format(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    #[derive(Deserialize)]
+    struct Format {
+        format: u32,
+    }
+
+    let found = match serde_json::from_slice::<Format>(bytes) {
+        Ok(Format { format }) => format,
+        Err(error) => {
+            return Err(Error::Corrupt {
+                path: path.to_owned(),
+                reason: error.to_string(),
+            })
+        }
+    };
+    match found {
+        JOURNAL_FORMAT => Ok(()),
+        found if found < JOURNAL_FORMAT => Err(Error::OldFormat {
+            path: path.to_owned(),
+            found,
+        }),
+        found => Err(Error::Corrupt {
+            path: path.to_owned(),
+            reason: format!("format {found}, this build reads {JOURNAL_FORMAT}"),
+        }),
+    }
 }
 
 /// Write `bytes` to `path` so that a crash leaves the old file or the new one.
@@ -577,7 +604,6 @@ impl Batch {
             prepared: self.last_sequence(),
             staged: journal.and_then(|journal| journal.staged.clone()),
             replay: journal.map(|journal| journal.replay.clone()),
-            horizon: journal.and_then(|journal| journal.horizon),
         }
     }
 
@@ -773,7 +799,6 @@ impl Batch {
             point: bundle.cursor().into(),
             bundle: bundle_identity(bundle),
             bytes: bundle.bytes(),
-            horizon: bundle.horizon(),
         };
         let journal = self.journal.get_or_insert_with(|| Journal {
             format: JOURNAL_FORMAT,
@@ -782,14 +807,9 @@ impl Batch {
             prepared: Vec::new(),
             replay: prepared.point.clone(),
             staged: None,
-            horizon: None,
             ready: None,
         });
         journal.replay = prepared.point.clone();
-        journal.horizon = match (journal.horizon, prepared.horizon) {
-            (Some(held), Some(new)) => Some(held.min(new)),
-            (held, new) => held.or(new),
-        };
         journal.prepared.push(prepared);
         self.save()
     }
@@ -929,7 +949,6 @@ impl Batch {
         };
         journal.prepared.remove(0);
         journal.predecessor = Some(committed.clone());
-        journal.horizon = journal.prepared.iter().filter_map(|p| p.horizon).min();
         self.predecessor = Some(committed);
         self.save()?;
         self.store
@@ -1007,7 +1026,6 @@ fn differing(held: &Source, found: &Source) -> Option<&'static str> {
             "mutable slot count",
             held.mutable_slots != found.mutable_slots,
         ),
-        ("retained list", held.retained != found.retained),
         (
             "Dolos revision",
             held.dolos_revision != found.dolos_revision,
@@ -1105,7 +1123,6 @@ mod tests {
             network_magic: 2,
             store_contract: "contract".to_owned(),
             mutable_slots: 129_600,
-            retained: vec![1],
             dolos_revision: "revision".to_owned(),
         }
     }
@@ -1127,7 +1144,6 @@ mod tests {
             },
             bundle: format!("bundle-{sequence}"),
             bytes,
-            horizon: Some(0),
         }
     }
 
@@ -1140,7 +1156,6 @@ mod tests {
             prepared: held.to_vec(),
             replay: held[held.len() - 1].point.clone(),
             staged: None,
-            horizon: Some(0),
             ready: None,
         });
         fs::write(dir.join("payload"), vec![0; used as usize]).unwrap();
@@ -1295,7 +1310,6 @@ mod tests {
             ("network", |s| s.network_magic = 1),
             ("store contract", |s| s.store_contract = "other".to_owned()),
             ("mutable slot count", |s| s.mutable_slots = 1),
-            ("retained list", |s| s.retained = vec![]),
             ("Dolos revision", |s| s.dolos_revision = "other".to_owned()),
         ] {
             let mut other = source();
@@ -1313,7 +1327,7 @@ mod tests {
     #[test]
     fn a_damaged_journal_is_refused_rather_than_read_as_none() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(JOURNAL_FILE), b"{\"format\":1").unwrap();
+        fs::write(dir.path().join(JOURNAL_FILE), b"{\"format\":2").unwrap();
         assert!(matches!(
             Batch::open(dir.path().to_owned(), Limits::ONE, source()),
             Err(Error::Corrupt { .. })
@@ -1331,13 +1345,53 @@ mod tests {
                 hash: None,
             },
             staged: None,
-            horizon: None,
             ready: None,
         });
         held.save().unwrap();
         assert!(matches!(
             Batch::open(dir.path().to_owned(), Limits::ONE, source()),
             Err(Error::Corrupt { .. })
+        ));
+    }
+
+    /// A journal from before the diff chain has the fields that format held,
+    /// and is refused by its number with the reset, not read as damage.
+    #[test]
+    fn an_earlier_format_is_refused_with_the_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let earlier = serde_json::json!({
+            "format": 1,
+            "source": {
+                "repository": "oci://registry.invalid/cardano/preview",
+                "network_magic": 2,
+                "store_contract": "contract",
+                "mutable_slots": 129_600,
+                "retained": [1],
+                "dolos_revision": "revision",
+            },
+            "predecessor": null,
+            "prepared": [],
+            "replay": { "slot": 0, "hash": null },
+            "staged": null,
+            "horizon": null,
+            "ready": null,
+        });
+        fs::write(dir.path().join(JOURNAL_FILE), earlier.to_string()).unwrap();
+        let error = Batch::open(dir.path().to_owned(), Limits::ONE, source())
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, Error::OldFormat { found: 1, .. }),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("Reset the publisher"), "{message}");
+        assert!(message.contains("--allow-genesis"), "{message}");
+
+        fs::write(dir.path().join(BEGAN_FILE), b"{\"format\":1,\"first\":1}").unwrap();
+        assert!(matches!(
+            refuse_lost_history(dir.path(), 2),
+            Err(Error::OldFormat { found: 1, .. })
         ));
     }
 
@@ -1399,26 +1453,6 @@ mod tests {
         let reopened = Batch::open(dir.path().to_owned(), Limits::ONE, source()).unwrap();
         assert_eq!(reopened.predecessor(), Some(&stele(1)));
         assert_eq!(reopened.prepared(), &held[1..]);
-    }
-
-    /// The oldest slot the batch needs moves on as its sequences commit, and
-    /// the last commit leaves nothing to keep.
-    #[test]
-    fn the_horizon_follows_what_is_left() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut held = [prepared(1, 1), prepared(2, 1)];
-        held[0].horizon = Some(10);
-        held[1].horizon = Some(20);
-        let mut batch = batch_holding(dir.path(), limits(9, u64::MAX, 0), &held, 0);
-        let stele = |sequence| Committed {
-            sequence,
-            identity: format!("sha256:{sequence}"),
-        };
-
-        batch.commit(stele(1)).unwrap();
-        assert_eq!(batch.frontiers().horizon, Some(20));
-        batch.commit(stele(2)).unwrap();
-        assert_eq!(batch.frontiers().horizon, None);
     }
 
     #[test]
