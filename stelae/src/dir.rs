@@ -567,6 +567,22 @@ impl SnapshotDir {
         self.pull(profile, &checked_tag_for_sequence(profile, sequence)?)
     }
 
+    /// The inscription under the immutable tag `profile` renders for
+    /// `sequence`, held to its diff manifest as [`SnapshotDir::pull`] holds
+    /// it, without reading the tip manifest.
+    ///
+    /// A sequence whose tip is gone still has its inscription. A tag the
+    /// layout does not hold is [`Error::NoSuchTag`].
+    pub fn pull_inscription(
+        &self,
+        profile: &dyn Profile,
+        sequence: u64,
+    ) -> Result<Inscription, Error> {
+        let tag = checked_tag_for_sequence(profile, sequence)?;
+        let (_, inscription, _) = self.pull_diff(&self.tags()?, profile, &tag)?;
+        Ok(inscription)
+    }
+
     /// Pull the profile's moving tag.
     pub fn pull_latest(&self, profile: &dyn Profile) -> Result<Snapshot, Error> {
         self.pull(profile, profile.moving_tag())
@@ -625,21 +641,7 @@ impl SnapshotDir {
         profile: &dyn Profile,
         tag: &str,
     ) -> Result<Snapshot, Error> {
-        let found = tags.get(tag).ok_or_else(|| Error::NoSuchTag {
-            tag: tag.to_owned(),
-        })?;
-
-        let (diff, inscription) = self.linked(found)?.ok_or_else(|| {
-            Error::Layout(format!(
-                "{INDEX_FILE} tags {tag:?} as {}, and its manifest or inscription is not in \
-                 {BLOBS_DIR}/",
-                found.digest,
-            ))
-        })?;
-
-        inscription.check_profile(profile)?;
-
-        let mut index = read_manifest(&diff, &inscription, Array::Diff)?;
+        let (diff, inscription, mut index) = self.pull_diff(tags, profile, tag)?;
 
         let tip = if inscription.tip.is_empty() {
             None
@@ -670,6 +672,33 @@ impl SnapshotDir {
             index,
             chain: None,
         })
+    }
+
+    /// The diff manifest `tags` names `tag` by and its inscription, held to
+    /// each other and to `profile`: a pull short of its tip.
+    fn pull_diff(
+        &self,
+        tags: &BTreeMap<String, Descriptor>,
+        profile: &dyn Profile,
+        tag: &str,
+    ) -> Result<(Manifest, Inscription, BlobIndex), Error> {
+        let found = tags.get(tag).ok_or_else(|| Error::NoSuchTag {
+            tag: tag.to_owned(),
+        })?;
+
+        let (diff, inscription) = self.linked(found)?.ok_or_else(|| {
+            Error::Layout(format!(
+                "{INDEX_FILE} tags {tag:?} as {}, and its manifest or inscription is not in \
+                 {BLOBS_DIR}/",
+                found.digest,
+            ))
+        })?;
+
+        inscription.check_profile(profile)?;
+
+        let index = read_manifest(&diff, &inscription, Array::Diff)?;
+
+        Ok((diff, inscription, index))
     }
 
     /// The manifest an `index.json` entry names, or `None` when its blob is not

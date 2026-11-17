@@ -738,19 +738,19 @@ fn run_digest(
         args.scratch_dir.as_deref(),
         &report_plan,
         |source, plan| {
-            let held = match &published {
-                Some(published) => published.inputs(config, plan)?,
-                None => Inputs::default(),
+            // A flag replaces the root's input unread, so a part of the root
+            // the operator stands in for cannot fail the digest.
+            let previous = match (args.previous, &published) {
+                (Some(digest), _) => Some(snapshot::previous_at(plan.sequence, digest)?),
+                (None, Some(published)) => published.previous(plan)?,
+                (None, None) => None,
             };
-            let previous = match args.previous {
-                Some(digest) => Some(snapshot::previous_at(plan.sequence, digest)?),
-                None => held.previous,
+            let blocks = match (args.blocks, &published) {
+                (Some(blocks), _) => Some(blocks),
+                (None, Some(published)) => Some(published.blocks(config, plan)?),
+                (None, None) => None,
             };
-            let inputs = Inputs {
-                previous,
-                blocks: args.blocks.or(held.blocks),
-            };
-            snapshot::digest(source, plan, inputs)
+            snapshot::digest(source, plan, Inputs { previous, blocks })
         },
     )
     .map_err(diagnose)?;
@@ -841,11 +841,13 @@ fn run_verify(
                 args.scratch_dir.as_deref(),
                 &report_plan,
                 |source, plan| {
+                    let verified = transport()?;
+                    // The published stele's sequence, not the stores': stores at
+                    // another one are the reproduction's refusal to make.
                     let previous = args
                         .previous
-                        .map(|digest| snapshot::previous_at(plan.sequence, digest))
+                        .map(|digest| snapshot::previous_at(verified.inscription.sequence, digest))
                         .transpose()?;
-                    let verified = transport()?;
                     let reproduced =
                         snapshot::reproduce(source, plan, &verified.inscription, previous)?;
                     let layers = reproduced.layers().count();

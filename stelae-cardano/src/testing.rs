@@ -152,6 +152,22 @@ impl Node {
         session.finish().unwrap();
         (genesis, boundary)
     }
+
+    /// Replays on from `first`, the boundary
+    /// [`Self::replay_to_the_first_boundary`] stops on, to the first block of
+    /// epoch 2: the boundary the second stele is cut at.
+    pub fn replay_to_the_second_boundary(
+        &self,
+        genesis: &Arc<Genesis>,
+        first: &ChainPoint,
+    ) -> ChainPoint {
+        let epoch_one = genesis.shelley.epoch_length.unwrap() as u64;
+        let (boundary, block) = make_conway_block_with_prev(2 * epoch_one, first.hash(), 3);
+        let mut session = BulkReplaySession::open(&self.config, genesis.clone(), Some(2)).unwrap();
+        session.import_blocks(vec![block]).unwrap();
+        session.finish().unwrap();
+        boundary
+    }
 }
 
 impl Default for Node {

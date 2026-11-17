@@ -93,14 +93,17 @@ the order in [publisher.md](publisher.md#first-publication). The chart
 directory and name remain `dolos-publisher` to preserve release and object
 naming.
 
-1. Stop every other writer to the repository and wait for its pod to
+1. Stop every other writer to the network root and wait for its pod to
    terminate. Helm's resource replacement order does not guarantee a single
    writer.
-2. Delete every tag in the repository, `latest` first. The first run must
-   find it empty. With `persistence.enabled: true`, also delete any claim an
-   earlier attempt left, because initialization resumes kept stores. A
-   deleted `persistence.existingClaim` must be created again, empty, before
-   step 3: until it exists the pod stays Pending (see the chart README's
+2. Delete every tag in the root's `dolos` repository, `latest` first. The
+   first run must find it empty. A lineage published before the diff chain
+   sits at the root itself, not under `dolos`: leave it alone, since a
+   rollback to its image restores from it. With `persistence.enabled: true`,
+   also delete any claim an earlier attempt left, because initialization
+   resumes kept stores. A deleted `persistence.existingClaim` must be created
+   again, empty, before step 3: until it exists the pod stays Pending (see the
+   chart README's
    [Data volume](../k8s/dolos-publisher/README.md#data-volume)). Delete only a
    claim that holds nothing but the publisher's stores: point
    `persistence.existingClaim` at a new, empty claim instead of deleting one

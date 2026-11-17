@@ -181,8 +181,13 @@ stderr and the canonical inscription goes to stdout (or `--output FILE`), so it
 hashes to the identity reported. Two inputs are part of the document and so of
 its digest: the snapshot at N−1 it follows, and the blocks snapshot at N it
 names. `--repo` reads both from a root, and `--previous DIGEST` and
-`--blocks DIGEST` give either one instead. With neither, the reproduction
-starts a lineage and names no blocks snapshot. Stderr says which it used:
+`--blocks DIGEST` give either one instead, leaving that part of the root
+unread. The root's N−1 is read without its tip, which a repository may no
+longer keep, and a root with none there starts a lineage. A root's blocks
+snapshot is held to what a publish names: one absent at N, or of another
+sequence or network, is refused. With neither `--repo` nor the flags, the
+reproduction starts a lineage and names no blocks snapshot. Stderr says which
+it used:
 
 ```sh
 stelae-publisher --config dolos.toml digest \

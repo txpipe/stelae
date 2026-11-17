@@ -128,7 +128,10 @@ fn digest_is_the_profile_document_over_the_same_store_and_plan() {
 
     let digested = fixture
         .with_plan(|source, plan| {
-            let inputs = published.inputs(&fixture.node.config, plan)?;
+            let inputs = Inputs {
+                previous: published.previous(plan)?,
+                blocks: Some(published.blocks(&fixture.node.config, plan)?),
+            };
             snapshot::digest(source, plan, inputs)
         })
         .unwrap();
@@ -212,10 +215,37 @@ fn verify_reproduce_holds_the_published_link_to_the_one_given() {
         "the refusal names what it compared"
     );
 
+    // A stele that follows one: the same link passes, and only its digest
+    // tells another apart, at the same sequence.
+    let link = snapshot::previous_at(1, stelae::Digest::compute(b"before")).unwrap();
+    let mut linked = verified.inscription.clone();
+    linked.previous = Some(link);
+    fixture
+        .with_plan(|source, plan| snapshot::reproduce(source, plan, &linked, Some(link)))
+        .unwrap();
+    let error = fixture
+        .with_plan(|source, plan| snapshot::reproduce(source, plan, &linked, Some(other)))
+        .unwrap_err();
+    assert!(error.is_mismatch(), "{error:?}");
+
     assert!(matches!(
         snapshot::previous_at(0, stelae::Digest::compute(b"another")),
         Err(snapshot::Error::NothingBefore)
     ));
+}
+
+/// A stele the stores do not rebuild is the stele's mismatch, not a failure
+/// to run.
+#[test]
+fn a_reproduction_that_differs_from_the_stele_is_a_mismatch() {
+    let fixture = Fixture::published();
+    let mut published = fixture.open().verify(Point::Latest).unwrap().inscription;
+    published.diff[0].records += 1;
+
+    let error = fixture
+        .with_plan(|source, plan| snapshot::reproduce(source, plan, &published, None))
+        .unwrap_err();
+    assert!(error.is_mismatch(), "{error:?}");
 }
 
 #[test]

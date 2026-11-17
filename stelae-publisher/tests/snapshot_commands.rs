@@ -8,7 +8,7 @@ use stelae_cardano::{
     publisher::{publish_once, Destination},
     snapshot::{read_position, Published},
     testing::{loopback::Loopback, open_repository, seal_blank_blocks, Node},
-    Auth, Point, RestoreSource, Selection,
+    Auth, Genesis, Point, RestoreSource, Selection,
 };
 
 /// A node at its first boundary, published into a network root on disk: the
@@ -23,18 +23,20 @@ impl Fixture {
         let node = Node::new();
         let (genesis, _) = node.replay_to_the_first_boundary();
         let root = node.path().join("root");
-        publish_once(
-            &node.config,
-            &genesis,
-            Selection::default(),
-            Destination::Directory {
-                path: root.clone(),
-                scratch_dir: None,
-            },
-            false,
-            &Observer::silent(),
-        )
-        .unwrap();
+        publish_into(&node, &genesis, &root);
+        Self { node, root }
+    }
+
+    /// [`Fixture::published`], then replayed on to the second boundary and
+    /// published again: the root holds sequences 1 and 2, the stores stand
+    /// at 2.
+    fn published_twice() -> Self {
+        let node = Node::new();
+        let (genesis, first) = node.replay_to_the_first_boundary();
+        let root = node.path().join("root");
+        publish_into(&node, &genesis, &root);
+        node.replay_to_the_second_boundary(&genesis, &first);
+        publish_into(&node, &genesis, &root);
         Self { node, root }
     }
 
@@ -64,6 +66,10 @@ impl Fixture {
 
     /// The canonical inscription the `dolos` layout holds at `latest`.
     fn inscription(&self) -> Vec<u8> {
+        self.inscription_at(Point::Latest)
+    }
+
+    fn inscription_at(&self, point: Point) -> Vec<u8> {
         Published::open(
             &self.node.config,
             &RestoreSource::Dir(self.root.clone()),
@@ -71,7 +77,7 @@ impl Fixture {
             Auth::Anonymous,
         )
         .unwrap()
-        .inspect(Point::Latest)
+        .inspect(point)
         .unwrap()
         .inscription
         .canonicalize()
@@ -94,6 +100,35 @@ impl Fixture {
             .max_by_key(|blob| std::fs::metadata(blob).unwrap().len())
             .unwrap()
     }
+}
+
+/// Publish the stores' boundary into the network root `root` on disk.
+fn publish_into(node: &Node, genesis: &Genesis, root: &Path) {
+    publish_once(
+        &node.config,
+        genesis,
+        Selection::default(),
+        Destination::Directory {
+            path: root.to_owned(),
+            scratch_dir: None,
+        },
+        false,
+        &Observer::silent(),
+    )
+    .unwrap();
+}
+
+/// Drop `tag` from the layout at `layout`'s index, as a repository that no
+/// longer keeps it would.
+fn drop_tag(layout: &Path, tag: &str) {
+    let path = layout.join("index.json");
+    let mut index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let entries = index["manifests"].as_array_mut().unwrap();
+    let held = entries.len();
+    entries.retain(|entry| entry["annotations"]["org.opencontainers.image.ref.name"] != tag);
+    assert_eq!(entries.len(), held - 1, "{tag} was not in the index once");
+    std::fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
 }
 
 /// Replace the inscription every manifest of the layout at `layout` carries
@@ -321,6 +356,121 @@ fn a_digest_takes_its_link_and_blocks_from_the_root_or_the_flags() {
         "{}",
         stderr_words(&linked)
     );
+
+    // A blocks snapshot given in place of the root's.
+    let named = fixture.run(&["digest", "--repo", &fixture.repo(), "--blocks", &other]);
+    assert_eq!(code(&named), 0, "{}", stderr_words(&named));
+    let position = Inscription::parse(&named.stdout).unwrap().position;
+    let named = read_position(&position)
+        .unwrap()
+        .blocks
+        .unwrap()
+        .to_string();
+    assert_eq!(named, other);
+
+    // The flag leaves the root's blocks repository unread, so a root whose
+    // blocks layout does not open still digests with it, and only with it.
+    std::fs::remove_file(fixture.root.join("blocks").join("oci-layout")).unwrap();
+    let unread = fixture.run(&["digest", "--repo", &fixture.repo(), "--blocks", &blocks]);
+    assert_eq!(code(&unread), 0, "{}", stderr_words(&unread));
+    assert_eq!(unread.stdout, published);
+    let refused = fixture.run(&["digest", "--repo", &fixture.repo()]);
+    assert_eq!(code(&refused), 1, "{}", stderr_words(&refused));
+}
+
+/// Past a lineage's first stele, a digest follows the one before it as the
+/// root holds it, whether or not the root still keeps that stele's tip, and
+/// `--previous` stands in for it.
+#[test]
+fn a_digest_follows_the_stele_before_with_or_without_its_tip() {
+    let fixture = Fixture::published_twice();
+    let repo = fixture.repo();
+    let first = Inscription::parse(&fixture.inscription_at(Point::Epoch(1)))
+        .unwrap()
+        .digest()
+        .unwrap();
+    let published = fixture.inscription_at(Point::Epoch(2));
+
+    let follows = |what: &str| {
+        let digested = fixture.run(&["digest", "--repo", &repo]);
+        assert_eq!(code(&digested), 0, "{what}: {}", stderr_words(&digested));
+        assert_eq!(digested.stdout, published, "{what}");
+        let words = stderr_words(&digested);
+        assert!(
+            words.contains(&format!("previous: sequence 1 ({first})")),
+            "{what}: {words}"
+        );
+    };
+    follows("with its tip");
+    drop_tag(&fixture.dolos(), "epoch-1.tip");
+    follows("without its tip");
+
+    let other = stelae::Digest::compute(b"another stele").to_string();
+    let linked = fixture.run(&["digest", "--repo", &repo, "--previous", &other]);
+    assert_eq!(code(&linked), 0, "{}", stderr_words(&linked));
+    let link = Inscription::parse(&linked.stdout)
+        .unwrap()
+        .previous
+        .unwrap();
+    assert_eq!(
+        (link.sequence, link.inscription_digest.to_string()),
+        (1, other)
+    );
+}
+
+/// `--previous` names the stele before the published one, so stores at
+/// another sequence are refused as themselves, not blamed on the flag.
+#[test]
+fn a_reproduction_from_stores_at_another_sequence_says_where_they_stand() {
+    let fixture = Fixture::published_twice();
+    let first = Inscription::parse(&fixture.inscription_at(Point::Epoch(1)))
+        .unwrap()
+        .digest()
+        .unwrap()
+        .to_string();
+    let behind = Fixture {
+        node: Node::new(),
+        root: fixture.root.clone(),
+    };
+    behind.node.replay_to_the_first_boundary();
+
+    let output = behind.run(&[
+        "verify",
+        "--repo",
+        &behind.repo(),
+        "--point",
+        "epoch-2",
+        "--reproduce",
+        "--previous",
+        &first,
+    ]);
+    assert_eq!(code(&output), 3, "{}", stderr_words(&output));
+    let words = stderr_words(&output);
+    assert!(words.contains("stores stand at sequence 1"), "{words}");
+    assert!(!words.contains("--previous"), "{words}");
+}
+
+/// A root without a blocks snapshot at the stores' sequence gives no digest:
+/// a publish there would refuse, so the document is none it could publish.
+#[test]
+fn a_digest_refuses_a_root_without_its_blocks_snapshot() {
+    let fixture = Fixture::published();
+    let registry = tempfile::tempdir().unwrap();
+    let loopback = Loopback::serve(registry.path()).unwrap();
+
+    let output = fixture.run(&[
+        "digest",
+        "--repo",
+        &loopback.repository("cardano/empty"),
+        "--insecure",
+    ]);
+    assert_eq!(code(&output), 1, "{}", stderr_words(&output));
+    let words = stderr_words(&output);
+    assert!(
+        words.contains("holds no blocks snapshot at epoch-1"),
+        "{words}"
+    );
+    assert!(words.contains("cardano/empty/blocks"), "{words}");
 }
 
 #[test]
@@ -649,20 +799,96 @@ fn a_repository_publish_refuses_without_its_blocks_snapshot() {
     assert_eq!(named, Some(blocks));
 }
 
+/// Neither a publish nor a digest names a blocks snapshot of another sequence
+/// or network than the stores', whatever tag the root holds it under; the
+/// publish writes nothing.
+#[test]
+fn a_blocks_snapshot_of_another_sequence_or_network_is_refused() {
+    let fixture = Fixture::published();
+    let magic = Seed::of(&fixture).magic;
+
+    let refused = |what: &str, named: &str, seed: &dyn Fn(&Loopback, &Path)| {
+        let registry = tempfile::tempdir().unwrap();
+        let loopback = Loopback::serve(registry.path()).unwrap();
+        seed(&loopback, registry.path());
+        let repo = loopback.repository("cardano/test");
+        for command in ["publish", "digest"] {
+            let output = fixture.run(&[command, "--repo", &repo, "--insecure"]);
+            let words = stderr_words(&output);
+            assert_eq!(code(&output), 1, "{what}, {command}: {words}");
+            assert!(words.contains(named), "{what}, {command}: {words}");
+            assert!(
+                words.contains("cardano/test/blocks"),
+                "{what}, {command}: {words}"
+            );
+        }
+        assert!(
+            loopback.manifests("cardano/test/dolos").is_empty(),
+            "{what}"
+        );
+    };
+
+    refused(
+        "another sequence",
+        "the blocks snapshot of sequence 2 at epoch-1",
+        &|loopback, registry| {
+            // Sequence 2's snapshot, tagged as sequence 1's too.
+            Seed::of(&fixture).at(2).seal_into(loopback, "cardano/test");
+            let tags = registry.join("cardano/test/blocks/manifests/tags");
+            std::fs::copy(tags.join("epoch-2"), tags.join("epoch-1")).unwrap();
+        },
+    );
+    refused(
+        "another network",
+        &format!("network magic {}", magic + 1),
+        &|loopback, _| {
+            let mut seed = Seed::of(&fixture);
+            seed.magic += 1;
+            seed.seal_into(loopback, "cardano/test");
+        },
+    );
+}
+
+/// A blank blocks snapshot to seal, starting a lineage at `sequence`: by
+/// default the fixture network's first.
+struct Seed {
+    magic: u64,
+    sequence: u64,
+    epoch_length: u64,
+}
+
+impl Seed {
+    fn of(fixture: &Fixture) -> Self {
+        let genesis = stelae_cardano::config::genesis(&fixture.node.config).unwrap();
+        Self {
+            magic: u64::from(genesis.network_magic()),
+            sequence: 1,
+            epoch_length: genesis.shelley.epoch_length.unwrap() as u64,
+        }
+    }
+
+    fn at(self, sequence: u64) -> Self {
+        Self { sequence, ..self }
+    }
+
+    /// Seal it under the network root `name`, and return its digest.
+    fn seal_into(self, loopback: &Loopback, name: &str) -> stelae::Digest {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let scratch = tempfile::tempdir().unwrap();
+        let blocks = open_repository(
+            &loopback.repository(&format!("{name}/blocks")),
+            scratch.path(),
+        );
+        seal_blank_blocks(
+            &blocks,
+            self.magic,
+            self.sequence,
+            (0, 0, self.epoch_length - 1),
+        )
+    }
+}
+
 /// A blank blocks snapshot at sequence 1 under the network root `name`.
 fn seed_first_blocks(fixture: &Fixture, loopback: &Loopback, name: &str) -> stelae::Digest {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let scratch = tempfile::tempdir().unwrap();
-    let blocks = open_repository(
-        &loopback.repository(&format!("{name}/blocks")),
-        scratch.path(),
-    );
-    let genesis = stelae_cardano::config::genesis(&fixture.node.config).unwrap();
-    let epoch = genesis.shelley.epoch_length.unwrap() as u64;
-    seal_blank_blocks(
-        &blocks,
-        u64::from(genesis.network_magic()),
-        1,
-        (0, 0, epoch - 1),
-    )
+    Seed::of(fixture).seal_into(loopback, name)
 }

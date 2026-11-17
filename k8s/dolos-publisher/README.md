@@ -240,13 +240,15 @@ Rolling back to chart 0.3 drops the claim from the Job: 0.3 accepts the
 restores all of history into ephemeral storage. The claim stays, and a
 later 0.4 install with persistence adopts it again.
 
-An image on a new Dolos profile pin cannot continue a repository cut by an
+An image on a new Dolos profile pin cannot continue a lineage cut by an
 earlier one: restoring or chaining onto an older stele is unsupported, so the
-move starts a fresh lineage in an emptied repository, as
+move starts a fresh lineage in the root's emptied `dolos` repository, as
 [First publication on the chart](../../docs/publisher-packaging.md#first-publication-on-the-chart)
-describes. Rollback to the earlier image works only while the repository
-still holds its lineage, that is, before its tags are deleted. Never reuse
-incompatible persistent scratch or an unpublished checkpoint across images.
+describes. A lineage from before the diff chain sits at the root itself and
+is left alone. Rollback to the earlier image works only while its lineage is
+still held: at the root for an image from before the diff chain, in `dolos`
+before its tags are deleted for a later one. Never reuse incompatible
+persistent scratch or an unpublished checkpoint across images.
 
 Full build and release details, and the first publication of a fresh
 lineage, are in

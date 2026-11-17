@@ -20,6 +20,7 @@ use stelae_driver::Standing;
 use crate::{
     backfill,
     batch::{self, Committed, Held},
+    snapshot,
 };
 
 /// Resolved repository publication settings. `repo` is the network root,
@@ -246,22 +247,24 @@ impl Blocks {
 
     /// The inscription digest of the blocks snapshot at `plan`'s sequence,
     /// which the Dolos snapshot there names, or `None` when the repository
-    /// holds none. A blocks snapshot of another network is refused.
-    pub fn reference(&self, plan: &Plan) -> Result<Option<Digest>, dolos_snapshot::Error> {
-        let snapshot = match self.registry.pull_sequence(&BlocksProfile, plan.sequence) {
-            Ok(snapshot) => snapshot,
+    /// holds none. One of another sequence or network is refused.
+    pub fn reference(
+        &self,
+        plan: &Plan,
+    ) -> Result<Option<Digest>, Box<dyn std::error::Error + Send + Sync>> {
+        let held = match self.registry.pull_sequence(&BlocksProfile, plan.sequence) {
+            Ok(held) => held,
             Err(error) if error.is_absent() => return Ok(None),
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(dolos_snapshot::Error::from(error).into()),
         };
-        let inscription = snapshot.read_inscription()?;
-        let found = stelae_blocks::read_position(&inscription.position)?.network_magic;
-        if found != plan.network.magic() {
-            return Err(dolos_snapshot::Error::NetworkMismatch {
-                expected: plan.network.magic(),
-                found,
-            });
-        }
-        Ok(Some(inscription.digest()?))
+        let inscription = held
+            .read_inscription()
+            .map_err(dolos_snapshot::Error::from)?;
+        Ok(Some(snapshot::blocks_reference(
+            &self.repository(),
+            &inscription,
+            plan,
+        )?))
     }
 
     /// `plan` naming the blocks snapshot at its sequence, refused when there
@@ -310,8 +313,9 @@ impl backfill::Publish for BackfillPublisher<'_> {
 
     fn blocks(&self, plan: &Plan) -> Result<Option<Digest>, backfill::Error> {
         Blocks::open(self.config, &self.settings)
-            .and_then(|blocks| blocks.reference(plan))
-            .map_err(backfill::Error::caller)
+            .map_err(backfill::Error::caller)?
+            .reference(plan)
+            .map_err(backfill::Error::Caller)
     }
 
     fn finalize(

@@ -17,7 +17,7 @@ use std::{
 
 use dolos::engine::{BulkReplaySession, ReplayWorkspace};
 use dolos_core::ChainPoint;
-use dolos_snapshot::{export::Following, source::SnapshotSource};
+use dolos_snapshot::{export::Following, source::SnapshotSource, DolosProfile};
 use pallas::ledger::traverse::MultiEraBlock;
 use serde_json::Value;
 use stelae::{
@@ -28,8 +28,13 @@ use stelae_cardano::{
     backfill::{self, Options, Outcome},
     batch::{self, Limits},
     initialize,
-    testing::{chain::Chain, loopback::Loopback, open_repository, Node},
-    Auth, MithrilSource, Point, RestoreSource,
+    snapshot::{self, Inputs, Published},
+    testing::{
+        chain::Chain,
+        loopback::{Loopback, Verdict},
+        open_repository, Node,
+    },
+    Auth, MithrilSource, Point, RestoreSource, Selection,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{
@@ -538,6 +543,85 @@ fn a_consumer_restores_every_publication_of_a_batch_and_replays_on() {
         let next = (sequence < UNTIL).then(|| reference.canonical(name, sequence + 1));
         restores_and_continues(reference, name, sequence, next.as_deref());
     }
+}
+
+/// Past a lineage's first stele, a digest at the stores' sequence takes its
+/// link from the stele before and its blocks from the root, and gives the
+/// stele the root holds there. The registry no longer serving that earlier
+/// stele's tip does not stop it, as a repository may drop it.
+#[test]
+fn a_digest_past_the_first_stele_follows_one_whose_tip_is_gone() {
+    provider();
+    let reference = &*SHELLEY;
+    // A server of its own over the reference's root, so its rule meets no
+    // other test's request.
+    let loopback = Loopback::serve(reference.root.path()).unwrap();
+    let gone = format!("/v2/{}/manifests/epoch-1.tip", dolos(ONE));
+    loopback.rule(move |seen| match seen.path == gone {
+        true => Verdict::Refuse(404),
+        false => Verdict::Proceed,
+    });
+    let root = || loopback.repository(ONE).parse().unwrap();
+
+    // The rule is the gone tip a publisher's read of sequence 1 refuses.
+    let scratch = tempfile::tempdir().unwrap();
+    let error = open_repository(&loopback.repository(&dolos(ONE)), scratch.path())
+        .pull_sequence(&DolosProfile, 1)
+        .unwrap_err();
+    assert!(
+        matches!(error, stelae::Error::TipGone { sequence: 1, .. }),
+        "{error:?}"
+    );
+
+    let chain = &reference.chain;
+    let node = chain.node();
+    let outcome = initialize::run(
+        &node.config,
+        &chain.genesis,
+        &initialize::Options {
+            source: RestoreSource::Repo(root()),
+            point: Point::Epoch(2),
+            auth: Auth::Anonymous,
+            insecure: true,
+            scratch_dir: None,
+            skip_space_check: true,
+            resume: false,
+            allow_genesis: false,
+        },
+        &Observer::silent(),
+    )
+    .unwrap();
+    assert_eq!(outcome, initialize::Outcome::Restored { sequence: 2 });
+
+    let published = Published::open(
+        &node.config,
+        &RestoreSource::Repo(root()),
+        true,
+        Auth::Anonymous,
+    )
+    .unwrap();
+    let digested = snapshot::with_plan(
+        &node.config,
+        &chain.genesis,
+        Selection::default(),
+        None,
+        &|_, _| {},
+        |source, plan| {
+            let inputs = Inputs {
+                previous: published.previous(plan)?,
+                blocks: Some(published.blocks(&node.config, plan)?),
+            };
+            snapshot::digest(source, plan, inputs)
+        },
+    )
+    .unwrap();
+    let expected = reference.inscription(ONE, 2);
+    assert_eq!(digested.inputs.previous, expected.previous);
+    assert_eq!(
+        digested.inputs.previous.map(|link| link.inscription_digest),
+        Some(reference.inscription(ONE, 1).digest().unwrap())
+    );
+    assert_eq!(digested.document.canonical, reference.canonical(ONE, 2));
 }
 
 static BYRON: LazyLock<Reference> = LazyLock::new(|| {

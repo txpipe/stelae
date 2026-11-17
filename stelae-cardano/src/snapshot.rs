@@ -65,6 +65,90 @@ pub enum Error {
 
     #[error("a stele at sequence 0 follows nothing, so --previous names no stele before it")]
     NothingBefore,
+
+    /// A network root whose blocks repository holds nothing at the plan's
+    /// sequence, which a publish there refuses as well.
+    #[error(
+        "the blocks repository {repository} holds no blocks snapshot at epoch-{sequence}, which a \
+         stele there names; --blocks names one in its place"
+    )]
+    BlocksAbsent { repository: String, sequence: u64 },
+
+    #[error(transparent)]
+    Blocks(#[from] BlocksRefusal),
+}
+
+/// A blocks snapshot the stele at a plan's sequence cannot name.
+#[derive(Debug, thiserror::Error)]
+pub enum BlocksRefusal {
+    /// A tag naming another sequence's snapshot, which a copied or moved tag
+    /// leaves: the protocol's pull does not hold an inscription to its tag.
+    #[error(
+        "the blocks repository {repository} holds the blocks snapshot of sequence {found} at \
+         epoch-{sequence}, and a stele names the blocks snapshot of its own sequence"
+    )]
+    OtherSequence {
+        repository: String,
+        sequence: u64,
+        found: u64,
+    },
+
+    #[error(
+        "the blocks repository {repository} holds a blocks snapshot for network magic {found}, \
+         and this node is configured for {expected}"
+    )]
+    OtherNetwork {
+        repository: String,
+        expected: u64,
+        found: u64,
+    },
+
+    #[error("reading the blocks snapshot at epoch-{sequence} in {repository}")]
+    Unreadable {
+        repository: String,
+        sequence: u64,
+        #[source]
+        source: Box<dolos_snapshot::Error>,
+    },
+}
+
+/// The digest the stele at `plan`'s sequence names `blocks` by, the
+/// inscription `repository` holds at that sequence.
+///
+/// Refused when it is another sequence's or another network's: Dolos takes
+/// the reference as given, and a stele naming either could not be restored.
+pub fn blocks_reference(
+    repository: &str,
+    blocks: &Inscription,
+    plan: &Plan,
+) -> Result<Digest, BlocksRefusal> {
+    let unreadable = |source: dolos_snapshot::Error| BlocksRefusal::Unreadable {
+        repository: repository.to_owned(),
+        sequence: plan.sequence,
+        source: Box::new(source),
+    };
+
+    if blocks.sequence != plan.sequence {
+        return Err(BlocksRefusal::OtherSequence {
+            repository: repository.to_owned(),
+            sequence: plan.sequence,
+            found: blocks.sequence,
+        });
+    }
+
+    let found = stelae_blocks::read_position(&blocks.position)
+        .map_err(|error| unreadable(error.into()))?
+        .network_magic;
+    let expected = plan.network.magic();
+    if found != expected {
+        return Err(BlocksRefusal::OtherNetwork {
+            repository: repository.to_owned(),
+            expected,
+            found,
+        });
+    }
+
+    blocks.digest().map_err(|error| unreadable(error.into()))
 }
 
 impl Error {
@@ -360,19 +444,16 @@ impl Side {
         }
     }
 
-    /// The inscription `profile` holds at `sequence` here, or `None`.
+    /// The inscription `profile` holds at `sequence` here, or `None`. Its tip
+    /// is not read: a repository may no longer keep an older sequence's.
     fn inscription(
         &self,
         profile: &dyn Profile,
         sequence: u64,
     ) -> Result<Option<Inscription>, stelae::Error> {
         let pulled = match self {
-            Self::Directory(dir) => dir
-                .pull_sequence(profile, sequence)
-                .and_then(|snapshot| snapshot.read_inscription()),
-            Self::Repository(registry) => registry
-                .pull_sequence(profile, sequence)
-                .and_then(|snapshot| snapshot.read_inscription()),
+            Self::Directory(dir) => dir.pull_inscription(profile, sequence),
+            Self::Repository(registry) => registry.pull_inscription(profile, sequence),
         };
         match pulled {
             Ok(inscription) => Ok(Some(inscription)),
@@ -436,34 +517,43 @@ impl Published {
         verified.map_err(Error::verifying("verifying the stele"))
     }
 
-    /// What a publish of `plan` here is chained to and names: the stele
-    /// before its sequence, which a lineage starting there lacks, and the
-    /// blocks snapshot at it.
-    pub fn inputs(&self, config: &RootConfig, plan: &Plan) -> Result<Inputs, Error> {
-        let previous = match plan.sequence.checked_sub(1) {
-            None => None,
-            Some(sequence) => {
-                let what = format!("reading the stele at sequence {sequence}");
-                match self.dolos.inscription(&DolosProfile, sequence) {
-                    Ok(Some(previous)) => Following::new(&previous, plan)
-                        .map_err(Error::profile(what))?
-                        .previous(),
-                    Ok(None) => None,
-                    Err(error) => return Err(Error::profile(what)(error.into())),
-                }
-            }
+    /// The link a publish of `plan` here carries: to the stele before its
+    /// sequence, or `None` where there is none, which starts a lineage.
+    pub fn previous(&self, plan: &Plan) -> Result<Option<Link>, Error> {
+        let Some(sequence) = plan.sequence.checked_sub(1) else {
+            return Ok(None);
         };
+        let what = format!("reading the stele at sequence {sequence}");
+        match self.dolos.inscription(&DolosProfile, sequence) {
+            Ok(Some(previous)) => Ok(Following::new(&previous, plan)
+                .map_err(Error::profile(what))?
+                .previous()),
+            Ok(None) => Ok(None),
+            Err(error) => Err(Error::profile(what)(error.into())),
+        }
+    }
 
+    /// The blocks snapshot a publish of `plan` here names: the one at its
+    /// sequence in the root's `blocks` repository, refused where a publish
+    /// refuses it.
+    pub fn blocks(&self, config: &RootConfig, plan: &Plan) -> Result<Digest, Error> {
         let what = format!("reading the blocks snapshot at sequence {}", plan.sequence);
-        let blocks = self
+        let source = self
             .root
             .profile(BLOCKS_REPOSITORY)
-            .and_then(|blocks| Side::open(config, &blocks, self.insecure, self.auth.clone()))
+            .map_err(Error::profile(what.clone()))?;
+        let held = Side::open(config, &source, self.insecure, self.auth.clone())
             .and_then(|blocks| Ok(blocks.inscription(&BlocksProfile, plan.sequence)?))
-            .and_then(|blocks| Ok(blocks.map(|blocks| blocks.digest()).transpose()?))
             .map_err(Error::profile(what))?;
 
-        Ok(Inputs { previous, blocks })
+        let repository = source.to_string();
+        match held {
+            Some(held) => Ok(blocks_reference(&repository, &held, plan)?),
+            None => Err(Error::BlocksAbsent {
+                repository,
+                sequence: plan.sequence,
+            }),
+        }
     }
 }
 

@@ -3231,10 +3231,19 @@ fn a_gone_tip_is_not_an_absent_sequence() {
         assert!(!err.is_absent());
     }
 
+    // Its inscription is still published, and reading it asks for no tip.
+    let tip_reads = fault.gets("manifests/chapter-4.tip");
+    let inscription = registry.pull_inscription(&ToyProfile, 4).unwrap();
+    assert_eq!(inscription.sequence, 4);
+    assert!(!inscription.tip.is_empty());
+    assert_eq!(fault.gets("manifests/chapter-4.tip"), tip_reads);
+
     // The sequence before still has its tip, and one never published is absent.
     registry.pull_sequence(&ToyProfile, 3).unwrap();
 
     let err = registry.pull_sequence(&ToyProfile, 9).unwrap_err();
+    assert!(err.is_absent(), "{err:?}");
+    let err = registry.pull_inscription(&ToyProfile, 9).unwrap_err();
     assert!(err.is_absent(), "{err:?}");
 }
 

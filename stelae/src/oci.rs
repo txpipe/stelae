@@ -1101,18 +1101,7 @@ impl Registry {
         validate_tag(tag)?;
 
         let reference = self.shared.tagged(tag);
-        let diff = self.shared.pull_manifest(&reference)?;
-
-        check_envelope(&diff)?;
-
-        let raw = self
-            .shared
-            .pull_blob_bytes(&reference, &to_oci(&diff.config))?;
-        let inscription = inscription_of(&diff, &raw)?;
-
-        inscription.check_profile(profile)?;
-
-        let mut blobs = read_manifest(&diff, &inscription, Array::Diff)?;
+        let (diff, inscription, mut blobs) = self.pull_diff(profile, &reference)?;
 
         let tip = if inscription.tip.is_empty() {
             None
@@ -1148,10 +1137,50 @@ impl Registry {
         })
     }
 
+    /// Steps 1 to 5 of [`Registry::pull`]: the diff manifest under
+    /// `reference` and its inscription, held to each other and to `profile`.
+    fn pull_diff(
+        &self,
+        profile: &dyn Profile,
+        reference: &Reference,
+    ) -> Result<(Manifest, Inscription, BlobIndex), Error> {
+        let diff = self.shared.pull_manifest(reference)?;
+
+        check_envelope(&diff)?;
+
+        let raw = self
+            .shared
+            .pull_blob_bytes(reference, &to_oci(&diff.config))?;
+        let inscription = inscription_of(&diff, &raw)?;
+
+        inscription.check_profile(profile)?;
+
+        let blobs = read_manifest(&diff, &inscription, Array::Diff)?;
+
+        Ok((diff, inscription, blobs))
+    }
+
     /// Pull the immutable tag `profile` renders for `sequence`.
     pub fn pull_sequence(&self, profile: &dyn Profile, sequence: u64) -> Result<Snapshot, Error> {
         let tag = checked_tag_for_sequence(profile, sequence)?;
         self.pull(profile, &tag)
+    }
+
+    /// The inscription under the immutable tag `profile` renders for
+    /// `sequence`, held to its diff manifest as [`Registry::pull`] holds it,
+    /// without reading the tip manifest.
+    ///
+    /// What a caller that needs only the link to a sequence reads: a sequence
+    /// whose tip is gone still has its inscription. An absent tag is
+    /// [`Error::is_absent`].
+    pub fn pull_inscription(
+        &self,
+        profile: &dyn Profile,
+        sequence: u64,
+    ) -> Result<Inscription, Error> {
+        let tag = checked_tag_for_sequence(profile, sequence)?;
+        let (_, inscription, _) = self.pull_diff(profile, &self.shared.tagged(&tag))?;
+        Ok(inscription)
     }
 
     /// Pull the profile's moving tag — the most recent sequence, by its diff
