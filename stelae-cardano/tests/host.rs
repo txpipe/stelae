@@ -8,9 +8,10 @@ use stelae_blocks::BlocksProfile;
 use stelae_cardano::{
     backfill::{self, Batching, Driver},
     batch, initialize,
-    publisher::{publish_once, Destination, PublishOutcome},
+    publisher::{publish_once, BackfillPublisher, Destination, PublishOutcome, RepositoryPublish},
+    snapshot::BlocksRefusal,
     testing::{loopback::Loopback, open_repository, seal_blank_blocks, Node},
-    Auth, MithrilSource, Point, RestoreSource, Selection,
+    Auth, MithrilSource, Point, Repository, RestoreSource, Selection,
 };
 
 #[test]
@@ -583,4 +584,100 @@ fn an_aggregator_that_doesnt_answer_fails_a_batched_run_as_the_source() {
         ),
         "{error}"
     );
+}
+
+/// A back-fill names the blocks snapshot at a boundary through the refusals a
+/// publish makes: one of another sequence or network is refused, whatever tag
+/// the root holds it under. Called on the publisher itself, short of the
+/// driver's retries.
+#[test]
+fn a_backfill_names_no_blocks_snapshot_of_another_sequence_or_network() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let node = Node::new();
+    let (genesis, _) = node.replay_to_the_first_boundary();
+    let magic = u64::from(genesis.network_magic());
+    let epoch = genesis.shelley.epoch_length.unwrap() as u64;
+    let plan = {
+        let workspace = ReplayWorkspace::open(&node.config, genesis.clone()).unwrap();
+        let plan = workspace.snapshot().plan(magic).unwrap();
+        workspace.finish().unwrap();
+        plan
+    };
+    assert_eq!(plan.sequence, 1);
+
+    let named = |seed: &dyn Fn(&Loopback, &std::path::Path) -> Option<Digest>| {
+        let registry = tempfile::tempdir().unwrap();
+        let loopback = Loopback::serve(registry.path()).unwrap();
+        let sealed = seed(&loopback, registry.path());
+        let repo: Repository = loopback.repository("cardano/test").parse().unwrap();
+        let observer = Observer::silent();
+        let publisher = BackfillPublisher {
+            config: &node.config,
+            settings: RepositoryPublish {
+                repo: &repo,
+                auth: Auth::Anonymous,
+                insecure: true,
+                scratch_dir: None,
+                tuning: Default::default(),
+            },
+            observer: &observer,
+        };
+        (sealed, backfill::Publish::blocks(&publisher, &plan))
+    };
+    let seal = |loopback: &Loopback, magic: u64, sequence: u64| {
+        let scratch = tempfile::tempdir().unwrap();
+        let first = (sequence - 1) * epoch;
+        seal_blank_blocks(
+            &open_repository(&loopback.repository("cardano/test/blocks"), scratch.path()),
+            magic,
+            sequence,
+            (sequence - 1, first, first + epoch - 1),
+        )
+    };
+
+    let (sealed, found) = named(&|loopback, _| Some(seal(loopback, magic, 1)));
+    assert_eq!(found.unwrap(), sealed);
+
+    let (_, found) = named(&|_, _| None);
+    assert_eq!(found.unwrap(), None);
+
+    let (_, found) = named(&|loopback, registry| {
+        // Sequence 2's snapshot, tagged as sequence 1's too.
+        seal(loopback, magic, 2);
+        let tags = registry.join("cardano/test/blocks/manifests/tags");
+        std::fs::copy(tags.join("epoch-2"), tags.join("epoch-1")).unwrap();
+        None
+    });
+    let refused = refusal(found);
+    assert!(
+        matches!(
+            refused,
+            BlocksRefusal::OtherSequence {
+                sequence: 1,
+                found: 2,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+
+    let (_, found) = named(&|loopback, _| {
+        seal(loopback, magic + 1, 1);
+        None
+    });
+    let refused = refusal(found);
+    assert!(
+        matches!(refused, BlocksRefusal::OtherNetwork { found, .. } if found == magic + 1),
+        "{refused:?}"
+    );
+}
+
+/// The blocks refusal a back-fill's publisher gave.
+fn refusal(found: Result<Option<Digest>, backfill::Error>) -> BlocksRefusal {
+    match found {
+        Err(backfill::Error::Caller(source)) => *source
+            .downcast::<BlocksRefusal>()
+            .unwrap_or_else(|source| panic!("not a blocks refusal: {source}")),
+        other => panic!("not refused: {other:?}"),
+    }
 }
