@@ -30,6 +30,7 @@ use stelae::{inscription::Inscription, progress::Observer, Digest};
 use stelae_cardano::{
     backfill::{self, Batching, Driver, Outcome, Session, Workspace},
     batch::{self, Batch, Committed, Flush, Frontiers, Held, Limits},
+    blocks::{self, EpochFiles},
     testing::{empty_registry, Node},
     MithrilSource,
 };
@@ -41,7 +42,7 @@ const REPOSITORY: &str = "oci://registry.invalid/cardano/test";
 /// Preview's: `k * 10`.
 const SLOTS_PER_FILE: u64 = 4_320;
 
-/// The blocks snapshot the fake repository holds at `sequence`, which every
+/// The blocks snapshot the fake repository names at `sequence`, which every
 /// stele here names. Nothing reads it back, so any digest serves.
 fn blocks_at(sequence: u64) -> Digest {
     Digest::compute(format!("the blocks snapshot at {sequence}").as_bytes())
@@ -556,8 +557,11 @@ struct Repository {
     keep_singles: Cell<bool>,
     /// The sequence whose immutable tag can't be read.
     unreadable_tag: Cell<Option<u64>>,
-    /// The first sequence the blocks repository holds no snapshot at.
-    absent_blocks: Cell<Option<u64>>,
+    /// Refuse the blocks snapshot at this sequence as one the immutable files
+    /// don't reproduce.
+    refuse_blocks: Cell<Option<u64>>,
+    /// The sequences a blocks snapshot was asked for, each time one was.
+    named_blocks: RefCell<Vec<u64>>,
     /// The payloads the batch held as each sequence was published.
     payloads: RefCell<Vec<(u64, usize)>>,
     batch_dir: PathBuf,
@@ -616,12 +620,24 @@ impl backfill::Publish for Repository {
         Ok(self.latest.borrow().clone())
     }
 
-    fn blocks(&self, plan: &Plan) -> Result<Option<Digest>, backfill::Error> {
-        let absent = self
-            .absent_blocks
-            .get()
-            .is_some_and(|from| plan.sequence >= from);
-        Ok((!absent).then(|| blocks_at(plan.sequence)))
+    fn blocks(
+        &self,
+        plan: &Plan,
+        _: &dyn Fn() -> Result<EpochFiles, backfill::Error>,
+    ) -> Result<Digest, backfill::Error> {
+        let sequence = plan.sequence;
+        self.named_blocks.borrow_mut().push(sequence);
+        if self.refuse_blocks.get() == Some(sequence) {
+            return Err(blocks::Error::Differs {
+                repository: format!("{REPOSITORY}/blocks"),
+                sequence,
+                epoch: sequence - 1,
+                held: blocks_at(sequence),
+                reproduced: Digest::compute(b"what the files give"),
+            }
+            .into());
+        }
+        Ok(blocks_at(sequence))
     }
 
     fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
@@ -737,8 +753,12 @@ impl backfill::Publish for Around<'_> {
         self.inner.stele(sequence)
     }
 
-    fn blocks(&self, plan: &Plan) -> Result<Option<Digest>, backfill::Error> {
-        self.inner.blocks(plan)
+    fn blocks(
+        &self,
+        plan: &Plan,
+        files: &dyn Fn() -> Result<EpochFiles, backfill::Error>,
+    ) -> Result<Digest, backfill::Error> {
+        self.inner.blocks(plan, files)
     }
 
     fn finalize(
@@ -794,7 +814,8 @@ impl<'a> Rig<'a> {
                 fault: Cell::new(None),
                 keep_singles: Cell::new(false),
                 unreadable_tag: Cell::new(None),
-                absent_blocks: Cell::new(None),
+                refuse_blocks: Cell::new(None),
+                named_blocks: RefCell::default(),
                 payloads: RefCell::default(),
                 batch_dir,
             },
@@ -837,6 +858,12 @@ impl<'a> Rig<'a> {
             aggregator: "http://unused.invalid".to_owned(),
             genesis_vkey: String::new(),
         };
+        let fetch = backfill::mithril_fetch(
+            &mithril,
+            true,
+            self.runtime.handle().clone(),
+            calls.cancel.get(),
+        );
         let after_capture = |calls: &Calls| {
             let last = calls.prepared.borrow().last().copied();
             if last.is_some() && calls.cancel_after.get() == last {
@@ -869,15 +896,12 @@ impl<'a> Rig<'a> {
         let driver_genesis = self.driver_genesis.borrow().clone();
         let driver = Driver {
             genesis: &driver_genesis,
-            mithril: &mithril,
             download_dir: self.download.clone(),
             scratch: self.node.path().join("spool"),
             window: 1,
             until_epoch,
-            skip_validation: true,
-            runtime: self.runtime.handle().clone(),
             cancel: calls.cancel.get(),
-            mithril_feedback: &|| None,
+            fetch: &fetch,
             // Unless a test says otherwise, the source offers nothing the db does
             // not already hold.
             beacon: &|| {
@@ -1610,52 +1634,76 @@ fn a_batch_of_one_publishes_each_boundary_and_keeps_no_journal() {
     assert!(!batch::dir_in(&rig.node.config.storage.path).exists());
 }
 
-/// A boundary whose blocks snapshot isn't there yet is refused before its
-/// capture: the batch keeps what came before it, and a rerun once the blocks
-/// snapshot is there captures it from the stores.
+/// A boundary's blocks snapshot is named before its capture: one refused is
+/// asked for once, and leaves the batch keeping what came before it. A rerun
+/// captures the boundary from the stores.
 #[test]
-fn a_boundary_without_its_blocks_snapshot_is_refused_before_its_capture() {
+fn a_refused_blocks_snapshot_leaves_the_batch_as_it_was() {
     let chain = Chain::spanning(12);
     let rig = Rig::new(&chain);
-    rig.repository.absent_blocks.set(Some(3));
+    rig.repository.refuse_blocks.set(Some(3));
 
     let error = rig.run(limits(4), None).unwrap_err();
     assert!(
-        matches!(error, backfill::Error::BlocksAbsent { sequence: 3 }),
+        matches!(
+            error,
+            backfill::Error::Blocks(blocks::Error::Differs { sequence: 3, .. })
+        ),
         "{error}"
     );
+    assert_eq!(*rig.repository.named_blocks.borrow(), [1, 2, 3]);
     assert_eq!(rig.sequences(), [1, 2]);
     assert_eq!(*rig.calls.prepared.borrow(), [1, 2]);
     assert!(rig.repository.uploaded.borrow().is_empty());
 
-    rig.repository.absent_blocks.set(None);
+    rig.repository.refuse_blocks.set(None);
     rig.calls.cancel.restart();
     let (_, frontiers) = ready(rig.run(limits(4), None));
     assert_eq!(frontiers.prepared, Some(4));
     assert_eq!(rig.sequences(), [1, 2, 3, 4]);
 }
 
-/// The one-boundary path asks the same before it publishes.
+/// The one-boundary path names it before it publishes, and a refusal publishes
+/// nothing at that sequence.
 #[test]
-fn a_batch_of_one_refuses_a_boundary_without_its_blocks_snapshot() {
+fn a_batch_of_one_publishes_nothing_where_its_blocks_snapshot_is_refused() {
     let chain = Chain::spanning(6);
     let rig = Rig::new(&chain);
-    rig.repository.absent_blocks.set(Some(2));
+    rig.repository.refuse_blocks.set(Some(2));
 
     let error = rig.run(Limits::ONE, Some(2)).unwrap_err();
     assert!(
-        matches!(error, backfill::Error::BlocksAbsent { sequence: 2 }),
+        matches!(
+            error,
+            backfill::Error::Blocks(blocks::Error::Differs { sequence: 2, .. })
+        ),
         "{error}"
     );
     assert_eq!(rig.calls.published.get(), 1, "sequence 1 alone");
+    assert_eq!(*rig.repository.named_blocks.borrow(), [1, 2]);
 
-    rig.repository.absent_blocks.set(None);
+    rig.repository.refuse_blocks.set(None);
     rig.calls.cancel.restart();
     assert_eq!(
         rig.run(Limits::ONE, Some(2)).unwrap(),
         Outcome::UntilEpoch { sequence: 2 }
     );
     assert_eq!(rig.calls.published.get(), 2);
+}
+
+/// A batch of one reads the repository's standing before it names anything:
+/// stores two sequences past its latest are a gap, whatever their blocks.
+#[test]
+fn a_batch_of_one_refuses_a_gap_before_it_names_blocks() {
+    let chain = Chain::spanning(12);
+    let rig = Rig::new(&chain);
+    repository_at(&rig, 1);
+    stand_on(&rig, 3);
+
+    let error = rig.run(Limits::ONE, None).unwrap_err();
+    assert!(error.to_string().contains("would leave a gap"), "{error}");
+    assert!(rig.repository.named_blocks.borrow().is_empty());
+    assert_eq!(rig.calls.published.get(), 0);
 }
 
 /// Input behind a boundary goes only once the journal names that boundary.
@@ -1909,7 +1957,8 @@ fn the_record_of_a_beginning_is_inert_over_a_held_repository() {
         rig.run(Limits::ONE, Some(2)).unwrap(),
         Outcome::UntilEpoch { sequence: 2 }
     );
-    assert_eq!(rig.calls.published.get(), 3);
+    // The repository holds 1, so the rerun publishes 2 alone.
+    assert_eq!(rig.calls.published.get(), 2);
 }
 
 /// Clearing the storage path, the recovery the refusal names, takes the record.
@@ -4612,7 +4661,7 @@ mod over_a_registry {
         Auth, Inspected, Point, Repository, SnapshotRepository, Tuning,
     };
     use stelae::transport::WrittenLayer;
-    use stelae_cardano::publisher::{BackfillPublisher, Publisher, RepositoryPublish};
+    use stelae_cardano::publisher::{BackfillPublisher, Blocks, Publisher, RepositoryPublish};
     use stelae_driver::publish::{Chained, Origin, PublishRecord};
 
     use super::*;
@@ -4798,12 +4847,58 @@ mod over_a_registry {
     ) -> Result<Outcome, backfill::Error> {
         seed_blocks(repo, until);
         let observer = Observer::silent();
-        let publisher = BackfillPublisher {
+        let publisher = Seeded(BackfillPublisher {
             config: &rig.node.config,
             settings: settings(repo),
             observer: &observer,
-        };
+        });
         rig.drive(limits, Some(until), true, &publisher)
+    }
+
+    /// The blocks snapshot a test seeded at `plan`'s sequence, as the real
+    /// publisher's read finds it. This rig's immutable files hold one block
+    /// each and skip the numbers between, so no epoch's files are whole enough
+    /// to reproduce one from: `blocks_publishing` covers that.
+    fn seeded(publisher: &BackfillPublisher<'_>, plan: &Plan) -> Result<Digest, backfill::Error> {
+        let found = Blocks::open(publisher.config, &publisher.settings)
+            .map_err(backfill::Error::caller)?
+            .reference(plan)
+            .map_err(backfill::Error::Caller)?;
+        Ok(found.expect("the test seeds a blocks snapshot at every sequence it publishes"))
+    }
+
+    /// The real publisher, naming the blocks snapshots the test seeded.
+    struct Seeded<'a>(BackfillPublisher<'a>);
+
+    impl backfill::Publish for Seeded<'_> {
+        fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {
+            self.0.publish(plan, source)
+        }
+
+        fn latest(&self, plan: &Plan) -> Result<Option<Committed>, backfill::Error> {
+            self.0.latest(plan)
+        }
+
+        fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+            self.0.stele(sequence)
+        }
+
+        fn blocks(
+            &self,
+            plan: &Plan,
+            _: &dyn Fn() -> Result<EpochFiles, backfill::Error>,
+        ) -> Result<Digest, backfill::Error> {
+            seeded(&self.0, plan)
+        }
+
+        fn finalize(
+            &self,
+            finalizing: &Finalizing<'_>,
+            predecessor: Option<&Committed>,
+            source: &dyn SnapshotSource,
+        ) -> Result<Committed, backfill::Error> {
+            self.0.finalize(finalizing, predecessor, source)
+        }
     }
 
     /// Another writer over the same chain: its steles name other blocks
@@ -4823,9 +4918,13 @@ mod over_a_registry {
             self.0.stele(sequence)
         }
 
-        fn blocks(&self, plan: &Plan) -> Result<Option<Digest>, backfill::Error> {
+        fn blocks(
+            &self,
+            plan: &Plan,
+            _: &dyn Fn() -> Result<EpochFiles, backfill::Error>,
+        ) -> Result<Digest, backfill::Error> {
             let other = format!("another writer's blocks snapshot at {}", plan.sequence);
-            Ok(Some(Digest::compute(other.as_bytes())))
+            Ok(Digest::compute(other.as_bytes()))
         }
 
         fn finalize(
@@ -4952,8 +5051,12 @@ mod over_a_registry {
             self.inner.stele(sequence)
         }
 
-        fn blocks(&self, plan: &Plan) -> Result<Option<Digest>, backfill::Error> {
-            self.inner.blocks(plan)
+        fn blocks(
+            &self,
+            plan: &Plan,
+            _: &dyn Fn() -> Result<EpochFiles, backfill::Error>,
+        ) -> Result<Digest, backfill::Error> {
+            seeded(&self.inner, plan)
         }
 
         fn finalize(
@@ -5061,11 +5164,11 @@ mod over_a_registry {
             seed_blocks(&repo, 4);
             let rig = Rig::new(&chain);
             let observer = Observer::silent();
-            let inner = BackfillPublisher {
+            let inner = Seeded(BackfillPublisher {
                 config: &rig.node.config,
                 settings: settings(&repo),
                 observer: &observer,
-            };
+            });
             let fired = Cell::new(false);
             let publisher = Around {
                 inner: &inner,
@@ -5138,11 +5241,11 @@ mod over_a_registry {
         let late = Rig::new(&chain);
         seed_blocks(&batched, 2);
         let observer = Observer::silent();
-        let inner = BackfillPublisher {
+        let inner = Seeded(BackfillPublisher {
             config: &rig.node.config,
             settings: settings(&batched),
             observer: &observer,
-        };
+        });
         let attempts = Cell::new(0);
         let publisher = Around {
             inner: &inner,
@@ -5347,5 +5450,539 @@ mod over_a_registry {
         );
         assert!(!record.exists());
         assert_same_steles(&batched, &single, 3);
+    }
+}
+
+/// The host publishing the blocks snapshot of every boundary itself: real
+/// stores and transport, a loopback registry, and the immutable files of a
+/// chain with a block in each, as a real network fills them, so each epoch's
+/// files are whole.
+mod blocks_publishing {
+    use std::sync::{Arc, Mutex};
+
+    use dolos_snapshot::registry::{Auth, Repository};
+    use stelae::{dir::SnapshotDir, inscription::Link, SnapshotReader as _};
+    use stelae_blocks::{hardano, BlocksProfile, EpochScope};
+    use stelae_cardano::{
+        publisher::{dolos_repository, BackfillPublisher, RepositoryPublish},
+        snapshot::read_position,
+        testing::{
+            chain::Chain as Filled,
+            loopback::{Loopback, Verdict},
+            open_repository, seal_blank_blocks,
+        },
+    };
+
+    use super::*;
+
+    const ROOT: &str = "cardano/test";
+
+    /// Four epochs, so three boundaries close.
+    fn chain() -> Filled {
+        Filled::shelley(4 * Filled::blocks_per_epoch(), |_| {})
+    }
+
+    /// The file numbers `epoch` covers on this chain's geometry.
+    fn files_of(epoch: u64) -> std::ops::RangeInclusive<u64> {
+        let per_epoch = Filled::blocks_per_epoch() as u64;
+        epoch * per_epoch..=(epoch + 1) * per_epoch - 1
+    }
+
+    /// One publisher over one node and a loopback registry, run as many times
+    /// as a test restarts it.
+    struct Host<'a> {
+        chain: &'a Filled,
+        node: Node,
+        download: PathBuf,
+        /// The immutable files a download takes its copies from.
+        source: tempfile::TempDir,
+        registry: tempfile::TempDir,
+        loopback: Loopback,
+        root: Repository,
+        cancel: Restartable,
+        observer: Observer,
+        /// Each download's first and last file.
+        fetched: RefCell<Vec<(Option<u64>, u64)>>,
+        /// Every manifest tag written, as `repository:tag`, in order.
+        written: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<'a> Host<'a> {
+        fn new(chain: &'a Filled) -> Self {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let node = chain.node();
+            let download = chain.write_immutable(&node);
+            let source = tempfile::tempdir().unwrap();
+            for entry in std::fs::read_dir(download.join("immutable"))
+                .unwrap()
+                .flatten()
+            {
+                std::fs::copy(entry.path(), source.path().join(entry.file_name())).unwrap();
+            }
+            let registry = tempfile::tempdir().unwrap();
+            let loopback = Loopback::serve(registry.path()).unwrap();
+            let written = Arc::<Mutex<Vec<String>>>::default();
+            let log = written.clone();
+            loopback.rule(move |seen| {
+                if let Some((repository, tag)) = seen.path.split_once("/manifests/") {
+                    if seen.method == "PUT" {
+                        let profile = repository.rsplit('/').next().unwrap();
+                        log.lock().unwrap().push(format!("{profile}:{tag}"));
+                    }
+                }
+                Verdict::Proceed
+            });
+            let root = loopback.repository(ROOT).parse().unwrap();
+            Self {
+                chain,
+                node,
+                download,
+                source,
+                registry,
+                loopback,
+                root,
+                cancel: Restartable::default(),
+                observer: Observer::silent(),
+                fetched: RefCell::default(),
+                written,
+            }
+        }
+
+        fn publisher_at<'r>(&'r self, root: &'r Repository) -> BackfillPublisher<'r> {
+            BackfillPublisher {
+                config: &self.node.config,
+                settings: RepositoryPublish {
+                    repo: root,
+                    auth: Auth::Anonymous,
+                    insecure: true,
+                    scratch_dir: None,
+                    tuning: Default::default(),
+                },
+                observer: &self.observer,
+            }
+        }
+
+        fn run(&self, limits: Limits, until: u64) -> Result<Outcome, backfill::Error> {
+            self.drive(limits, until, &self.root, &self.publisher_at(&self.root))
+        }
+
+        /// A download copies the files it names out of the chain's own.
+        fn drive(
+            &self,
+            limits: Limits,
+            until: u64,
+            root: &Repository,
+            publish: &dyn backfill::Publish,
+        ) -> Result<Outcome, backfill::Error> {
+            let genesis = self.chain.genesis.clone();
+            let fetch = |dir: &Path, start: Option<u64>, end: u64| {
+                self.fetched.borrow_mut().push((start, end));
+                let into = dir.join("immutable");
+                std::fs::create_dir_all(&into).map_err(backfill::Error::caller)?;
+                for entry in std::fs::read_dir(self.source.path()).unwrap().flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let number: u64 = name.split('.').next().unwrap().parse().unwrap();
+                    if (start.unwrap_or(0)..=end).contains(&number) {
+                        std::fs::copy(entry.path(), into.join(&name))
+                            .map_err(backfill::Error::caller)?;
+                    }
+                }
+                Ok(Some(()))
+            };
+            let open_workspace = || {
+                ReplayWorkspace::open(&self.node.config, genesis.clone())
+                    .map_err(backfill::Error::caller)
+            };
+            let room = |_: &Path, _: u64| true;
+            let driver = Driver {
+                genesis: &genesis,
+                download_dir: self.download.clone(),
+                scratch: self.node.path().join("spool"),
+                window: 1,
+                until_epoch: Some(until),
+                cancel: self.cancel.get(),
+                // The files on disk are all the source offers.
+                beacon: &|| Ok(Some(0)),
+                fetch: &fetch,
+                replay: &(),
+                open_workspace: &open_workspace,
+                check_stores: &|| {
+                    backfill::refuse_archive_behind(&self.node.config, genesis.clone())
+                },
+                publish,
+                batching: Batching {
+                    limits,
+                    storage_path: self.node.config.storage.path.clone(),
+                    repository: dolos_repository(root).unwrap().to_string(),
+                    room: &room,
+                    observer: &self.observer,
+                },
+            };
+            driver.run()
+        }
+
+        fn tags(&self, profile: &str) -> BTreeSet<String> {
+            let name = format!("{ROOT}/{profile}");
+            self.loopback.manifests(&name).into_keys().collect()
+        }
+
+        /// The inscription `profile`'s repository holds under `tag`.
+        fn inscription(&self, profile: &str, tag: &str) -> Inscription {
+            let name = format!("{ROOT}/{profile}");
+            let manifest = self
+                .loopback
+                .manifest(&name, tag)
+                .unwrap_or_else(|| panic!("{name} holds no {tag}"));
+            let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+            let digest = manifest["config"]["digest"].as_str().unwrap();
+            let blob = self
+                .registry
+                .path()
+                .join(&name)
+                .join("blobs/sha256")
+                .join(digest.trim_start_matches("sha256:"));
+            Inscription::parse(&std::fs::read(blob).unwrap()).unwrap()
+        }
+
+        fn times_written(&self, entry: &str) -> usize {
+            let written = self.written.lock().unwrap();
+            written.iter().filter(|written| *written == entry).count()
+        }
+
+        fn first_write(&self, entry: &str) -> usize {
+            let written = self.written.lock().unwrap();
+            written
+                .iter()
+                .position(|written| written == entry)
+                .unwrap_or_else(|| panic!("{entry} was never written: {written:?}"))
+        }
+
+        fn refetched(&self) -> PathBuf {
+            self.download.join("blocks-refetch")
+        }
+    }
+
+    /// Both repositories hold `epoch-1` through `epoch-{until}`. Each blocks
+    /// snapshot is the one the chain's blocks give, written before the stele
+    /// of its sequence, and that stele names it.
+    fn assert_published_through(host: &Host<'_>, until: u64) {
+        let tags = |tip: bool| -> BTreeSet<String> {
+            (1..=until)
+                .flat_map(|sequence| {
+                    let tip = tip.then(|| format!("epoch-{sequence}.tip"));
+                    std::iter::once(format!("epoch-{sequence}")).chain(tip)
+                })
+                .chain(["latest".to_owned()])
+                .collect()
+        };
+        assert_eq!(host.tags("blocks"), tags(false));
+        assert_eq!(host.tags("dolos"), tags(true));
+        for sequence in 1..=until {
+            let tag = format!("epoch-{sequence}");
+            let blocks = host.inscription("blocks", &tag).digest().unwrap();
+            assert_eq!(blocks, host.chain.blocks_digest(sequence), "at {sequence}");
+            let stele = host.inscription("dolos", &tag);
+            let named = read_position(&stele.position).unwrap().blocks;
+            assert_eq!(named, Some(blocks), "the stele at {sequence}");
+            assert!(
+                host.first_write(&format!("blocks:{tag}"))
+                    < host.first_write(&format!("dolos:{tag}.tip")),
+                "the blocks snapshot at {sequence} goes first"
+            );
+        }
+    }
+
+    #[test]
+    fn a_boundary_publishes_its_blocks_snapshot_before_its_stele() {
+        let chain = chain();
+        for window in [Limits::ONE, limits(2)] {
+            let host = Host::new(&chain);
+            assert_eq!(
+                host.run(window, 1).unwrap(),
+                Outcome::UntilEpoch { sequence: 1 }
+            );
+            assert_published_through(&host, 1);
+            assert!(host.fetched.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn three_boundaries_leave_both_repositories_through_epoch_3() {
+        let chain = chain();
+        for window in [Limits::ONE, limits(3)] {
+            let host = Host::new(&chain);
+            assert_eq!(
+                host.run(window, 3).unwrap(),
+                Outcome::UntilEpoch { sequence: 3 }
+            );
+            assert_published_through(&host, 3);
+            for sequence in 1..=3 {
+                let tag = format!("blocks:epoch-{sequence}");
+                assert_eq!(host.times_written(&tag), 1, "{tag}");
+            }
+            assert!(host.fetched.borrow().is_empty(), "every file was at hand");
+        }
+    }
+
+    /// The real publisher, dying at `at` as a killed process would: before
+    /// its blocks snapshot, or once it is sealed.
+    struct Dies<'a> {
+        inner: BackfillPublisher<'a>,
+        at: u64,
+        sealed: bool,
+        cancel: CancellationToken,
+    }
+
+    impl backfill::Publish for Dies<'_> {
+        fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), backfill::Error> {
+            self.inner.publish(plan, source)
+        }
+
+        fn latest(&self, plan: &Plan) -> Result<Option<Committed>, backfill::Error> {
+            self.inner.latest(plan)
+        }
+
+        fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+            self.inner.stele(sequence)
+        }
+
+        fn blocks(
+            &self,
+            plan: &Plan,
+            files: &dyn Fn() -> Result<EpochFiles, backfill::Error>,
+        ) -> Result<Digest, backfill::Error> {
+            if plan.sequence != self.at || self.cancel.is_cancelled() {
+                return self.inner.blocks(plan, files);
+            }
+            if self.sealed {
+                self.inner.blocks(plan, files)?;
+            }
+            self.cancel.cancel();
+            Err(backfill::Error::caller(io::Error::other(
+                "the process died",
+            )))
+        }
+
+        fn finalize(
+            &self,
+            finalizing: &Finalizing<'_>,
+            predecessor: Option<&Committed>,
+            source: &dyn SnapshotSource,
+        ) -> Result<Committed, backfill::Error> {
+            self.inner.finalize(finalizing, predecessor, source)
+        }
+    }
+
+    /// A kill between a blocks snapshot and anything of its stele: the rerun
+    /// reproduces the blocks snapshot from the files still there, writes it no
+    /// second time, and goes on.
+    #[test]
+    fn a_kill_between_the_blocks_snapshot_and_its_stele_converges() {
+        let chain = chain();
+        for window in [Limits::ONE, limits(3)] {
+            let host = Host::new(&chain);
+            let dies = Dies {
+                inner: host.publisher_at(&host.root),
+                at: 2,
+                sealed: true,
+                cancel: host.cancel.get(),
+            };
+            host.drive(window, 3, &host.root, &dies).unwrap_err();
+            assert!(host.tags("blocks").contains("epoch-2"));
+            assert!(!host.tags("dolos").contains("epoch-2"));
+
+            host.cancel.restart();
+            assert_eq!(
+                host.run(window, 3).unwrap(),
+                Outcome::UntilEpoch { sequence: 3 }
+            );
+            assert_published_through(&host, 3);
+            assert_eq!(host.times_written("blocks:epoch-2"), 1);
+            assert!(
+                host.fetched.borrow().is_empty(),
+                "the files were still there"
+            );
+        }
+    }
+
+    /// A restart that needs a blocks snapshot after its epoch's files went
+    /// downloads them again apart from the window, and removes them once the
+    /// snapshot is published.
+    #[test]
+    fn a_restart_after_the_files_are_gone_downloads_them_again() {
+        let chain = chain();
+        for window in [Limits::ONE, limits(3)] {
+            let host = Host::new(&chain);
+            let dies = Dies {
+                inner: host.publisher_at(&host.root),
+                at: 3,
+                sealed: false,
+                cancel: host.cancel.get(),
+            };
+            host.drive(window, 3, &host.root, &dies).unwrap_err();
+            assert!(!host.tags("blocks").contains("epoch-3"));
+            // A volume that came back empty.
+            std::fs::remove_dir_all(host.download.join("immutable")).unwrap();
+
+            host.cancel.restart();
+            assert_eq!(
+                host.run(window, 3).unwrap(),
+                Outcome::UntilEpoch { sequence: 3 }
+            );
+            assert_published_through(&host, 3);
+            let epoch = files_of(2);
+            assert_eq!(
+                *host.fetched.borrow(),
+                [(Some(*epoch.start()), epoch.end() + 1)],
+                "epoch 2's files, and the one after them"
+            );
+            assert!(!host.refetched().exists());
+        }
+    }
+
+    /// A blocks snapshot already at a boundary that the files don't reproduce
+    /// is refused, asked for once, and nothing of the stele is written.
+    #[test]
+    fn a_held_blocks_snapshot_the_files_do_not_reproduce_is_refused() {
+        let chain = chain();
+        let epoch_length = chain.genesis.shelley.epoch_length.unwrap() as u64;
+        for window in [Limits::ONE, limits(2)] {
+            let host = Host::new(&chain);
+            let scratch = tempfile::tempdir().unwrap();
+            let blocks = host.loopback.repository(&format!("{ROOT}/blocks"));
+            seal_blank_blocks(
+                &open_repository(&blocks, scratch.path()),
+                chain.magic(),
+                1,
+                (0, 0, epoch_length - 1),
+            );
+
+            let error = host.run(window, 1).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    backfill::Error::Blocks(blocks::Error::Differs { sequence: 1, .. })
+                ),
+                "{error}"
+            );
+            assert!(host.tags("dolos").is_empty());
+            assert_eq!(host.times_written("blocks:epoch-1"), 1, "the seed alone");
+        }
+    }
+
+    /// Stores past the first boundary start no lineage over an empty Dolos
+    /// repository, whose blocks repository holds the sequence before theirs:
+    /// what stores restored from another lineage would otherwise do.
+    #[test]
+    fn a_first_stele_past_epoch_1_is_refused() {
+        let chain = chain();
+        for window in [Limits::ONE, limits(3)] {
+            let host = Host::new(&chain);
+            assert_eq!(
+                host.run(window, 2).unwrap(),
+                Outcome::UntilEpoch { sequence: 2 }
+            );
+            let other: Repository = host.loopback.repository("cardano/other").parse().unwrap();
+            let scratch = tempfile::tempdir().unwrap();
+            let blocks = host.loopback.repository("cardano/other/blocks");
+            chain.seal_blocks(&open_repository(&blocks, scratch.path()), 1);
+            // Stores restored from a stele keep no record of a batch.
+            let began = host
+                .node
+                .config
+                .storage
+                .path
+                .join(".stelae-batch-began.json");
+            let _ = std::fs::remove_file(began);
+
+            let error = host
+                .drive(window, 3, &other, &host.publisher_at(&other))
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    backfill::Error::Batch(batch::Error::AfterTheFirst { sequence: 2 })
+                ),
+                "{error}"
+            );
+            assert!(host.loopback.manifests("cardano/other/dolos").is_empty());
+        }
+    }
+
+    /// The link a lineage of blocks snapshots carries, resuming nothing.
+    struct Follows(Option<Link>);
+
+    impl Predecessor for Follows {
+        fn previous(&self) -> Option<Link> {
+            self.0
+        }
+    }
+
+    /// The blocks layer the host builds from an epoch's immutable files is the
+    /// one Dolos writes for that epoch from its archive, byte for byte.
+    #[test]
+    fn a_blocks_layer_from_immutable_files_is_the_one_dolos_writes_from_its_archive() {
+        let chain = chain();
+        let node = chain.node();
+        let download = chain.write_immutable(&node);
+        let mut session =
+            BulkReplaySession::open(&node.config, chain.genesis.clone(), Some(3)).unwrap();
+        assert!(session
+            .import_blocks(chain.blocks.clone())
+            .unwrap()
+            .is_boundary());
+        let snapshot = session.snapshot();
+        let plan = snapshot.plan(chain.magic()).unwrap();
+        let root = node.path().join("root");
+        snapshot
+            .publish_directory(&root, &plan, &Observer::silent())
+            .unwrap();
+        drop(snapshot);
+        session.finish().unwrap();
+
+        let theirs = SnapshotDir::open(root.join("blocks")).unwrap();
+        let written = theirs.pull_latest(&BlocksProfile).unwrap();
+        let listed = written.read_inscription().unwrap();
+        assert_eq!(
+            listed.diff.len(),
+            3,
+            "one layer an epoch, from a lineage cut at 3"
+        );
+
+        let ours = SnapshotDir::create(node.path().join("ours")).unwrap();
+        let mut previous = None;
+        for (index, window) in plan.epochs[..3].iter().enumerate() {
+            let files = EpochFiles {
+                dir: download.join("immutable"),
+                scope: EpochScope::new(
+                    chain.magic(),
+                    window.epoch,
+                    window.start_slot,
+                    window.end_slot,
+                )
+                .unwrap(),
+                slots_per_file: SLOTS_PER_FILE,
+            };
+            let sealed = hardano::export(&ours, &Follows(previous), &files.epoch()).unwrap();
+            assert_eq!(sealed.inscription.diff, [listed.diff[index].clone()]);
+
+            let built = ours
+                .pull_sequence(&BlocksProfile, sealed.inscription.sequence)
+                .unwrap();
+            let (blob, expected) = (
+                &built.manifest().layers[0].digest,
+                &written.manifest().layers[index].digest,
+            );
+            assert_eq!(blob, expected, "epoch {}", window.epoch);
+            let digest: Digest = blob.parse().unwrap();
+            assert_eq!(
+                std::fs::read(ours.blob_path(&digest)).unwrap(),
+                std::fs::read(theirs.blob_path(&digest)).unwrap()
+            );
+            previous = Some(Link {
+                sequence: sealed.inscription.sequence,
+                inscription_digest: sealed.digest,
+            });
+        }
     }
 }

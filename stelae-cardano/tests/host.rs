@@ -7,10 +7,11 @@ use stelae::{dir::SnapshotDir, progress::Observer, Digest, SnapshotReader as _};
 use stelae_blocks::BlocksProfile;
 use stelae_cardano::{
     backfill::{self, Batching, Driver},
-    batch, initialize,
+    batch, blocks, initialize,
     publisher::{publish_once, BackfillPublisher, Destination, PublishOutcome, RepositoryPublish},
     snapshot::BlocksRefusal,
     testing::{
+        chain::Chain,
         loopback::{Loopback, Verdict},
         open_repository, seal_blank_blocks, Node,
     },
@@ -196,17 +197,32 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
             }
         }
 
+        /// An empty repository, which the boundary starts.
         fn latest(&self, _: &Plan) -> Result<Option<batch::Committed>, backfill::Error> {
-            unreachable!("a batch of one never asks")
+            Ok(None)
         }
 
         fn stele(&self, _: u64) -> Result<Option<batch::Held>, backfill::Error> {
             unreachable!("a batch of one never asks")
         }
 
-        fn blocks(&self, plan: &Plan) -> Result<Option<Digest>, backfill::Error> {
+        fn blocks(
+            &self,
+            plan: &Plan,
+            _: &dyn Fn() -> Result<blocks::EpochFiles, backfill::Error>,
+        ) -> Result<Digest, backfill::Error> {
             assert_eq!(plan.sequence, 1);
-            Ok(self.blocks)
+            assert!(!self.called.get(), "named before the publish");
+            self.blocks.ok_or_else(|| {
+                blocks::Error::Differs {
+                    repository: "oci://registry.invalid/cardano/preview/blocks".to_owned(),
+                    sequence: 1,
+                    epoch: 0,
+                    held: Digest::compute(b"held"),
+                    reproduced: Digest::compute(b"reproduced"),
+                }
+                .into()
+            })
         }
 
         fn finalize(
@@ -222,19 +238,10 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
     let node = Node::new();
     let (genesis, boundary) = node.replay_to_the_first_boundary();
 
-    let mithril = MithrilSource {
-        aggregator: "http://unused.invalid".to_owned(),
-        genesis_vkey: String::new(),
-    };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
     let observer = Observer::silent();
     let named = Some(Digest::compute(b"the blocks snapshot at 1"));
 
-    // A boundary without its blocks snapshot is refused before the publish.
+    // A boundary whose blocks snapshot is refused is refused before the publish.
     for (fail, blocks) in [(true, named), (false, named), (false, None)] {
         let cancel = tokio_util::sync::CancellationToken::new();
         let publish = Publisher {
@@ -250,16 +257,13 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
         };
         let driver = Driver {
             genesis: &genesis,
-            mithril: &mithril,
             download_dir: node.path().join("unused"),
             scratch: node.path().join("spool"),
             window: 1,
             until_epoch: Some(1),
-            skip_validation: false,
-            runtime: runtime.handle().clone(),
             cancel,
-            mithril_feedback: &|| None,
             beacon: &|| unreachable!("the publish decides this run"),
+            fetch: &|_, _, _| unreachable!("the publish decides this run"),
             replay: &(),
             open_workspace: &open_workspace,
             check_stores: &|| backfill::refuse_archive_behind(&node.config, genesis.clone()),
@@ -273,7 +277,9 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
             },
         };
         match driver.run() {
-            Err(backfill::Error::BlocksAbsent { sequence: 1 }) if blocks.is_none() => {
+            Err(backfill::Error::Blocks(blocks::Error::Differs { sequence: 1, .. }))
+                if blocks.is_none() =>
+            {
                 assert!(!publish.called.get())
             }
             outcome => {
@@ -454,27 +460,21 @@ fn a_backfill_refuses_stores_whose_state_passed_the_archive() {
     );
 }
 
-/// The option reaches both a backfill's spool and its staging: nothing lands on
-/// the store volume.
+/// The option reaches a backfill's spool and the staging of both its
+/// snapshots: nothing lands on the store volume. The source is the immutable
+/// files on disk, so the run replays to its first boundary and asks nothing
+/// more.
 #[test]
 fn a_backfill_spools_under_the_scratch_directory_it_is_given() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let node = Node::new();
-    let (genesis, _) = node.replay_to_the_first_boundary();
+    let chain = Chain::shelley(Chain::blocks_per_epoch() + 1, |_| {});
+    let node = chain.node();
+    let download = chain.write_immutable(&node);
     let default = node.config.storage.path.join("scratch");
-    assert!(!default.exists());
     let spool = node.path().join("named-spool");
 
     let registry = tempfile::tempdir().unwrap();
     let loopback = Loopback::serve(registry.path()).unwrap();
-    let epoch = genesis.shelley.epoch_length.unwrap() as u64;
-    let seeding = tempfile::tempdir().unwrap();
-    seal_blank_blocks(
-        &open_repository(&loopback.repository("cardano/test/blocks"), seeding.path()),
-        u64::from(genesis.network_magic()),
-        1,
-        (0, 0, epoch - 1),
-    );
 
     let options = backfill::Options {
         direct_s3: None,
@@ -483,7 +483,7 @@ fn a_backfill_spools_under_the_scratch_directory_it_is_given() {
         insecure: true,
         scratch_dir: Some(spool.clone()),
         concurrency: None,
-        download_dir: Some(node.path().join("unused")),
+        download_dir: Some(download),
         window: 1,
         until_epoch: Some(1),
         skip_validation: true,
@@ -495,7 +495,7 @@ fn a_backfill_spools_under_the_scratch_directory_it_is_given() {
     };
     let outcome = backfill::run(
         &node.config,
-        &genesis,
+        &chain.genesis,
         &options,
         tokio_util::sync::CancellationToken::new(),
         &Observer::silent(),
@@ -508,6 +508,9 @@ fn a_backfill_spools_under_the_scratch_directory_it_is_given() {
     );
     assert!(spool.is_dir());
     assert!(!default.exists());
+    assert!(loopback
+        .manifest("cardano/test/blocks", "epoch-1")
+        .is_some());
     assert!(loopback.manifest("cardano/test/dolos", "epoch-1").is_some());
 }
 
@@ -592,8 +595,10 @@ fn an_aggregator_that_doesnt_answer_fails_a_batched_run_as_the_source() {
 /// A back-fill names the blocks snapshot at a boundary through the refusals a
 /// publish makes: one of another sequence, above or below, or of another
 /// network is refused, whatever tag the root holds it under, and a read the
-/// registry refuses fails rather than reading as absent. Called on the
-/// publisher itself, short of the driver's retries.
+/// registry refuses fails rather than reading as absent. Each is decided
+/// before the epoch's files are asked for, which a snapshot of its own
+/// sequence and network, or none, goes on to. Called on the publisher itself,
+/// short of the driver's retries.
 #[test]
 fn a_backfill_names_no_blocks_snapshot_of_another_sequence_or_network() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -626,7 +631,18 @@ fn a_backfill_names_no_blocks_snapshot_of_another_sequence_or_network() {
             },
             observer: &observer,
         };
-        (sealed, backfill::Publish::blocks(&publisher, plan))
+        let asked = Cell::new(false);
+        let files = || {
+            asked.set(true);
+            Err(backfill::Error::Interrupted)
+        };
+        let found = backfill::Publish::blocks(&publisher, plan, &files);
+        assert_eq!(
+            asked.get(),
+            matches!(found, Err(backfill::Error::Interrupted)),
+            "{found:?}"
+        );
+        (sealed, found)
     };
     let seal = |loopback: &Loopback, magic: u64, sequence: u64| {
         let scratch = tempfile::tempdir().unwrap();
@@ -640,10 +656,17 @@ fn a_backfill_names_no_blocks_snapshot_of_another_sequence_or_network() {
     };
 
     let (sealed, found) = named(&plan, &|loopback, _| Some(seal(loopback, magic, 1)));
-    assert_eq!(found.unwrap(), sealed);
+    assert!(sealed.is_some());
+    assert!(
+        matches!(found, Err(backfill::Error::Interrupted)),
+        "{found:?}"
+    );
 
     let (_, found) = named(&plan, &|_, _| None);
-    assert_eq!(found.unwrap(), None);
+    assert!(
+        matches!(found, Err(backfill::Error::Interrupted)),
+        "{found:?}"
+    );
 
     let (_, found) = named(&plan, &|loopback, registry| {
         // Sequence 2's snapshot, tagged as sequence 1's too.
@@ -711,19 +734,17 @@ fn a_backfill_names_no_blocks_snapshot_of_another_sequence_or_network() {
         None
     });
     match found {
-        Err(backfill::Error::Caller(source)) => {
-            assert!(!source.is::<BlocksRefusal>(), "{source}")
+        Err(backfill::Error::Blocks(error @ blocks::Error::Repository { .. })) => {
+            assert!(!error.is_refusal(), "{error}")
         }
         other => panic!("not a failed read: {other:?}"),
     }
 }
 
 /// The blocks refusal a back-fill's publisher gave.
-fn refusal(found: Result<Option<Digest>, backfill::Error>) -> BlocksRefusal {
+fn refusal(found: Result<Digest, backfill::Error>) -> BlocksRefusal {
     match found {
-        Err(backfill::Error::Caller(source)) => *source
-            .downcast::<BlocksRefusal>()
-            .unwrap_or_else(|source| panic!("not a blocks refusal: {source}")),
+        Err(backfill::Error::Blocks(blocks::Error::Refused(refusal))) => refusal,
         other => panic!("not refused: {other:?}"),
     }
 }

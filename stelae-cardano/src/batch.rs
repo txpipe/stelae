@@ -316,6 +316,12 @@ pub enum Error {
         sequence: u64,
         path: PathBuf,
     },
+    #[error(
+        "the Dolos repository is empty and these stores stand at sequence {sequence}: a published \
+         lineage starts at epoch-1, and stores at a later sequence only continue a repository \
+         that holds the one before theirs. To start one: {REPLAY_FROM_GENESIS}"
+    )]
+    AfterTheFirst { sequence: u64 },
     #[error("preparing a boundary")]
     Preparing(#[source] Box<dolos_snapshot::Error>),
     #[error("staging the batch at {path}: {source}")]
@@ -405,6 +411,15 @@ pub fn refuse_lost_history(storage_path: &Path, sequence: u64) -> Result<(), Err
             path,
         }),
         _ => Ok(()),
+    }
+}
+
+/// Refuse to start a published lineage anywhere but `epoch-1`: stores restored
+/// from another lineage would otherwise begin a new one part way along it.
+pub fn refuse_after_the_first(sequence: u64) -> Result<(), Error> {
+    match sequence {
+        0 | 1 => Ok(()),
+        sequence => Err(Error::AfterTheFirst { sequence }),
     }
 }
 
@@ -619,6 +634,7 @@ impl Batch {
     ) -> Result<(), Error> {
         if predecessor.is_none() {
             refuse_lost_history(storage_path, sequence)?;
+            refuse_after_the_first(sequence)?;
             let path = storage_path.join(BEGAN_FILE);
             if read_began(&path)? != Some(sequence) {
                 let began = Began {
@@ -1488,16 +1504,36 @@ mod tests {
         refuse_lost_history(dir.path(), 9).unwrap();
 
         let mut batch = batch_holding(dir.path(), limits(9, u64::MAX, 0), &[], 0);
-        batch.begin(dir.path(), 4, None).unwrap();
-        refuse_lost_history(dir.path(), 4).unwrap();
+        batch.begin(dir.path(), 1, None).unwrap();
+        refuse_lost_history(dir.path(), 1).unwrap();
         assert!(matches!(
-            refuse_lost_history(dir.path(), 5),
+            refuse_lost_history(dir.path(), 2),
             Err(Error::HistoryLost {
-                first: 4,
-                sequence: 5,
+                first: 1,
+                sequence: 2,
                 ..
             })
         ));
+    }
+
+    /// A published lineage starts at `epoch-1`, so only a batch there begins
+    /// over an empty repository, and it records nothing elsewhere.
+    #[test]
+    fn a_batch_over_an_empty_repository_begins_only_at_epoch_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut batch = batch_holding(dir.path(), limits(9, u64::MAX, 0), &[], 0);
+        assert!(matches!(
+            batch.begin(dir.path(), 4, None),
+            Err(Error::AfterTheFirst { sequence: 4 })
+        ));
+        assert!(!dir.path().join(BEGAN_FILE).exists());
+
+        let latest = Committed {
+            sequence: 3,
+            identity: "sha256:3".to_owned(),
+        };
+        batch.begin(dir.path(), 4, Some(latest)).unwrap();
+        refuse_after_the_first(1).unwrap();
     }
 
     #[test]

@@ -104,19 +104,40 @@ fn delegation_certificates(address: &str) -> Vec<Certificate> {
     ]
 }
 
+/// The preview genesis a post-Byron chain runs over.
+fn shelley_genesis() -> Genesis {
+    let mut genesis = dolos_cardano::include::preview::load();
+    genesis.force_protocol = Some(9);
+    genesis
+}
+
+fn slots_per_file(genesis: &Genesis) -> u64 {
+    genesis
+        .shelley
+        .security_param
+        .map_or(21_600, |k| u64::from(k) * 10)
+}
+
 impl Chain {
-    /// Post-Byron blocks half an epoch apart from slot 0, so an epoch boundary
-    /// falls on every second block. `shape` starts from what makes that so.
+    /// How many blocks [`Self::shelley`] puts in an epoch: one per immutable
+    /// file.
+    pub fn blocks_per_epoch() -> usize {
+        let genesis = shelley_genesis();
+        (genesis.shelley.epoch_length.unwrap() as u64 / slots_per_file(&genesis)) as usize
+    }
+
+    /// Post-Byron blocks one immutable file apart from slot 0, so every file
+    /// holds a block, as on a real network, and an epoch's files are whole.
+    /// `shape` starts from what makes that so.
     pub fn shelley(count: usize, shape: impl FnOnce(&mut SyntheticBlockConfig)) -> Self {
-        let mut genesis = dolos_cardano::include::preview::load();
-        genesis.force_protocol = Some(9);
-        let epoch = genesis.shelley.epoch_length.unwrap() as u64;
+        let genesis = shelley_genesis();
+        let width = slots_per_file(&genesis);
         let mut config = SyntheticBlockConfig {
             block_count: count,
             txs_per_block: 1,
             slot: 0,
             start_block: 0,
-            slot_step: epoch / 2,
+            slot_step: width,
             plain_txs: true,
             seed_amount: dolos_testing::MIN_UTXO_AMOUNT + 7,
             ..Default::default()
@@ -124,10 +145,6 @@ impl Chain {
         shape(&mut config);
         let delegating = !config.extra_certs_by_block.is_empty();
         let (seed_address, seed_amount) = (config.seed_address.clone(), config.seed_amount);
-        let width = genesis
-            .shelley
-            .security_param
-            .map_or(21_600, |k| u64::from(k) * 10);
         let (blocks, _, mut built) = build_synthetic_blocks(config);
         if delegating {
             // The first transaction pays the deposits out of what it spends,
@@ -155,7 +172,8 @@ impl Chain {
     /// pool minting every block, and a new asset each epoch but for the epochs
     /// in `no_new_assets`, whose entity layers don't exist.
     pub fn delegating(epochs: usize, no_new_assets: &[usize]) -> Self {
-        let blocks = epochs * 2;
+        let per_epoch = Self::blocks_per_epoch();
+        let blocks = epochs * per_epoch;
         Self::shelley(blocks, |config| {
             config.lovelace = DELEGATED_LOVELACE;
             config.seed_amount = DELEGATED_LOVELACE + 7;
@@ -164,7 +182,7 @@ impl Chain {
             config.extra_certs_by_block = certificates;
             config.asset_names_by_block = (0..blocks)
                 .map(|block| {
-                    let epoch = block / 2;
+                    let epoch = block / per_epoch;
                     let new = !no_new_assets.contains(&epoch);
                     format!("asset{}", if new { epoch } else { 0 })
                 })
@@ -177,10 +195,7 @@ impl Chain {
     /// can't tell apart.
     pub fn byron(epochs: u64) -> Self {
         let genesis = dolos_cardano::include::preprod::load();
-        let width = genesis
-            .shelley
-            .security_param
-            .map_or(21_600, |k| u64::from(k) * 10);
+        let width = slots_per_file(&genesis);
         let mut blocks = Vec::new();
         let mut previous = Hash::new([0; 32]);
         let mut number = 0;
