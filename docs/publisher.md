@@ -426,7 +426,7 @@ free space on volume  >=  W x (bundle + reserve) + one publication's check + tra
 For a window of 4 here, on a lineage with no dump at `--concurrency 4`, that's about 2.1 GiB
 of budget and 3.8 GiB free with the download elsewhere, and 2.3 and 4.0 on the default layout,
 where it shares the volume. Those free figures leave out `N x growth`. The default concurrency
-adds 0.13 GiB, and a lineage's dumps add what its manifest says. That is the floor a run should
+adds 0.13 GiB. That is the floor a run should
 get through, not what it was seen to take: the one window 4 run that held its window with the
 registry off this volume saw it fall 6.2 GiB over 16 epochs, other work on it included. A batch
 of one holds none of the batch's terms, and needs its index spool, the check, the transient and

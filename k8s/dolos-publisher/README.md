@@ -177,8 +177,7 @@ about 158 to 175 MiB with the download on the same volume, so a window of 4
 needs a `scratchMib` of about 2.3 GiB and at least 4 GiB free beyond the
 stores and their growth over the run, with the stores growing about 0.1 GiB an
 epoch. That 4 GiB is a floor, measured on a lineage with no dump at a
-`concurrency` of 4: the default of 8 adds about 0.13 GiB, each dump the
-lineage holds adds its size from the `latest` manifest, and a run that held
+`concurrency` of 4: the default of 8 adds about 0.13 GiB, and a run that held
 its window was seen to use 6.2 GiB. Size the persistent claim, or the
 emptyDir's `ephemeral-storage`, for that free space on top of the stores, with
 margin. A bundle follows the network's state,
