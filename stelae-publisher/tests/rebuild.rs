@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use stelae::Digest;
 use stelae_cardano::testing::{
     loopback::{Loopback, Verdict},
+    rebuild::lay_old_lineage,
     Node,
 };
 
@@ -40,11 +41,29 @@ impl Served {
                 std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
             }
         }
+        Self::serving(root, None)
+    }
+
+    /// The lineage with a blob behind every layer, refusing and counting the
+    /// writes outside its `dolos` repository.
+    fn writable() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        lay_old_lineage(root.path(), NAME);
+        Self::serving(root, Some(format!("/v2/{NAME}/dolos/")))
+    }
+
+    fn serving(root: tempfile::TempDir, writable: Option<String>) -> Self {
         let loopback = Loopback::serve(root.path()).unwrap();
         let writes = Arc::new(AtomicU64::new(0));
         let counted = writes.clone();
         loopback.rule(move |seen| match seen.method {
             "GET" | "HEAD" => Verdict::Proceed,
+            _ if writable
+                .as_ref()
+                .is_some_and(|prefix| seen.path.starts_with(prefix)) =>
+            {
+                Verdict::Proceed
+            }
             _ => {
                 counted.fetch_add(1, Ordering::SeqCst);
                 Verdict::Refuse(405)
@@ -74,21 +93,41 @@ impl Served {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        let source = self.loopback.repository(NAME);
+        let mut all = vec!["--source", &source];
+        all.extend(args);
+        self.rebuild(&all)
+    }
+
+    /// `stelae-publisher rebuild --insecure` and `args`.
+    fn rebuild(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_stelae-publisher"))
             .arg("--config")
             .arg(self.node.config_path())
-            .args([
-                "rebuild",
-                "--source",
-                &self.loopback.repository(NAME),
-                "--insecure",
-            ])
+            .args(["rebuild", "--insecure"])
             .args(args)
             .env_remove("DOLOS_STELAE_USER")
             .env_remove("DOLOS_STELAE_PASSWORD")
             .env_remove("DOLOS_STELAE_TOKEN")
             .output()
             .unwrap()
+    }
+
+    /// A plan of the lineage keeping the tips at 3 and 7, written by the
+    /// command.
+    fn plan(&self) -> PathBuf {
+        let (journal, kept) = self.inputs();
+        let plan = self.path("rebuild.plan");
+        let output = self.run(&[
+            "--blocks-journal",
+            journal.to_str().unwrap(),
+            "--kept-tips-file",
+            kept.to_str().unwrap(),
+            "--plan",
+            plan.to_str().unwrap(),
+        ]);
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        plan
     }
 
     /// Give `epoch-8` a layer no array of the chain holds, keeping its
@@ -226,5 +265,96 @@ fn a_failed_self_check_exits_three_and_leaves_no_plan() {
     assert!(stderr.contains("entity-asset"), "{stderr}");
     assert!(!plan.exists());
     assert!(!plan.with_extension("partial").exists());
+    assert_eq!(served.writes.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_written_plan_lands_under_the_root_and_a_rerun_writes_nothing() {
+    let served = Served::writable();
+    let plan = served.plan();
+    let write = || served.rebuild(&["--write", "--plan", plan.to_str().unwrap()]);
+
+    let output = write();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let stdout = text(&output.stdout);
+    let target = served.loopback.repository(&format!("{NAME}/dolos"));
+    assert!(
+        stdout.contains(&format!(
+            "{target}: epoch-1 to epoch-8, resolved as planned"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("tags: 12 written, 0 already there"),
+        "{stdout}"
+    );
+
+    let tags = served.loopback.manifests(&format!("{NAME}/dolos"));
+    assert_eq!(tags.len(), 12, "{:?}", tags.keys());
+    assert!(tags.contains_key("epoch-7.tip") && tags.contains_key("latest"));
+
+    let again = write();
+    assert!(again.status.success(), "{}", text(&again.stderr));
+    let stdout = text(&again.stdout);
+    assert!(
+        stdout.contains("tags: 0 written, 12 already there"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("blobs: 0 copied, 0 pulled"), "{stdout}");
+    assert_eq!(served.writes.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_lineage_that_does_not_resolve_exits_three_and_moves_no_latest() {
+    let served = Served::writable();
+    let plan = served.plan();
+    let broken = format!("/v2/{NAME}/dolos/manifests/epoch-4");
+    let writable = format!("/v2/{NAME}/dolos/");
+    served.loopback.rule(move |seen| match seen.method {
+        "GET" if seen.path == broken => Verdict::Refuse(404),
+        "GET" | "HEAD" => Verdict::Proceed,
+        _ if seen.path.starts_with(&writable) => Verdict::Proceed,
+        _ => Verdict::Refuse(405),
+    });
+
+    let output = served.rebuild(&["--write", "--plan", plan.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(3), "{}", text(&output.stderr));
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("does not resolve at epoch-8"), "{stderr}");
+    let dolos = format!("{NAME}/dolos");
+    assert!(served.loopback.manifest(&dolos, "epoch-8").is_some());
+    assert!(served.loopback.manifest(&dolos, "latest").is_none());
+}
+
+#[test]
+fn a_write_takes_its_source_from_the_plan_alone() {
+    let served = Served::new();
+    let plan = served.path("plan");
+    let source = served.loopback.repository(NAME);
+    for args in [
+        vec!["--write"],
+        vec![
+            "--write",
+            "--plan",
+            plan.to_str().unwrap(),
+            "--source",
+            &source,
+        ],
+        vec!["--source", &source, "--root", &source],
+        vec![
+            "--source",
+            &source,
+            "--direct-s3-config",
+            plan.to_str().unwrap(),
+        ],
+    ] {
+        let output = served.rebuild(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            text(&output.stderr)
+        );
+    }
     assert_eq!(served.writes.load(Ordering::SeqCst), 0);
 }

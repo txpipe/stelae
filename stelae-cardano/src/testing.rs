@@ -3,6 +3,7 @@
 
 pub mod chain;
 pub mod loopback;
+pub mod rebuild;
 
 use std::{
     path::{Path, PathBuf},
