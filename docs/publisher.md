@@ -286,6 +286,43 @@ the summary to stderr. `rebuild` exits 0 on success, 1 on an error or a
 refused lineage, 2 on a usage error and 3 when the self-check refused a
 sequence.
 
+#### Writing the rebuilt lineage
+
+`rebuild --write --plan FILE` executes a plan. It takes the old repository
+from the plan's header and writes the new lineage to the `dolos` repository
+under the network root, which is that repository unless `--root` names
+another. It refuses a plan whose lines disagree (a gap, a broken `previous`
+link, a manifest that does not list its inscription's array, blobs other than
+the manifests name, an unkept newest tip), a plan whose positions are on
+another network than the configuration's, and a target that is the plan's own
+source.
+
+```sh
+stelae-publisher --config dolos.toml rebuild --write --plan rebuild.plan \
+  --direct-s3-config /run/secrets/direct-s3.json
+```
+
+Every tag the plan writes is read first. A tag that already holds the planned
+manifest is skipped, so a run that stopped part way is resumed by running it
+again; a tag that holds another manifest refuses the run before anything is
+written. Then:
+
+1. every blob the published manifests name is put in the target: copied inside
+   the registry's storage with `--direct-s3-config` when both repositories are
+   on the same host (up to one copy's limit, 5 GiB), otherwise pulled from the
+   old repository, held to its digest, and pushed;
+2. per sequence, in ascending order: the inscription, the tip manifest under
+   `epoch-N.tip` where the tip is kept, the diff manifest under `epoch-N`;
+3. the closing pass resolves the last sequence from the target and holds its
+   chain, its layer set and each layer's blob to the plan;
+4. only then does `latest` move to the last sequence.
+
+Nothing is written to the old repository, and nothing is deleted. A closing
+pass that finds the target other than the plan exits 3; one the registry
+could not answer exits 1, and a rerun resumes it. Either way `latest` is left
+unwritten. Other failures exit 1 too.
+`--scratch-dir` is where a pulled blob is staged on its way up.
+
 OCI operations run synchronously on the process thread. Mithril calls have a
 separate Tokio runtime. SIGINT and SIGTERM cancel acquisition and are observed
 between import chunks and retry attempts; an in-flight OCI publication still
@@ -858,7 +895,9 @@ The local OCI and host-policy evidence is documented in
 
 ## Direct S3 blob uploads to Zot (opt-in)
 
-`publish --repo`, `backfill` and `run` accept `--direct-s3-config PATH`.
+`publish --repo`, `backfill`, `run` and `rebuild --write` accept
+`--direct-s3-config PATH`; `rebuild --write` uses it to copy blobs between
+repositories inside the bucket.
 The file is JSON containing `endpoint`, `bucket`, `prefix`, `region`,
 `access_key_id` and `secret_access_key`. Keep it outside source control,
 readable only by the publisher identity; mount it from a Secret in Kubernetes.
