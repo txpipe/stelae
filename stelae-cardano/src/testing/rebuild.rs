@@ -2,6 +2,8 @@
 //! laid out for the loopback registry with a blob behind every layer, so a
 //! rebuild has something to write.
 
+pub mod blocks;
+
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
