@@ -69,8 +69,8 @@ pub enum Error {
     /// A network root whose blocks repository holds nothing at the plan's
     /// sequence, which a publish there refuses as well.
     #[error(
-        "the blocks repository {repository} holds no blocks snapshot at epoch-{sequence}, which a \
-         snapshot there names; --blocks names one in its place"
+        "the blocks repository {repository} holds no blocks snapshot at epoch-{sequence}, which the \
+         Dolos snapshot there names; --blocks names one in its place"
     )]
     BlocksAbsent { repository: String, sequence: u64 },
 
@@ -112,11 +112,12 @@ pub enum BlocksRefusal {
     },
 }
 
-/// The digest the snapshot at `plan`'s sequence names `blocks` by, the
+/// The digest the Dolos snapshot at `plan`'s sequence names `blocks` by, the
 /// inscription `repository` holds at that sequence.
 ///
 /// Refused when it is another sequence's or another network's: Dolos takes
-/// the reference as given, and a snapshot naming either could not be restored.
+/// the reference as given, and a Dolos snapshot naming either could not be
+/// restored.
 pub fn blocks_reference(
     repository: &str,
     blocks: &Inscription,

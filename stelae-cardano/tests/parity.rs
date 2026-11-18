@@ -321,8 +321,8 @@ fn the_reference_holds_every_case_the_comparisons_are_about() {
     assert_eq!(reference.traversals["exact"], UNTIL);
     assert!(reference.traversals["entity"] >= 1);
 
-    // A chain: each snapshot follows the one before, and names the blocks
-    // snapshot of its own sequence.
+    // A chain: each Dolos snapshot follows the one before, and names the
+    // blocks snapshot of its own sequence.
     for sequence in 1..=UNTIL {
         let inscription = reference.inscription(ONE, sequence);
         assert_eq!(

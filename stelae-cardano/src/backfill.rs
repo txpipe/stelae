@@ -352,8 +352,8 @@ pub trait Publish {
     /// The snapshot the repository holds under `sequence`'s immutable tag.
     fn snapshot(&self, sequence: u64) -> Result<Option<Held>, Error>;
     /// The inscription digest of the blocks snapshot at `plan`'s sequence,
-    /// which the snapshot there names: the one the blocks repository holds,
-    /// once reproduced from `files`, or else one published from them.
+    /// which the Dolos snapshot there names: the one the blocks repository
+    /// holds, once reproduced from `files`, or else one published from them.
     fn blocks(
         &self,
         plan: &Plan,

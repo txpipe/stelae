@@ -2751,6 +2751,10 @@ fn stores_whose_state_passed_the_archive_are_refused() {
     let message = rig.run(Limits::ONE, None).unwrap_err().to_string();
     assert!(message.contains("latest snapshot"), "{message}");
     assert!(message.contains("--allow-genesis"), "{message}");
+    assert!(
+        message.contains("no snapshot has nothing to restore"),
+        "{message}"
+    );
 }
 
 /// A batch resuming is no exception: what it holds doesn't vouch for the blocks
@@ -2826,6 +2830,10 @@ fn a_cursor_estart_left_names_how_to_recover() {
         let message = rig.run(batching, None).unwrap_err().to_string();
         assert!(message.contains("latest snapshot"), "{message}");
         assert!(message.contains("--allow-genesis"), "{message}");
+        assert!(
+            message.contains("no snapshot has nothing to restore"),
+            "{message}"
+        );
     }
 }
 
@@ -4561,6 +4569,10 @@ fn a_bundle_lost_part_way_through_stops_with_its_recovery() {
     let message = error.to_string();
     assert!(message.contains("clear the storage path"), "{message}");
     assert!(message.contains("latest snapshot"), "{message}");
+    assert!(
+        message.contains("no snapshot has nothing to restore"),
+        "{message}"
+    );
     assert_nothing_moved(&rig, &journal, &[1]);
 }
 
@@ -5019,8 +5031,8 @@ mod over_a_registry {
         }
     }
 
-    /// Another writer over the same chain: its snapshots name other blocks
-    /// snapshots, which their identities state.
+    /// Another writer over the same chain: its Dolos snapshots name other
+    /// blocks snapshots, which their identities state.
     struct NamesOtherBlocks<'a>(BackfillPublisher<'a>);
 
     impl backfill::Publish for NamesOtherBlocks<'_> {
@@ -5895,8 +5907,8 @@ mod blocks_publishing {
     }
 
     /// Both repositories hold `epoch-1` through `epoch-{until}`. Each blocks
-    /// snapshot is the one the chain's blocks give, written before the snapshot
-    /// of its sequence, and that snapshot names it.
+    /// snapshot is the one the chain's blocks give, written before the Dolos
+    /// snapshot of its sequence, and that Dolos snapshot names it.
     fn assert_published_through(host: &Host<'_>, until: u64) {
         let tags = |tip: bool| -> BTreeSet<String> {
             (1..=until)
