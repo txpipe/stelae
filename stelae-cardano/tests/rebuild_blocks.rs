@@ -553,3 +553,98 @@ fn an_upload_refused_at_an_epoch_resumes_after_its_journal() {
     .unwrap_err();
     assert!(matches!(behind, Error::Journal(_)), "{behind:?}");
 }
+
+#[test]
+fn an_upload_seals_again_after_a_lost_journal_line_and_refuses_a_journal_the_target_does_not_follow(
+) {
+    let served = serve();
+    let genesis = genesis();
+    let target = format!("{ROOT}/blocks");
+    let digests = chunk_digests(&served.immutable, 0..EPOCHS);
+    let foreign = Digest::compute(b"another lineage");
+    let refuses = |journal: &str| {
+        let refused = blocks::run(
+            &served.options(true),
+            &genesis,
+            &digests,
+            journal,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(refused, Error::Journal(_)),
+            "{journal}: {refused:?}"
+        );
+    };
+
+    // An empty target follows no journal.
+    refuses(&served.journal(2));
+    assert!(served.loopback.manifests(&target).is_empty());
+
+    // Epochs 0 and 1 are sealed, 2 refused: file 2 is not certified yet.
+    let early = chunk_digests(&served.immutable, 0..2);
+    blocks::run(&served.options(true), &genesis, &early, "", &mut Vec::new()).unwrap_err();
+    let sealed = served.loopback.manifests(&target);
+    assert!(sealed.contains_key("epoch-2") && !sealed.contains_key("epoch-3"));
+
+    // The target's newest under another digest, and a snapshot one past the
+    // journal that links elsewhere.
+    refuses(&format!("1 {}\n2 {foreign}\n", served.exported[0]));
+    refuses(&format!("1 {foreign}\n"));
+    assert_eq!(served.loopback.manifests(&target), sealed);
+
+    // The journal lost the line of the target's newest seal: it is sealed
+    // again with the same bytes and the lineage goes on.
+    let mut appended = Vec::new();
+    let summary = blocks::run(
+        &served.options(true),
+        &genesis,
+        &digests,
+        &served.journal(1),
+        &mut appended,
+    )
+    .unwrap();
+    assert_eq!((summary.resumed, summary.epochs), (1, 2));
+    assert_eq!(
+        served.journal(1) + &String::from_utf8(appended).unwrap(),
+        served.journal(EPOCHS)
+    );
+    assert_eq!(
+        served.loopback.manifest(&target, "epoch-2"),
+        sealed.get("epoch-2").cloned()
+    );
+
+    let registry = Registry::open(
+        &served.loopback.repository(&target).parse().unwrap(),
+        RegistryOptions {
+            insecure: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for sequence in 1..=EPOCHS {
+        let inscription = registry.pull_inscription(&BlocksProfile, sequence).unwrap();
+        assert_eq!(
+            inscription.digest().unwrap(),
+            served.exported[sequence as usize - 1]
+        );
+    }
+}
+
+#[test]
+fn a_failed_digest_fetch_does_not_report_the_aggregator_credentials() {
+    provider();
+    let root = tempfile::tempdir().unwrap();
+    let loopback = Loopback::serve(root.path()).unwrap();
+    let aggregator = loopback
+        .aggregator()
+        .replace("http://", "http://reader:secret@");
+
+    // Nothing is offered, so the route answers 404.
+    let error = blocks::fetch(&aggregator).unwrap_err().to_string();
+    assert!(error.contains("127.0.0.1"), "{error}");
+    assert!(
+        !error.contains("secret") && !error.contains("reader"),
+        "{error}"
+    );
+}

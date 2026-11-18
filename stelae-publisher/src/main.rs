@@ -348,7 +348,7 @@ impl BackfillArgs {
             None => "network catalog",
         };
         tracing::info!(
-            aggregator = %without_userinfo(&mithril.aggregator),
+            aggregator = %config::without_userinfo(&mithril.aggregator),
             from = origin,
             "Mithril aggregator"
         );
@@ -366,19 +366,6 @@ impl BackfillArgs {
             mithril,
             limits: self.limits()?,
         })
-    }
-}
-
-/// The URL as logged: userinfo works as Basic auth, so it never reaches the
-/// logs.
-fn without_userinfo(url: &str) -> String {
-    match url::Url::parse(url) {
-        Ok(mut url) => {
-            let _ = url.set_username("");
-            let _ = url.set_password(None);
-            url.to_string()
-        }
-        Err(_) => "(unparseable URL)".to_owned(),
     }
 }
 
@@ -1709,15 +1696,6 @@ mod tests {
             );
             assert!(!dir.path().join("data").exists(), "{}", command[0]);
         }
-    }
-
-    #[test]
-    fn a_logged_aggregator_drops_its_userinfo() {
-        assert_eq!(
-            without_userinfo("https://user:key@aggregator.invalid/aggregator"),
-            "https://aggregator.invalid/aggregator"
-        );
-        assert_eq!(without_userinfo("not a url"), "(unparseable URL)");
     }
 
     #[test]

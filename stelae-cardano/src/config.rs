@@ -119,6 +119,19 @@ pub fn mithril_aggregator(
         })
 }
 
+/// The URL as logged or reported: userinfo works as Basic auth, so it never
+/// reaches the logs or an error.
+pub fn without_userinfo(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.to_string()
+        }
+        Err(_) => "(unparseable URL)".to_owned(),
+    }
+}
+
 /// The aggregator a backfill trusts: what the invocation names, else the
 /// known network's.
 pub fn mithril_source(
@@ -152,6 +165,15 @@ mod tests {
     use dolos_cardano::networks::KnownNetwork;
 
     use super::*;
+
+    #[test]
+    fn a_logged_aggregator_drops_its_userinfo() {
+        assert_eq!(
+            without_userinfo("https://user:key@aggregator.invalid/aggregator"),
+            "https://aggregator.invalid/aggregator"
+        );
+        assert_eq!(without_userinfo("not a url"), "(unparseable URL)");
+    }
 
     fn config(document: &str) -> (tempfile::TempDir, Result<RootConfig, ConfigError>) {
         let dir = tempfile::tempdir().unwrap();

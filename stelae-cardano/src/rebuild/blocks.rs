@@ -32,7 +32,10 @@ use stelae_blocks::{record, BlocksProfile, EpochScope, OrderCheck, COMPRESSION_L
 
 use super::{read_journal, sequences, OldSequence};
 use crate::Repository;
-use crate::{backfill::slots_per_immutable_file, publisher::blocks_repository, Auth, Genesis};
+use crate::{
+    backfill::slots_per_immutable_file, config::without_userinfo, publisher::blocks_repository,
+    Auth, Genesis,
+};
 
 /// The aggregator route serving the digest list of the latest Cardano
 /// database snapshot.
@@ -166,7 +169,9 @@ impl ChunkDigests {
 /// Fetch the digest list from `aggregator`'s [`DIGESTS_ROUTE`].
 pub fn fetch(aggregator: &str) -> Result<ChunkDigests, Error> {
     let url = format!("{}/{DIGESTS_ROUTE}", aggregator.trim_end_matches('/'));
-    let failed = |error: reqwest::Error| Error::Digests(format!("at {url}: {error}"));
+    let shown = without_userinfo(&url);
+    let failed =
+        |error: reqwest::Error| Error::Digests(format!("at {shown}: {}", error.without_url()));
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -478,8 +483,8 @@ fn resumed(journal: &str, last: u64) -> Result<Option<Link>, Error> {
 }
 
 /// Refuse a target whose newest snapshot is not where the journal ends, or
-/// the one after it: a seal whose journal line was lost is sealed again with
-/// the same bytes.
+/// the one after it linked to where the journal ends: a seal whose journal
+/// line was lost is sealed again with the same bytes.
 fn check_target(
     target: &Repository,
     registry: &Registry,
@@ -490,15 +495,19 @@ fn check_target(
             return Ok(None);
         };
         let inscription = snapshot.read_inscription()?;
-        Ok(Some((inscription.sequence, inscription.digest()?)))
+        Ok(Some((
+            inscription.sequence,
+            inscription.digest()?,
+            inscription.previous,
+        )))
     };
     let newest = newest().map_err(|e| target_error(target, "reading the newest snapshot of", e))?;
     let at = resumed.map_or(0, |link| link.sequence);
 
     match (newest, resumed) {
         (None, None) => Ok(()),
-        (Some((sequence, _)), _) if sequence == at + 1 => Ok(()),
-        (Some((sequence, digest)), Some(link))
+        (Some((sequence, _, previous)), _) if sequence == at + 1 && previous == resumed => Ok(()),
+        (Some((sequence, digest, _)), Some(link))
             if sequence == at && digest == link.inscription_digest =>
         {
             Ok(())
@@ -506,7 +515,7 @@ fn check_target(
         (newest, _) => Err(Error::Journal(format!(
             "ends at sequence {at}, and {target} holds {}",
             match newest {
-                Some((sequence, digest)) => format!("epoch-{sequence} as {digest}"),
+                Some((sequence, digest, _)) => format!("epoch-{sequence} as {digest}"),
                 None => "nothing".into(),
             }
         ))),
