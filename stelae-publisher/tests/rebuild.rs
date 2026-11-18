@@ -513,6 +513,10 @@ impl OldBlocks {
             .env_remove("DOLOS_STELAE_PASSWORD")
             .env_remove("DOLOS_STELAE_TOKEN")
             .env_remove("DOLOS_MITHRIL_AGGREGATOR")
+            // Plain reports, whatever the caller's terminal settings.
+            .env("NO_COLOR", "1")
+            .env_remove("FORCE_COLOR")
+            .env_remove("CLICOLOR_FORCE")
             .output()
             .unwrap()
     }
@@ -638,6 +642,21 @@ fn a_file_mithril_lists_otherwise_exits_three_and_is_named() {
     assert_eq!(
         std::fs::read_to_string(&journal).unwrap(),
         served.journal(1)
+    );
+    assert_eq!(served.writes.load(Ordering::SeqCst), 0);
+
+    // Rerun with a list certifying every file: the run continues after the
+    // journal's last line, appending to it rather than writing over it.
+    let again = served.run(&served.digests(), &journal, &[]);
+    assert!(again.status.success(), "{}", text(&again.stderr));
+    assert!(
+        text(&again.stdout).contains("1 resumed from the journal, 2 re-encoded"),
+        "{}",
+        text(&again.stdout)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&journal).unwrap(),
+        served.journal(EPOCHS)
     );
     assert_eq!(served.writes.load(Ordering::SeqCst), 0);
 }
