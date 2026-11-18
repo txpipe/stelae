@@ -408,7 +408,8 @@ pub fn write(plan: &Plan, options: &Options) -> Result<Written, Error> {
 }
 
 /// Every planned inscription is positioned on the network `magic` names, so a
-/// plan of one network is never published under another's root.
+/// plan of another network than the configured one is never written. The root
+/// is not held to the network.
 fn on_network(plan: &Plan, magic: u64) -> Result<(), Error> {
     for planned in &plan.sequences {
         let reason = match dolos_snapshot::read_position(&planned.inscription.position) {
@@ -551,4 +552,74 @@ fn resolves(registry: &Registry, repository: &str, plan: &Plan) -> Result<(), Er
 /// checks refuse. Anything else is a registry, network or disk failure.
 fn found_wrong(error: &stelae::Error) -> bool {
     error.is_absent() || matches!(error, stelae::Error::TipGone { .. }) || refused_stele(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use oci_client::errors::{DigestError, OciDistributionError};
+
+    use super::found_wrong;
+
+    fn exhausted(source: stelae::Error) -> stelae::Error {
+        stelae::Error::RetriesExhausted {
+            subject: "epoch-8".to_owned(),
+            attempts: 6,
+            source: Box::new(source),
+        }
+    }
+
+    fn other_bytes() -> stelae::Error {
+        stelae::Error::Registry(
+            DigestError::VerificationError {
+                expected: "sha256:aa".to_owned(),
+                actual: "sha256:bb".to_owned(),
+            }
+            .into(),
+        )
+    }
+
+    /// Exit 3 is for what the closing pass found published other than planned,
+    /// whether on the first attempt or after retries; a registry that could not
+    /// answer, retried or not, is exit 1.
+    #[test]
+    fn a_closing_pass_failure_is_wrong_by_what_it_found() {
+        for error in [
+            stelae::Error::NoSuchTag {
+                tag: "epoch-8".to_owned(),
+            },
+            stelae::Error::Registry(OciDistributionError::ImageManifestNotFoundError(
+                "epoch-8".to_owned(),
+            )),
+            stelae::Error::TipGone {
+                sequence: 8,
+                tag: "epoch-8.tip".to_owned(),
+            },
+            stelae::Error::MissingLink {
+                from: 8,
+                sequence: 4,
+            },
+            stelae::Error::ManifestMismatch("a layer without its diffId".to_owned()),
+            other_bytes(),
+            exhausted(other_bytes()),
+        ] {
+            assert!(found_wrong(&error), "{error}");
+        }
+
+        for error in [
+            stelae::Error::Registry(OciDistributionError::UnauthorizedError {
+                url: "https://registry/v2/".to_owned(),
+            }),
+            exhausted(stelae::Error::Registry(OciDistributionError::ServerError {
+                code: 503,
+                url: "https://registry/v2/".to_owned(),
+                message: "unavailable".to_owned(),
+            })),
+            exhausted(stelae::Error::Registry(
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset).into(),
+            )),
+            stelae::Error::Io(std::io::ErrorKind::ConnectionReset.into()),
+        ] {
+            assert!(!found_wrong(&error), "{error}");
+        }
+    }
 }

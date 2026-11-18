@@ -316,8 +316,8 @@ written. Then:
 
 Nothing is written to the old repository, and nothing is deleted. A closing
 pass that finds the target other than the plan exits 3; one the registry
-could not answer exits 1, as do other failures, and a rerun resumes it. Either
-way `latest` is left unwritten.
+could not answer exits 1, and a rerun resumes it. Either way `latest` is left
+unwritten. Other failures exit 1 too.
 `--scratch-dir` is where a pulled blob is staged on its way up.
 
 OCI operations run synchronously on the process thread. Mithril calls have a
