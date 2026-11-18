@@ -182,7 +182,7 @@ fn publish(
     (node, outcome, counted)
 }
 
-/// The document a stele's manifest names, as the registry holds it.
+/// The document a snapshot's manifest names, as the registry holds it.
 fn canonical(root: &std::path::Path, name: &str, sequence: u64) -> Vec<u8> {
     let manifest = std::fs::read(
         root.join(name)
@@ -321,7 +321,7 @@ fn the_reference_holds_every_case_the_comparisons_are_about() {
     assert_eq!(reference.traversals["exact"], UNTIL);
     assert!(reference.traversals["entity"] >= 1);
 
-    // A chain: each stele follows the one before, and names the blocks
+    // A chain: each snapshot follows the one before, and names the blocks
     // snapshot of its own sequence.
     for sequence in 1..=UNTIL {
         let inscription = reference.inscription(ONE, sequence);
@@ -358,7 +358,7 @@ fn the_reference_holds_every_case_the_comparisons_are_about() {
 
     // Settling account rows: each publication holds the window its boundary
     // stands in. A closed window's rows hold the stake leg alone at the next
-    // stele and take their rewards at the one after, where they stay. Rewards
+    // snapshot and take their rewards at the one after, where they stay. Rewards
     // start from the window of FIRST_REWARDED, so a later view can't stand in.
     let settling = reference.epochs_of(UNTIL, "log-account-epochs");
     assert!(settling.contains(&UNTIL) && settling.contains(&(UNTIL - 1)));
@@ -376,7 +376,7 @@ fn the_reference_holds_every_case_the_comparisons_are_about() {
         assert_eq!(row(epoch + 2), row(epoch + 3), "window {epoch} moved twice");
     }
 
-    // A diff is listed once, by the stele that sealed it, and never uploaded
+    // A diff is listed once, by the snapshot that sealed it, and never uploaded
     // again.
     let sealed = reference.inscription(ONE, 3);
     assert!(sealed
@@ -462,8 +462,8 @@ fn every_publication_is_what_stores_frozen_at_its_boundary_publish() {
     }
 }
 
-/// Restore `sequence` into fresh stores, hold them to the stele, and replay on
-/// to the next boundary, as a node restoring from it would.
+/// Restore `sequence` into fresh stores, hold them to the snapshot, and replay
+/// on to the next boundary, as a node restoring from it would.
 fn restores_and_continues(reference: &Reference, name: &str, sequence: u64, next: Option<&[u8]>) {
     let chain = &reference.chain;
     let node = chain.node();
@@ -509,7 +509,7 @@ fn restores_and_continues(reference: &Reference, name: &str, sequence: u64, next
     let plan = plan.clone().with_blocks(chain.blocks_digest(plan.sequence));
     let following = Following::read(&published, &plan).unwrap();
     let document = snapshot.digest_document(&plan, &following).unwrap();
-    assert_eq!(document.canonical, next, "the stele after {sequence}");
+    assert_eq!(document.canonical, next, "the snapshot after {sequence}");
     drop(snapshot);
     session.finish().unwrap();
 }
@@ -524,10 +524,10 @@ fn blocks_after(chain: &Chain, cursor: &ChainPoint) -> Vec<dolos_core::RawBlock>
     chain.blocks[at + 1..].to_vec()
 }
 
-/// The consumer knows nothing of batches: `initialize` restores whichever stele
-/// it is given, the stores reproduce that stele, and replaying on from them
-/// reaches the next one byte for byte. The batch publishes one boundary at a
-/// time's bytes, so this holds for both.
+/// The consumer knows nothing of batches: `initialize` restores whichever
+/// snapshot it is given, the stores reproduce that snapshot, and replaying on
+/// from them reaches the next one byte for byte. The batch publishes one
+/// boundary at a time's bytes, so this holds for both.
 #[test]
 fn a_consumer_restores_every_publication_of_a_batch_and_replays_on() {
     let reference = &*SHELLEY;
@@ -545,12 +545,12 @@ fn a_consumer_restores_every_publication_of_a_batch_and_replays_on() {
     }
 }
 
-/// Past a lineage's first stele, a digest at the stores' sequence takes its
-/// link from the stele before and its blocks from the root, and gives the
-/// stele the root holds there. The registry no longer serving that earlier
-/// stele's tip does not stop it, as a repository may drop it.
+/// Past a lineage's first snapshot, a digest at the stores' sequence takes its
+/// link from the snapshot before and its blocks from the root, and gives the
+/// snapshot the root holds there. The registry no longer serving that earlier
+/// snapshot's tip does not stop it, as a repository may drop it.
 #[test]
-fn a_digest_past_the_first_stele_follows_one_whose_tip_is_gone() {
+fn a_digest_past_the_first_snapshot_follows_one_whose_tip_is_gone() {
     provider();
     let reference = &*SHELLEY;
     // A server of its own over the reference's root, so its rule meets no
@@ -639,7 +639,7 @@ static BYRON: LazyLock<Reference> = LazyLock::new(|| {
 });
 
 /// A Byron main block shares its boundary block's slot. A later archive
-/// filtered by slot takes that main block into the earlier boundary's stele,
+/// filtered by slot takes that main block into the earlier boundary's snapshot,
 /// and a replay stopped at the boundary doesn't hold it. So each boundary's
 /// window holds the boundary block alone, stands on it, and matches whatever
 /// window batched it.
@@ -693,7 +693,7 @@ fn a_byron_boundary_holds_its_boundary_block_and_not_the_main_block_beside_it() 
 }
 
 /// A restored Byron boundary replays on into the main block beside it, which it
-/// couldn't if the stele had already taken it.
+/// couldn't if the snapshot had already taken it.
 #[test]
 fn a_consumer_restores_a_byron_boundary_and_replays_the_main_block_beside_it() {
     let reference = &*BYRON;

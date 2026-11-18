@@ -115,7 +115,7 @@ naming.
    and a bumped `run`. From an emptyDir or a fresh
    claim, the Job replays from genesis and publishes both snapshots of every
    epoch boundary on the way: the blocks snapshot into the root's `blocks`
-   repository, then the stele naming it into `dolos`. The `blocks` repository
+   repository, then the Dolos snapshot naming it into `dolos`. The `blocks` repository
    may keep what it holds, since each blocks snapshot found there is
    reproduced and kept, and one that differs refuses.
 4. Set `allowGenesisFallback: false` for every later run. Initialization

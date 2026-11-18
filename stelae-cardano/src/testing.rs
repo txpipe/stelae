@@ -138,7 +138,7 @@ impl Node {
     }
 
     /// Replays the last block of epoch 0 and the first of epoch 1, stopping on
-    /// the boundary a stele is cut at.
+    /// the boundary a snapshot is cut at.
     pub fn replay_to_the_first_boundary(&self) -> (Arc<Genesis>, ChainPoint) {
         let mut genesis = dolos_cardano::include::preview::load();
         genesis.force_protocol = Some(9);
@@ -156,7 +156,7 @@ impl Node {
 
     /// Replays on from `first`, the boundary
     /// [`Self::replay_to_the_first_boundary`] stops on, to the first block of
-    /// epoch 2: the boundary the second stele is cut at.
+    /// epoch 2: the boundary the second snapshot is cut at.
     pub fn replay_to_the_second_boundary(
         &self,
         genesis: &Arc<Genesis>,

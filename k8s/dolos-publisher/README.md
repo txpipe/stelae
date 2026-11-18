@@ -1,7 +1,7 @@
 # Publisher — deployment unit
 
 The chart in [chart/](chart/) runs one `stelae-publisher` Job per network.
-The publisher restores its latest stele, replays to epoch boundaries,
+The publisher restores its latest snapshot, replays to epoch boundaries,
 publishes, prunes, and exits at the aggregator tip. The operator maintains
 network values and owns deployment, first publication and monitoring.
 
@@ -37,7 +37,7 @@ image's UID/GID `65532:65532` write access to `/data`.
 cost.
 
 - **emptyDir** (the default). Every pod restart, eviction included, restores
-  the latest stele, all of history, and `resources` bounds `/data` through
+  the latest snapshot, all of history, and `resources` bounds `/data` through
   its `ephemeral-storage` request and limit, which must hold the whole
   archive. A failed container reruns in the same pod and keeps `/data`;
   deleting the pod or bumping `run` starts over. It suits only a network whose
@@ -52,8 +52,8 @@ cost.
   accepted unchecked by every later run. Killed before, they hold partial
   rows with no cursor, and the next run restores into them without clearing
   them. Restarts of the same Job restore the same `repo` again, which is
-  harmless while `latest` is the same stele. Nothing refuses a changed
-  `repo` or network, though: a different stele lands over the stale rows,
+  harmless while `latest` is the same snapshot. Nothing refuses a changed
+  `repo` or network, though: a different snapshot lands over the stale rows,
   which then become authoritative. Delete the claim when a first restore
   did not complete, before the next run.
   The chart creates `<release>-data` of `persistence.size` in
@@ -129,7 +129,7 @@ adds another Job. To recover, delete the release's backfill Jobs with
 | --- | --- |
 | `network` | Job name prefix |
 | `run` | Deliberate re-run counter; bump when changing the Job |
-| `repo` | Network root, `oci://`: each boundary's blocks snapshot goes to its `blocks` repository, then the stele naming it to its `dolos` repository |
+| `repo` | Network root, `oci://`: each boundary's blocks snapshot goes to its `blocks` repository, then the Dolos snapshot naming it to its `dolos` repository |
 | `concurrency` | Measured upload concurrency, with no chart default |
 | `dolosToml` | Network's Dolos v2 configuration, verbatim |
 | `image.repository` | Defaults to `ghcr.io/txpipe/stelae-publisher` |
@@ -241,7 +241,7 @@ restores all of history into ephemeral storage. The claim stays, and a
 later 0.4 install with persistence adopts it again.
 
 An image on a new Dolos profile pin cannot continue a lineage cut by an
-earlier one: restoring or chaining onto an older stele is unsupported, so the
+earlier one: restoring or chaining onto an older snapshot is unsupported, so the
 move starts a fresh lineage in the root's emptied `dolos` repository, as
 [First publication on the chart](../../docs/publisher-packaging.md#first-publication-on-the-chart)
 describes. A lineage from before the diff chain sits at the root itself and

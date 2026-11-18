@@ -12,7 +12,7 @@ use stelae_cardano::{
 };
 
 /// A node replayed to its first boundary, and that boundary published into a
-/// network root on disk: its blocks snapshot and the stele naming it.
+/// network root on disk: its blocks snapshot and the Dolos snapshot naming it.
 struct Fixture {
     node: Node,
     genesis: Genesis,
@@ -119,7 +119,7 @@ fn blobs(layout: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// A digest over the inputs the root holds is the stele published there: the
+/// A digest over the inputs the root holds is the snapshot published there: the
 /// first of its lineage, naming the blocks snapshot beside it.
 #[test]
 fn digest_is_the_profile_document_over_the_same_store_and_plan() {
@@ -189,7 +189,7 @@ fn verify_passes_on_the_published_directory_and_finds_an_altered_layer() {
 }
 
 /// A reproduction holds the published link to the one it is given: none is
-/// what a lineage's first stele follows, and any other is a mismatch.
+/// what a lineage's first snapshot follows, and any other is a mismatch.
 #[test]
 fn verify_reproduce_holds_the_published_link_to_the_one_given() {
     let fixture = Fixture::published();
@@ -215,7 +215,7 @@ fn verify_reproduce_holds_the_published_link_to_the_one_given() {
         "the refusal names what it compared"
     );
 
-    // A stele that follows one: the same link passes, and only its digest
+    // A snapshot that follows one: the same link passes, and only its digest
     // tells another apart, at the same sequence.
     let link = snapshot::previous_at(1, stelae::Digest::compute(b"before")).unwrap();
     let mut linked = verified.inscription.clone();
@@ -234,10 +234,10 @@ fn verify_reproduce_holds_the_published_link_to_the_one_given() {
     ));
 }
 
-/// A stele the stores do not rebuild is the stele's mismatch, not a failure
-/// to run.
+/// A snapshot the stores do not rebuild is the snapshot's mismatch, not a
+/// failure to run.
 #[test]
-fn a_reproduction_that_differs_from_the_stele_is_a_mismatch() {
+fn a_reproduction_that_differs_from_the_snapshot_is_a_mismatch() {
     let fixture = Fixture::published();
     let mut published = fixture.open().verify(Point::Latest).unwrap().inscription;
     published.diff[0].records += 1;

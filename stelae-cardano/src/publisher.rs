@@ -83,9 +83,9 @@ pub enum PolicyError {
     NothingToPublish(String),
 
     #[error(
-        "this repository's latest stele is sequence {latest} and this node is at sequence \
+        "this repository's latest snapshot is sequence {latest} and this node is at sequence \
          {sequence}, {distance} sequences ahead: a publish must follow the repository's latest \
-         stele, and this one would leave a gap no later stele could close"
+         snapshot, and this one would leave a gap no later snapshot could close"
     )]
     PublishWouldGap {
         latest: u64,
@@ -145,8 +145,8 @@ impl Publisher {
         registry::standing(&self.registry, plan)
     }
 
-    /// What the repository really holds, as a stele that follows it would name
-    /// it.
+    /// What the repository really holds, as a snapshot that follows it would
+    /// name it.
     pub fn latest(&self, plan: &Plan) -> Result<Option<Committed>, dolos_snapshot::Error> {
         if self.standing(plan)? == Standing::Empty {
             return Ok(None);
@@ -154,12 +154,13 @@ impl Publisher {
         Ok(Some(held(&Point::Latest.pull(&self.registry)?)?.committed))
     }
 
-    /// The stele under `sequence`'s immutable tag, if the repository holds one.
+    /// The snapshot under `sequence`'s immutable tag, if the repository holds
+    /// one.
     ///
     /// A seal tags a sequence's tip before the sequence itself, so a sequence
     /// held here has its tip too, and one tagged only at its tip is absent:
     /// sealing it again writes the same tip.
-    pub fn stele(&self, sequence: u64) -> Result<Option<Held>, dolos_snapshot::Error> {
+    pub fn snapshot(&self, sequence: u64) -> Result<Option<Held>, dolos_snapshot::Error> {
         match Point::Epoch(sequence).pull(&self.registry) {
             Ok(snapshot) => Ok(Some(held(&snapshot)?)),
             Err(dolos_snapshot::Error::Stelae(error)) if error.is_absent() => Ok(None),
@@ -188,8 +189,8 @@ impl Publisher {
         source.publish_repository(self.publishing(), plan, observer)
     }
 
-    /// Publish a prepared boundary, chained to the repository's latest stele,
-    /// which has to be `predecessor`.
+    /// Publish a prepared boundary, chained to the repository's latest
+    /// snapshot, which has to be `predecessor`.
     pub fn finalize(
         &self,
         finalizing: &Finalizing<'_>,
@@ -318,9 +319,9 @@ impl backfill::Publish for BackfillPublisher<'_> {
             .map_err(backfill::Error::caller)
     }
 
-    fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+    fn snapshot(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
         Publisher::open(self.config, &self.settings)
-            .and_then(|publisher| publisher.stele(sequence))
+            .and_then(|publisher| publisher.snapshot(sequence))
             .map_err(backfill::Error::caller)
     }
 
@@ -567,7 +568,7 @@ mod tests {
             require_new: false,
         };
         let directory = |scratch_dir: Option<&str>| Destination::Directory {
-            path: PathBuf::from("/stele"),
+            path: PathBuf::from("/snapshot"),
             scratch_dir: scratch_dir.map(PathBuf::from),
         };
         let default = storage.path.join("scratch");

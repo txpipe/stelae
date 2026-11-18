@@ -27,7 +27,7 @@ use stelae::{
 };
 
 use super::{PlanHeader, Planned, PLAN_FORMAT};
-use crate::{publisher::dolos_repository, snapshot::refused_stele, Auth, Repository};
+use crate::{publisher::dolos_repository, snapshot::refused_snapshot, Auth, Repository};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -548,10 +548,10 @@ fn resolves(registry: &Registry, repository: &str, plan: &Plan) -> Result<(), Er
 }
 
 /// Whether resolving what was just written found it other than published:
-/// the head absent, its tip gone, or a document or link the stele's own
+/// the head absent, its tip gone, or a document or link the snapshot's own
 /// checks refuse. Anything else is a registry, network or disk failure.
 fn found_wrong(error: &stelae::Error) -> bool {
-    error.is_absent() || matches!(error, stelae::Error::TipGone { .. }) || refused_stele(error)
+    error.is_absent() || matches!(error, stelae::Error::TipGone { .. }) || refused_snapshot(error)
 }
 
 #[cfg(test)]

@@ -67,7 +67,7 @@ pub fn genesis(config: &RootConfig) -> Result<Genesis, ChainError> {
 /// A publisher configured to keep less than the full archive.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "a stele publisher needs `history.mode = \"full\"`, but this configuration keeps {kept}: \
+    "a Stelae snapshot publisher needs `history.mode = \"full\"`, but this configuration keeps {kept}: \
      Dolos publishes only from an archive that starts at the origin, so the first prune \
      would stall the lineage"
 )]

@@ -73,10 +73,10 @@ fn a_bounded_fixture_publishes_to_a_directory_through_the_new_host() {
     assert!(dolos::storage::has_existing_data(&restored.config).unwrap());
 }
 
-/// A fresh lineage's first stele reproduces itself: the stores it restores
+/// A fresh lineage's first snapshot reproduces itself: the stores it restores
 /// publish the same inscription again.
 #[test]
-fn a_restored_stele_publishes_the_same_inscription() {
+fn a_restored_snapshot_publishes_the_same_inscription() {
     fn publish(node: &Node, genesis: &dolos_core::Genesis, destination: PathBuf) -> String {
         let (_, outcome) = publish_once(
             &node.config,
@@ -124,10 +124,10 @@ fn a_restored_stele_publishes_the_same_inscription() {
     assert_eq!(republished, published);
 }
 
-/// A directory stele lists its own layers and names the blocks snapshot Dolos
-/// wrote beside it, and its parameters carry no retained epochs.
+/// A directory Dolos snapshot lists its own layers and names the blocks
+/// snapshot Dolos wrote beside it, and its parameters carry no retained epochs.
 #[test]
-fn a_directory_stele_names_the_blocks_snapshot_beside_it() {
+fn a_directory_dolos_snapshot_names_the_blocks_snapshot_beside_it() {
     let node = Node::new();
     let (genesis, _) = node.replay_to_the_first_boundary();
 
@@ -153,16 +153,16 @@ fn a_directory_stele_names_the_blocks_snapshot_beside_it() {
             .read_inscription()
             .unwrap()
     };
-    let stele = read("dolos", &DolosProfile);
+    let snapshot = read("dolos", &DolosProfile);
     let blocks = read("blocks", &BlocksProfile);
-    let position = dolos_snapshot::read_position(&stele.position).unwrap();
+    let position = dolos_snapshot::read_position(&snapshot.position).unwrap();
     assert_eq!(position.blocks, Some(blocks.digest().unwrap()));
-    assert_eq!(stele.previous, None);
-    assert!(!stele.diff.is_empty() && !stele.tip.is_empty());
+    assert_eq!(snapshot.previous, None);
+    assert!(!snapshot.diff.is_empty() && !snapshot.tip.is_empty());
     assert!(
-        stele.parameters.get("stateEpochs").is_none(),
+        snapshot.parameters.get("stateEpochs").is_none(),
         "{}",
-        stele.parameters
+        snapshot.parameters
     );
 }
 
@@ -202,7 +202,7 @@ fn relocated_backfill_publishes_a_pending_boundary_before_any_advance() {
             Ok(None)
         }
 
-        fn stele(&self, _: u64) -> Result<Option<batch::Held>, backfill::Error> {
+        fn snapshot(&self, _: u64) -> Result<Option<batch::Held>, backfill::Error> {
             unreachable!("a batch of one never asks")
         }
 
@@ -302,7 +302,7 @@ fn cold_start_fails_closed_and_genesis_requires_explicit_opt_in() {
     let node = Node::new();
     let genesis = dolos_cardano::include::preview::load();
     let mut options = initialize::Options {
-        source: RestoreSource::Dir(node.path().join("missing-stele")),
+        source: RestoreSource::Dir(node.path().join("missing-snapshot")),
         point: Point::Latest,
         auth: Auth::Anonymous,
         insecure: false,
@@ -340,7 +340,7 @@ fn a_rolling_history_is_refused_before_any_store_opens() {
         dolos_core::config::HistoryWindow::slots(432_000),
     );
     let options = initialize::Options {
-        source: RestoreSource::Dir(node.path().join("missing-stele")),
+        source: RestoreSource::Dir(node.path().join("missing-snapshot")),
         point: Point::Latest,
         auth: Auth::Anonymous,
         insecure: false,

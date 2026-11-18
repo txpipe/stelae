@@ -1,14 +1,14 @@
-//! Reading and reproducing published steles: what `digest`, `verify` and
+//! Reading and reproducing published snapshots: what `digest`, `verify` and
 //! `inspect` run.
 //!
 //! Every check is the Dolos profile's own. This module opens the stores and the
-//! stele a command names and composes the profile's digest, transport and
+//! snapshot a command names and composes the profile's digest, transport and
 //! reproduction entry points over them. A source names a network root: its
-//! `dolos` repository holds the steles, and its `blocks` repository the blocks
-//! snapshots they name, each a registry repository or an OCI image layout on
-//! disk. A layout's documents are held to the profile the way a registry pull
-//! holds them, and its layers are checked through the protocol reader the way
-//! the profile checks a repository's.
+//! `dolos` repository holds the snapshots, and its `blocks` repository the
+//! blocks snapshots they name, each a registry repository or an OCI image
+//! layout on disk. A layout's documents are held to the profile the way a
+//! registry pull holds them, and its layers are checked through the protocol
+//! reader the way the profile checks a repository's.
 
 use std::{path::Path, sync::Arc};
 
@@ -55,7 +55,7 @@ pub enum Error {
         source: Box<dolos_snapshot::Error>,
     },
 
-    /// The check ran and the stele failed it.
+    /// The check ran and the snapshot failed it.
     #[error("{what}")]
     Mismatch {
         what: String,
@@ -63,14 +63,14 @@ pub enum Error {
         source: Box<dolos_snapshot::Error>,
     },
 
-    #[error("a stele at sequence 0 follows nothing, so --previous names no stele before it")]
+    #[error("a snapshot at sequence 0 follows nothing, so --previous names no snapshot before it")]
     NothingBefore,
 
     /// A network root whose blocks repository holds nothing at the plan's
     /// sequence, which a publish there refuses as well.
     #[error(
         "the blocks repository {repository} holds no blocks snapshot at epoch-{sequence}, which a \
-         stele there names; --blocks names one in its place"
+         snapshot there names; --blocks names one in its place"
     )]
     BlocksAbsent { repository: String, sequence: u64 },
 
@@ -78,14 +78,14 @@ pub enum Error {
     Blocks(#[from] BlocksRefusal),
 }
 
-/// A blocks snapshot the stele at a plan's sequence cannot name.
+/// A blocks snapshot the Dolos snapshot at a plan's sequence cannot name.
 #[derive(Debug, thiserror::Error)]
 pub enum BlocksRefusal {
     /// A tag naming another sequence's snapshot, which a copied or moved tag
     /// leaves: the protocol's pull does not hold an inscription to its tag.
     #[error(
         "the blocks repository {repository} holds the blocks snapshot of sequence {found} at \
-         epoch-{sequence}, and a stele names the blocks snapshot of its own sequence"
+         epoch-{sequence}, and a Dolos snapshot names the blocks snapshot of its own sequence"
     )]
     OtherSequence {
         repository: String,
@@ -112,11 +112,11 @@ pub enum BlocksRefusal {
     },
 }
 
-/// The digest the stele at `plan`'s sequence names `blocks` by, the
+/// The digest the snapshot at `plan`'s sequence names `blocks` by, the
 /// inscription `repository` holds at that sequence.
 ///
 /// Refused when it is another sequence's or another network's: Dolos takes
-/// the reference as given, and a stele naming either could not be restored.
+/// the reference as given, and a snapshot naming either could not be restored.
 pub fn blocks_reference(
     repository: &str,
     blocks: &Inscription,
@@ -152,7 +152,7 @@ pub fn blocks_reference(
 }
 
 impl Error {
-    /// Whether a verification found the stele wrong, rather than failing to
+    /// Whether a verification found the snapshot wrong, rather than failing to
     /// run.
     pub fn is_mismatch(&self) -> bool {
         matches!(self, Self::Mismatch { .. })
@@ -166,7 +166,7 @@ impl Error {
         }
     }
 
-    /// A verification failure, classified by whether it is the stele's.
+    /// A verification failure, classified by whether it is the snapshot's.
     fn verifying(what: impl Into<String>) -> impl FnOnce(dolos_snapshot::Error) -> Self {
         Self::classified(what, found_wrong)
     }
@@ -188,7 +188,7 @@ impl Error {
     }
 }
 
-/// Whether a check refused the published stele's own bytes or documents,
+/// Whether a check refused the published snapshot's own bytes or documents,
 /// rather than failing to read them or to read the local stores.
 ///
 /// A layer's failure is classified by what it wraps: a registry that keeps
@@ -198,7 +198,7 @@ fn found_wrong(error: &dolos_snapshot::Error) -> bool {
 
     match error {
         E::LayerVerification { source, .. } => found_wrong(source),
-        E::Stelae(error) => refused_stele(error),
+        E::Stelae(error) => refused_snapshot(error),
         E::ReproductionMismatch { .. }
         | E::NetworkMismatch { .. }
         | E::MalformedInscription { .. }
@@ -213,14 +213,14 @@ fn found_wrong(error: &dolos_snapshot::Error) -> bool {
 }
 
 /// Exhaustive, so a new protocol refusal is classified where it is added.
-pub(crate) fn refused_stele(error: &stelae::Error) -> bool {
+pub(crate) fn refused_snapshot(error: &stelae::Error) -> bool {
     use stelae::Error as E;
 
     match error {
         // The digest check `pull_blob` runs, and the size ceiling beside it.
         E::Registry(_) => error.is_blob_refusal(),
         // Classified by what the last attempt hit, as a layer failure is.
-        E::RetriesExhausted { source, .. } => refused_stele(source),
+        E::RetriesExhausted { source, .. } => refused_snapshot(source),
         E::Json(_)
         | E::NonCanonicalCbor { .. }
         | E::TruncatedCbor { .. }
@@ -237,8 +237,8 @@ pub(crate) fn refused_stele(error: &stelae::Error) -> bool {
         | E::LinkInvariant(_)
         | E::DuplicateLayer { .. }
         | E::DuplicateInChain { .. }
-        // A document the stele's own chain names and the source doesn't hold:
-        // the stele can't be resolved, whatever else is published.
+        // A document the snapshot's own chain names and the source doesn't hold:
+        // the snapshot can't be resolved, whatever else is published.
         | E::MissingLink { .. }
         | E::MalformedRecord { .. }
         | E::InvalidDigest { .. }
@@ -269,14 +269,14 @@ pub(crate) fn refused_stele(error: &stelae::Error) -> bool {
     }
 }
 
-/// Whether a reproduction that ran found the stele differing from the local
+/// Whether a reproduction that ran found the snapshot differing from the local
 /// stores, rather than failing to read them.
 ///
 /// Narrower than [`found_wrong`]: a reproduction re-runs the export, and the
 /// export refuses malformed or out-of-order records from the stores it reads
-/// with the same errors a verification raises for a stele's own. The published
-/// documents were held to the profile before the reproduction began, so
-/// whatever else it raises came from the stores.
+/// with the same errors a verification raises for a snapshot's own. The
+/// published documents were held to the profile before the reproduction began,
+/// so whatever else it raises came from the stores.
 fn reproduction_differs(error: &dolos_snapshot::Error) -> bool {
     use dolos_snapshot::Error as E;
 
@@ -324,17 +324,17 @@ pub fn with_plan<T>(
     }
 }
 
-/// What a reproduction is chained to and names, as the stele it reproduces
+/// What a reproduction is chained to and names, as the snapshot it reproduces
 /// would be.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Inputs {
-    /// The stele before it, or `None` where it starts a lineage.
+    /// The snapshot before it, or `None` where it starts a lineage.
     pub previous: Option<Link>,
     /// The blocks snapshot at its sequence, or `None` to name none.
     pub blocks: Option<Digest>,
 }
 
-/// The link to the stele `digest` names, just before `sequence`.
+/// The link to the snapshot `digest` names, just before `sequence`.
 pub fn previous_at(sequence: u64, digest: Digest) -> Result<Link, Error> {
     Ok(Link {
         sequence: sequence.checked_sub(1).ok_or(Error::NothingBefore)?,
@@ -370,7 +370,7 @@ pub fn digest(
     };
     let document = snapshot
         .digest_document(&plan, &Linked(inputs.previous))
-        .map_err(Error::profile("reproducing the stele"))?;
+        .map_err(Error::profile("reproducing the snapshot"))?;
 
     Ok(Digested { inputs, document })
 }
@@ -378,7 +378,7 @@ pub fn digest(
 /// Rebuild every layer of `published` from the local stores and require the
 /// result to be byte-identical.
 ///
-/// The transport check's chain walk held the published link to the stele
+/// The transport check's chain walk held the published link to the snapshot
 /// before it. `previous`, when the caller names one, is held to that link as
 /// well, so the documents compared are chained where the caller says.
 pub fn reproduce(
@@ -389,8 +389,9 @@ pub fn reproduce(
 ) -> Result<Inscription, Error> {
     // The one part of the published documents the reproduction reads that the
     // transport check did not.
-    read_position(&published.position)
-        .map_err(Error::verifying("reading the published stele's position"))?;
+    read_position(&published.position).map_err(Error::verifying(
+        "reading the published snapshot's position",
+    ))?;
 
     if let Some(previous) = previous.filter(|previous| published.previous != Some(*previous)) {
         let follows = match published.previous {
@@ -398,11 +399,11 @@ pub fn reproduce(
             None => "nothing".to_owned(),
         };
         return Err(Error::Mismatch {
-            what: "holding the published stele to --previous".to_owned(),
+            what: "holding the published snapshot to --previous".to_owned(),
             source: Box::new(dolos_snapshot::Error::ReproductionMismatch {
                 subject: "previous".to_owned(),
                 reason: format!(
-                    "the published stele follows {follows}, and --previous names {} at sequence \
+                    "the published snapshot follows {follows}, and --previous names {} at sequence \
                      {}",
                     previous.inscription_digest, previous.sequence,
                 ),
@@ -413,7 +414,7 @@ pub fn reproduce(
     snapshot
         .verify_reproduction(published, plan)
         .map_err(Error::classified(
-            "reproducing the published stele from the local stores",
+            "reproducing the published snapshot from the local stores",
             reproduction_differs,
         ))
 }
@@ -463,7 +464,7 @@ impl Side {
     }
 }
 
-/// A network root's steles, opened.
+/// A network root's snapshots, opened.
 pub struct Published {
     root: Source,
     dolos: Side,
@@ -484,7 +485,7 @@ impl Published {
         let dolos = source
             .profile(DOLOS_REPOSITORY)
             .and_then(|dolos| Side::open(config, &dolos, insecure, auth.clone()))
-            .map_err(Error::profile("opening the stele"))?;
+            .map_err(Error::profile("opening the snapshot"))?;
         Ok(Self {
             root: source.clone(),
             dolos,
@@ -493,18 +494,18 @@ impl Published {
         })
     }
 
-    /// Read the stele's documents and its chain's, without pulling a layer.
+    /// Read the snapshot's documents and its chain's, without pulling a layer.
     pub fn inspect(&self, point: Point) -> Result<Inspected, Error> {
         let inspected = match &self.dolos {
             Side::Repository(registry) => registry::inspect(registry, point),
             Side::Directory(dir) => inspect_dir(dir, point),
         };
 
-        inspected.map_err(Error::profile("reading the stele"))
+        inspected.map_err(Error::profile("reading the snapshot"))
     }
 
-    /// Check the stele's digests: its chain, its documents against each other,
-    /// then every blob of its layer set against both of its digests.
+    /// Check the snapshot's digests: its chain, its documents against each
+    /// other, then every blob of its layer set against both of its digests.
     ///
     /// Both sources' failures are classified at one place, so what the
     /// directory tests hold a refusal to holds for a registry's too.
@@ -514,16 +515,16 @@ impl Published {
             Side::Directory(dir) => verify_dir(dir, point),
         };
 
-        verified.map_err(Error::verifying("verifying the stele"))
+        verified.map_err(Error::verifying("verifying the snapshot"))
     }
 
-    /// The link a publish of `plan` here carries: to the stele before its
+    /// The link a publish of `plan` here carries: to the snapshot before its
     /// sequence, or `None` where there is none, which starts a lineage.
     pub fn previous(&self, plan: &Plan) -> Result<Option<Link>, Error> {
         let Some(sequence) = plan.sequence.checked_sub(1) else {
             return Ok(None);
         };
-        let what = format!("reading the stele at sequence {sequence}");
+        let what = format!("reading the snapshot at sequence {sequence}");
         match self.dolos.inscription(&DolosProfile, sequence) {
             Ok(Some(previous)) => Ok(Following::new(&previous, plan)
                 .map_err(Error::profile(what))?
@@ -676,7 +677,7 @@ mod tests {
             assert!(!Error::verifying("verifying")(error).is_mismatch());
         }
 
-        // A registry or a staging directory that failed is not the stele.
+        // A registry or a staging directory that failed is not the snapshot.
         for source in [
             stelae::Error::Registry(std::io::Error::from(std::io::ErrorKind::StorageFull).into()),
             stelae::Error::Scratch {
