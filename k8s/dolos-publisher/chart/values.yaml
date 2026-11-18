@@ -24,7 +24,7 @@ network: ""
 run: ""
 
 # Where the publisher writes: an oci:// URL to the network root. Each
-# boundary's blocks snapshot goes to its `blocks` repository, then the stele
+# boundary's blocks snapshot goes to its `blocks` repository, then the Dolos snapshot
 # naming it to its `dolos` repository.
 repo: ""
 

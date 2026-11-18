@@ -16,17 +16,18 @@
 //! once a window left from the lost replay is out of the way.
 //!
 //! Ordering at a commit: read what the repository really holds, hold it to the
-//! journal, publish, and journal the stele before its bundle goes. A stele the
-//! repository already holds at the next sequence is an upload whose
-//! acknowledgement was lost, or another writer's, and only its identity tells
-//! them apart: it is reproduced and compared, and a difference refuses.
+//! journal, publish, and journal the snapshot before its bundle goes. A
+//! snapshot the repository already holds at the next sequence is an upload
+//! whose acknowledgement was lost, or another writer's, and only its identity
+//! tells them apart: it is reproduced and compared, and a difference refuses.
 //!
-//! Every stele names the blocks snapshot of its own sequence, which the host
-//! publishes into the blocks repository first ([`crate::blocks`]): at a batch's
-//! capture, or before a batch of one publishes, and in either case before the
-//! closed epoch's immutable files are removed. A batch of one therefore removes
-//! them only once the stele is published. A restart that needs a blocks
-//! snapshot after its files are gone downloads them again beside the window.
+//! Every Dolos snapshot names the blocks snapshot of its own sequence, which
+//! the host publishes into the blocks repository first ([`crate::blocks`]): at
+//! a batch's capture, or before a batch of one publishes, and in either case
+//! before the closed epoch's immutable files are removed. A batch of one
+//! therefore removes them only once the snapshot is published. A restart that
+//! needs a blocks snapshot after its files are gone downloads them again beside
+//! the window.
 
 use std::{
     path::{Path, PathBuf},
@@ -164,7 +165,7 @@ pub enum Error {
     StorePoisoned(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error(
         "the state store stands at slot {cursor} and {}: the state passed blocks the archive \
-         never got, and replaying on would leave them out of every stele. {START_OVER}",
+         never got, and replaying on would leave them out of every snapshot. {START_OVER}",
         archive_end(.tip)
     )]
     ArchiveBehind {
@@ -231,8 +232,8 @@ impl Error {
 /// Refuse stores whose state has passed the archive. Dolos commits a block's
 /// state first and an import keeps no WAL to catch the archive up from, so
 /// replaying on would close the difference and leave those blocks out of every
-/// stele. Only a block's commit moves a hashed cursor, and an archive ahead of
-/// it heals as the same blocks import again, up to the next boundary.
+/// snapshot. Only a block's commit moves a hashed cursor, and an archive ahead
+/// of it heals as the same blocks import again, up to the next boundary.
 ///
 /// This can't see a gap later imports already closed.
 pub fn refuse_archive_behind(config: &RootConfig, genesis: Arc<Genesis>) -> Result<(), Error> {
@@ -345,22 +346,23 @@ pub trait Publish {
         Ok(())
     }
     fn publish(&self, plan: &Plan, source: &dyn SnapshotSource) -> Result<(), Error>;
-    /// The repository's latest stele as `plan` finds it: what a batch follows.
+    /// The repository's latest snapshot as `plan` finds it: what a batch
+    /// follows.
     fn latest(&self, plan: &Plan) -> Result<Option<Committed>, Error>;
-    /// The stele the repository holds under `sequence`'s immutable tag.
-    fn stele(&self, sequence: u64) -> Result<Option<Held>, Error>;
+    /// The snapshot the repository holds under `sequence`'s immutable tag.
+    fn snapshot(&self, sequence: u64) -> Result<Option<Held>, Error>;
     /// The inscription digest of the blocks snapshot at `plan`'s sequence,
-    /// which the stele there names: the one the blocks repository holds, once
-    /// reproduced from `files`, or else one published from them.
+    /// which the Dolos snapshot there names: the one the blocks repository
+    /// holds, once reproduced from `files`, or else one published from them.
     fn blocks(
         &self,
         plan: &Plan,
         files: &dyn Fn() -> Result<EpochFiles, Error>,
     ) -> Result<Digest, Error>;
-    /// Publish a prepared boundary, chained to the repository's latest stele,
-    /// which has to be `predecessor`. Failures of the publication itself are
-    /// [`Error::Finalizing`], which is what tells a damaged bundle from a
-    /// registry that didn't answer.
+    /// Publish a prepared boundary, chained to the repository's latest
+    /// snapshot, which has to be `predecessor`. Failures of the publication
+    /// itself are [`Error::Finalizing`], which is what tells a damaged
+    /// bundle from a registry that didn't answer.
     fn finalize(
         &self,
         finalizing: &Finalizing<'_>,
@@ -741,7 +743,7 @@ struct Reconciled {
     capture: Option<Capture>,
 }
 
-/// The repository's latest stele, once a batch may follow it.
+/// The repository's latest snapshot, once a batch may follow it.
 struct Latest(Option<Committed>);
 
 fn finish_both<T>(work: Result<T, Error>, finish: Result<(), Error>) -> Result<T, Error> {
@@ -920,7 +922,7 @@ impl<W: Workspace> Driver<'_, W> {
             };
             match self.extend(target, prune, width, None)? {
                 // Its blocks snapshot reads the files the boundary closed, so
-                // they go once its stele is published, at the next turn.
+                // they go once its snapshot is published, at the next turn.
                 Advance::Boundary { .. } => {}
                 Advance::MithrilExhausted { .. } => return Ok(Outcome::UpToDate),
                 Advance::Cancelled => return Err(Error::Interrupted),
@@ -1036,9 +1038,9 @@ impl<W: Workspace> Driver<'_, W> {
             return Ok(None);
         };
         let held = stelae_driver::retry::transient(
-            "reading the stele a batch follows",
+            "reading the snapshot a batch follows",
             &|| self.aborted(),
-            || self.publish.stele(planned.sequence),
+            || self.publish.snapshot(planned.sequence),
         )?;
         match held {
             Some(held) if held.committed == *planned => Ok(Some(held.inscription)),
@@ -1110,7 +1112,7 @@ impl<W: Workspace> Driver<'_, W> {
         // A seal writes the sequence's tags before it moves the latest one, so
         // a tag here is a seal that stopped half way, or another writer's.
         // Sealing again only repeats what this batch would write.
-        if let Some(held) = self.publish.stele(sequence)? {
+        if let Some(held) = self.publish.snapshot(sequence)? {
             let expected = self.reproduce(source, batch, &finalizing, sequence)?;
             if expected != held.committed.identity {
                 let found = held.committed.identity;
@@ -1123,7 +1125,7 @@ impl<W: Workspace> Driver<'_, W> {
             .map_err(|error| finalizing_failure(batch, sequence, error))
     }
 
-    /// Hold a `latest` stele already at the next sequence to what this batch
+    /// Hold a `latest` snapshot already at the next sequence to what this batch
     /// publishes there.
     fn confirm(
         &self,
@@ -1199,7 +1201,7 @@ impl<W: Workspace> Driver<'_, W> {
         let scope = blocks::closed_epoch(&plan).map_err(Error::caller)?;
         let files = || self.epoch_files(scope);
         let named = stelae_driver::retry::transient(
-            "publishing the blocks snapshot a stele names",
+            "publishing the blocks snapshot a Dolos snapshot names",
             &|| self.aborted(),
             || match self.publish.blocks(&plan, &files) {
                 Err(error) if error.is_refusal() || error.is_source_failure() => Ok(Err(error)),
@@ -1292,7 +1294,7 @@ impl<W: Workspace> Driver<'_, W> {
 
     fn latest(&self, plan: &Plan) -> Result<Option<Committed>, Error> {
         stelae_driver::retry::transient(
-            "reading the repository's latest stele",
+            "reading the repository's latest snapshot",
             &|| self.aborted(),
             || self.publish.latest(plan),
         )

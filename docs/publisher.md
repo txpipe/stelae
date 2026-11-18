@@ -164,7 +164,7 @@ stelae-publisher --config dolos.toml run \
 
 `run` restores `latest` from the root's `dolos` repository before replay, with
 the closed epochs' blocks from its `blocks` repository. `backfill` and `run`
-publish each boundary's blocks snapshot themselves, before its stele (see
+publish each boundary's blocks snapshot themselves, before its Dolos snapshot (see
 [Blocks snapshots](#blocks-snapshots)). Use
 `--restore-source` to restore elsewhere. Restore failure is fatal and partial
 stores are cleared. `--allow-genesis` is the only genesis fallback and is for
@@ -481,7 +481,7 @@ Three cases read differently:
 ## Blocks snapshots
 
 Each boundary has two snapshots, written in this order: the blocks snapshot,
-in the root's `blocks` repository, then the stele, in its `dolos` repository,
+in the root's `blocks` repository, then the Dolos snapshot, in its `dolos` repository,
 whose `position` names the blocks snapshot by its inscription digest. Both are
 tagged `epoch-N` at the boundary that opens epoch N, and both lineages start at
 `epoch-1`.
@@ -491,23 +491,23 @@ immutable files with the blocks profile, one `blocks` layer for the whole
 epoch, and seals it at sequence N after the blocks repository's `latest`,
 which has to be `epoch-(N−1)`:
 
-- A batch of one does this before it publishes the stele, and removes the
-  immutable files the boundary consumed only once the stele is published. It
+- A batch of one does this before it publishes the Dolos snapshot, and removes the
+  immutable files the boundary consumed only once the Dolos snapshot is published. It
   keeps every file of the epoch the stores stand in, which the next
   boundary's blocks snapshot reads, so a run that ends part way through an
   epoch leaves its files to the next run.
 - A larger batch does it when it captures the boundary, before the consumed
   files go. The bundle, which the journal names, carries the reference, so the
-  flush publishes the stele later without reading the blocks repository.
+  flush publishes the Dolos snapshot later without reading the blocks repository.
 
 A blocks snapshot already at N, which a run killed between the two snapshots
 leaves, is reproduced from the same files, following the repository's
-`epoch-(N−1)`, and compared by inscription digest, as a stele already at its
+`epoch-(N−1)`, and compared by inscription digest, as a Dolos snapshot already at its
 sequence is. A seal writes `epoch-N` before it moves `latest`, so one held
 under a `latest` still at N−1 is a seal that stopped between the two: it is
 reproduced following that `latest` and, once it compares, sealed again, which
 writes the same tag and moves `latest`. A `latest` past N never moves. These
-refuse, with nothing of the stele at N written and no retry:
+refuse, with nothing of the Dolos snapshot at N written and no retry:
 
 - a blocks snapshot at N that the files do not reproduce;
 - one that is another sequence's or another network's;
@@ -526,10 +526,10 @@ rerun seals from it without downloading again. Files without that marker,
 as a crash part way through a download leaves them, are downloaded again.
 One that Mithril rejected, or that was stopped, is
 removed, and the run ends on that failure, which the download has already
-retried. A boundary whose stele the `dolos` repository already holds reads no
+retried. A boundary whose Dolos snapshot the `dolos` repository already holds reads no
 blocks snapshot.
 
-The blocks upload goes through the same transport settings as the stele's:
+The blocks upload goes through the same transport settings as the Dolos snapshot's:
 registry credentials, `--concurrency` and `--direct-s3-config`.
 
 ## Prepared batches

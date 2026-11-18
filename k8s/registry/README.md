@@ -1,6 +1,6 @@
 # Stelae registry
 
-The registry software that serves stele repositories: **zot over an S3
+The registry software that serves snapshot repositories: **zot over an S3
 object store**, packaged so that no cluster, bucket, hostname or credential
 is assumed. This directory is the instance-agnostic deployment unit;
 deployment values, Secret manifests, and operational procedures belong in the
@@ -94,7 +94,7 @@ Worker over the `stelae-registry` bucket, and the first zot deployment in a
 Cloudflare Container behind a Worker router. Both were decommissioned under
 the operator's infrastructure plan; the deployment unit lives in git history.
 
-The steles themselves were moved once, on 2026-08-28, from the retired
+The snapshots themselves were moved once, on 2026-08-28, from the retired
 Worker's R2 layout into zot's by a control-plane copy tool that lived here
 as `migrate/`. It was removed on 2026-09-06: its source layout no longer
 exists and everything it carried over has since been re-published from

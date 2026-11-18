@@ -66,7 +66,7 @@ impl Run {
         let config = node.write_config();
         let registry = tempfile::tempdir().unwrap();
         let loopback = Loopback::serve(registry.path()).unwrap();
-        // The blocks snapshots every stele names, there before the process.
+        // The blocks snapshots every Dolos snapshot names, there before the process.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let scratch = tempfile::tempdir().unwrap();
         let blocks = loopback.repository(&format!("{ROOT}/blocks"));

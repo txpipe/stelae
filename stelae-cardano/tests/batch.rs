@@ -43,7 +43,7 @@ const REPOSITORY: &str = "oci://registry.invalid/cardano/test";
 const SLOTS_PER_FILE: u64 = 4_320;
 
 /// The blocks snapshot the fake repository names at `sequence`, which every
-/// stele here names. Nothing reads it back, so any digest serves.
+/// snapshot here names. Nothing reads it back, so any digest serves.
 fn blocks_at(sequence: u64) -> Digest {
     Digest::compute(format!("the blocks snapshot at {sequence}").as_bytes())
 }
@@ -529,7 +529,7 @@ enum Fault {
     Upload,
     /// Die with the immutable tag written and the latest tag not moved.
     SealHalfWay,
-    /// Die with the stele published, before its answer is read.
+    /// Die with the snapshot published, before its answer is read.
     Acknowledgement,
     /// The answer is lost, and the process lives to try again.
     AcknowledgementLostAlive,
@@ -542,14 +542,14 @@ enum Fault {
 }
 
 /// A repository holding what the test says it holds, which otherwise moves only
-/// by what is published into it. Identities are real: each stele is the
+/// by what is published into it. Identities are real: each snapshot is the
 /// document a chained publish produces from the same bundle, runs and
 /// predecessor.
 struct Repository {
     latest: RefCell<Option<Committed>>,
     calls: Rc<Calls>,
     /// The immutable tags.
-    steles: RefCell<BTreeMap<u64, Document>>,
+    snapshots: RefCell<BTreeMap<u64, Document>>,
     /// Sequences that reached the repository, each time one did.
     uploaded: RefCell<Vec<u64>>,
     fault: Cell<Option<(u64, Fault)>>,
@@ -576,12 +576,12 @@ impl Repository {
     }
 
     fn inscription(&self, sequence: u64) -> Option<Inscription> {
-        let steles = self.steles.borrow();
-        let document = steles.get(&sequence)?;
+        let snapshots = self.snapshots.borrow();
+        let document = snapshots.get(&sequence)?;
         Some(Inscription::parse(&document.canonical).unwrap())
     }
 
-    /// What the repository's latest stele chains the next one to.
+    /// What the repository's latest snapshot chains the next one to.
     fn followed(&self) -> Option<Inscription> {
         let latest = self.latest.borrow();
         latest.as_ref().and_then(|l| self.inscription(l.sequence))
@@ -593,8 +593,8 @@ impl Repository {
     }
 
     fn tags(&self) -> BTreeMap<u64, Vec<u8>> {
-        let steles = self.steles.borrow();
-        steles
+        let snapshots = self.snapshots.borrow();
+        snapshots
             .iter()
             .map(|(sequence, document)| (*sequence, document.canonical.clone()))
             .collect()
@@ -611,7 +611,7 @@ impl backfill::Publish for Repository {
                 .digest_document(plan, &*following)
                 .map_err(backfill::Error::caller)?;
             *self.latest.borrow_mut() = Some(Self::committed(plan.sequence, &document));
-            self.steles.borrow_mut().insert(plan.sequence, document);
+            self.snapshots.borrow_mut().insert(plan.sequence, document);
         } else {
             // Its latest moves all the same, so the next boundary continues it.
             *self.latest.borrow_mut() = Some(Committed {
@@ -646,14 +646,14 @@ impl backfill::Publish for Repository {
         Ok(blocks_at(sequence))
     }
 
-    fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+    fn snapshot(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
         if self.unreadable_tag.get() == Some(sequence) {
             // Spares the retries' backoff: this failure is all a test asks of them.
             self.calls.cancel.get().cancel();
             return Err(backfill::Error::caller(io::Error::other(UNREADABLE_TAG)));
         }
-        let steles = self.steles.borrow();
-        Ok(steles.get(&sequence).map(|document| Held {
+        let snapshots = self.snapshots.borrow();
+        Ok(snapshots.get(&sequence).map(|document| Held {
             committed: Self::committed(sequence, document),
             inscription: Inscription::parse(&document.canonical).unwrap(),
         }))
@@ -705,7 +705,7 @@ impl backfill::Publish for Repository {
             .finalize_document(finalizing, &*following)
             .map_err(|error| backfill::Error::Finalizing(Box::new(error)))?;
         let committed = Self::committed(sequence, &document);
-        self.steles.borrow_mut().insert(sequence, document);
+        self.snapshots.borrow_mut().insert(sequence, document);
         if fault == Some(Fault::SealHalfWay) {
             return Err(self.die());
         }
@@ -755,8 +755,8 @@ impl backfill::Publish for Around<'_> {
         self.inner.latest(plan)
     }
 
-    fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
-        self.inner.stele(sequence)
+    fn snapshot(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+        self.inner.snapshot(sequence)
     }
 
     fn blocks(
@@ -815,7 +815,7 @@ impl<'a> Rig<'a> {
             repository: Repository {
                 latest: RefCell::new(None),
                 calls: calls.clone(),
-                steles: RefCell::default(),
+                snapshots: RefCell::default(),
                 uploaded: RefCell::default(),
                 fault: Cell::new(None),
                 keep_singles: Cell::new(false),
@@ -1747,8 +1747,8 @@ impl backfill::Publish for BlocksFailOnce<'_> {
         self.inner.latest(plan)
     }
 
-    fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
-        self.inner.stele(sequence)
+    fn snapshot(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+        self.inner.snapshot(sequence)
     }
 
     fn blocks(
@@ -1825,7 +1825,7 @@ fn consumed_input_goes_only_after_the_journal_names_the_boundary() {
 }
 
 /// Stand the stores on `stop`'s boundary with no batch: what a restore of the
-/// repository's latest stele, or a batch of one, leaves behind.
+/// repository's latest snapshot, or a batch of one, leaves behind.
 fn stand_on(rig: &Rig<'_>, stop: u64) {
     let mut session =
         BulkReplaySession::open(&rig.node.config, rig.chain.genesis.clone(), Some(stop)).unwrap();
@@ -2025,9 +2025,9 @@ fn a_deleted_batch_over_a_held_repository_refuses_the_gap() {
     assert!(error.to_string().contains("gap"), "{error}");
 }
 
-/// A batch of one over a record it hasn't passed is the same first stele.
+/// A batch of one over a record it hasn't passed is the same first snapshot.
 #[test]
-fn a_first_capture_that_failed_leaves_the_first_stele_possible() {
+fn a_first_capture_that_failed_leaves_the_first_snapshot_possible() {
     let chain = Chain::spanning(12);
     let rig = Rig::new(&chain);
     rig.calls.full_at.set(Some(1));
@@ -2043,7 +2043,7 @@ fn a_first_capture_that_failed_leaves_the_first_stele_possible() {
     assert_eq!(rig.calls.published.get(), 1);
 }
 
-/// Once the repository holds a stele, the record has nothing left to say.
+/// Once the repository holds a snapshot, the record has nothing left to say.
 #[test]
 fn the_record_of_a_beginning_is_inert_over_a_held_repository() {
     let chain = Chain::spanning(12);
@@ -2158,7 +2158,7 @@ fn initialize_from(
     .map_err(|error| error.to_string())
 }
 
-/// The refusal's own steps, in its order, over a repository holding a stele.
+/// The refusal's own steps, in its order, over a repository holding a snapshot.
 #[test]
 fn the_recovery_over_a_held_repository_works_as_written() {
     use stelae_cardano::initialize::Outcome as Init;
@@ -2170,13 +2170,13 @@ fn the_recovery_over_a_held_repository_works_as_written() {
         Outcome::UntilEpoch { sequence: 1 }
     );
     repository_at(&rig, 1);
-    let stele = rig.node.path().join("stele");
+    let snapshot = rig.node.path().join("snapshot");
     stelae_cardano::publisher::publish_once(
         &rig.node.config,
         &chain.genesis,
         stelae_cardano::Selection::default(),
         stelae_cardano::publisher::Destination::Directory {
-            path: stele.clone(),
+            path: snapshot.clone(),
             scratch_dir: None,
         },
         false,
@@ -2194,11 +2194,11 @@ fn the_recovery_over_a_held_repository_works_as_written() {
     );
 
     // Out of order, the restore finds the stores there and changes nothing.
-    assert_eq!(initialize_from(&rig, &stele, false), Ok(Init::Existing));
+    assert_eq!(initialize_from(&rig, &snapshot, false), Ok(Init::Existing));
 
     dolos::storage::clear_storage(&rig.node.config.storage.path).unwrap();
     assert_eq!(
-        initialize_from(&rig, &stele, false),
+        initialize_from(&rig, &snapshot, false),
         Ok(Init::Restored { sequence: 1 })
     );
     rig.restart_with_the_whole_source();
@@ -2217,9 +2217,9 @@ fn the_recovery_clears_stores_configured_outside_the_storage_path() {
     let outside = rig.node.path().join("elsewhere");
     rig.node.config.storage.state.path = Some(outside.join("state"));
     rig.node.config.storage.archive.path = Some(outside.join("archive"));
-    let no_stele = rig.node.path().join("no-stele");
+    let no_snapshot = rig.node.path().join("no-snapshot");
 
-    assert_eq!(initialize_from(&rig, &no_stele, true), Ok(Init::Genesis));
+    assert_eq!(initialize_from(&rig, &no_snapshot, true), Ok(Init::Genesis));
     ready(rig.run(limits(4), None));
     std::fs::remove_file(batch_dir(&rig).join("prepared/bundles/2.json")).unwrap();
     let message = rig.run(limits(4), None).unwrap_err().to_string();
@@ -2227,10 +2227,13 @@ fn the_recovery_clears_stores_configured_outside_the_storage_path() {
 
     let storage = &rig.node.config.storage.path;
     dolos::storage::clear_storage(storage).unwrap();
-    assert_eq!(initialize_from(&rig, &no_stele, true), Ok(Init::Existing));
+    assert_eq!(
+        initialize_from(&rig, &no_snapshot, true),
+        Ok(Init::Existing)
+    );
 
     std::fs::remove_dir_all(&outside).unwrap();
-    assert_eq!(initialize_from(&rig, &no_stele, true), Ok(Init::Genesis));
+    assert_eq!(initialize_from(&rig, &no_snapshot, true), Ok(Init::Genesis));
     rig.restart_with_the_whole_source();
     ready(rig.run(limits(4), None));
     assert_eq!(rig.sequences(), [1, 2, 3, 4]);
@@ -2266,7 +2269,7 @@ fn the_recovery_names_a_route_for_an_empty_repository() {
     assert!(message.contains("--allow-genesis"), "{message}");
 
     let options = |allow_genesis| initialize::Options {
-        source: dolos_snapshot::restore::Source::Dir(rig.node.path().join("no-stele")),
+        source: dolos_snapshot::restore::Source::Dir(rig.node.path().join("no-snapshot")),
         point: dolos_snapshot::facade::Point::Latest,
         auth: stelae_cardano::Auth::Anonymous,
         insecure: false,
@@ -2746,8 +2749,12 @@ fn stores_whose_state_passed_the_archive_are_refused() {
     }
 
     let message = rig.run(Limits::ONE, None).unwrap_err().to_string();
-    assert!(message.contains("latest stele"), "{message}");
+    assert!(message.contains("latest snapshot"), "{message}");
     assert!(message.contains("--allow-genesis"), "{message}");
+    assert!(
+        message.contains("no snapshot has nothing to restore"),
+        "{message}"
+    );
 }
 
 /// A batch resuming is no exception: what it holds doesn't vouch for the blocks
@@ -2821,8 +2828,12 @@ fn a_cursor_estart_left_names_how_to_recover() {
 
     for batching in [Limits::ONE, limits(3)] {
         let message = rig.run(batching, None).unwrap_err().to_string();
-        assert!(message.contains("latest stele"), "{message}");
+        assert!(message.contains("latest snapshot"), "{message}");
         assert!(message.contains("--allow-genesis"), "{message}");
+        assert!(
+            message.contains("no snapshot has nothing to restore"),
+            "{message}"
+        );
     }
 }
 
@@ -2842,7 +2853,7 @@ fn a_failed_read_of_the_epoch_doesnt_ask_to_clear_the_stores() {
             panic!("{error}");
         };
         assert!(cause.to_string().contains("read failed"), "{error}");
-        assert!(!error.to_string().contains("latest stele"), "{error}");
+        assert!(!error.to_string().contains("latest snapshot"), "{error}");
     }
 }
 
@@ -2961,10 +2972,10 @@ fn stores_past_the_repository_begin_no_batch() {
     assert!(rig.sequences().is_empty());
 }
 
-/// A batch over a non-empty repository follows its latest stele: at every
+/// A batch over a non-empty repository follows its latest snapshot: at every
 /// boundary, in the journal, in the frontiers and across a restart.
 #[test]
-fn a_batch_keeps_following_the_stele_it_began_over() {
+fn a_batch_keeps_following_the_snapshot_it_began_over() {
     let chain = Chain::spanning(12);
     let rig = Rig::new(&chain);
     stand_on(&rig, 2);
@@ -3193,8 +3204,8 @@ fn assert_batch_is_gone(rig: &Rig<'_>) {
     }
 }
 
-/// Every sequence in order, one staging for the batch, each stele what stores
-/// frozen at its boundary publish, chained to the real digest before it.
+/// Every sequence in order, one staging for the batch, each snapshot what
+/// stores frozen at its boundary publish, chained to the real digest before it.
 #[test]
 fn a_batch_publishes_in_order_as_frozen_stores_do_from_one_staging() {
     let chain = Chain::spanning(12);
@@ -3911,8 +3922,8 @@ fn a_kill_during_an_upload_converges() {
     assert_eq!(rig.repository.tags(), uninterrupted(&chain));
 }
 
-/// The stele landed and nothing said so: the rerun finds it, proves it is this
-/// batch's by its identity, and doesn't upload it again.
+/// The snapshot landed and nothing said so: the rerun finds it, proves it is
+/// this batch's by its identity, and doesn't upload it again.
 #[test]
 fn a_lost_acknowledgement_reconciles_without_another_upload() {
     let chain = Chain::spanning(12);
@@ -3945,7 +3956,7 @@ fn an_attempt_after_a_lost_acknowledgement_reconciles_in_place() {
 /// The first sequence has no predecessor to read, which reconciling also
 /// covers.
 #[test]
-fn a_lost_acknowledgement_of_a_first_stele_reconciles() {
+fn a_lost_acknowledgement_of_a_first_snapshot_reconciles() {
     let chain = Chain::spanning(12);
     let rig = Rig::new(&chain);
     rig.repository.fault.set(Some((1, Fault::Acknowledgement)));
@@ -3972,7 +3983,7 @@ fn a_seal_that_stopped_half_way_is_finished() {
     assert_eq!(rig.repository.tags(), uninterrupted(&chain));
 }
 
-/// The stele landed and its journal write failed, so the journal still names
+/// The snapshot landed and its journal write failed, so the journal still names
 /// it: the rerun reconciles rather than uploading it again.
 #[cfg(unix)]
 #[test]
@@ -4129,10 +4140,10 @@ fn another_source_refuses_a_batch_part_way_through() {
     assert_eq!(rig.repository.tags(), uninterrupted(&chain));
 }
 
-/// Another writer's stele at the next sequence differs in its identity, and
+/// Another writer's snapshot at the next sequence differs in its identity, and
 /// nothing overwrites it or moves past it.
 #[test]
-fn another_writers_stele_at_the_next_sequence_refuses() {
+fn another_writers_snapshot_at_the_next_sequence_refuses() {
     let chain = Chain::spanning(12);
     let rig = Rig::new(&chain);
     stopped_after_the_first_commit(&rig);
@@ -4169,9 +4180,12 @@ fn another_writers_immutable_tag_refuses_before_it_is_overwritten() {
     stopped_after_the_first_commit(&rig);
     let journal = journal_bytes(&rig);
 
-    let mut theirs = rig.repository.steles.borrow()[&1].clone();
+    let mut theirs = rig.repository.snapshots.borrow()[&1].clone();
     theirs.identity = stelae::Digest::compute(b"another writer");
-    rig.repository.steles.borrow_mut().insert(2, theirs.clone());
+    rig.repository
+        .snapshots
+        .borrow_mut()
+        .insert(2, theirs.clone());
 
     let error = rig.drain(limits(4), None).unwrap_err();
     assert!(
@@ -4212,7 +4226,10 @@ fn another_writers_immutable_tag_refuses_before_it_is_overwritten() {
         "{message}"
     );
     assert_nothing_moved(&rig, &journal, &[1]);
-    assert_eq!(rig.repository.steles.borrow()[&2].identity, theirs.identity);
+    assert_eq!(
+        rig.repository.snapshots.borrow()[&2].identity,
+        theirs.identity
+    );
 }
 
 /// A failed read of the tag isn't an absent tag: the seal would push over
@@ -4224,15 +4241,21 @@ fn an_immutable_tag_that_cant_be_read_isnt_sealed_over() {
     stopped_after_the_first_commit(&rig);
     let journal = journal_bytes(&rig);
 
-    let mut theirs = rig.repository.steles.borrow()[&1].clone();
+    let mut theirs = rig.repository.snapshots.borrow()[&1].clone();
     theirs.identity = stelae::Digest::compute(b"another writer");
-    rig.repository.steles.borrow_mut().insert(2, theirs.clone());
+    rig.repository
+        .snapshots
+        .borrow_mut()
+        .insert(2, theirs.clone());
     rig.repository.unreadable_tag.set(Some(2));
 
     let error = rig.drain(limits(4), None).unwrap_err();
     assert!(error.to_string().contains(UNREADABLE_TAG), "{error}");
     assert_nothing_moved(&rig, &journal, &[1]);
-    assert_eq!(rig.repository.steles.borrow()[&2].identity, theirs.identity);
+    assert_eq!(
+        rig.repository.snapshots.borrow()[&2].identity,
+        theirs.identity
+    );
 }
 
 /// The refusal's recovery works as written, and keeps the batch.
@@ -4241,18 +4264,18 @@ fn deleting_another_writers_immutable_tag_lets_the_batch_go_on() {
     let chain = Chain::spanning(12);
     let rig = Rig::new(&chain);
     stopped_after_the_first_commit(&rig);
-    let mut theirs = rig.repository.steles.borrow()[&1].clone();
+    let mut theirs = rig.repository.snapshots.borrow()[&1].clone();
     theirs.identity = stelae::Digest::compute(b"another writer");
-    rig.repository.steles.borrow_mut().insert(2, theirs);
+    rig.repository.snapshots.borrow_mut().insert(2, theirs);
     rig.drain(limits(4), None).unwrap_err();
 
-    rig.repository.steles.borrow_mut().remove(&2);
+    rig.repository.snapshots.borrow_mut().remove(&2);
     assert_eq!(rig.restart_and_drain(limits(4)).unwrap(), Outcome::UpToDate);
     assert_eq!(rig.repository.tags(), uninterrupted(&chain));
 }
 
-/// Put another writer's stele under `latest` at `sequence`, as a rewrite of its
-/// tags would.
+/// Put another writer's snapshot under `latest` at `sequence`, as a rewrite of
+/// its tags would.
 fn rewrite_latest(repository: &Repository, sequence: u64) -> Committed {
     let mut theirs = repository.inscription(sequence).unwrap();
     theirs.parameters = serde_json::json!({ "another-writer": true });
@@ -4264,7 +4287,7 @@ fn rewrite_latest(repository: &Repository, sequence: u64) -> Committed {
     };
     let committed = Repository::committed(sequence, &document);
     *repository.latest.borrow_mut() = Some(committed.clone());
-    repository.steles.borrow_mut().insert(sequence, document);
+    repository.snapshots.borrow_mut().insert(sequence, document);
     committed
 }
 
@@ -4296,8 +4319,8 @@ fn moved_to(error: backfill::Error) -> Option<Committed> {
     }
 }
 
-/// Stele 2 would otherwise attest a digest nothing checked, and the next read
-/// would match it.
+/// Snapshot 2 would otherwise attest a digest nothing checked, and the next
+/// read would match it.
 #[test]
 fn a_predecessor_rewritten_before_the_chain_read_refuses() {
     let chain = Chain::spanning(12);
@@ -4315,7 +4338,7 @@ fn a_predecessor_rewritten_before_the_chain_read_refuses() {
 }
 
 /// A tag deleted under a batch begun over an empty repository would otherwise
-/// seal stele 2 with no history at all, and under a followed one lose the
+/// seal snapshot 2 with no history at all, and under a followed one lose the
 /// chain.
 #[test]
 fn a_tag_deleted_before_the_chain_read_refuses() {
@@ -4372,8 +4395,8 @@ fn a_moved_chain_read_is_refused_at_once() {
 
 /// A seal's `latest` answers with an error and the registry applies it late,
 /// during the retry's reproduction. The chain read then finds this batch's own
-/// stele at the sequence being published, which the next try reconciles. Takes
-/// two backoffs.
+/// snapshot at the sequence being published, which the next try reconciles.
+/// Takes two backoffs.
 #[test]
 fn our_own_late_latest_before_the_chain_read_reconciles() {
     let chain = Chain::spanning(12);
@@ -4418,10 +4441,10 @@ fn our_own_late_latest_before_the_chain_read_reconciles() {
     assert_eq!(rig.repository.tags(), uninterrupted(&chain));
 }
 
-/// Another writer's stele landing at the same place isn't this batch's, and the
-/// next try's compare is what says so. Takes one backoff.
+/// Another writer's snapshot landing at the same place isn't this batch's, and
+/// the next try's compare is what says so. Takes one backoff.
 #[test]
-fn another_writers_stele_at_the_chain_read_ends_as_diverged() {
+fn another_writers_snapshot_at_the_chain_read_ends_as_diverged() {
     let chain = Chain::spanning(12);
     let rig = Rig::new(&chain);
     let theirs = Committed {
@@ -4508,7 +4531,7 @@ fn a_predecessor_rewritten_under_its_tag_refuses() {
 
     let rewritten = stelae::Digest::compute(b"another writer");
     rig.repository
-        .steles
+        .snapshots
         .borrow_mut()
         .get_mut(&1)
         .unwrap()
@@ -4545,12 +4568,16 @@ fn a_bundle_lost_part_way_through_stops_with_its_recovery() {
     );
     let message = error.to_string();
     assert!(message.contains("clear the storage path"), "{message}");
-    assert!(message.contains("latest stele"), "{message}");
+    assert!(message.contains("latest snapshot"), "{message}");
+    assert!(
+        message.contains("no snapshot has nothing to restore"),
+        "{message}"
+    );
     assert_nothing_moved(&rig, &journal, &[1]);
 }
 
 /// Damage a bundle's load can't see surfaces as its payload is read, with no
-/// stele and no silent use of what the stores hold now.
+/// snapshot and no silent use of what the stores hold now.
 #[test]
 fn a_damaged_payload_stops_at_its_sequence_with_its_recovery() {
     let chain = Chain::spanning(12);
@@ -4855,10 +4882,10 @@ mod over_a_registry {
             (status, answer[start + 4..].to_vec())
         }
 
-        /// Point `to`'s `latest` at what `from`'s names, its stele at
+        /// Point `to`'s `latest` at what `from`'s names, its snapshot at
         /// `sequence`, as another writer's push would: the blobs of its tip
         /// and its diff mounted, then its tip manifest and the moved tag.
-        /// Nothing else in the transport writes a stele under a number the
+        /// Nothing else in the transport writes a snapshot under a number the
         /// repository already holds.
         fn move_latest(&self, from: &str, to: &str, sequence: u64) {
             const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -4921,7 +4948,7 @@ mod over_a_registry {
     }
 
     /// Seal a blank blocks snapshot at every sequence through `until` under the
-    /// network root `repo`, for its steles to name.
+    /// network root `repo`, for its snapshots to name.
     fn seed_blocks(repo: &Repository, until: u64) {
         let scratch = tempfile::tempdir().unwrap();
         let blocks = stelae_cardano::testing::open_repository(
@@ -4982,8 +5009,8 @@ mod over_a_registry {
             self.0.latest(plan)
         }
 
-        fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
-            self.0.stele(sequence)
+        fn snapshot(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+            self.0.snapshot(sequence)
         }
 
         fn blocks(
@@ -5004,8 +5031,8 @@ mod over_a_registry {
         }
     }
 
-    /// Another writer over the same chain: its steles name other blocks
-    /// snapshots, which their identities state.
+    /// Another writer over the same chain: its Dolos snapshots name other
+    /// blocks snapshots, which their identities state.
     struct NamesOtherBlocks<'a>(BackfillPublisher<'a>);
 
     impl backfill::Publish for NamesOtherBlocks<'_> {
@@ -5017,8 +5044,8 @@ mod over_a_registry {
             self.0.latest(plan)
         }
 
-        fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
-            self.0.stele(sequence)
+        fn snapshot(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+            self.0.snapshot(sequence)
         }
 
         fn blocks(
@@ -5040,7 +5067,7 @@ mod over_a_registry {
         }
     }
 
-    /// Another writer's steles through `until`, one boundary at a time.
+    /// Another writer's snapshots through `until`, one boundary at a time.
     fn another_writer_on(rig: &Rig<'_>, repo: &Repository, until: u64) {
         let observer = Observer::silent();
         let publisher = NamesOtherBlocks(BackfillPublisher {
@@ -5081,7 +5108,7 @@ mod over_a_registry {
         );
     }
 
-    fn assert_same_steles(found: &Repository, expected: &Repository, through: u64) {
+    fn assert_same_snapshots(found: &Repository, expected: &Repository, through: u64) {
         for sequence in 1..=through {
             let (found, expected) = (
                 inspect(found, Point::Epoch(sequence)),
@@ -5102,7 +5129,7 @@ mod over_a_registry {
     }
 
     /// A repository a batch filled holds what one filled a boundary at a time
-    /// holds: the same steles, the same blobs and a `latest` standing on the
+    /// holds: the same snapshots, the same blobs and a `latest` standing on the
     /// last.
     #[test]
     #[ignore = "spawns a registry"]
@@ -5118,7 +5145,7 @@ mod over_a_registry {
             Outcome::UntilEpoch { sequence: 4 }
         );
         assert_batch_is_gone(&rig);
-        assert_same_steles(&batched, &single, 4);
+        assert_same_snapshots(&batched, &single, 4);
 
         let scratch = tempfile::tempdir().unwrap();
         SnapshotRepository::open(
@@ -5150,8 +5177,8 @@ mod over_a_registry {
             self.inner.latest(plan)
         }
 
-        fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
-            self.inner.stele(sequence)
+        fn snapshot(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+            self.inner.snapshot(sequence)
         }
 
         fn blocks(
@@ -5211,13 +5238,13 @@ mod over_a_registry {
             Outcome::UntilEpoch { sequence: 4 }
         );
         assert_eq!(*publisher.uploads.borrow(), [1, 2, 3, 4]);
-        assert_same_steles(&batched, &single, 4);
+        assert_same_snapshots(&batched, &single, 4);
     }
 
-    /// Another writer's stele is told by its identity, and it stays.
+    /// Another writer's snapshot is told by its identity, and it stays.
     #[test]
     #[ignore = "spawns a registry"]
-    fn another_writers_stele_refuses_and_stays() {
+    fn another_writers_snapshot_refuses_and_stays() {
         let chain = Chain::spanning(12);
         let registry = LocalRegistry::spawn();
         let repo = registry.repository("shared");
@@ -5247,8 +5274,8 @@ mod over_a_registry {
 
     /// The chain read itself, on the real transport: `latest` moves past every
     /// check the flush makes, and nothing is sealed on it. Sequence 1 reads
-    /// another writer's stele at the sequence it publishes, which the next
-    /// try's compare refuses, and sequence 2 reads another stele under the
+    /// another writer's snapshot at the sequence it publishes, which the next
+    /// try's compare refuses, and sequence 2 reads another snapshot under the
     /// number it follows, which refuses at once. In both, the chain read's own
     /// compare gives the first answer, because at sequence 1 the retry alone
     /// would end the same way.
@@ -5322,7 +5349,7 @@ mod over_a_registry {
             assert_eq!(rig.sequences().first(), Some(&at), "the journal stands");
             assert!(
                 held_at(&repo, at).is_none(),
-                "at {at}: another stele was sealed on what it read"
+                "at {at}: another snapshot was sealed on what it read"
             );
         }
     }
@@ -5331,7 +5358,7 @@ mod over_a_registry {
     /// chain read finds it at the sequence being published, and the next
     /// try reconciles it without another upload. Another publisher over the
     /// same chain stands in for the late write, since it seals the same
-    /// stele. Takes one backoff.
+    /// snapshot. Takes one backoff.
     #[test]
     #[ignore = "spawns a registry"]
     fn our_own_late_seal_found_by_the_chain_read_reconciles() {
@@ -5366,7 +5393,7 @@ mod over_a_registry {
             Outcome::UntilEpoch { sequence: 2 }
         );
         assert_eq!(attempts.get(), 1, "reconciled, not published again");
-        assert_same_steles(&batched, &single, 2);
+        assert_same_snapshots(&batched, &single, 2);
     }
 
     /// What the immutable tag holds, reading no further than a publish does.
@@ -5381,7 +5408,7 @@ mod over_a_registry {
             Tuning::default(),
         )
         .unwrap()
-        .stele(sequence)
+        .snapshot(sequence)
         .unwrap()
     }
 
@@ -5415,8 +5442,8 @@ mod over_a_registry {
         };
 
         let empty: Repository = empty_registry().parse().unwrap();
-        assert!(open(&empty).stele(2).unwrap().is_none());
-        assert!(open(&dead).stele(2).is_err());
+        assert!(open(&empty).snapshot(2).unwrap().is_none());
+        assert!(open(&dead).snapshot(2).is_err());
     }
 
     /// A real publication's failure is told apart from a damaged bundle by its
@@ -5449,9 +5476,10 @@ mod over_a_registry {
     }
 
     /// The driver's half of a deleted tag, which a real registry here can't do:
-    /// nothing under `latest` refuses a publish held to a stele, and only that.
+    /// nothing under `latest` refuses a publish held to a snapshot, and only
+    /// that.
     #[test]
-    fn a_publish_held_to_a_stele_refuses_a_repository_holding_nothing() {
+    fn a_publish_held_to_a_snapshot_refuses_a_repository_holding_nothing() {
         let dead = dead_registry();
         let scratch = tempfile::tempdir().unwrap();
         let registry = stelae_driver::publish::open(
@@ -5480,7 +5508,7 @@ mod over_a_registry {
             .err()
         };
 
-        let held = (1, stelae::Digest::compute(b"the stele it follows"));
+        let held = (1, stelae::Digest::compute(b"the snapshot it follows"));
         let refused = chained(Publishing::new(&registry).following(Some(held)));
         assert!(
             matches!(
@@ -5499,7 +5527,7 @@ mod over_a_registry {
     }
 
     /// A publish record a batch of one left resumes under a batch: a recorded
-    /// layer whose blob isn't there is rebuilt, the same stele results, and
+    /// layer whose blob isn't there is rebuilt, the same snapshot results, and
     /// the record goes with its seal.
     #[test]
     #[ignore = "spawns a registry"]
@@ -5552,7 +5580,7 @@ mod over_a_registry {
             Outcome::UntilEpoch { sequence: 3 }
         );
         assert!(!record.exists());
-        assert_same_steles(&batched, &single, 3);
+        assert_same_snapshots(&batched, &single, 3);
     }
 }
 
@@ -5879,8 +5907,8 @@ mod blocks_publishing {
     }
 
     /// Both repositories hold `epoch-1` through `epoch-{until}`. Each blocks
-    /// snapshot is the one the chain's blocks give, written before the stele
-    /// of its sequence, and that stele names it.
+    /// snapshot is the one the chain's blocks give, written before the Dolos
+    /// snapshot of its sequence, and that Dolos snapshot names it.
     fn assert_published_through(host: &Host<'_>, until: u64) {
         let tags = |tip: bool| -> BTreeSet<String> {
             (1..=until)
@@ -5897,9 +5925,9 @@ mod blocks_publishing {
             let tag = format!("epoch-{sequence}");
             let blocks = host.inscription("blocks", &tag).digest().unwrap();
             assert_eq!(blocks, host.chain.blocks_digest(sequence), "at {sequence}");
-            let stele = host.inscription("dolos", &tag);
-            let named = read_position(&stele.position).unwrap().blocks;
-            assert_eq!(named, Some(blocks), "the stele at {sequence}");
+            let snapshot = host.inscription("dolos", &tag);
+            let named = read_position(&snapshot.position).unwrap().blocks;
+            assert_eq!(named, Some(blocks), "the snapshot at {sequence}");
             assert!(
                 host.first_write(&format!("blocks:{tag}"))
                     < host.first_write(&format!("dolos:{tag}.tip")),
@@ -5909,7 +5937,7 @@ mod blocks_publishing {
     }
 
     #[test]
-    fn a_boundary_publishes_its_blocks_snapshot_before_its_stele() {
+    fn a_boundary_publishes_its_blocks_snapshot_before_its_dolos_snapshot() {
         let chain = chain();
         for window in [Limits::ONE, limits(2)] {
             let host = Host::new(&chain);
@@ -5958,8 +5986,8 @@ mod blocks_publishing {
             self.inner.latest(plan)
         }
 
-        fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
-            self.inner.stele(sequence)
+        fn snapshot(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+            self.inner.snapshot(sequence)
         }
 
         fn blocks(
@@ -5989,11 +6017,11 @@ mod blocks_publishing {
         }
     }
 
-    /// A kill between a blocks snapshot and anything of its stele: the rerun
-    /// reproduces the blocks snapshot from the files still there, writes it no
-    /// second time, and goes on.
+    /// A kill between a blocks snapshot and anything of its Dolos snapshot: the
+    /// rerun reproduces the blocks snapshot from the files still there,
+    /// writes it no second time, and goes on.
     #[test]
-    fn a_kill_between_the_blocks_snapshot_and_its_stele_converges() {
+    fn a_kill_between_the_blocks_snapshot_and_its_dolos_snapshot_converges() {
         let chain = chain();
         for window in [Limits::ONE, limits(3)] {
             let host = Host::new(&chain);
@@ -6096,8 +6124,8 @@ mod blocks_publishing {
     }
 
     /// A seal again that is itself refused before its `latest` fails the
-    /// attempt, which is tried again, so the stele never names a snapshot
-    /// its `latest` doesn't stand at.
+    /// attempt, which is tried again, so the Dolos snapshot never names a
+    /// blocks snapshot its `latest` doesn't stand at.
     #[test]
     fn a_seal_again_refused_before_its_latest_is_tried_again() {
         let chain = chain();
@@ -6137,8 +6165,8 @@ mod blocks_publishing {
             assert_eq!(host.times_written("blocks:latest"), 3, "the seed's alone");
             for sequence in 1..=2 {
                 let tag = format!("epoch-{sequence}");
-                let stele = host.inscription("dolos", &tag);
-                let named = read_position(&stele.position).unwrap().blocks;
+                let snapshot = host.inscription("dolos", &tag);
+                let named = read_position(&snapshot.position).unwrap().blocks;
                 assert_eq!(named, Some(chain.blocks_digest(sequence)), "at {sequence}");
             }
         }
@@ -6203,8 +6231,8 @@ mod blocks_publishing {
             self.inner.latest(plan)
         }
 
-        fn stele(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
-            self.inner.stele(sequence)
+        fn snapshot(&self, sequence: u64) -> Result<Option<Held>, backfill::Error> {
+            self.inner.snapshot(sequence)
         }
 
         fn blocks(
@@ -6425,7 +6453,7 @@ mod blocks_publishing {
     }
 
     /// A blocks snapshot already at a boundary that the files don't reproduce
-    /// is refused, asked for once, and nothing of the stele is written. Held
+    /// is refused, asked for once, and nothing of the snapshot is written. Held
     /// under no `latest`, as a seal stopped before it leaves it, it is still
     /// compared first, and neither sealed again nor given a `latest`.
     #[test]
@@ -6475,7 +6503,7 @@ mod blocks_publishing {
     /// do. It is refused before anything is downloaded or written, whether the
     /// blocks repository holds the sequence before theirs or nothing.
     #[test]
-    fn a_first_stele_past_epoch_1_is_refused() {
+    fn a_first_snapshot_past_epoch_1_is_refused() {
         let chain = chain();
         for window in [Limits::ONE, limits(3)] {
             for seeded in [true, false] {
@@ -6495,7 +6523,7 @@ mod blocks_publishing {
                     .manifests("cardano/other/blocks")
                     .into_keys()
                     .collect();
-                // Stores restored from a stele keep no record of a batch.
+                // Stores restored from a snapshot keep no record of a batch.
                 let began = host
                     .node
                     .config

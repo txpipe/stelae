@@ -23,7 +23,7 @@ type AnyError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// The network root: the stele is restored from its `dolos` repository,
+    /// The network root: the snapshot is restored from its `dolos` repository,
     /// and the blocks it names from its `blocks` repository.
     pub source: Source,
     pub point: Point,
@@ -241,7 +241,7 @@ fn restore(
     Ok(outcome.plan.sequence)
 }
 
-/// Initialize empty publisher storage from its own latest stele.
+/// Initialize empty publisher storage from its own latest snapshot.
 ///
 /// A failed restore clears partial stores and fails. Genesis is selected only
 /// when the caller explicitly opts in. An existing initialized dataset is
@@ -301,7 +301,7 @@ pub fn run(
             dolos::storage::clear_storage(&config.storage.path)?;
             if !options.allow_genesis {
                 return Err(format!(
-                    "latest stele restore failed; refusing genesis fallback: {error}"
+                    "latest snapshot restore failed; refusing genesis fallback: {error}"
                 )
                 .into());
             }
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn the_history_window_bounds_a_restore() {
         let options = Options {
-            source: Source::Dir(PathBuf::from("/stele")),
+            source: Source::Dir(PathBuf::from("/snapshot")),
             point: Point::Latest,
             auth: Auth::Anonymous,
             insecure: false,

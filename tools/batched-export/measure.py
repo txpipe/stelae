@@ -397,7 +397,7 @@ def immutable_slice(corpus, target, first, last):
 
 
 def command_prepare(args):
-    """Replay to the base epoch and seed a repository with its stele, once."""
+    """Replay to the base epoch and seed a repository with its snapshot, once."""
     root = Path(args.root)
     base = root / "base" / args.network
     config = base / "dolos.toml"

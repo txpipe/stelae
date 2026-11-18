@@ -1,6 +1,6 @@
 //! The durable record of a multi-boundary batch.
 //!
-//! Replay may stand past the repository's latest stele only while every
+//! Replay may stand past the repository's latest snapshot only while every
 //! sequence in between is held here: a complete bundle and a journal entry
 //! naming it. The journal is written after the stores that reached a boundary
 //! closed, so the frontier it names is one the stores really hold, and a cursor
@@ -48,11 +48,11 @@ pub fn dir_in(storage_path: &Path) -> PathBuf {
 }
 
 /// What a batch over an empty repository leaves beside the stores, outside the
-/// batch: the first sequence they may pass unpublished. No stele can restore
-/// those stores, so without this a lost batch reads as a deliberate first stele
-/// further on. Clearing the storage path takes it too, and a store configured
-/// outside that path has to go with it: left standing, nothing refuses a first
-/// stele past what the batch held.
+/// batch: the first sequence they may pass unpublished. No snapshot can restore
+/// those stores, so without this a lost batch reads as a deliberate first
+/// snapshot further on. Clearing the storage path takes it too, and a store
+/// configured outside that path has to go with it: left standing, nothing
+/// refuses a first snapshot past what the batch held.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Began {
@@ -97,7 +97,7 @@ pub struct Source {
     pub dolos_revision: String,
 }
 
-/// A stele the repository really holds.
+/// A snapshot the repository really holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Committed {
@@ -121,7 +121,7 @@ impl From<&ChainPoint> for Point {
     }
 }
 
-/// A stele as the repository holds it, under its immutable tag.
+/// A snapshot as the repository holds it, under its immutable tag.
 #[derive(Debug, Clone)]
 pub struct Held {
     pub committed: Committed,
@@ -156,8 +156,8 @@ pub enum Flush {
 struct Journal {
     format: u32,
     source: Source,
-    /// The stele the next publication has to follow: the repository's latest
-    /// when the batch began, `None` for an empty repository, then each stele
+    /// The snapshot the next publication has to follow: the repository's latest
+    /// when the batch began, `None` for an empty repository, then each snapshot
     /// the batch committed.
     predecessor: Option<Committed>,
     prepared: Vec<Prepared>,
@@ -259,7 +259,7 @@ pub enum Error {
         path: PathBuf,
     },
     #[error(
-        "the repository's latest stele is {found:?}, and the batch at {path} follows {planned:?}: \
+        "the repository's latest snapshot is {found:?}, and the batch at {path} follows {planned:?}: \
          another writer moved it. Stop that writer. {REPLAY}"
     )]
     PredecessorMoved {
@@ -279,7 +279,7 @@ pub enum Error {
         path: PathBuf,
     },
     #[error(
-        "the repository's latest stele still follows the batch at {path}, and the immutable tag \
+        "the repository's latest snapshot still follows the batch at {path}, and the immutable tag \
          of sequence {sequence} holds {found} where this batch would publish {expected}: another \
          writer stopped before moving the latest tag, or this publisher did and these stores \
          aren't what the batch was prepared from. Nothing was overwritten. If you know that tag \
@@ -345,7 +345,7 @@ pub enum Error {
 /// survives clearing it, so both are named.
 const REPLAY: &str = "Nothing else holds those boundaries: clear the storage path and any store \
                       configured outside it to delete the batch, then restore the stores from the \
-                      repository's latest stele to replay them. A repository with no stele has \
+                      repository's latest snapshot to replay them. A repository with no snapshot has \
                       nothing to restore, so clear them the same way and run with --allow-genesis";
 
 /// The recovery from a batch an earlier format left. The lineage it followed
@@ -360,7 +360,7 @@ const REPLAY_FROM_GENESIS: &str =
 /// The recovery for stores nothing can repair.
 pub const START_OVER: &str =
     "Clear the storage path and any store configured outside it, then restore the stores from the \
-     repository's latest stele. A repository with no stele has nothing to restore, so clear them \
+     repository's latest snapshot. A repository with no snapshot has nothing to restore, so clear them \
      the same way and run with --allow-genesis";
 
 fn io_at(path: &Path) -> impl FnOnce(io::Error) -> Error + '_ {
@@ -611,7 +611,7 @@ impl Batch {
         self.journal.as_ref().map_or(&[], |j| &j.prepared)
     }
 
-    /// The stele the next publication has to follow.
+    /// The snapshot the next publication has to follow.
     pub fn predecessor(&self) -> Option<&Committed> {
         self.predecessor.as_ref()
     }
@@ -659,8 +659,9 @@ impl Batch {
     }
 
     /// Refuse a repository that moved since the batch last committed. Only a
-    /// closed batch has uploaded anything, so only there can the latest stele
-    /// be the next sequence, whose identity the flush holds to the batch.
+    /// closed batch has uploaded anything, so only there can the latest
+    /// snapshot be the next sequence, whose identity the flush holds to the
+    /// batch.
     pub fn check_predecessor(&self, latest: Option<Committed>) -> Result<(), Error> {
         let next = self.prepared().first().map(|p| p.sequence);
         let reconcilable =
@@ -680,7 +681,7 @@ impl Batch {
         }
     }
 
-    /// The refusal of a stele that isn't the one this batch publishes.
+    /// The refusal of a snapshot that isn't the one this batch publishes.
     pub fn diverged(&self, sequence: u64, found: String, expected: String) -> Error {
         Error::Diverged {
             sequence,
@@ -959,8 +960,8 @@ impl Batch {
         remove_tree(&self.dir.join(STAGING_DIR))
     }
 
-    /// Move past a stele the repository now holds: durably, and only then drop
-    /// its bundle and whatever payload no later one shares.
+    /// Move past a snapshot the repository now holds: durably, and only then
+    /// drop its bundle and whatever payload no later one shares.
     pub fn commit(&mut self, committed: Committed) -> Result<(), Error> {
         let sequence = committed.sequence;
         let next = self.prepared().first().map(|prepared| prepared.sequence);
@@ -1451,12 +1452,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let held = [prepared(1, 1), prepared(2, 1)];
         let mut batch = batch_holding(dir.path(), limits(9, u64::MAX, 0), &held, 0);
-        let stele = |sequence| Committed {
+        let snapshot = |sequence| Committed {
             sequence,
             identity: format!("sha256:{sequence}"),
         };
         assert!(matches!(
-            batch.commit(stele(2)),
+            batch.commit(snapshot(2)),
             Err(Error::OutOfTurn {
                 sequence: 2,
                 next: Some(1),
@@ -1465,17 +1466,17 @@ mod tests {
         ));
         assert_eq!(batch.prepared(), &held);
 
-        batch.commit(stele(1)).unwrap();
-        assert_eq!(batch.predecessor(), Some(&stele(1)));
+        batch.commit(snapshot(1)).unwrap();
+        assert_eq!(batch.predecessor(), Some(&snapshot(1)));
         assert_eq!(batch.frontiers().published, Some(1));
         assert_eq!(batch.prepared(), &held[1..]);
         assert!(matches!(
-            batch.commit(stele(1)),
+            batch.commit(snapshot(1)),
             Err(Error::OutOfTurn { .. })
         ));
 
         let reopened = Batch::open(dir.path().to_owned(), Limits::ONE, source()).unwrap();
-        assert_eq!(reopened.predecessor(), Some(&stele(1)));
+        assert_eq!(reopened.predecessor(), Some(&snapshot(1)));
         assert_eq!(reopened.prepared(), &held[1..]);
     }
 
@@ -1545,7 +1546,7 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_following_a_stele_records_no_beginning() {
+    fn a_batch_following_a_snapshot_records_no_beginning() {
         let dir = tempfile::tempdir().unwrap();
         let mut batch = batch_holding(dir.path(), limits(9, u64::MAX, 0), &[], 0);
         let latest = Committed {
@@ -1666,7 +1667,7 @@ mod tests {
                 .find("clear the storage path and any store configured outside it")
                 .unwrap_or_else(|| panic!("{recovery}"));
             let restore = text
-                .find("restore the stores from the repository's latest stele")
+                .find("restore the stores from the repository's latest snapshot")
                 .unwrap_or_else(|| panic!("{recovery}"));
             assert!(clear < restore, "{recovery}");
         }

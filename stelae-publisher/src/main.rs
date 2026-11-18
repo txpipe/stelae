@@ -82,8 +82,8 @@ impl CredentialArgs {
         self.resolve(env, None)
     }
 
-    /// As Dolos reads a stele: with neither a user nor a token, `official` is
-    /// the user, and the official password comes with it.
+    /// As Dolos reads a snapshot: with neither a user nor a token, `official`
+    /// is the user, and the official password comes with it.
     fn read_auth_from(&self, env: Env, official: Option<&str>) -> miette::Result<Auth> {
         self.resolve(env, official)
     }
@@ -142,7 +142,7 @@ enum Format {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Initialize empty stores from a stele, failing closed by default.
+    /// Initialize empty stores from a snapshot, failing closed by default.
     Initialize(InitializeArgs),
     /// Publish the currently committed dataset once.
     Publish(PublishArgs),
@@ -150,13 +150,13 @@ enum Command {
     Backfill(BackfillArgs),
     /// Initialize and then run the backfill state machine.
     Run(RunArgs),
-    /// Compute a stele's inscription and identity from the committed stores,
+    /// Compute a snapshot's inscription and identity from the committed stores,
     /// standing on the first block of an epoch, without writing one.
     Digest(DigestArgs),
-    /// Check a published stele's digests and, with --reproduce, rebuild every
-    /// layer from the committed stores.
+    /// Check a published snapshot's digests and, with --reproduce, rebuild
+    /// every layer from the committed stores.
     Verify(VerifyArgs),
-    /// Print what a published stele contains, without pulling a layer.
+    /// Print what a published snapshot contains, without pulling a layer.
     Inspect(InspectArgs),
     /// Plan the rebuild of a lineage published before the diff chain from
     /// its documents, self-checking every sequence and writing nothing to a
@@ -465,18 +465,18 @@ struct PublishArgs {
 
 #[derive(Debug, Args)]
 struct DigestArgs {
-    /// Network root to read the stele before this one and the blocks snapshot
-    /// at this sequence from: file://DIR or oci://HOST/PATH.
+    /// Network root to read the Dolos snapshot before this one and the blocks
+    /// snapshot at this sequence from: file://DIR or oci://HOST/PATH.
     #[arg(long, value_name = "URL")]
     repo: Option<RestoreSource>,
     #[arg(long, action, requires = "repo")]
     insecure: bool,
-    /// Inscription digest of the stele before this one, in place of the one
+    /// Inscription digest of the snapshot before this one, in place of the one
     /// --repo holds; without either the reproduction starts a lineage.
     #[arg(long, value_name = "DIGEST")]
     previous: Option<Digest>,
     /// Inscription digest of the blocks snapshot at this sequence, in place of
-    /// the one --repo holds; without either the stele names none.
+    /// the one --repo holds; without either the snapshot names none.
     #[arg(long, value_name = "DIGEST")]
     blocks: Option<Digest>,
     /// Layer producers run at once; changes nothing about the digest.
@@ -496,27 +496,27 @@ struct DigestArgs {
 
 #[derive(Debug, Args)]
 struct VerifyArgs {
-    /// Network root whose `dolos` repository holds the stele: oci://HOST/PATH,
-    /// or file://DIR for image layouts on disk.
+    /// Network root whose `dolos` repository holds the snapshot:
+    /// oci://HOST/PATH, or file://DIR for image layouts on disk.
     #[arg(long, value_name = "URL")]
     repo: RestoreSource,
-    /// `latest`, or `epoch-N` for the stele published at the end of epoch N.
+    /// `latest`, or `epoch-N` for the snapshot published at the end of epoch N.
     #[arg(long, default_value = "latest")]
     point: Point,
     #[arg(long, action)]
     insecure: bool,
     /// Also rebuild every layer from the committed stores, which must stand on
-    /// the first block of the stele's epoch, and require a byte-identical
+    /// the first block of the snapshot's epoch, and require a byte-identical
     /// inscription. Costs what a publish costs.
     #[arg(long, action)]
     reproduce: bool,
     #[arg(long, value_name = "N", requires = "reproduce")]
     producers: Option<NonZeroUsize>,
-    /// Where the index runs spool while the stele is reproduced; defaults to
+    /// Where the index runs spool while the snapshot is reproduced; defaults to
     /// the storage path's `scratch` directory.
     #[arg(long, value_name = "PATH", requires = "reproduce")]
     scratch_dir: Option<PathBuf>,
-    /// Inscription digest of the stele before this one, which the published
+    /// Inscription digest of the snapshot before this one, which the published
     /// one must follow; the repository's own is held to it in any case.
     #[arg(long, value_name = "DIGEST", requires = "reproduce")]
     previous: Option<Digest>,
@@ -526,11 +526,11 @@ struct VerifyArgs {
 
 #[derive(Debug, Args)]
 struct InspectArgs {
-    /// Network root whose `dolos` repository holds the stele: oci://HOST/PATH,
-    /// or file://DIR for image layouts on disk.
+    /// Network root whose `dolos` repository holds the snapshot:
+    /// oci://HOST/PATH, or file://DIR for image layouts on disk.
     #[arg(long, value_name = "URL")]
     repo: RestoreSource,
-    /// `latest`, or `epoch-N` for the stele published at the end of epoch N.
+    /// `latest`, or `epoch-N` for the snapshot published at the end of epoch N.
     #[arg(long, default_value = "latest")]
     point: Point,
     #[arg(long, action)]
@@ -707,7 +707,7 @@ fn run_publish(
     Ok(())
 }
 
-/// A check that ran and failed: a stele's verification, or a rebuild's
+/// A check that ran and failed: a snapshot's verification, or a rebuild's
 /// self-check.
 #[derive(Debug)]
 struct Mismatch(Box<dyn std::error::Error + Send + Sync>);
@@ -745,7 +745,7 @@ fn source_name(source: &RestoreSource) -> String {
     }
 }
 
-fn open_stele(
+fn open_snapshot(
     config: &RootConfig,
     source: &RestoreSource,
     insecure: bool,
@@ -809,7 +809,7 @@ fn run_digest(
     let published = args
         .repo
         .as_ref()
-        .map(|source| open_stele(config, source, args.insecure, auth))
+        .map(|source| open_snapshot(config, source, args.insecure, auth))
         .transpose()?;
     let digested = snapshot::with_plan(
         config,
@@ -874,7 +874,7 @@ fn print_verified(name: &str, point: Point, verified: &Verified) {
     println!("sequence: {}", inscription.sequence);
     println!(
         "previous: {}",
-        link_text(inscription.previous, "none; this stele starts a lineage")
+        link_text(inscription.previous, "none; this snapshot starts a lineage")
     );
     println!(
         "chain:    {} inscriptions, back to sequence {}",
@@ -896,11 +896,11 @@ fn run_verify(
     args: &VerifyArgs,
     auth: ResolveReadAuth,
 ) -> miette::Result<()> {
-    let stele = open_stele(config, &args.repo, args.insecure, auth)?;
+    let snapshot = open_snapshot(config, &args.repo, args.insecure, auth)?;
     let name = source_name(&args.repo);
     let text = args.format == Format::Text;
     let transport = || {
-        let verified = stele.verify(args.point)?;
+        let verified = snapshot.verify(args.point)?;
         if text {
             print_verified(&name, args.point, &verified);
         }
@@ -922,7 +922,7 @@ fn run_verify(
                 &report_plan,
                 |source, plan| {
                     let verified = transport()?;
-                    // The published stele's sequence, not the stores': stores at
+                    // The published snapshot's sequence, not the stores': stores at
                     // another one are the reproduction's refusal to make.
                     let previous = args
                         .previous
@@ -976,7 +976,7 @@ fn run_inspect(
     args: &InspectArgs,
     auth: ResolveReadAuth,
 ) -> miette::Result<()> {
-    let inspected = open_stele(config, &args.repo, args.insecure, auth)?
+    let inspected = open_snapshot(config, &args.repo, args.insecure, auth)?
         .inspect(args.point)
         .map_err(diagnose)?;
     let inscription = &inspected.inscription;
@@ -989,7 +989,7 @@ fn run_inspect(
 
     let position = snapshot::read_position(&inscription.position)
         .into_diagnostic()
-        .context("reading the stele's position")?;
+        .context("reading the snapshot's position")?;
     println!("{} at {}", source_name(&args.repo), args.point);
     println!("identity: {}", inspected.identity);
     println!(
@@ -1010,7 +1010,7 @@ fn run_inspect(
     );
     println!(
         "previous: {}",
-        link_text(inscription.previous, "none; this stele starts a lineage")
+        link_text(inscription.previous, "none; this snapshot starts a lineage")
     );
     println!(
         "own:      {} diff and {} tip layers",
@@ -1482,15 +1482,15 @@ mod tests {
         let plain = parse(&[
             "verify",
             "--repo",
-            "file:///stele",
+            "file:///snapshot",
             "--scratch-dir",
             "/spool",
         ]);
         assert!(plain.is_err());
     }
 
-    /// Each named what a stele inherited or retained, which the diff chain no
-    /// longer has.
+    /// Each named what a snapshot inherited or retained, which the diff chain
+    /// no longer has.
     #[test]
     fn the_flags_that_lost_their_meaning_are_gone() {
         let repo = ["--repo", "oci://registry.invalid/cardano/preview"];
@@ -1533,7 +1533,7 @@ mod tests {
                 "digest {flags:?}"
             );
         }
-        parse(&["initialize", "--source", "file:///stele"]).unwrap();
+        parse(&["initialize", "--source", "file:///snapshot"]).unwrap();
     }
 
     /// A digest's link and blocks come from a network root, a digest given in
@@ -1684,7 +1684,7 @@ mod tests {
             "--window",
             "0",
             "--restore-source",
-            "file:///missing-stele",
+            "file:///missing-snapshot",
         ])
         .unwrap();
         let error = format!("{:?}", execute(cli, &|_| None).unwrap_err());
@@ -1696,14 +1696,14 @@ mod tests {
     fn a_command_off_the_registry_ignores_its_credentials() {
         let dir = tempfile::tempdir().unwrap();
         let config = node(dir.path());
-        let output = dir.path().join("stele");
+        let output = dir.path().join("snapshot");
 
         let from_directory = parse(&[
             "--config",
             &config,
             "initialize",
             "--source",
-            "file:///missing-stele",
+            "file:///missing-snapshot",
             "--allow-genesis",
         ])
         .unwrap();
@@ -1741,7 +1741,7 @@ mod tests {
                 "--repo",
                 repo,
                 "--restore-source",
-                "file:///missing-stele",
+                "file:///missing-snapshot",
             ],
         ];
         for command in commands {
@@ -1920,7 +1920,7 @@ mod tests {
             let cli = parse(&[
                 command,
                 "--repo",
-                "file:///stele",
+                "file:///snapshot",
                 "--registry-credentials-file",
                 "/run/secrets/stelae.toml",
             ])

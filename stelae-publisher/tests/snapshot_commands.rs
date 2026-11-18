@@ -12,7 +12,8 @@ use stelae_cardano::{
 };
 
 /// A node at its first boundary, published into a network root on disk: the
-/// blocks snapshot in its `blocks` layout and the stele in its `dolos` one.
+/// blocks snapshot in its `blocks` layout and the Dolos snapshot in its `dolos`
+/// one.
 struct Fixture {
     node: Node,
     root: PathBuf,
@@ -224,7 +225,7 @@ fn verify_exits_zero_on_the_published_directory_and_three_on_an_altered_layer() 
     let stdout = String::from_utf8(text.stdout).unwrap();
     assert!(stdout.contains("sequence: 1"), "{stdout}");
     assert!(
-        stdout.contains("previous: none; this stele starts a lineage"),
+        stdout.contains("previous: none; this snapshot starts a lineage"),
         "{stdout}"
     );
 
@@ -255,11 +256,11 @@ fn verify_exits_zero_on_the_published_directory_and_three_on_an_altered_layer() 
     assert!(altered.stdout.is_empty());
 }
 
-/// A reproduction held to a link the published stele doesn't carry.
+/// A reproduction held to a link the published snapshot doesn't carry.
 #[test]
 fn a_reproduction_held_to_another_previous_exits_three() {
     let fixture = Fixture::published();
-    let other = stelae::Digest::compute(b"another stele").to_string();
+    let other = stelae::Digest::compute(b"another snapshot").to_string();
 
     let output = fixture.run(&[
         "verify",
@@ -317,7 +318,7 @@ fn a_digest_takes_its_link_and_blocks_from_the_root_or_the_flags() {
         .unwrap()
         .to_string();
 
-    // What the root holds: a lineage's first stele, naming its blocks.
+    // What the root holds: a lineage's first snapshot, naming its blocks.
     let from_root = fixture.run(&["digest", "--repo", &fixture.repo()]);
     assert_eq!(code(&from_root), 0, "{}", stderr_words(&from_root));
     assert_eq!(from_root.stdout, published);
@@ -330,7 +331,8 @@ fn a_digest_takes_its_link_and_blocks_from_the_root_or_the_flags() {
     assert_eq!(code(&given), 0, "{}", stderr_words(&given));
     assert_eq!(given.stdout, published);
 
-    // Neither: a stele naming no blocks snapshot, which is another document.
+    // Neither: a Dolos snapshot naming no blocks snapshot, which is another
+    // document.
     let neither = fixture.run(&["digest"]);
     assert_eq!(code(&neither), 0, "{}", stderr_words(&neither));
     assert_ne!(neither.stdout, published);
@@ -341,7 +343,7 @@ fn a_digest_takes_its_link_and_blocks_from_the_root_or_the_flags() {
     );
 
     // A link given in place of the root's.
-    let other = stelae::Digest::compute(b"another stele").to_string();
+    let other = stelae::Digest::compute(b"another snapshot").to_string();
     let linked = fixture.run(&["digest", "--repo", &fixture.repo(), "--previous", &other]);
     assert_eq!(code(&linked), 0, "{}", stderr_words(&linked));
     assert_ne!(linked.stdout, published);
@@ -378,11 +380,11 @@ fn a_digest_takes_its_link_and_blocks_from_the_root_or_the_flags() {
     assert_eq!(code(&refused), 1, "{}", stderr_words(&refused));
 }
 
-/// Past a lineage's first stele, a digest follows the one before it as the
-/// root holds it, whether or not the root still keeps that stele's tip, and
+/// Past a lineage's first snapshot, a digest follows the one before it as the
+/// root holds it, whether or not the root still keeps that snapshot's tip, and
 /// `--previous` stands in for it.
 #[test]
-fn a_digest_follows_the_stele_before_with_or_without_its_tip() {
+fn a_digest_follows_the_snapshot_before_with_or_without_its_tip() {
     let fixture = Fixture::published_twice();
     let repo = fixture.repo();
     let first = Inscription::parse(&fixture.inscription_at(Point::Epoch(1)))
@@ -405,7 +407,7 @@ fn a_digest_follows_the_stele_before_with_or_without_its_tip() {
     drop_tag(&fixture.dolos(), "epoch-1.tip");
     follows("without its tip");
 
-    let other = stelae::Digest::compute(b"another stele").to_string();
+    let other = stelae::Digest::compute(b"another snapshot").to_string();
     let linked = fixture.run(&["digest", "--repo", &repo, "--previous", &other]);
     assert_eq!(code(&linked), 0, "{}", stderr_words(&linked));
     let link = Inscription::parse(&linked.stdout)
@@ -418,7 +420,7 @@ fn a_digest_follows_the_stele_before_with_or_without_its_tip() {
     );
 }
 
-/// `--previous` names the stele before the published one, so stores at
+/// `--previous` names the snapshot before the published one, so stores at
 /// another sequence are refused as themselves, not blamed on the flag.
 #[test]
 fn a_reproduction_from_stores_at_another_sequence_says_where_they_stand() {
@@ -474,7 +476,7 @@ fn a_digest_refuses_a_root_without_its_blocks_snapshot() {
 }
 
 #[test]
-fn an_unreadable_stele_exits_one_and_a_bad_invocation_two() {
+fn an_unreadable_snapshot_exits_one_and_a_bad_invocation_two() {
     let fixture = Fixture::published();
     let missing = format!("file://{}", fixture.node.path().join("missing").display());
     assert_eq!(code(&fixture.run(&["verify", "--repo", &missing])), 1);
@@ -482,7 +484,7 @@ fn an_unreadable_stele_exits_one_and_a_bad_invocation_two() {
     assert_eq!(code(&fixture.run(&["digest", "--repo", &missing])), 1);
 
     let repo = fixture.repo();
-    let other = stelae::Digest::compute(b"another stele").to_string();
+    let other = stelae::Digest::compute(b"another snapshot").to_string();
     assert_eq!(
         code(&fixture.run(&["verify", "--repo", &repo, "--epochs", "1"])),
         2
@@ -594,7 +596,7 @@ fn a_command_off_the_registry_ignores_its_credentials() {
 }
 
 /// Bytes the directory holds under a blob's name that do not decompress are
-/// the stele's, however the decoder gives up on them.
+/// the snapshot's, however the decoder gives up on them.
 #[test]
 fn a_blob_that_does_not_decompress_exits_three() {
     type Alter = fn(&mut Vec<u8>);
