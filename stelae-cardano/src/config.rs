@@ -102,6 +102,36 @@ pub enum InputError {
     },
 }
 
+/// The aggregator the invocation names, else the known network's.
+pub fn mithril_aggregator(
+    config: &RootConfig,
+    aggregator: Option<String>,
+) -> Result<String, InputError> {
+    aggregator
+        .or_else(|| {
+            let network = ResolvedNetwork::resolve(&config.chain).ok()?;
+            Some(network.known()?.mithril.aggregator.to_owned())
+        })
+        .ok_or(InputError::MissingMithril {
+            what: "aggregator",
+            flag: "aggregator",
+            env: "DOLOS_MITHRIL_AGGREGATOR",
+        })
+}
+
+/// The URL as logged or reported: userinfo works as Basic auth, so it never
+/// reaches the logs or an error.
+pub fn without_userinfo(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.to_string()
+        }
+        Err(_) => "(unparseable URL)".to_owned(),
+    }
+}
+
 /// The aggregator a backfill trusts: what the invocation names, else the
 /// known network's.
 pub fn mithril_source(
@@ -114,13 +144,7 @@ pub fn mithril_source(
         .and_then(|network| network.known())
         .map(|network| &network.mithril);
 
-    let aggregator = aggregator
-        .or_else(|| catalog.map(|mithril| mithril.aggregator.to_owned()))
-        .ok_or(InputError::MissingMithril {
-            what: "aggregator",
-            flag: "aggregator",
-            env: "DOLOS_MITHRIL_AGGREGATOR",
-        })?;
+    let aggregator = mithril_aggregator(config, aggregator)?;
 
     let genesis_vkey = genesis_vkey
         .or_else(|| catalog.map(|mithril| mithril.genesis_vkey.to_owned()))
@@ -141,6 +165,15 @@ mod tests {
     use dolos_cardano::networks::KnownNetwork;
 
     use super::*;
+
+    #[test]
+    fn a_logged_aggregator_drops_its_userinfo() {
+        assert_eq!(
+            without_userinfo("https://user:key@aggregator.invalid/aggregator"),
+            "https://aggregator.invalid/aggregator"
+        );
+        assert_eq!(without_userinfo("not a url"), "(unparseable URL)");
+    }
 
     fn config(document: &str) -> (tempfile::TempDir, Result<RootConfig, ConfigError>) {
         let dir = tempfile::tempdir().unwrap();

@@ -5,6 +5,8 @@
 //! the network being the inscription's `position`. Both slot bounds are
 //! inclusive and are the epoch's own bounds, not the first and last block.
 
+use std::ops::RangeInclusive;
+
 use minicbor::Decoder;
 use serde_json::json;
 use stelae::{
@@ -48,6 +50,37 @@ impl EpochScope {
     /// Whether the epoch covers `slot`.
     pub fn covers(&self, slot: u64) -> bool {
         (self.start_slot..=self.end_slot).contains(&slot)
+    }
+
+    /// The numbers of the immutable files the epoch covers, file `n` holding
+    /// the slots `n * slots_per_file .. (n + 1) * slots_per_file`. Refused
+    /// when the epoch's bounds do not fall on file boundaries.
+    pub fn files(&self, slots_per_file: u64) -> Result<RangeInclusive<u64>, Error> {
+        let Self {
+            epoch,
+            start_slot,
+            end_slot,
+            ..
+        } = *self;
+        let width = slots_per_file;
+        let malformed = |why: String| Error::MalformedScope(format!("epoch {epoch}: {why}"));
+
+        if width == 0 {
+            return Err(malformed("an immutable file covers no slots".into()));
+        }
+
+        let end = end_slot
+            .checked_add(1)
+            .ok_or_else(|| malformed(format!("end slot {end_slot} has no successor")))?;
+
+        if start_slot % width != 0 || end % width != 0 {
+            return Err(malformed(format!(
+                "slots {start_slot}..={end_slot} are not a whole number of {width}-slot \
+                 immutable files"
+            )));
+        }
+
+        Ok(start_slot / width..=end_slot / width)
     }
 
     /// The CBOR form, for the layer header record.

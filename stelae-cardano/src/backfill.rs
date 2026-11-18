@@ -425,7 +425,7 @@ enum Import {
     Cancelled,
 }
 
-fn slots_per_immutable_file(genesis: &Genesis) -> u64 {
+pub(crate) fn slots_per_immutable_file(genesis: &Genesis) -> u64 {
     genesis
         .shelley
         .security_param

@@ -1252,6 +1252,18 @@ impl Registry {
         })
     }
 
+    /// Stage the blob a layer of a [`RawDocument`]'s manifest names, held to
+    /// its digest and size, as [`SnapshotReader::stream_layer`] stages one.
+    ///
+    /// For a reader of documents this crate no longer parses, which opens the
+    /// layer itself.
+    pub fn pull_raw_blob(&self, layer: &Descriptor) -> Result<File, Error> {
+        self.shared.runtime.block_on(
+            self.shared
+                .pull_layer(&self.shared.repository, &to_oci(layer)),
+        )
+    }
+
     /// The bytes of the manifest under `tag`, a sequence's or its tip's, as
     /// the registry serves them, or `None` when this repository holds none
     /// there.

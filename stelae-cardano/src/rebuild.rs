@@ -40,6 +40,7 @@ use stelae_driver::{DriverProfile as _, Role};
 
 use crate::{Auth, Genesis, Repository};
 
+pub mod blocks;
 pub mod write;
 
 /// The plan file's format, its first line's `rebuildPlan`.

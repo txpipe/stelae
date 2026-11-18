@@ -24,6 +24,9 @@ use stelae::digest::{digest_reader, Digest};
 
 const MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
+/// The file under the root the aggregator's digest list is served from.
+const DIGESTS_FILE: &str = "mithril-digests.json";
+
 /// What a repository was sent while this server ran.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Accounting {
@@ -153,6 +156,11 @@ impl Loopback {
         self.shared
             .highest_immutable
             .store(highest, Ordering::SeqCst);
+    }
+
+    /// Serve `list` as the aggregator's digest list.
+    pub fn offer_digests(&self, list: &[u8]) -> io::Result<()> {
+        fs::write(self.shared.root.join(DIGESTS_FILE), list)
     }
 
     /// Stop writing blobs past `bytes`, keeping only their size, so the
@@ -547,6 +555,12 @@ fn route(head: &Head, reader: &mut impl BufRead, shared: &Shared) -> io::Result<
     }
     if path == "/aggregator/artifact/cardano-database" {
         return Ok(Answer::json(200, listing(shared)));
+    }
+    if path == "/aggregator/artifact/cardano-database/digests" {
+        return Ok(match fs::read(shared.root.join(DIGESTS_FILE)) {
+            Ok(list) => Answer::json(200, list),
+            Err(_) => Answer::status(404),
+        });
     }
     if path == "/accounting" {
         let accounting = shared.accounting.lock().unwrap();
