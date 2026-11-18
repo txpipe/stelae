@@ -1254,17 +1254,20 @@ impl<W: Workspace> Driver<'_, W> {
             start, end, "the epoch's immutable files are gone: downloading them again"
         );
         self.remove_refetched()?;
-        let fetched = match (self.fetch)(&refetch, Some(start), end) {
-            Ok(Some(())) => again
-                .epoch()
-                .check_files()
-                .map_err(|error| refused(&again.dir, error).into())
-                .and_then(|()| {
-                    keep_download(&again.dir, &marker, &downloaded).map_err(Error::caller)
-                }),
-            Ok(None) => Err(Error::Interrupted),
-            Err(error) => Err(error),
-        };
+        // Mithril unpacks only into a directory that is already there.
+        let fetched = std::fs::create_dir_all(&refetch)
+            .map_err(Error::caller)
+            .and_then(|()| (self.fetch)(&refetch, Some(start), end))
+            .and_then(|done| match done {
+                Some(()) => again
+                    .epoch()
+                    .check_files()
+                    .map_err(|error| refused(&again.dir, error).into())
+                    .and_then(|()| {
+                        keep_download(&again.dir, &marker, &downloaded).map_err(Error::caller)
+                    }),
+                None => Err(Error::Interrupted),
+            });
         if let Err(error) = fetched {
             if let Err(removing) = self.remove_refetched() {
                 warn!(%removing, "removing a download that did not finish");

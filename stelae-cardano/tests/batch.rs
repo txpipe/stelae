@@ -5708,7 +5708,8 @@ mod blocks_publishing {
             self.drive(limits, until, &self.root, &self.publisher_at(&self.root))
         }
 
-        /// A download copies the files it names out of the chain's own.
+        /// A download copies the files it names out of the chain's own. As
+        /// Mithril's does, it needs its directory to be there already.
         fn drive(
             &self,
             limits: Limits,
@@ -5719,6 +5720,16 @@ mod blocks_publishing {
             let genesis = self.chain.genesis.clone();
             let fetch = |dir: &Path, start: Option<u64>, end: u64| {
                 self.fetched.borrow_mut().push((start, end));
+                if !dir.is_dir() {
+                    return Err(backfill::Error::Mithril {
+                        what: "fetching a mithril immutable window",
+                        reason: format!("{} is not a directory or does not exist", dir.display()),
+                    });
+                }
+                assert!(
+                    !dir.join("downloaded").exists(),
+                    "a download never starts beside a marker"
+                );
                 let into = dir.join("immutable");
                 std::fs::create_dir_all(&into).map_err(backfill::Error::caller)?;
                 for entry in std::fs::read_dir(self.source.path()).unwrap().flatten() {
@@ -6281,6 +6292,21 @@ mod blocks_publishing {
         }
     }
 
+    /// Leave the chain's immutable `files` in the refetch directory, as a
+    /// download does, and return where they are.
+    fn leave_a_download(host: &Host<'_>, files: std::ops::RangeInclusive<u64>) -> PathBuf {
+        let left = host.refetched().join("immutable");
+        std::fs::create_dir_all(&left).unwrap();
+        for entry in std::fs::read_dir(host.source.path()).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let number: u64 = name.split('.').next().unwrap().parse().unwrap();
+            if files.contains(&number) {
+                std::fs::copy(entry.path(), left.join(&name)).unwrap();
+            }
+        }
+        left
+    }
+
     /// Files in the refetch directory that no finished download vouches for,
     /// as a crash part way through one leaves them, are downloaded again
     /// before anything is sealed from them: with no marker, and with a marker
@@ -6294,15 +6320,7 @@ mod blocks_publishing {
             for marker in [None, Some(format!("{start}..={}", epoch.end()))] {
                 let host = Host::new(&chain);
                 lose_the_files_at(&host, window, 3);
-                let left = host.refetched().join("immutable");
-                std::fs::create_dir_all(&left).unwrap();
-                for entry in std::fs::read_dir(host.source.path()).unwrap().flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let number: u64 = name.split('.').next().unwrap().parse().unwrap();
-                    if (start..=end).contains(&number) {
-                        std::fs::copy(entry.path(), left.join(&name)).unwrap();
-                    }
-                }
+                let left = leave_a_download(&host, start..=end);
                 // Cut short, as an unpack that never finished leaves a chunk.
                 let chunk = left.join(format!("{:05}.chunk", epoch.end()));
                 let length = std::fs::metadata(&chunk).unwrap().len();
@@ -6329,6 +6347,35 @@ mod blocks_publishing {
                 );
                 assert!(!host.refetched().exists(), "marker: {marker:?}");
             }
+        }
+    }
+
+    /// A finished download that has since lost a file, as a stop part way
+    /// through its removal leaves it, is downloaded again, not refused.
+    #[test]
+    fn a_finished_download_missing_a_file_is_done_again() {
+        let chain = chain();
+        let epoch = files_of(2);
+        let (start, end) = (*epoch.start(), epoch.end() + 1);
+        for window in [Limits::ONE, limits(3)] {
+            let host = Host::new(&chain);
+            lose_the_files_at(&host, window, 3);
+            let left = leave_a_download(&host, start..=end);
+            let marker = host.refetched().join("downloaded");
+            std::fs::write(marker, format!("{start}..={end}")).unwrap();
+            std::fs::remove_file(left.join(format!("{start:05}.chunk"))).unwrap();
+
+            assert_eq!(
+                host.run(window, 3).unwrap(),
+                Outcome::UntilEpoch { sequence: 3 }
+            );
+            assert_published_through(&host, 3);
+            assert_eq!(
+                *host.fetched.borrow(),
+                [(Some(start), end)],
+                "downloaded again"
+            );
+            assert!(!host.refetched().exists());
         }
     }
 
