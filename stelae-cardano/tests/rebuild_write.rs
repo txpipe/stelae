@@ -123,10 +123,16 @@ impl Served {
     }
 }
 
+/// The write options of the network the fixture lineage is on.
 fn options() -> write::Options {
+    let genesis = stelae_cardano::config::genesis(&Node::new().config).unwrap();
     write::Options {
+        network_magic: u64::from(genesis.network_magic()),
+        root: None,
         insecure: true,
-        ..Default::default()
+        auth: Auth::Anonymous,
+        direct_s3: None,
+        scratch_dir: None,
     }
 }
 
@@ -367,6 +373,77 @@ fn latest_moves_only_once_the_lineage_resolves() {
         .manifest(NEW, &format!("epoch-{UNTIL}"))
         .is_some());
     assert!(served.loopback.manifest(NEW, "latest").is_none());
+}
+
+/// A registry that cannot answer the closing pass is a failed read, not a
+/// lineage that differs: `latest` stays unwritten, and a rerun moves it.
+#[test]
+fn a_registry_failing_the_closing_pass_is_not_a_lineage_that_differs() {
+    let served = Served::new();
+    let plan = Plan::read(&served.plan(&[])).unwrap();
+    let tag = served
+        .root
+        .path()
+        .join(NEW)
+        .join(format!("manifests/tags/epoch-{UNTIL}"));
+    let head = format!("/v2/{NEW}/manifests/epoch-{UNTIL}");
+    served.guard(move |method, path| {
+        // Only once it is written: the run first reads it as absent.
+        match method == "GET" && path == head && tag.exists() {
+            true => Verdict::Refuse(401),
+            false => Verdict::Proceed,
+        }
+    });
+
+    let failed = served.write(&plan).unwrap_err();
+    match &failed {
+        Error::Registry { what, .. } => assert_eq!(what, &format!("resolving epoch-{UNTIL}")),
+        other => panic!("{other}"),
+    }
+    assert!(served.loopback.manifest(NEW, "latest").is_none());
+
+    served.guard(|_, _| Verdict::Proceed);
+    let resumed = served.write(&plan).unwrap();
+    assert_eq!(
+        (resumed.tags_written, resumed.tags_present),
+        (1, UNTIL as usize + 1)
+    );
+    assert!(served.loopback.manifest(NEW, "latest").is_some());
+}
+
+/// A plan of another network than the configured one is refused before
+/// either repository is asked anything.
+#[test]
+fn a_plan_of_another_network_is_refused_before_any_request() {
+    let served = Served::new();
+    let plan = Plan::read(&served.plan(&[])).unwrap();
+    let requests = Arc::new(AtomicU64::new(0));
+    let counted = requests.clone();
+    served.guard(move |_, _| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Verdict::Proceed
+    });
+
+    let planned = options().network_magic;
+    let options = write::Options {
+        network_magic: planned + 1,
+        ..options()
+    };
+    let refused = write::write(&plan, &options).unwrap_err();
+    match &refused {
+        Error::OtherNetwork {
+            sequence,
+            magic,
+            reason,
+        } => {
+            assert_eq!((*sequence, *magic), (1, planned + 1));
+            assert!(reason.contains(&format!("magic {planned}")), "{reason}");
+        }
+        other => panic!("{other}"),
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert_eq!(served.outside.load(Ordering::SeqCst), 0);
+    assert_eq!(served.loopback.accounting(NEW), Default::default());
 }
 
 /// The closing pass holds each layer to its planned blob: a manifest served

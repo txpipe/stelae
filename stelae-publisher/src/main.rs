@@ -1127,7 +1127,11 @@ fn run_rebuild(genesis: &Genesis, args: &RebuildArgs, auth: ResolveReadAuth) -> 
     Ok(())
 }
 
-fn run_rebuild_write(args: &RebuildArgs, auth: ResolveAuth) -> miette::Result<()> {
+fn run_rebuild_write(
+    genesis: &Genesis,
+    args: &RebuildArgs,
+    auth: ResolveAuth,
+) -> miette::Result<()> {
     let Some(path) = &args.plan else {
         unreachable!("clap requires --plan with --write");
     };
@@ -1136,6 +1140,7 @@ fn run_rebuild_write(args: &RebuildArgs, auth: ResolveAuth) -> miette::Result<()
         .with_context(|| format!("reading {}", path.display()))?;
     let plan = rebuild::write::Plan::read(&text).into_diagnostic()?;
     let options = rebuild::write::Options {
+        network_magic: u64::from(genesis.network_magic()),
         root: args.root.clone(),
         insecure: args.insecure,
         auth: auth()?,
@@ -1210,7 +1215,7 @@ fn execute(cli: Cli, env: Env) -> miette::Result<()> {
         Command::Digest(args) => run_digest(&config, &genesis, &args, &read_auth),
         Command::Verify(args) => run_verify(&config, &genesis, &args, &read_auth),
         Command::Inspect(args) => run_inspect(&config, &args, &read_auth),
-        Command::Rebuild(args) if args.write => run_rebuild_write(&args, &auth),
+        Command::Rebuild(args) if args.write => run_rebuild_write(&genesis, &args, &auth),
         Command::Rebuild(args) => run_rebuild(&genesis, &args, &read_auth),
     }
 }

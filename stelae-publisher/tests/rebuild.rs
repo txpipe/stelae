@@ -101,9 +101,14 @@ impl Served {
 
     /// `stelae-publisher rebuild --insecure` and `args`.
     fn rebuild(&self, args: &[&str]) -> Output {
+        self.rebuild_with(&self.node.config_path(), args)
+    }
+
+    /// The same, configured by `config`.
+    fn rebuild_with(&self, config: &Path, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_stelae-publisher"))
             .arg("--config")
-            .arg(self.node.config_path())
+            .arg(config)
             .args(["rebuild", "--insecure"])
             .args(args)
             .env_remove("DOLOS_STELAE_USER")
@@ -324,6 +329,58 @@ fn a_lineage_that_does_not_resolve_exits_three_and_moves_no_latest() {
     let dolos = format!("{NAME}/dolos");
     assert!(served.loopback.manifest(&dolos, "epoch-8").is_some());
     assert!(served.loopback.manifest(&dolos, "latest").is_none());
+}
+
+#[test]
+fn a_registry_failing_the_closing_pass_exits_one_and_moves_no_latest() {
+    let served = Served::writable();
+    let plan = served.plan();
+    let tag = served
+        .root
+        .path()
+        .join(format!("{NAME}/dolos/manifests/tags/epoch-{UNTIL}"));
+    let head = format!("/v2/{NAME}/dolos/manifests/epoch-{UNTIL}");
+    let writable = format!("/v2/{NAME}/dolos/");
+    served.loopback.rule(move |seen| match seen.method {
+        // Only once it is written: the run first reads it as absent.
+        "GET" if seen.path == head && tag.exists() => Verdict::Refuse(401),
+        "GET" | "HEAD" => Verdict::Proceed,
+        _ if seen.path.starts_with(&writable) => Verdict::Proceed,
+        _ => Verdict::Refuse(405),
+    });
+
+    let output = served.rebuild(&["--write", "--plan", plan.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("resolving epoch-8"), "{stderr}");
+    let dolos = format!("{NAME}/dolos");
+    assert!(served.loopback.manifest(&dolos, "epoch-8").is_some());
+    assert!(served.loopback.manifest(&dolos, "latest").is_none());
+}
+
+#[test]
+fn a_plan_of_another_network_than_the_configured_one_writes_nothing() {
+    let served = Served::writable();
+    let plan = served.plan();
+    let config = std::fs::read_to_string(served.node.config_path()).unwrap();
+    let preprod = config.replace(r#"network = "preview""#, r#"network = "preprod""#);
+    assert_ne!(preprod, config);
+    let preprod_config = served.path("preprod.toml");
+    std::fs::write(&preprod_config, preprod).unwrap();
+
+    let output = served.rebuild_with(
+        &preprod_config,
+        &["--write", "--plan", plan.to_str().unwrap()],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("epoch-1 of the plan is not on the configured network"),
+        "{stderr}"
+    );
+    let dolos = format!("{NAME}/dolos");
+    assert_eq!(served.loopback.accounting(&dolos), Default::default());
+    assert_eq!(served.writes.load(Ordering::SeqCst), 0);
 }
 
 #[test]

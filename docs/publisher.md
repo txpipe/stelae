@@ -290,7 +290,8 @@ from the plan's header and writes the new lineage to the `dolos` repository
 under the network root, which is that repository unless `--root` names
 another. It refuses a plan whose lines disagree (a gap, a broken `previous`
 link, a manifest that does not list its inscription's array, blobs other than
-the manifests name, an unkept newest tip) and a target that is the plan's own
+the manifests name, an unkept newest tip), a plan whose positions are on
+another network than the configuration's, and a target that is the plan's own
 source.
 
 ```sh
@@ -313,8 +314,10 @@ written. Then:
    chain, its layer set and each layer's blob to the plan;
 4. only then does `latest` move to the last sequence.
 
-Nothing is written to the old repository, and nothing is deleted. A failed
-closing pass exits 3 and leaves `latest` unwritten; other failures exit 1.
+Nothing is written to the old repository, and nothing is deleted. A closing
+pass that finds the target other than the plan exits 3; one the registry
+could not answer exits 1, as do other failures, and a rerun resumes it. Either
+way `latest` is left unwritten.
 `--scratch-dir` is where a pulled blob is staged on its way up.
 
 OCI operations run synchronously on the process thread. Mithril calls have a

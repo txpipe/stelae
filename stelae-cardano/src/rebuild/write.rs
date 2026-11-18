@@ -27,7 +27,7 @@ use stelae::{
 };
 
 use super::{PlanHeader, Planned, PLAN_FORMAT};
-use crate::{publisher::dolos_repository, Auth, Repository};
+use crate::{publisher::dolos_repository, snapshot::refused_stele, Auth, Repository};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -43,6 +43,15 @@ pub enum Error {
 
     #[error("the plan's lineage is in {repository}, the repository it would be written to")]
     SameRepository { repository: String },
+
+    #[error(
+        "epoch-{sequence} of the plan is not on the configured network, magic {magic}: {reason}"
+    )]
+    OtherNetwork {
+        sequence: u64,
+        magic: u64,
+        reason: String,
+    },
 
     #[error("{what} in {repository}")]
     Registry {
@@ -234,8 +243,10 @@ fn published(planned: &Planned) -> impl Iterator<Item = (Array, &Manifest)> {
 }
 
 /// What `stelae-publisher rebuild --write` reads beside the plan.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Options {
+    /// The configured network's magic, which every planned position must name.
+    pub network_magic: u64,
     /// The network root to write `dolos` under; the plan's source when `None`.
     pub root: Option<Repository>,
     pub insecure: bool,
@@ -271,6 +282,7 @@ struct Tagged {
 /// Write `plan`'s lineage to `<root>/dolos` as the module documentation says,
 /// and resolve it back.
 pub fn write(plan: &Plan, options: &Options) -> Result<Written, Error> {
+    on_network(plan, options.network_magic)?;
     let source = &plan.source;
     let root = options.root.as_ref().unwrap_or(source);
     let target = dolos_repository(root).map_err(|error| Error::Target {
@@ -383,11 +395,7 @@ pub fn write(plan: &Plan, options: &Options) -> Result<Written, Error> {
         tracing::info!("{new}: epoch-{} in place", planned.sequence);
     }
 
-    resolves(&writing, plan).map_err(|(sequence, reason)| Error::Resolved {
-        repository: new.clone(),
-        sequence,
-        reason,
-    })?;
+    resolves(&writing, &new, plan)?;
 
     if !present.contains(&latest.tag) {
         writing
@@ -397,6 +405,25 @@ pub fn write(plan: &Plan, options: &Options) -> Result<Written, Error> {
     }
 
     Ok(written)
+}
+
+/// Every planned inscription is positioned on the network `magic` names, so a
+/// plan of one network is never published under another's root.
+fn on_network(plan: &Plan, magic: u64) -> Result<(), Error> {
+    for planned in &plan.sequences {
+        let reason = match dolos_snapshot::read_position(&planned.inscription.position) {
+            Ok(position) if position.network.magic() == magic => continue,
+            Ok(position) => format!("its position is on magic {}", position.network.magic()),
+            Err(error) => format!("its position: {error}"),
+        };
+        return Err(Error::OtherNetwork {
+            sequence: planned.sequence,
+            magic,
+            reason,
+        });
+    }
+
+    Ok(())
 }
 
 /// The tags of `wanted` that `registry` already holds as wanted, refusing one
@@ -435,14 +462,25 @@ fn held<'a>(
 
 /// The closing pass: the last sequence resolves through every planned
 /// inscription to the planned layer set, each layer in the blob its manifest
-/// names.
-fn resolves(registry: &Registry, plan: &Plan) -> Result<(), (u64, String)> {
+/// names. A registry that cannot answer is not a lineage that differs.
+fn resolves(registry: &Registry, repository: &str, plan: &Plan) -> Result<(), Error> {
     let newest = &plan.sequences[plan.sequences.len() - 1];
-    let refused = |reason: String| (newest.sequence, reason);
+    let refused = |reason: String| Error::Resolved {
+        repository: repository.to_owned(),
+        sequence: newest.sequence,
+        reason,
+    };
 
     let snapshot = registry
         .resolve_sequence(&DolosProfile, newest.sequence)
-        .map_err(|error| refused(error.to_string()))?;
+        .map_err(|error| match found_wrong(&error) {
+            true => refused(error.to_string()),
+            false => Error::Registry {
+                repository: repository.to_owned(),
+                what: format!("resolving epoch-{}", newest.sequence),
+                source: Box::new(error),
+            },
+        })?;
     let chain = snapshot
         .chain()
         .ok_or_else(|| refused("it resolved no chain".into()))?;
@@ -506,4 +544,11 @@ fn resolves(registry: &Registry, plan: &Plan) -> Result<(), (u64, String)> {
     }
 
     Ok(())
+}
+
+/// Whether resolving what was just written found it other than published:
+/// the head absent, its tip gone, or a document or link the stele's own
+/// checks refuse. Anything else is a registry, network or disk failure.
+fn found_wrong(error: &stelae::Error) -> bool {
+    error.is_absent() || matches!(error, stelae::Error::TipGone { .. }) || refused_stele(error)
 }
