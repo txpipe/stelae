@@ -443,8 +443,10 @@ them, which shows the epoch's last file is closed. They go to
 `blocks-refetch/` under the download directory, apart from the replay's
 window, and are removed once the blocks snapshot is named. Only a download
 that finished, with its files all there, is used: a `downloaded` marker
-beside them records it, and a retry or a rerun seals from it without
-downloading again. One that Mithril rejected, or that was stopped, is
+beside them records it once the files are synced to disk, and a retry or a
+rerun seals from it without downloading again. Files without that marker,
+as a crash part way through a download leaves them, are downloaded again.
+One that Mithril rejected, or that was stopped, is
 removed, and the run ends on that failure, which the download has already
 retried. A boundary whose stele the `dolos` repository already holds reads no
 blocks snapshot.

@@ -5610,9 +5610,15 @@ mod blocks_publishing {
         fetch_fault: Cell<Option<FetchFault>>,
         /// Every manifest tag written, as `repository:tag`, in order.
         written: Arc<Mutex<Vec<String>>>,
-        /// Refuse the blocks repository's `latest` once, right after its
-        /// `epoch-2`, and cancel this token as it does when there is one.
-        refuse_latest: Arc<Mutex<Option<Option<CancellationToken>>>>,
+        refuse_latest: Arc<Mutex<Option<RefuseLatest>>>,
+    }
+
+    /// Refuse the blocks repository's `latest` right after its `epoch-{after}`,
+    /// `times` times, and cancel `stop` each time when there is one.
+    struct RefuseLatest {
+        after: u64,
+        times: usize,
+        stop: Option<CancellationToken>,
     }
 
     /// How a download ends that copied its files.
@@ -5639,7 +5645,7 @@ mod blocks_publishing {
             let registry = tempfile::tempdir().unwrap();
             let loopback = Loopback::serve(registry.path()).unwrap();
             let written = Arc::<Mutex<Vec<String>>>::default();
-            let refuse_latest = Arc::<Mutex<Option<Option<CancellationToken>>>>::default();
+            let refuse_latest = Arc::<Mutex<Option<RefuseLatest>>>::default();
             let (log, refusing) = (written.clone(), refuse_latest.clone());
             loopback.rule(move |seen| {
                 if let Some((repository, tag)) = seen.path.split_once("/manifests/") {
@@ -5647,11 +5653,16 @@ mod blocks_publishing {
                         let profile = repository.rsplit('/').next().unwrap();
                         let mut log = log.lock().unwrap();
                         let entry = format!("{profile}:{tag}");
-                        let after = log.last().map(String::as_str) == Some("blocks:epoch-2");
-                        if entry == "blocks:latest" && after {
-                            if let Some(stop) = refusing.lock().unwrap().take() {
-                                if let Some(stop) = stop {
+                        let mut refusing = refusing.lock().unwrap();
+                        if let Some(refusal) = refusing.as_mut() {
+                            let after = format!("blocks:epoch-{}", refusal.after);
+                            if entry == "blocks:latest" && log.last() == Some(&after) {
+                                if let Some(stop) = &refusal.stop {
                                     stop.cancel();
+                                }
+                                refusal.times -= 1;
+                                if refusal.times == 0 {
+                                    *refusing = None;
                                 }
                                 return Verdict::Refuse(403);
                             }
@@ -5802,6 +5813,27 @@ mod blocks_publishing {
             self.download.join("blocks-refetch")
         }
 
+        /// Refuse the blocks `latest` right after `epoch-{after}`, `times`
+        /// times, stopping the run with each refusal when `stop` holds.
+        fn refuse_blocks_latest(&self, after: u64, times: usize, stop: bool) {
+            *self.refuse_latest.lock().unwrap() = Some(RefuseLatest {
+                after,
+                times,
+                stop: stop.then(|| self.cancel.get()),
+            });
+        }
+
+        /// Remove `tag` from the blocks repository, as a seal stopped before
+        /// it, or a hand edit, leaves it.
+        fn remove_blocks_tag(&self, tag: &str) {
+            let tags = self
+                .registry
+                .path()
+                .join(ROOT)
+                .join("blocks/manifests/tags");
+            std::fs::remove_file(tags.join(tag)).unwrap();
+        }
+
         /// Keep only the immutable files up to `last`, as a source that offered
         /// no more would.
         fn files_through(&self, last: u64) {
@@ -5826,9 +5858,12 @@ mod blocks_publishing {
             }
         }
 
-        /// The sequence the inscription under `blocks:latest` stands at.
-        fn blocks_latest(&self) -> u64 {
-            self.inscription("blocks", "latest").sequence
+        /// The sequence the inscription under `blocks:latest` stands at, if
+        /// there is one.
+        fn blocks_latest(&self) -> Option<u64> {
+            self.tags("blocks")
+                .contains("latest")
+                .then(|| self.inscription("blocks", "latest").sequence)
         }
     }
 
@@ -6010,34 +6045,65 @@ mod blocks_publishing {
         }
     }
 
-    /// A blocks seal refused between its `epoch-2` and its `latest` leaves
-    /// `latest` behind. The retry, or the rerun of a run stopped there,
-    /// reproduces the held `epoch-2` and seals it again, which moves `latest`,
-    /// so the next boundary follows it.
+    /// A blocks seal refused between its `epoch-N` and its `latest` leaves
+    /// `latest` behind, or absent at 1. The retry, or the rerun of a run
+    /// stopped there, reproduces the held `epoch-N` and seals it again, which
+    /// moves `latest`, so the next boundary follows it.
     #[test]
     fn a_blocks_seal_stopped_before_its_latest_is_sealed_again() {
         let chain = chain();
         for window in [Limits::ONE, limits(3)] {
-            for stopped in [false, true] {
-                let host = Host::new(&chain);
-                *host.refuse_latest.lock().unwrap() = Some(stopped.then(|| host.cancel.get()));
-                if stopped {
-                    host.run(window, 3).unwrap_err();
-                    assert!(host.tags("blocks").contains("epoch-2"));
-                    assert!(!host.tags("dolos").contains("epoch-2"));
-                    assert_eq!(host.blocks_latest(), 1);
-                    host.cancel.restart();
+            for at in [1, 2] {
+                for stopped in [false, true] {
+                    let case = format!("at {at}, stopped: {stopped}");
+                    let tag = format!("epoch-{at}");
+                    let host = Host::new(&chain);
+                    host.refuse_blocks_latest(at, 1, stopped);
+                    if stopped {
+                        host.run(window, 3).unwrap_err();
+                        assert!(host.tags("blocks").contains(&tag), "{case}");
+                        assert!(!host.tags("dolos").contains(&tag), "{case}");
+                        assert_eq!(host.blocks_latest(), (at > 1).then(|| at - 1), "{case}");
+                        host.cancel.restart();
+                    }
+                    assert_eq!(
+                        host.run(window, 3).unwrap(),
+                        Outcome::UntilEpoch { sequence: 3 },
+                        "{case}"
+                    );
+                    assert_published_through(&host, 3);
+                    assert_eq!(host.blocks_latest(), Some(3), "{case}");
+                    assert_eq!(
+                        host.times_written(&format!("blocks:{tag}")),
+                        2,
+                        "{case}: sealed again"
+                    );
+                    assert!(host.fetched.borrow().is_empty(), "{case}");
                 }
-                assert_eq!(
-                    host.run(window, 3).unwrap(),
-                    Outcome::UntilEpoch { sequence: 3 },
-                    "stopped: {stopped}"
-                );
-                assert_published_through(&host, 3);
-                assert_eq!(host.blocks_latest(), 3);
-                assert_eq!(host.times_written("blocks:epoch-2"), 2, "sealed again");
-                assert!(host.fetched.borrow().is_empty());
             }
+        }
+    }
+
+    /// A seal again that is itself refused before its `latest` fails the
+    /// attempt, which is tried again, so the stele never names a snapshot
+    /// its `latest` doesn't stand at.
+    #[test]
+    fn a_seal_again_refused_before_its_latest_is_tried_again() {
+        let chain = chain();
+        for window in [Limits::ONE, limits(3)] {
+            let host = Host::new(&chain);
+            host.refuse_blocks_latest(2, 2, false);
+            assert_eq!(
+                host.run(window, 3).unwrap(),
+                Outcome::UntilEpoch { sequence: 3 }
+            );
+            assert_published_through(&host, 3);
+            assert_eq!(host.blocks_latest(), Some(3));
+            assert_eq!(
+                host.times_written("blocks:epoch-2"),
+                3,
+                "the seal, and two seals again"
+            );
         }
     }
 
@@ -6056,7 +6122,7 @@ mod blocks_publishing {
                 host.run(window, 2).unwrap(),
                 Outcome::UntilEpoch { sequence: 2 }
             );
-            assert_eq!(host.blocks_latest(), 3);
+            assert_eq!(host.blocks_latest(), Some(3));
             assert_eq!(host.times_written("blocks:latest"), 3, "the seed's alone");
             for sequence in 1..=2 {
                 let tag = format!("epoch-{sequence}");
@@ -6075,17 +6141,9 @@ mod blocks_publishing {
         for window in [Limits::ONE, limits(2)] {
             let host = Host::new(&chain);
             let scratch = tempfile::tempdir().unwrap();
-            let name = format!("{ROOT}/blocks");
-            chain.seal_blocks(
-                &open_repository(&host.loopback.repository(&name), scratch.path()),
-                3,
-            );
-            let tag = host
-                .registry
-                .path()
-                .join(&name)
-                .join("manifests/tags/epoch-2");
-            std::fs::remove_file(tag).unwrap();
+            let blocks = host.loopback.repository(&format!("{ROOT}/blocks"));
+            chain.seal_blocks(&open_repository(&blocks, scratch.path()), 3);
+            host.remove_blocks_tag("epoch-2");
             let counted = Flaky::new(host.publisher_at(&host.root), None);
 
             let error = host.drive(window, 2, &host.root, &counted).unwrap_err();
@@ -6223,6 +6281,57 @@ mod blocks_publishing {
         }
     }
 
+    /// Files in the refetch directory that no finished download vouches for,
+    /// as a crash part way through one leaves them, are downloaded again
+    /// before anything is sealed from them: with no marker, and with a marker
+    /// naming another range.
+    #[test]
+    fn a_download_no_marker_vouches_for_is_done_again() {
+        let chain = chain();
+        let epoch = files_of(2);
+        let (start, end) = (*epoch.start(), epoch.end() + 1);
+        for window in [Limits::ONE, limits(3)] {
+            for marker in [None, Some(format!("{start}..={}", epoch.end()))] {
+                let host = Host::new(&chain);
+                lose_the_files_at(&host, window, 3);
+                let left = host.refetched().join("immutable");
+                std::fs::create_dir_all(&left).unwrap();
+                for entry in std::fs::read_dir(host.source.path()).unwrap().flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let number: u64 = name.split('.').next().unwrap().parse().unwrap();
+                    if (start..=end).contains(&number) {
+                        std::fs::copy(entry.path(), left.join(&name)).unwrap();
+                    }
+                }
+                // Cut short, as an unpack that never finished leaves a chunk.
+                let chunk = left.join(format!("{:05}.chunk", epoch.end()));
+                let length = std::fs::metadata(&chunk).unwrap().len();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&chunk)
+                    .unwrap()
+                    .set_len(length / 2)
+                    .unwrap();
+                if let Some(marker) = &marker {
+                    std::fs::write(host.refetched().join("downloaded"), marker).unwrap();
+                }
+
+                assert_eq!(
+                    host.run(window, 3).unwrap(),
+                    Outcome::UntilEpoch { sequence: 3 },
+                    "marker: {marker:?}"
+                );
+                assert_published_through(&host, 3);
+                assert_eq!(
+                    *host.fetched.borrow(),
+                    [(Some(start), end)],
+                    "marker: {marker:?}: downloaded again"
+                );
+                assert!(!host.refetched().exists(), "marker: {marker:?}");
+            }
+        }
+    }
+
     /// A blocks snapshot retried after its download finished seals from that
     /// download, without another.
     #[test]
@@ -6269,32 +6378,48 @@ mod blocks_publishing {
     }
 
     /// A blocks snapshot already at a boundary that the files don't reproduce
-    /// is refused, asked for once, and nothing of the stele is written.
+    /// is refused, asked for once, and nothing of the stele is written. Held
+    /// under no `latest`, as a seal stopped before it leaves it, it is still
+    /// compared first, and neither sealed again nor given a `latest`.
     #[test]
     fn a_held_blocks_snapshot_the_files_do_not_reproduce_is_refused() {
         let chain = chain();
         let epoch_length = chain.genesis.shelley.epoch_length.unwrap() as u64;
         for window in [Limits::ONE, limits(2)] {
-            let host = Host::new(&chain);
-            let scratch = tempfile::tempdir().unwrap();
-            let blocks = host.loopback.repository(&format!("{ROOT}/blocks"));
-            seal_blank_blocks(
-                &open_repository(&blocks, scratch.path()),
-                chain.magic(),
-                1,
-                (0, 0, epoch_length - 1),
-            );
+            for latest in [true, false] {
+                let host = Host::new(&chain);
+                let scratch = tempfile::tempdir().unwrap();
+                let blocks = host.loopback.repository(&format!("{ROOT}/blocks"));
+                seal_blank_blocks(
+                    &open_repository(&blocks, scratch.path()),
+                    chain.magic(),
+                    1,
+                    (0, 0, epoch_length - 1),
+                );
+                if !latest {
+                    host.remove_blocks_tag("latest");
+                }
 
-            let error = host.run(window, 1).unwrap_err();
-            assert!(
-                matches!(
-                    error,
-                    backfill::Error::Blocks(blocks::Error::Differs { sequence: 1, .. })
-                ),
-                "{error}"
-            );
-            assert!(host.tags("dolos").is_empty());
-            assert_eq!(host.times_written("blocks:epoch-1"), 1, "the seed alone");
+                let error = host.run(window, 1).unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        backfill::Error::Blocks(blocks::Error::Differs { sequence: 1, .. })
+                    ),
+                    "latest: {latest}: {error}"
+                );
+                assert!(host.tags("dolos").is_empty(), "latest: {latest}");
+                assert_eq!(
+                    host.times_written("blocks:epoch-1"),
+                    1,
+                    "latest: {latest}: the seed alone"
+                );
+                assert_eq!(
+                    host.tags("blocks").contains("latest"),
+                    latest,
+                    "latest: {latest}"
+                );
+            }
         }
     }
 

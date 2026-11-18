@@ -503,20 +503,22 @@ fn check_format(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     }
 }
 
-/// Write `bytes` to `path` so that a crash leaves the old file or the new one.
+/// [`write_file_durably`], naming `path` in its error.
 fn write_durably(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    write_file_durably(path, bytes).map_err(io_at(path))
+}
+
+/// Write `bytes` to `path` so that a crash leaves the old file or the new one.
+pub(crate) fn write_file_durably(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let partial = path.with_extension("partial");
-    let write = || -> io::Result<()> {
-        let mut file = File::create(&partial)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&partial, path)?;
-        match path.parent() {
-            Some(parent) => sync_dir(parent),
-            None => Ok(()),
-        }
-    };
-    write().map_err(io_at(path))
+    let mut file = File::create(&partial)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&partial, path)?;
+    match path.parent() {
+        Some(parent) => sync_dir(parent),
+        None => Ok(()),
+    }
 }
 
 /// What a bundle holds: every layer's descriptor, and the boundary it stands
@@ -1064,14 +1066,14 @@ pub fn volume_has_room(path: &Path, bytes: u64) -> bool {
 }
 
 #[cfg(unix)]
-fn sync_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
 /// Windows cannot open a directory to sync it, so a crash may lose the rename:
 /// the boundary is then captured again.
 #[cfg(not(unix))]
-fn sync_dir(_: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(_: &Path) -> io::Result<()> {
     Ok(())
 }
 

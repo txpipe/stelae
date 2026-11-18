@@ -809,6 +809,23 @@ fn close_after_capture(capture: Option<&Capture>, finish: Result<(), Error>) -> 
     }
 }
 
+/// Put a finished download's files and the directories naming them on disk,
+/// then write the `marker` that vouches for them, so a host crash leaves the
+/// marker only beside files that are whole. Mithril syncs nothing it unpacks.
+fn keep_download(files: &Path, marker: &Path, range: &str) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(files)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::File::open(entry.path())?.sync_all()?;
+        }
+    }
+    batch::sync_dir(files)?;
+    if let Some(download) = files.parent() {
+        batch::sync_dir(download)?;
+    }
+    batch::write_file_durably(marker, range.as_bytes())
+}
+
 impl<W: Workspace> Driver<'_, W> {
     fn immutable_dir(&self) -> PathBuf {
         self.download_dir.join("immutable")
@@ -1197,8 +1214,9 @@ impl<W: Workspace> Driver<'_, W> {
     /// holds them, or else downloaded again apart from it, which a restart
     /// after they were removed needs.
     ///
-    /// A download is used only once it finished and its files checked, which
-    /// a marker beside them records. One that failed or stopped is removed.
+    /// A download is used only once it finished and its files were checked and
+    /// put on disk, which a marker beside them records. One that failed or
+    /// stopped is removed.
     fn epoch_files(&self, scope: EpochScope) -> Result<EpochFiles, Error> {
         let own = EpochFiles {
             dir: self.immutable_dir(),
@@ -1241,7 +1259,9 @@ impl<W: Workspace> Driver<'_, W> {
                 .epoch()
                 .check_files()
                 .map_err(|error| refused(&again.dir, error).into())
-                .and_then(|()| std::fs::write(&marker, &downloaded).map_err(Error::caller)),
+                .and_then(|()| {
+                    keep_download(&again.dir, &marker, &downloaded).map_err(Error::caller)
+                }),
             Ok(None) => Err(Error::Interrupted),
             Err(error) => Err(error),
         };
