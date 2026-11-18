@@ -129,7 +129,7 @@ adds another Job. To recover, delete the release's backfill Jobs with
 | --- | --- |
 | `network` | Job name prefix |
 | `run` | Deliberate re-run counter; bump when changing the Job |
-| `repo` | Network root, `oci://`: steles go to its `dolos` repository, naming the snapshots its `blocks` repository holds |
+| `repo` | Network root, `oci://`: each boundary's blocks snapshot goes to its `blocks` repository, then the stele naming it to its `dolos` repository |
 | `concurrency` | Measured upload concurrency, with no chart default |
 | `dolosToml` | Network's Dolos v2 configuration, verbatim |
 | `image.repository` | Defaults to `ghcr.io/txpipe/stelae-publisher` |

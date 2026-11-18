@@ -13,13 +13,14 @@ use dolos_snapshot::{
     restore::profile_repository,
     DolosProfile,
 };
-use stelae::{progress::Observer, Digest, SnapshotReader as _};
+use stelae::{progress::Observer, Digest, SnapshotReader as _, SnapshotWriter as _};
 use stelae_blocks::BlocksProfile;
 use stelae_driver::Standing;
 
 use crate::{
     backfill,
     batch::{self, Committed, Held},
+    blocks::{self, EpochFiles},
     snapshot,
 };
 
@@ -221,7 +222,7 @@ fn held(snapshot: &stelae::oci::Snapshot) -> Result<Held, dolos_snapshot::Error>
 }
 
 /// The blocks repository beside a Dolos repository, which a Dolos snapshot
-/// names its blocks in.
+/// names its blocks in. It uploads under the Dolos repository's tuning.
 pub struct Blocks {
     registry: Registry,
 }
@@ -236,7 +237,7 @@ impl Blocks {
             publish.insecure,
             publish.auth.clone(),
             node::scratch_dir(&config.storage, publish.scratch_dir),
-            Tuning::default(),
+            publish.tuning.clone(),
         )?;
         Ok(Self { registry })
     }
@@ -265,6 +266,18 @@ impl Blocks {
             &inscription,
             plan,
         )?))
+    }
+
+    /// The blocks snapshot at `plan`'s sequence, published from `files` first
+    /// when the repository holds none there: see [`blocks::ensure`].
+    pub fn ensure(
+        &self,
+        plan: &Plan,
+        files: &dyn Fn() -> Result<EpochFiles, backfill::Error>,
+        observer: &Observer,
+    ) -> Result<Digest, backfill::Error> {
+        self.registry.observe(observer.clone());
+        blocks::ensure(&self.registry, plan, files)
     }
 
     /// `plan` naming the blocks snapshot at its sequence, refused when there
@@ -311,11 +324,14 @@ impl backfill::Publish for BackfillPublisher<'_> {
             .map_err(backfill::Error::caller)
     }
 
-    fn blocks(&self, plan: &Plan) -> Result<Option<Digest>, backfill::Error> {
+    fn blocks(
+        &self,
+        plan: &Plan,
+        files: &dyn Fn() -> Result<EpochFiles, backfill::Error>,
+    ) -> Result<Digest, backfill::Error> {
         Blocks::open(self.config, &self.settings)
             .map_err(backfill::Error::caller)?
-            .reference(plan)
-            .map_err(backfill::Error::Caller)
+            .ensure(plan, files, self.observer)
     }
 
     fn finalize(
@@ -352,7 +368,8 @@ impl backfill::Publish for BackfillPublisher<'_> {
                 tracing::info!(%message);
                 return Ok(());
             }
-            Next::First | Next::After { .. } => {}
+            Next::First => batch::refuse_after_the_first(plan.sequence)?,
+            Next::After { .. } => {}
         }
         publisher.preflight().map_err(backfill::Error::caller)?;
         let published = publisher

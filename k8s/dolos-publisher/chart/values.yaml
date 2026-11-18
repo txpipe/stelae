@@ -23,9 +23,9 @@ network: ""
 # against re-running by accident. See README.md.
 run: ""
 
-# Where the publisher writes: an oci:// URL to the network root. Steles go to
-# its `dolos` repository, naming the blocks snapshots its `blocks` repository
-# holds.
+# Where the publisher writes: an oci:// URL to the network root. Each
+# boundary's blocks snapshot goes to its `blocks` repository, then the stele
+# naming it to its `dolos` repository.
 repo: ""
 
 # Uploads in flight during a publish. Measured per network against the

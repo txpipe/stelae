@@ -9,7 +9,8 @@ repository.workspace = true
 [dependencies]
 stelae = { path = "../stelae", version = "=0.6.0", features = ["oci"] }
 stelae-driver = { path = "../stelae-driver", version = "=0.6.0", features = ["oci"] }
-stelae-blocks = { path = "../stelae-blocks", version = "=0.6.0" }
+# `hardano`: the host exports each closed epoch from its immutable files.
+stelae-blocks = { path = "../stelae-blocks", version = "=0.6.0", features = ["hardano"] }
 
 # The Dolos commit whose profile exports the diff chain and names its blocks
 # snapshot (txpipe/dolos PR #1610 through PR #1625); see docs/publisher.md.
