@@ -316,6 +316,12 @@ pub enum Error {
         sequence: u64,
         path: PathBuf,
     },
+    #[error(
+        "the Dolos repository is empty and these stores stand at sequence {sequence}: a published \
+         lineage starts at epoch-1, and stores at a later sequence only continue a repository \
+         that holds the one before theirs. To start one: {REPLAY_FROM_GENESIS}"
+    )]
+    AfterTheFirst { sequence: u64 },
     #[error("preparing a boundary")]
     Preparing(#[source] Box<dolos_snapshot::Error>),
     #[error("staging the batch at {path}: {source}")]
@@ -408,6 +414,22 @@ pub fn refuse_lost_history(storage_path: &Path, sequence: u64) -> Result<(), Err
     }
 }
 
+/// Refuse to start a published lineage anywhere but `epoch-1`: stores restored
+/// from another lineage would otherwise begin a new one part way along it.
+pub fn refuse_after_the_first(sequence: u64) -> Result<(), Error> {
+    match sequence {
+        0 | 1 => Ok(()),
+        sequence => Err(Error::AfterTheFirst { sequence }),
+    }
+}
+
+/// What starting a published lineage at `sequence`, over an empty repository,
+/// refuses: a history a batch already passed, then a start past `epoch-1`.
+pub fn refuse_beginning(storage_path: &Path, sequence: u64) -> Result<(), Error> {
+    refuse_lost_history(storage_path, sequence)?;
+    refuse_after_the_first(sequence)
+}
+
 /// Finish cleaning up a batch every sequence of which committed, so a run that
 /// won't open a batch doesn't leave its runs on the volume.
 pub fn clear_if_drained(storage_path: &Path) -> Result<(), Error> {
@@ -481,20 +503,22 @@ fn check_format(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     }
 }
 
-/// Write `bytes` to `path` so that a crash leaves the old file or the new one.
+/// [`write_file_durably`], naming `path` in its error.
 fn write_durably(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    write_file_durably(path, bytes).map_err(io_at(path))
+}
+
+/// Write `bytes` to `path` so that a crash leaves the old file or the new one.
+pub(crate) fn write_file_durably(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let partial = path.with_extension("partial");
-    let write = || -> io::Result<()> {
-        let mut file = File::create(&partial)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&partial, path)?;
-        match path.parent() {
-            Some(parent) => sync_dir(parent),
-            None => Ok(()),
-        }
-    };
-    write().map_err(io_at(path))
+    let mut file = File::create(&partial)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&partial, path)?;
+    match path.parent() {
+        Some(parent) => sync_dir(parent),
+        None => Ok(()),
+    }
 }
 
 /// What a bundle holds: every layer's descriptor, and the boundary it stands
@@ -618,7 +642,7 @@ impl Batch {
         predecessor: Option<Committed>,
     ) -> Result<(), Error> {
         if predecessor.is_none() {
-            refuse_lost_history(storage_path, sequence)?;
+            refuse_beginning(storage_path, sequence)?;
             let path = storage_path.join(BEGAN_FILE);
             if read_began(&path)? != Some(sequence) {
                 let began = Began {
@@ -1042,14 +1066,14 @@ pub fn volume_has_room(path: &Path, bytes: u64) -> bool {
 }
 
 #[cfg(unix)]
-fn sync_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
 /// Windows cannot open a directory to sync it, so a crash may lose the rename:
 /// the boundary is then captured again.
 #[cfg(not(unix))]
-fn sync_dir(_: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(_: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -1488,16 +1512,36 @@ mod tests {
         refuse_lost_history(dir.path(), 9).unwrap();
 
         let mut batch = batch_holding(dir.path(), limits(9, u64::MAX, 0), &[], 0);
-        batch.begin(dir.path(), 4, None).unwrap();
-        refuse_lost_history(dir.path(), 4).unwrap();
+        batch.begin(dir.path(), 1, None).unwrap();
+        refuse_lost_history(dir.path(), 1).unwrap();
         assert!(matches!(
-            refuse_lost_history(dir.path(), 5),
+            refuse_lost_history(dir.path(), 2),
             Err(Error::HistoryLost {
-                first: 4,
-                sequence: 5,
+                first: 1,
+                sequence: 2,
                 ..
             })
         ));
+    }
+
+    /// A published lineage starts at `epoch-1`, so only a batch there begins
+    /// over an empty repository, and it records nothing elsewhere.
+    #[test]
+    fn a_batch_over_an_empty_repository_begins_only_at_epoch_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut batch = batch_holding(dir.path(), limits(9, u64::MAX, 0), &[], 0);
+        assert!(matches!(
+            batch.begin(dir.path(), 4, None),
+            Err(Error::AfterTheFirst { sequence: 4 })
+        ));
+        assert!(!dir.path().join(BEGAN_FILE).exists());
+
+        let latest = Committed {
+            sequence: 3,
+            identity: "sha256:3".to_owned(),
+        };
+        batch.begin(dir.path(), 4, Some(latest)).unwrap();
+        refuse_after_the_first(1).unwrap();
     }
 
     #[test]

@@ -21,10 +21,12 @@
 //! acknowledgement was lost, or another writer's, and only its identity tells
 //! them apart: it is reproduced and compared, and a difference refuses.
 //!
-//! Every stele names the blocks snapshot of its own sequence, read from the
-//! blocks repository before the boundary is captured or published. A sequence
-//! the blocks repository does not hold yet is refused before anything is
-//! written for it.
+//! Every stele names the blocks snapshot of its own sequence, which the host
+//! publishes into the blocks repository first ([`crate::blocks`]): at a batch's
+//! capture, or before a batch of one publishes, and in either case before the
+//! closed epoch's immutable files are removed. A batch of one therefore removes
+//! them only once the stele is published. A restart that needs a blocks
+//! snapshot after its files are gone downloads them again beside the window.
 
 use std::{
     path::{Path, PathBuf},
@@ -37,7 +39,7 @@ use dolos_core::{
     ArchiveIndexDelta, BlockSlot, ChainPoint, Genesis, RawBlock, ReplayProgress,
 };
 use dolos_mithril as mithril;
-use dolos_mithril::{mithril_client::feedback::FeedbackReceiver, MithrilSource};
+use dolos_mithril::MithrilSource;
 use dolos_snapshot::{
     export::{Following, Plan, Predecessor},
     node,
@@ -48,6 +50,7 @@ use dolos_snapshot::{
 };
 use itertools::Itertools as _;
 use stelae::{inscription::Inscription, progress::Observer, Digest};
+use stelae_blocks::EpochScope;
 use stelae_driver::{First, Standing};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -56,6 +59,7 @@ use crate::{
     batch::{
         self, Admission, Batch, Committed, Flush, Frontiers, Held, Limits, Position, START_OVER,
     },
+    blocks::{self, EpochFiles},
     publisher::{BackfillPublisher, PolicyError, RepositoryPublish},
 };
 
@@ -63,6 +67,11 @@ const IMPORT_CHUNK: usize = 100;
 const IMMUTABLE_FILE_MARGIN: u64 = 2;
 const SLOTS_PER_SECURITY_PARAM: u64 = 10;
 const FALLBACK_SLOTS_PER_IMMUTABLE_FILE: u64 = 21_600;
+/// Under the download directory: an epoch's immutable files downloaded again
+/// for its blocks snapshot, apart from the replay's window.
+const REFETCH_DIR: &str = "blocks-refetch";
+/// In the refetch directory once its download finished: the files it holds.
+const REFETCHED_FILE: &str = "downloaded";
 
 const IF_THE_STATE_PASSED: &str =
     "If the state passed the archive on the way, the rerun refuses and says how to recover";
@@ -169,12 +178,8 @@ pub enum Error {
          --batch-scratch-mib where that budget is what ran out, and rerun"
     )]
     FlushNoRoom(#[source] Box<dolos_snapshot::Error>),
-    #[error(
-        "the blocks repository holds no blocks snapshot at epoch-{sequence}: a Dolos snapshot \
-         names the blocks snapshot of its own sequence, so that one is published first. Nothing \
-         was prepared or published for this sequence, and a rerun once it is there continues"
-    )]
-    BlocksAbsent { sequence: u64 },
+    #[error(transparent)]
+    Blocks(#[from] blocks::Error),
 }
 
 fn archive_end(tip: &Option<BlockSlot>) -> String {
@@ -209,7 +214,11 @@ impl Error {
 
     /// What publishing a sequence can't get past by trying again.
     fn is_refusal(&self) -> bool {
-        matches!(self, Self::Batch(_) | Self::FlushNoRoom(_))
+        match self {
+            Self::Batch(_) | Self::FlushNoRoom(_) => true,
+            Self::Blocks(error) => error.is_refusal(),
+            _ => false,
+        }
     }
 
     /// The source stopped answering past its retries, or a fetch brought
@@ -340,9 +349,14 @@ pub trait Publish {
     fn latest(&self, plan: &Plan) -> Result<Option<Committed>, Error>;
     /// The stele the repository holds under `sequence`'s immutable tag.
     fn stele(&self, sequence: u64) -> Result<Option<Held>, Error>;
-    /// The inscription digest of the blocks snapshot the blocks repository
-    /// holds at `plan`'s sequence, which the stele there names.
-    fn blocks(&self, plan: &Plan) -> Result<Option<Digest>, Error>;
+    /// The inscription digest of the blocks snapshot at `plan`'s sequence,
+    /// which the stele there names: the one the blocks repository holds, once
+    /// reproduced from `files`, or else one published from them.
+    fn blocks(
+        &self,
+        plan: &Plan,
+        files: &dyn Fn() -> Result<EpochFiles, Error>,
+    ) -> Result<Digest, Error>;
     /// Publish a prepared boundary, chained to the repository's latest stele,
     /// which has to be `predecessor`. Failures of the publication itself are
     /// [`Error::Finalizing`], which is what tells a damaged bundle from a
@@ -492,8 +506,19 @@ fn dir_contents(immutable_dir: &Path) -> String {
     }
 }
 
+/// The first immutable file of the epoch after the one `plan` closes: the
+/// epoch the stores stand in, whose files the next blocks snapshot reads.
+fn epoch_first_file(plan: &Plan, width: u64) -> Result<u64, Error> {
+    let closed = blocks::closed_epoch(plan).map_err(Error::caller)?;
+    Ok((closed.end_slot + 1) / width)
+}
+
 fn cleanup_consumed(immutable_dir: &Path, cursor_slot: u64, width: u64) -> Result<(), Error> {
-    let threshold = consumed_below(cursor_slot, width);
+    cleanup_below(immutable_dir, consumed_below(cursor_slot, width))
+}
+
+/// Remove the numbered immutable files below `threshold`.
+fn cleanup_below(immutable_dir: &Path, threshold: u64) -> Result<(), Error> {
     if threshold == 0 {
         return Ok(());
     }
@@ -518,20 +543,22 @@ fn cleanup_consumed(immutable_dir: &Path, cursor_slot: u64, width: u64) -> Resul
     Ok(())
 }
 
+/// Download a source's immutable files `start..=end`, from its first when
+/// `start` is `None`, into a directory's `immutable` subdirectory, retrying
+/// what may pass; `None` when cancelled.
+pub type Fetch<'a> = dyn Fn(&Path, Option<u64>, u64) -> Result<Option<()>, Error> + 'a;
+
 pub struct Driver<'a, W: Workspace> {
     pub genesis: &'a Genesis,
-    pub mithril: &'a MithrilSource,
     pub download_dir: PathBuf,
     /// Where an export spools its index runs.
     pub scratch: PathBuf,
     pub window: u64,
     pub until_epoch: Option<u64>,
-    pub skip_validation: bool,
-    pub runtime: tokio::runtime::Handle,
     pub cancel: CancellationToken,
-    pub mithril_feedback: &'a dyn Fn() -> Option<Arc<dyn FeedbackReceiver>>,
     /// The highest immutable file the source offers; `None` when cancelled.
     pub beacon: &'a dyn Fn() -> Result<Option<u64>, Error>,
+    pub fetch: &'a Fetch<'a>,
     pub replay: &'a dyn Replay,
     pub open_workspace: &'a dyn Fn() -> Result<W, Error>,
     /// Refuse stores no run may continue. It opens them itself, so it runs with
@@ -641,18 +668,21 @@ pub fn run(
             reason: error.to_string(),
         })
     };
+    let fetch = mithril_fetch(
+        &options.mithril,
+        options.skip_validation,
+        runtime.handle().clone(),
+        cancel.clone(),
+    );
     let driver = Driver::<ReplayWorkspace> {
         genesis: &genesis,
-        mithril: &options.mithril,
         download_dir,
         scratch: options.spool(&config.storage),
         window: options.window,
         until_epoch: options.until_epoch,
-        skip_validation: options.skip_validation,
-        runtime: runtime.handle().clone(),
         cancel,
-        mithril_feedback: &|| None,
         beacon: &beacon,
+        fetch: &fetch,
         replay: &(),
         open_workspace: &|| ReplayWorkspace::open(config, genesis.clone()).map_err(Error::caller),
         check_stores: &|| refuse_archive_behind(config, genesis.clone()),
@@ -666,6 +696,40 @@ pub fn run(
         },
     };
     driver.run()
+}
+
+/// Download from `source` as a run does: retried, given up on cancellation,
+/// and on failure saying what the download's volume holds.
+pub fn mithril_fetch(
+    source: &MithrilSource,
+    skip_validation: bool,
+    runtime: tokio::runtime::Handle,
+    cancel: CancellationToken,
+) -> impl Fn(&Path, Option<u64>, u64) -> Result<Option<()>, Error> + '_ {
+    move |dir, start, end| {
+        let fetch = mithril::Fetch {
+            download_dir: dir,
+            skip_validation,
+            download_start: start,
+            download_end: Some(end),
+        };
+        stelae_driver::retry::transient(
+            "fetching a mithril immutable window",
+            &|| cancel.is_cancelled(),
+            || {
+                runtime.block_on(async {
+                    tokio::select! {
+                        result = mithril::fetch_snapshot(&fetch, source, None) => result.map(Some),
+                        _ = cancel.cancelled() => Ok(None),
+                    }
+                })
+            },
+        )
+        .map_err(|error| Error::Mithril {
+            what: "fetching a mithril immutable window",
+            reason: fetch_failure(&error, dir),
+        })
+    }
 }
 
 /// What the stores showed when a batched run looked at them.
@@ -743,6 +807,23 @@ fn close_after_capture(capture: Option<&Capture>, finish: Result<(), Error>) -> 
         }
         other => other,
     }
+}
+
+/// Put a finished download's files and the directories naming them on disk,
+/// then write the `marker` that vouches for them, so a host crash leaves the
+/// marker only beside files that are whole. Mithril syncs nothing it unpacks.
+fn keep_download(files: &Path, marker: &Path, range: &str) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(files)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::File::open(entry.path())?.sync_all()?;
+        }
+    }
+    batch::sync_dir(files)?;
+    if let Some(download) = files.parent() {
+        batch::sync_dir(download)?;
+    }
+    batch::write_file_durably(marker, range.as_bytes())
 }
 
 impl<W: Workspace> Driver<'_, W> {
@@ -825,7 +906,6 @@ impl<W: Workspace> Driver<'_, W> {
 
     fn run_one(&self) -> Result<Outcome, Error> {
         let width = self.begin()?;
-        let immutable_dir = self.immutable_dir();
         batch::clear_if_drained(&self.batching.storage_path)?;
         batch::refuse_pending(&self.batching.storage_path)?;
 
@@ -833,15 +913,15 @@ impl<W: Workspace> Driver<'_, W> {
             if self.aborted() {
                 return Err(Error::Interrupted);
             }
-            let (target, prune) = match self.publish_pending()? {
+            let (target, prune) = match self.publish_pending(width)? {
                 Step::Done { sequence } => return Ok(Outcome::UntilEpoch { sequence }),
                 Step::Ready(_) => unreachable!("a batch of one has nothing to close"),
                 Step::Extend { target, prune } => (target, prune),
             };
             match self.extend(target, prune, width, None)? {
-                Advance::Boundary { cursor_slot, .. } => {
-                    cleanup_consumed(&immutable_dir, cursor_slot, width)?
-                }
+                // Its blocks snapshot reads the files the boundary closed, so
+                // they go once its stele is published, at the next turn.
+                Advance::Boundary { .. } => {}
                 Advance::MithrilExhausted { .. } => return Ok(Outcome::UpToDate),
                 Advance::Cancelled => return Err(Error::Interrupted),
             }
@@ -1111,19 +1191,102 @@ impl<W: Workspace> Driver<'_, W> {
             .map_err(Error::Planning)
     }
 
-    /// `plan` naming the blocks snapshot at its sequence, refused when the
-    /// blocks repository holds none there.
+    /// `plan` naming the blocks snapshot at its sequence, which the blocks
+    /// repository holds or this publishes there first, from the files of the
+    /// epoch its cut closes. A refusal is not tried again, and neither is a
+    /// download that failed: it has had its own retries.
     fn name_blocks(&self, plan: Plan) -> Result<Plan, Error> {
-        let found = stelae_driver::retry::transient(
-            "reading the blocks snapshot a stele names",
+        let scope = blocks::closed_epoch(&plan).map_err(Error::caller)?;
+        let files = || self.epoch_files(scope);
+        let named = stelae_driver::retry::transient(
+            "publishing the blocks snapshot a stele names",
             &|| self.aborted(),
-            || self.publish.blocks(&plan),
-        )?;
-        match found {
-            Some(blocks) => Ok(plan.with_blocks(blocks)),
-            None => Err(Error::BlocksAbsent {
-                sequence: plan.sequence,
-            }),
+            || match self.publish.blocks(&plan, &files) {
+                Err(error) if error.is_refusal() || error.is_source_failure() => Ok(Err(error)),
+                other => other.map(Ok),
+            },
+        )??;
+        self.remove_refetched()?;
+        Ok(plan.with_blocks(named))
+    }
+
+    /// The immutable files of the epoch `scope` covers: the window's while it
+    /// holds them, or else downloaded again apart from it, which a restart
+    /// after they were removed needs.
+    ///
+    /// A download is used only once it finished and its files were checked and
+    /// put on disk, which a marker beside them records. One that failed or
+    /// stopped is removed.
+    fn epoch_files(&self, scope: EpochScope) -> Result<EpochFiles, Error> {
+        let own = EpochFiles {
+            dir: self.immutable_dir(),
+            scope,
+            slots_per_file: slots_per_immutable_file(self.genesis),
+        };
+        if own.epoch().check_files().is_ok() {
+            return Ok(own);
+        }
+        let refused = |dir: &Path, source| blocks::Error::Files {
+            epoch: scope.epoch,
+            dir: dir.to_owned(),
+            source: Box::new(source),
+        };
+        let files = own
+            .epoch()
+            .files()
+            .map_err(|error| refused(&own.dir, error))?;
+        // One file past the epoch, which shows its last one closed.
+        let (start, end) = (*files.start(), files.end() + 1);
+        let refetch = self.download_dir.join(REFETCH_DIR);
+        let again = EpochFiles {
+            dir: refetch.join("immutable"),
+            ..own.clone()
+        };
+        let marker = refetch.join(REFETCHED_FILE);
+        let downloaded = format!("{start}..={end}");
+        if std::fs::read_to_string(&marker).is_ok_and(|held| held == downloaded)
+            && again.epoch().check_files().is_ok()
+        {
+            return Ok(again);
+        }
+        warn!(
+            epoch = scope.epoch,
+            start, end, "the epoch's immutable files are gone: downloading them again"
+        );
+        self.remove_refetched()?;
+        // Mithril unpacks only into a directory that is already there.
+        let fetched = std::fs::create_dir_all(&refetch)
+            .map_err(Error::caller)
+            .and_then(|()| (self.fetch)(&refetch, Some(start), end))
+            .and_then(|done| match done {
+                Some(()) => again
+                    .epoch()
+                    .check_files()
+                    .map_err(|error| refused(&again.dir, error).into())
+                    .and_then(|()| {
+                        keep_download(&again.dir, &marker, &downloaded).map_err(Error::caller)
+                    }),
+                None => Err(Error::Interrupted),
+            });
+        if let Err(error) = fetched {
+            if let Err(removing) = self.remove_refetched() {
+                warn!(%removing, "removing a download that did not finish");
+            }
+            return Err(error);
+        }
+        Ok(again)
+    }
+
+    fn remove_refetched(&self) -> Result<(), Error> {
+        let dir = self.download_dir.join(REFETCH_DIR);
+        match std::fs::remove_dir_all(&dir) {
+            Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
+                Err(Error::RemoveConsumed {
+                    name: dir.display().to_string(),
+                    source,
+                })
+            }
+            _ => Ok(()),
         }
     }
 
@@ -1265,8 +1428,12 @@ impl<W: Workspace> Driver<'_, W> {
             },
             false => None,
         };
-        // Before anything is written for the boundary, so a sequence with no
-        // blocks snapshot leaves the batch as it was.
+        // Before anything is downloaded or written for either repository.
+        if let Some(None) = begins {
+            batch::refuse_beginning(&self.batching.storage_path, plan.sequence)?;
+        }
+        // Before anything is written for the boundary, so a blocks snapshot
+        // that can't be named leaves the batch as it was.
         let plan = self.name_blocks(plan)?;
         if let Some(latest) = begins {
             batch.begin(&self.batching.storage_path, plan.sequence, latest)?;
@@ -1317,13 +1484,16 @@ impl<W: Workspace> Driver<'_, W> {
         }
     }
 
-    fn publish_pending(&self) -> Result<Step, Error> {
+    fn publish_pending(&self, width: u64) -> Result<Step, Error> {
         let workspace = self.open()?;
-        let result = self.plan_pending(&workspace.snapshot());
+        let result = self.plan_pending(&workspace.snapshot(), width);
         finish_both(result, workspace.finish().map_err(Error::in_replay))
     }
 
-    fn plan_pending(&self, source: &dyn SnapshotSource) -> Result<Step, Error> {
+    /// Publish the boundary the stores stand on, unless the repository holds
+    /// it, then remove the immutable files it consumed. The files of the epoch
+    /// the stores stand in stay, for the next boundary's blocks snapshot.
+    fn plan_pending(&self, source: &dyn SnapshotSource, width: u64) -> Result<Step, Error> {
         let Some(cursor) = source.committed_position().map_err(Error::Planning)? else {
             return Ok(Step::Extend {
                 target: target_epoch(None),
@@ -1338,33 +1508,33 @@ impl<W: Workspace> Driver<'_, W> {
             });
         }
         let plan = self.plan(source)?.with_scratch(self.scratch.clone());
-        self.refuse_lost_history(&plan)?;
-        let plan = self.name_blocks(plan)?;
-        self.publish.announce(&plan)?;
-        stelae_driver::retry::transient(
-            "publishing the pending sequence",
-            &|| self.aborted(),
-            || self.publish.publish(&plan, source),
-        )?;
-        if self.until_epoch.is_some_and(|until| plan.sequence >= until) {
-            return Ok(Step::Done {
-                sequence: plan.sequence,
-            });
+        let sequence = plan.sequence;
+        let consumed = consumed_below(cursor.slot(), width).min(epoch_first_file(&plan, width)?);
+        // Standing first: a sequence the repository holds or can't take asks
+        // nothing of the blocks repository.
+        if let Some(Latest(latest)) = self.unpublished(&plan, sequence)? {
+            if latest.is_none() {
+                batch::refuse_beginning(&self.batching.storage_path, sequence)?;
+            }
+            let plan = self.name_blocks(plan)?;
+            self.publish.announce(&plan)?;
+            stelae_driver::retry::transient(
+                "publishing the pending sequence",
+                &|| self.aborted(),
+                || match self.publish.publish(&plan, source) {
+                    Err(error) if error.is_refusal() => Ok(Err(error)),
+                    other => other.map(Ok),
+                },
+            )??;
+        }
+        cleanup_below(&self.immutable_dir(), consumed)?;
+        if self.until_epoch.is_some_and(|until| sequence >= until) {
+            return Ok(Step::Done { sequence });
         }
         Ok(Step::Extend {
             target: target_epoch(Some(epoch)),
             prune: true,
         })
-    }
-
-    /// Over an empty repository, a stele here would start a history. Refuse if
-    /// a batch passed sequences before it. Only that reads the repository,
-    /// and a repository holding anything refuses a gap itself.
-    fn refuse_lost_history(&self, plan: &Plan) -> Result<(), Error> {
-        match batch::refuse_lost_history(&self.batching.storage_path, plan.sequence) {
-            Err(error) if self.latest(plan)?.is_none() => Err(error.into()),
-            _ => Ok(()),
-        }
     }
 
     fn extend(
@@ -1463,25 +1633,7 @@ impl<W: Workspace> Driver<'_, W> {
             let Some((start, end)) = next_window(resume, self.window, beacon) else {
                 return Ok(Advance::MithrilExhausted { cursor });
             };
-            let fetch = mithril::Fetch {
-                download_dir: &self.download_dir,
-                skip_validation: self.skip_validation,
-                download_start: start,
-                download_end: Some(end),
-            };
-            let fetched = stelae_driver::retry::transient(
-                "fetching a mithril immutable window",
-                &|| self.aborted(),
-                || self.runtime.block_on(async {
-                    tokio::select! {
-                        result = mithril::fetch_snapshot(&fetch, self.mithril, (self.mithril_feedback)()) => result.map(Some),
-                        _ = self.cancel.cancelled() => Ok(None),
-                    }
-                }),
-            ).map_err(|error| Error::Mithril {
-                what: "fetching a mithril immutable window",
-                reason: fetch_failure(&error, &self.download_dir),
-            })?;
+            let fetched = (self.fetch)(&self.download_dir, start, end)?;
             if fetched.is_none() {
                 return Ok(Advance::Cancelled);
             }

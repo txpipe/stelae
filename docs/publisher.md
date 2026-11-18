@@ -68,8 +68,9 @@ pinned; the patch would otherwise hide it.
 Snapshots cut against an earlier pin are not part of this lineage: the frozen
 profile renamed its payload media types and reset every schema revision to
 1, and the diff chain changed every document in place, at the same versions.
-Restoring or chaining onto an older snapshot is unsupported. A repository that
-holds one starts over (see [First publication](#first-publication)).
+Restoring or chaining onto an older snapshot is unsupported. A root's `dolos`
+repository that holds one starts over (see
+[First publication](#first-publication)).
 
 The lockfile is committed. These commands verify the intended graph:
 
@@ -162,7 +163,9 @@ stelae-publisher --config dolos.toml run \
 ```
 
 `run` restores `latest` from the root's `dolos` repository before replay, with
-the closed epochs' blocks from its `blocks` repository. Use
+the closed epochs' blocks from its `blocks` repository. `backfill` and `run`
+publish each boundary's blocks snapshot themselves, before its stele (see
+[Blocks snapshots](#blocks-snapshots)). Use
 `--restore-source` to restore elsewhere. Restore failure is fatal and partial
 stores are cleared. `--allow-genesis` is the only genesis fallback and is for
 a deliberately verified first publication. `initialize`, `publish`, and
@@ -324,6 +327,43 @@ journal ends, or the one after it, whose journal line was lost and which is
 sealed again with the same bytes. The summary gives the epochs re-encoded and
 resumed, the files compared, and the layers' sizes.
 
+#### Writing the rebuilt lineage
+
+`rebuild --write --plan FILE` executes a plan. It takes the old repository
+from the plan's header and writes the new lineage to the `dolos` repository
+under the network root, which is that repository unless `--root` names
+another. It refuses a plan whose lines disagree (a gap, a broken `previous`
+link, a manifest that does not list its inscription's array, blobs other than
+the manifests name, an unkept newest tip), a plan whose positions are on
+another network than the configuration's, and a target that is the plan's own
+source.
+
+```sh
+stelae-publisher --config dolos.toml rebuild --write --plan rebuild.plan \
+  --direct-s3-config /run/secrets/direct-s3.json
+```
+
+Every tag the plan writes is read first. A tag that already holds the planned
+manifest is skipped, so a run that stopped part way is resumed by running it
+again; a tag that holds another manifest refuses the run before anything is
+written. Then:
+
+1. every blob the published manifests name is put in the target: copied inside
+   the registry's storage with `--direct-s3-config` when both repositories are
+   on the same host (up to one copy's limit, 5 GiB), otherwise pulled from the
+   old repository, held to its digest, and pushed;
+2. per sequence, in ascending order: the inscription, the tip manifest under
+   `epoch-N.tip` where the tip is kept, the diff manifest under `epoch-N`;
+3. the closing pass resolves the last sequence from the target and holds its
+   chain, its layer set and each layer's blob to the plan;
+4. only then does `latest` move to the last sequence.
+
+Nothing is written to the old repository, and nothing is deleted. A closing
+pass that finds the target other than the plan exits 3; one the registry
+could not answer exits 1, and a rerun resumes it. Either way `latest` is left
+unwritten. Other failures exit 1 too.
+`--scratch-dir` is where a pulled blob is staged on its way up.
+
 OCI operations run synchronously on the process thread. Mithril calls have a
 separate Tokio runtime. SIGINT and SIGTERM cancel acquisition and are observed
 between import chunks and retry attempts; an in-flight OCI publication still
@@ -342,6 +382,7 @@ The following paths are part of restart compatibility:
 | `<storage.path>/.stelae-publisher-initialized.json` | source, storage path, network magic and restore/genesis decision for cold start |
 | `<storage.path>/scratch` | default OCI staging directory |
 | `<storage.path>/mithril/immutable` | default bounded Mithril download window |
+| `<storage.path>/mithril/blocks-refetch/immutable` | one epoch's immutable files downloaded again for its blocks snapshot, beside the default window; used only once a `downloaded` marker beside them records that the download finished, and removed once the snapshot is named or when its download fails or stops (see [Blocks snapshots](#blocks-snapshots)) |
 | `<storage.path>/.stelae-batch/` | a prepared batch's journal, bundles and staged runs; see [Prepared batches](#prepared-batches) |
 | `<storage.path>/.stelae-batch-began.json` | the sequence a batch over an empty repository began at, kept outside the batch; see [What a restart does](#what-a-restart-does) |
 
@@ -358,11 +399,13 @@ The backfill state machine preserves these rules from the accepted Dolos host:
 - prune history only after that publication succeeds, and on a larger batch only
   after its last sequence commits;
 - retain two immutable files of cleanup/download margin using the configured
-  network's genesis chunk geometry;
+  network's genesis chunk geometry, and on a batch of one, every file of the
+  epoch the stores stand in;
 - retry transient repository work in place using the publication journal;
-- name the blocks snapshot of each sequence, read from the blocks repository
-  before the boundary is captured or published, and refuse a sequence the
-  blocks repository holds none at;
+- publish the blocks snapshot of each sequence into the blocks repository,
+  from the immutable files of the epoch its boundary closes, before the
+  boundary is captured or published and before those files are removed (see
+  [Blocks snapshots](#blocks-snapshots));
 - keep the plan, schema, media-type,
   compression and journal identities of the pinned profile.
 
@@ -434,6 +477,60 @@ Three cases read differently:
   one gets no such refusal, and a clean run doesn't show that no gap was crossed. Clear
   the storage path and any store configured outside it, then restore from the
   repository's latest snapshot.
+
+## Blocks snapshots
+
+Each boundary has two snapshots, written in this order: the blocks snapshot,
+in the root's `blocks` repository, then the stele, in its `dolos` repository,
+whose `position` names the blocks snapshot by its inscription digest. Both are
+tagged `epoch-N` at the boundary that opens epoch N, and both lineages start at
+`epoch-1`.
+
+At the boundary that opens epoch N, the host exports epoch N−1 from its
+immutable files with the blocks profile, one `blocks` layer for the whole
+epoch, and seals it at sequence N after the blocks repository's `latest`,
+which has to be `epoch-(N−1)`:
+
+- A batch of one does this before it publishes the stele, and removes the
+  immutable files the boundary consumed only once the stele is published. It
+  keeps every file of the epoch the stores stand in, which the next
+  boundary's blocks snapshot reads, so a run that ends part way through an
+  epoch leaves its files to the next run.
+- A larger batch does it when it captures the boundary, before the consumed
+  files go. The bundle, which the journal names, carries the reference, so the
+  flush publishes the stele later without reading the blocks repository.
+
+A blocks snapshot already at N, which a run killed between the two snapshots
+leaves, is reproduced from the same files, following the repository's
+`epoch-(N−1)`, and compared by inscription digest, as a stele already at its
+sequence is. A seal writes `epoch-N` before it moves `latest`, so one held
+under a `latest` still at N−1 is a seal that stopped between the two: it is
+reproduced following that `latest` and, once it compares, sealed again, which
+writes the same tag and moves `latest`. A `latest` past N never moves. These
+refuse, with nothing of the stele at N written and no retry:
+
+- a blocks snapshot at N that the files do not reproduce;
+- one that is another sequence's or another network's;
+- a blocks repository whose latest is not N−1. The blocks lineage skips no
+  sequence, and only `epoch-1` starts one.
+
+A restart can need a blocks snapshot after its epoch's files were removed, as
+on a volume that came back empty. The host then downloads that epoch's files
+again from Mithril, with the window's validation setting, plus the file after
+them, which shows the epoch's last file is closed. They go to
+`blocks-refetch/` under the download directory, apart from the replay's
+window, and are removed once the blocks snapshot is named. Only a download
+that finished, with its files all there, is used: a `downloaded` marker
+beside them records it once the files are synced to disk, and a retry or a
+rerun seals from it without downloading again. Files without that marker,
+as a crash part way through a download leaves them, are downloaded again.
+One that Mithril rejected, or that was stopped, is
+removed, and the run ends on that failure, which the download has already
+retried. A boundary whose stele the `dolos` repository already holds reads no
+blocks snapshot.
+
+The blocks upload goes through the same transport settings as the stele's:
+registry credentials, `--concurrency` and `--direct-s3-config`.
 
 ## Prepared batches
 
@@ -785,17 +882,21 @@ store configured outside the storage path and runs with `--allow-genesis`
 
 ## First publication
 
-A fresh lineage starts from an empty repository and replays from genesis.
-Every inscription after the first names its predecessor, so the first snapshot
-is the only one published without a predecessor.
+A fresh lineage starts from an empty `dolos` repository and replays from
+genesis, publishing the blocks lineage beside it as it goes. Every inscription
+after the first names its predecessor, so the first snapshot is the only one
+published without a predecessor.
 
-1. Stop every other writer to the repository and wait for it to exit.
+1. Stop every other writer to the network root and wait for it to exit.
    Configure the node with full history (see
    [Configuration](#configuration)); its stores grow with the chain, to
    about 250 GiB on mainnet.
 2. Delete every tag in the root's `dolos` repository, `latest` first, so no
-   earlier pin's snapshot is restored or chained onto. Its `blocks` repository
-   holds the blocks snapshots each boundary names.
+   earlier pin's snapshot is restored or chained onto. A lineage published
+   before the diff chain sits at the root itself, not under `dolos`: leave it
+   alone. The `blocks` repository may keep what it holds: each blocks snapshot
+   there is reproduced and kept, and one that differs refuses (see
+   [Blocks snapshots](#blocks-snapshots)).
 3. Clear the storage path and any store configured outside it, since an
    earlier attempt can leave stores and a batch there, then start the first
    run with `--allow-genesis`. Initialization finds no `latest`, opts into
@@ -806,6 +907,12 @@ is the only one published without a predecessor.
 4. Run every later invocation without `--allow-genesis`. Initialization then
    restores the published `latest` (or reuses the committed stores) and
    fails closed if it cannot, instead of silently replaying from genesis.
+
+A published lineage starts at `epoch-1`. Stores at a later sequence publish
+only onto a `dolos` repository that holds the sequence before theirs: over an
+empty one, `backfill` and `run` refuse before anything is downloaded or
+written for either repository, so stores restored from another lineage never
+start one part way along it.
 
 On the chart these are `allowGenesisFallback: true` for the first run and
 `false` from the next one on; see
@@ -829,7 +936,9 @@ The local OCI and host-policy evidence is documented in
 
 ## Direct S3 blob uploads to Zot (opt-in)
 
-`publish --repo`, `backfill` and `run` accept `--direct-s3-config PATH`.
+`publish --repo`, `backfill`, `run` and `rebuild --write` accept
+`--direct-s3-config PATH`; `rebuild --write` uses it to copy blobs between
+repositories inside the bucket.
 The file is JSON containing `endpoint`, `bucket`, `prefix`, `region`,
 `access_key_id` and `secret_access_key`. Keep it outside source control,
 readable only by the publisher identity; mount it from a Secret in Kubernetes.

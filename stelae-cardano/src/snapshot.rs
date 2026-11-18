@@ -213,7 +213,7 @@ fn found_wrong(error: &dolos_snapshot::Error) -> bool {
 }
 
 /// Exhaustive, so a new protocol refusal is classified where it is added.
-fn refused_stele(error: &stelae::Error) -> bool {
+pub(crate) fn refused_stele(error: &stelae::Error) -> bool {
     use stelae::Error as E;
 
     match error {

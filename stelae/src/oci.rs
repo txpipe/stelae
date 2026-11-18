@@ -1264,6 +1264,98 @@ impl Registry {
         )
     }
 
+    /// The bytes of the manifest under `tag`, a sequence's or its tip's, as
+    /// the registry serves them, or `None` when this repository holds none
+    /// there.
+    pub fn manifest_at(&self, tag: &str) -> Result<Option<Vec<u8>>, Error> {
+        validate_any_tag(tag)?;
+
+        let reference = self.shared.tagged(tag);
+        let pulled = self.shared.reading(&format!("manifest {reference}"), || {
+            Ok(self
+                .shared
+                .runtime
+                .block_on(self.shared.client.pull_manifest_raw(
+                    &reference,
+                    &self.shared.auth,
+                    &[IMAGE_MANIFEST_MEDIA_TYPE],
+                ))?)
+        });
+
+        match pulled {
+            Ok((bytes, _)) => Ok(Some(bytes.to_vec())),
+            Err(error) if error.is_absent() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Tag `body`, the exact bytes of a manifest whose blobs are already up,
+    /// as `tag`, a sequence's or its tip's.
+    pub fn put_manifest(&self, tag: &str, body: Vec<u8>) -> Result<(), Error> {
+        validate_any_tag(tag)?;
+
+        self.shared.push_manifest(tag, body)
+    }
+
+    /// Upload a document a caller holds, such as an inscription, unless the
+    /// repository has it already, and return its digest.
+    pub fn put_document(&self, bytes: Vec<u8>) -> Result<Digest, Error> {
+        let digest = Digest::compute(&bytes);
+
+        self.shared.put_bytes(&digest, bytes)?;
+
+        Ok(digest)
+    }
+
+    /// Make the blob `blob` names exist in this repository, taking it from
+    /// `source`, which is only read.
+    ///
+    /// With [`Options::direct_s3`], a blob of a repository on the same host is
+    /// copied inside that storage, up to [`s3_upload::COPY_MAX`]. Otherwise it
+    /// is pulled into a scratch file, held to its digest and size, and
+    /// uploaded as a layer is.
+    pub fn carry_blob(&self, source: &Registry, blob: &Descriptor) -> Result<Carried, Error> {
+        let digest = blob.digest.parse::<Digest>()?;
+        let size = u64::try_from(blob.size).map_err(|_| {
+            Error::ManifestMismatch(format!("blob {} claims {} bytes", blob.digest, blob.size))
+        })?;
+        let shared = &self.shared;
+
+        let present = match &shared.direct_s3 {
+            Some(upload) => shared.runtime.block_on(upload.exists(&digest, size))?,
+            None => shared.blob_exists(&digest)?,
+        };
+        if present {
+            return Ok(Carried::Present);
+        }
+
+        let same_storage = source.repository().registry() == self.repository().registry();
+        if let Some(upload) = shared
+            .direct_s3
+            .as_ref()
+            .filter(|_| same_storage && size <= s3_upload::COPY_MAX)
+        {
+            shared.runtime.block_on(upload.copy_from(
+                source.repository().repository(),
+                &digest,
+                size,
+            ))?;
+
+            return Ok(Carried::Copied);
+        }
+
+        let staged = source.shared.runtime.block_on(
+            source
+                .shared
+                .pull_layer(&source.shared.repository, &to_oci(blob)),
+        )?;
+        shared
+            .runtime
+            .block_on(shared.upload(digest, size, staged))?;
+
+        Ok(Carried::Pulled)
+    }
+
     /// Pull the profile's moving tag — the most recent sequence, by its diff
     /// manifest, and its tip.
     pub fn pull_latest(&self, profile: &dyn Profile) -> Result<Snapshot, Error> {
@@ -2055,13 +2147,31 @@ impl Shared {
     /// was. What is deferred is the two round trips, and their failure, which
     /// [`Shared::join_layers`] collects at the seal.
     fn put_layer(&self, layer: &WrittenLayer, staged: File, permit: Permit) {
-        let digest = layer.digests.blob_digest;
-        let size = layer.digests.compressed_size;
-        let observer = self.observer();
-        let attempts = self.attempts;
-
         self.locked().pending.push(layer.clone());
 
+        let upload = self.upload(
+            layer.digests.blob_digest,
+            layer.digests.compressed_size,
+            staged,
+        );
+
+        self.defer(async move {
+            let _permit = permit;
+            upload.await
+        });
+    }
+
+    /// The round trips of [`Shared::put_layer`]: the blob-skip, then the
+    /// upload of the staged blob `digest` of `size` bytes. A future built out
+    /// of clones, for the reason [`Shared::defer`] gives.
+    fn upload(
+        &self,
+        digest: Digest,
+        size: u64,
+        staged: File,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send + 'static {
+        let observer = self.observer();
+        let attempts = self.attempts;
         let client = self.client.clone();
         let repository = self.repository.clone();
         let state = Arc::clone(&self.state);
@@ -2069,8 +2179,7 @@ impl Shared {
         let monolithic_max = self.monolithic_max;
         let direct_s3 = self.direct_s3.clone();
 
-        self.defer(async move {
-            let _permit = permit;
+        async move {
             let named = digest.to_string();
 
             if let Some(upload) = direct_s3 {
@@ -2195,7 +2304,7 @@ impl Shared {
             state.transfer.bytes_uploaded += size;
 
             Ok(())
-        });
+        }
     }
 
     /// Upload a small blob a caller already holds — the inscription, and
@@ -2738,6 +2847,25 @@ pub struct RawDocument {
     pub manifest: Manifest,
     /// The config blob's bytes, held to the digest the manifest names.
     pub config: Vec<u8>,
+}
+
+/// A tag a profile renders, or the tip tag [`tip_tag`] makes of one.
+fn validate_any_tag(tag: &str) -> Result<(), Error> {
+    match tag.strip_suffix(crate::TIP_SUFFIX) {
+        Some(sequence_tag) => tip_tag(sequence_tag).map(|_| ()),
+        None => validate_tag(tag),
+    }
+}
+
+/// What [`Registry::carry_blob`] did to put a blob in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carried {
+    /// The repository held it already.
+    Present,
+    /// Copied inside the storage both repositories share.
+    Copied,
+    /// Pulled from the other repository and uploaded.
+    Pulled,
 }
 
 /// A sequence of a chain as a walk reads it: its diff manifest, its

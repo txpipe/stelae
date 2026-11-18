@@ -160,36 +160,58 @@ enum Command {
     Inspect(InspectArgs),
     /// Plan the rebuild of a lineage published before the diff chain from
     /// its documents, self-checking every sequence and writing nothing to a
-    /// registry.
+    /// registry; with --write, execute such a plan.
     Rebuild(RebuildArgs),
 }
 
 #[derive(Debug, Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+#[command(group(clap::ArgGroup::new("plan_input").multiple(true).args(["blocks_journal", "write"])))]
 struct RebuildArgs {
     #[command(subcommand)]
     profile: Option<RebuildProfile>,
     /// The repository of the lineage before the diff chain:
     /// oci://HOST/cardano/NETWORK.
-    #[arg(long, value_name = "OCI_URL", required = true)]
+    #[arg(
+        long,
+        value_name = "OCI_URL",
+        required_unless_present = "write",
+        conflicts_with = "write"
+    )]
     source: Option<Repository>,
     #[arg(long, action)]
     insecure: bool,
     /// The blocks lineage's journal: a line per sequence, its number and the
     /// blocks inscription digest. Without it only the assignment and the
     /// self-check run.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "write")]
     blocks_journal: Option<PathBuf>,
-    /// Write the plan here, a JSON line per sequence after a header line.
-    #[arg(long, value_name = "PATH", requires = "blocks_journal")]
+    /// Write the plan here, a JSON line per sequence after a header line;
+    /// with --write, the plan to execute.
+    #[arg(long, value_name = "PATH", requires = "plan_input")]
     plan: Option<PathBuf>,
     /// The epochs whose tips the registry keeps, one per line. The newest
     /// tip is always kept.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "write")]
     kept_tips_file: Option<PathBuf>,
     /// Print each sequence with its new inscription digest.
     #[arg(long, action, requires = "blocks_journal")]
     print_digests: bool,
+    /// Write the plan's lineage to the `dolos` repository under the network
+    /// root, resolve it back, and only then move `latest`. Nothing is
+    /// written to the plan's source.
+    #[arg(long, action, requires = "plan")]
+    write: bool,
+    /// The network root to write under; the plan's source by default.
+    #[arg(long, value_name = "OCI_URL", requires = "write")]
+    root: Option<Repository>,
+    /// The registry's blob storage, so blobs are copied inside it rather
+    /// than pulled and pushed.
+    #[arg(long, value_name = "PATH", requires = "write")]
+    direct_s3_config: Option<PathBuf>,
+    /// Where a blob pulled from the source is staged on its way up.
+    #[arg(long, value_name = "PATH", requires = "write")]
+    scratch_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1033,7 +1055,9 @@ fn run_inspect(
 }
 
 fn run_rebuild(genesis: &Genesis, args: &RebuildArgs, auth: ResolveReadAuth) -> miette::Result<()> {
-    let source = args.source.as_ref().expect("required without a subcommand");
+    let Some(source) = &args.source else {
+        unreachable!("clap requires --source without --write or a subcommand");
+    };
     let read = |path: &Path| {
         std::fs::read_to_string(path)
             .into_diagnostic()
@@ -1106,8 +1130,8 @@ fn run_rebuild(genesis: &Genesis, args: &RebuildArgs, auth: ResolveReadAuth) -> 
         false => println!("{line}"),
     };
     say(format!(
-        "{}: epoch-{} to epoch-{}, every sequence self-checked",
-        source, summary.first, summary.last
+        "{source}: epoch-{} to epoch-{}, every sequence self-checked",
+        summary.first, summary.last
     ));
     say(format!(
         "layers: {} diff and {} tip; dropped {} closed-epoch blocks and {} retained dumps",
@@ -1212,6 +1236,47 @@ fn run_rebuild_blocks(
     Ok(())
 }
 
+fn run_rebuild_write(
+    genesis: &Genesis,
+    args: &RebuildArgs,
+    auth: ResolveAuth,
+) -> miette::Result<()> {
+    let Some(path) = &args.plan else {
+        unreachable!("clap requires --plan with --write");
+    };
+    let text = std::fs::read_to_string(path)
+        .into_diagnostic()
+        .with_context(|| format!("reading {}", path.display()))?;
+    let plan = rebuild::write::Plan::read(&text).into_diagnostic()?;
+    let options = rebuild::write::Options {
+        network_magic: u64::from(genesis.network_magic()),
+        root: args.root.clone(),
+        insecure: args.insecure,
+        auth: auth()?,
+        direct_s3: read_direct_s3(args.direct_s3_config.as_deref())?,
+        scratch_dir: args.scratch_dir.clone(),
+    };
+
+    let written = rebuild::write::write(&plan, &options).map_err(|error| match error {
+        rebuild::write::Error::Resolved { .. } => miette::Report::new(Mismatch(Box::new(error))),
+        error => miette::Report::from_err(error),
+    })?;
+
+    println!(
+        "{}: epoch-{} to epoch-{}, resolved as planned; latest names {}",
+        written.target, written.first, written.last, written.identity
+    );
+    println!(
+        "blobs: {} copied, {} pulled, {} already there",
+        written.blobs_copied, written.blobs_pulled, written.blobs_present
+    );
+    println!(
+        "tags: {} written, {} already there",
+        written.tags_written, written.tags_present
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
@@ -1263,6 +1328,7 @@ fn execute(cli: Cli, env: Env) -> miette::Result<()> {
             profile: Some(RebuildProfile::Blocks(args)),
             ..
         }) => run_rebuild_blocks(&config, &genesis, &args, &auth, &read_auth),
+        Command::Rebuild(args) if args.write => run_rebuild_write(&genesis, &args, &auth),
         Command::Rebuild(args) => run_rebuild(&genesis, &args, &read_auth),
     }
 }

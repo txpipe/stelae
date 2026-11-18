@@ -12,7 +12,8 @@
 //! The epoch geometry the rule needs is read from the newest inscription's
 //! `indexes` scopes, and the stability window from the configured genesis.
 //! Nothing here writes to a registry: given the blocks journal, the output is
-//! a [`Planned`] line per sequence, which `rebuild --write` executes.
+//! a [`Planned`] line per sequence, which `rebuild --write` executes
+//! ([`write`]).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -40,6 +41,7 @@ use stelae_driver::{DriverProfile as _, Role};
 use crate::{Auth, Genesis, Repository};
 
 pub mod blocks;
+pub mod write;
 
 /// The plan file's format, its first line's `rebuildPlan`.
 pub const PLAN_FORMAT: u64 = 1;
