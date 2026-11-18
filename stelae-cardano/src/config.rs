@@ -102,6 +102,23 @@ pub enum InputError {
     },
 }
 
+/// The aggregator the invocation names, else the known network's.
+pub fn mithril_aggregator(
+    config: &RootConfig,
+    aggregator: Option<String>,
+) -> Result<String, InputError> {
+    aggregator
+        .or_else(|| {
+            let network = ResolvedNetwork::resolve(&config.chain).ok()?;
+            Some(network.known()?.mithril.aggregator.to_owned())
+        })
+        .ok_or(InputError::MissingMithril {
+            what: "aggregator",
+            flag: "aggregator",
+            env: "DOLOS_MITHRIL_AGGREGATOR",
+        })
+}
+
 /// The aggregator a backfill trusts: what the invocation names, else the
 /// known network's.
 pub fn mithril_source(
@@ -114,13 +131,7 @@ pub fn mithril_source(
         .and_then(|network| network.known())
         .map(|network| &network.mithril);
 
-    let aggregator = aggregator
-        .or_else(|| catalog.map(|mithril| mithril.aggregator.to_owned()))
-        .ok_or(InputError::MissingMithril {
-            what: "aggregator",
-            flag: "aggregator",
-            env: "DOLOS_MITHRIL_AGGREGATOR",
-        })?;
+    let aggregator = mithril_aggregator(config, aggregator)?;
 
     let genesis_vkey = genesis_vkey
         .or_else(|| catalog.map(|mithril| mithril.genesis_vkey.to_owned()))

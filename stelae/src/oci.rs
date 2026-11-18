@@ -1252,6 +1252,18 @@ impl Registry {
         })
     }
 
+    /// Stage the blob a layer of a [`RawDocument`]'s manifest names, held to
+    /// its digest and size, as [`SnapshotReader::stream_layer`] stages one.
+    ///
+    /// For a reader of documents this crate no longer parses, which opens the
+    /// layer itself.
+    pub fn pull_raw_blob(&self, layer: &Descriptor) -> Result<File, Error> {
+        self.shared.runtime.block_on(
+            self.shared
+                .pull_layer(&self.shared.repository, &to_oci(layer)),
+        )
+    }
+
     /// Pull the profile's moving tag — the most recent sequence, by its diff
     /// manifest, and its tip.
     pub fn pull_latest(&self, profile: &dyn Profile) -> Result<Snapshot, Error> {

@@ -12,6 +12,8 @@
 //! - [`layer`] — writing a layer from records and reading one back.
 //! - `hardano` (feature `hardano`) — an epoch's blocks read out of the Haskell
 //!   node's immutable files, sealed as a blocks snapshot.
+//! - [`seal`] — the inscription over one epoch's layer, for every writer of a
+//!   blocks lineage.
 //!
 //! Every layer is final once its epoch has closed, so every layer goes in an
 //! inscription's `diff` and a blocks snapshot has no tip.
@@ -25,7 +27,11 @@ pub mod scope;
 use std::{ops::Range, path::PathBuf};
 
 use serde_json::json;
-use stelae::{inscription::Inscription, Compression, Profile};
+use stelae::{
+    inscription::{Inscription, LayerDescriptor, Link},
+    Compression, Digest, Profile, SnapshotWriter,
+};
+use stelae_driver::place_layers;
 
 pub use layer::{write_layer, BlocksReader, BlocksWriter};
 pub use record::{BlockRecord, OrderCheck};
@@ -269,6 +275,68 @@ pub fn compression() -> Compression {
         algo: COMPRESSION_ALGO.to_owned(),
         level: COMPRESSION_LEVEL as i64,
     }
+}
+
+/// A sealed blocks snapshot.
+#[derive(Debug, Clone)]
+pub struct Sealed {
+    pub inscription: Inscription,
+    /// The snapshot's identity: the digest of its canonical inscription.
+    pub digest: Digest,
+}
+
+/// Refuse a link that does not fit the snapshot at `sequence`: only sequence
+/// 1 starts a lineage, because one epoch's layer cannot list every epoch
+/// before it, and every later snapshot follows the one before it.
+pub fn check_link(sequence: u64, previous: Option<Link>) -> Result<(), Error> {
+    let lineage = |reason: String| Error::Lineage { sequence, reason };
+
+    match previous {
+        None if sequence > 1 => Err(lineage(
+            "it starts no lineage, so it must follow the snapshot at the sequence before it".into(),
+        )),
+        Some(link) if link.sequence + 1 != sequence => Err(lineage(format!(
+            "it would follow sequence {}, not the one before it",
+            link.sequence
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Seal the snapshot at `sequence` over `layer`, the `blocks` layer of the
+/// epoch its cut closes, linked to `previous`.
+///
+/// Every writer of a blocks lineage seals through this, so two of them given
+/// the same layer and link produce the same inscription.
+pub fn seal<W: SnapshotWriter>(
+    writer: &W,
+    network_magic: u64,
+    sequence: u64,
+    previous: Option<Link>,
+    layer: LayerDescriptor,
+) -> Result<Sealed, Error> {
+    check_link(sequence, previous)?;
+
+    let mut inscription = Inscription::new(
+        &BlocksProfile,
+        sequence,
+        position(&Position {
+            network_magic,
+            epoch: sequence,
+        }),
+        parameters(),
+        compression(),
+    );
+    inscription.previous = previous;
+    place_layers(&BlocksProfile, &mut inscription, [layer])?;
+    inscription.validate()?;
+
+    let digest = writer.seal(&BlocksProfile, &inscription)?;
+
+    Ok(Sealed {
+        inscription,
+        digest,
+    })
 }
 
 /// The epochs whose layers the inscription at `sequence` lists in `diff`.

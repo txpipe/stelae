@@ -39,6 +39,8 @@ use stelae_driver::{DriverProfile as _, Role};
 
 use crate::{Auth, Genesis, Repository};
 
+pub mod blocks;
+
 /// The plan file's format, its first line's `rebuildPlan`.
 pub const PLAN_FORMAT: u64 = 1;
 

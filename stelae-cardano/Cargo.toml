@@ -24,6 +24,10 @@ itertools = "0.14.0"
 pallas = { version = "1.4.0", features = ["hardano", "phase2", "unstable"] }
 serde = { version = "1.0.136", features = ["derive"] }
 serde_json = "1.0.122"
+# `rebuild blocks` hashes each immutable file's bodies, and fetches Mithril's
+# digest list with the client and TLS stack `stelae`'s registry uses.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+sha2 = "0.10.9"
 thiserror = "2.0.12"
 tokio = { version = "1.47", features = ["rt", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7.11", features = ["rt"] }
@@ -43,6 +47,8 @@ required-features = ["testing"]
 
 [dev-dependencies]
 stelae-cardano = { path = ".", features = ["testing"] }
+# The re-encode test exports the same epoch from immutable files.
+stelae-blocks = { path = "../stelae-blocks", version = "=0.6.0", features = ["hardano"] }
 dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "e52f2cf8f7d25870fac712fd85a31b4545c42acf" }
 dolos-fjall = { git = "https://github.com/txpipe/dolos", rev = "e52f2cf8f7d25870fac712fd85a31b4545c42acf" }
 # The tests build fjall errors directly, so this must be the fork revision

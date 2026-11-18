@@ -283,6 +283,47 @@ the summary to stderr. `rebuild` exits 0 on success, 1 on an error or a
 refused lineage, 2 on a usage error and 3 when the self-check refused a
 sequence.
 
+#### The blocks lineage
+
+`rebuild blocks` builds that journal, and the blocks lineage it names, from
+the same old repository. The newest `epoch-N` lists a `blocks` layer for
+every closed epoch, 0 to N−1, under a header naming the Dolos profile. Each is
+streamed in turn and written again with the blocks profile's header and
+every record byte kept, so the `diffId` and the blob change and the blocks do
+not. Epoch E is sealed at sequence E+1, linked to the one before, as
+`stelae-blocks` seals a blocks snapshot exported from immutable files.
+
+```sh
+stelae-publisher --config dolos.toml rebuild blocks \
+  --source oci://registry.example/cardano/preview \
+  --journal blocks.journal \
+  --upload oci://registry.example/cardano/preview
+```
+
+On the way past, the bodies of each immutable file the epoch covers are
+hashed: a block belongs to the file its slot divided by the network's file
+width (ten times the security parameter) gives, so a Byron boundary block
+falls in its epoch's first file, and a file with no block hashes as an empty
+one. Each digest must be the `.chunk` digest of Mithril's published list,
+fetched from the aggregator's `artifact/cardano-database/digests` route
+(`--mithril-aggregator`, defaulting to the configured network's), or read
+from a saved copy with `--mithril-digests FILE`. A file whose digest differs,
+or that the list does not certify yet, refuses its epoch: the error names
+each such file, nothing of that epoch is written, and the command exits 3.
+
+The journal gets a line per sequence, `N sha256:…`, once its snapshot is
+sealed. A run resumes after the journal's last line and appends to it, so a
+refused or interrupted run is continued by running it again. Without
+`--upload` nothing is written to a registry: the layers are hashed and
+discarded, and the journal is what `rebuild --blocks-journal` reads for a dry
+run. With `--upload ROOT`, the blobs, manifests and tags go to ROOT's
+`blocks` repository one layer at a time. A blob the repository already holds
+under the same digest, as after an interruption, is not sent again. Before
+anything is written, the repository's newest snapshot must be where the
+journal ends, or the one after it, whose journal line was lost and which is
+sealed again with the same bytes. The summary gives the epochs re-encoded and
+resumed, the files compared, and the layers' sizes.
+
 OCI operations run synchronously on the process thread. Mithril calls have a
 separate Tokio runtime. SIGINT and SIGTERM cancel acquisition and are observed
 between import chunks and retry attempts; an in-flight OCI publication still

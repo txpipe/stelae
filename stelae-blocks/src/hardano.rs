@@ -16,12 +16,12 @@ use std::{
 use minicbor::Decoder;
 use pallas_hardano::storage::immutable::chunk;
 use pallas_traverse::MultiEraHeader;
-use stelae::{inscription::Inscription, Digest, SnapshotWriter};
-use stelae_driver::{place_layers, Predecessor};
+use stelae::SnapshotWriter;
+use stelae_driver::Predecessor;
 
+pub use crate::Sealed;
 use crate::{
-    compression, parameters, position, BlockRecord, BlocksProfile, BlocksWriter, EpochScope, Error,
-    Position, BLOCKS, COMPRESSION_LEVEL,
+    check_link, seal, BlockRecord, BlocksWriter, EpochScope, Error, BLOCKS, COMPRESSION_LEVEL,
 };
 
 /// The three files the node writes per immutable file number.
@@ -37,43 +37,11 @@ pub struct Epoch<'a> {
     pub slots_per_file: u64,
 }
 
-/// A sealed blocks snapshot.
-#[derive(Debug, Clone)]
-pub struct Sealed {
-    pub inscription: Inscription,
-    /// The snapshot's identity: the digest of its canonical inscription.
-    pub digest: Digest,
-}
-
 impl Epoch<'_> {
     /// The numbers of the immutable files the epoch covers, refused when its
     /// bounds do not fall on file boundaries.
     pub fn files(&self) -> Result<RangeInclusive<u64>, Error> {
-        let EpochScope {
-            epoch,
-            start_slot,
-            end_slot,
-            ..
-        } = self.scope;
-        let width = self.slots_per_file;
-        let malformed = |why: String| Error::MalformedScope(format!("epoch {epoch}: {why}"));
-
-        if width == 0 {
-            return Err(malformed("an immutable file covers no slots".into()));
-        }
-
-        let end = end_slot
-            .checked_add(1)
-            .ok_or_else(|| malformed(format!("end slot {end_slot} has no successor")))?;
-
-        if start_slot % width != 0 || end % width != 0 {
-            return Err(malformed(format!(
-                "slots {start_slot}..={end_slot} are not a whole number of {width}-slot \
-                 immutable files"
-            )));
-        }
-
-        Ok(start_slot / width..=end_slot / width)
+        self.scope.files(self.slots_per_file)
     }
 
     /// Refuse a directory that lacks a file of the epoch, skips a number
@@ -153,24 +121,7 @@ pub fn export<W: SnapshotWriter>(
         reason: "the epoch has no successor".into(),
     })?;
     let previous = predecessor.previous();
-
-    let lineage = |reason: String| Error::Lineage { sequence, reason };
-
-    match previous {
-        None if sequence > 1 => {
-            return Err(lineage(
-                "it starts no lineage, so it must follow the snapshot at the sequence before it"
-                    .into(),
-            ))
-        }
-        Some(link) if link.sequence + 1 != sequence => {
-            return Err(lineage(format!(
-                "it would follow sequence {}, not the one before it",
-                link.sequence
-            )))
-        }
-        _ => {}
-    }
+    check_link(sequence, previous)?;
 
     let spec = scope.layer_spec()?;
 
@@ -189,26 +140,7 @@ pub fn export<W: SnapshotWriter>(
 
     predecessor.landed(&descriptor)?;
 
-    let mut inscription = Inscription::new(
-        &BlocksProfile,
-        sequence,
-        position(&Position {
-            network_magic: scope.network_magic,
-            epoch: sequence,
-        }),
-        parameters(),
-        compression(),
-    );
-    inscription.previous = previous;
-    place_layers(&BlocksProfile, &mut inscription, [descriptor])?;
-    inscription.validate()?;
-
-    let digest = writer.seal(&BlocksProfile, &inscription)?;
-
-    Ok(Sealed {
-        inscription,
-        digest,
-    })
+    seal(writer, scope.network_magic, sequence, previous, descriptor)
 }
 
 /// A block's record: the slot and hash its header gives, and the bytes the

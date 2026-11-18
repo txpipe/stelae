@@ -165,11 +165,14 @@ enum Command {
 }
 
 #[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct RebuildArgs {
+    #[command(subcommand)]
+    profile: Option<RebuildProfile>,
     /// The repository of the lineage before the diff chain:
     /// oci://HOST/cardano/NETWORK.
-    #[arg(long, value_name = "OCI_URL")]
-    source: Repository,
+    #[arg(long, value_name = "OCI_URL", required = true)]
+    source: Option<Repository>,
     #[arg(long, action)]
     insecure: bool,
     /// The blocks lineage's journal: a line per sequence, its number and the
@@ -187,6 +190,43 @@ struct RebuildArgs {
     /// Print each sequence with its new inscription digest.
     #[arg(long, action, requires = "blocks_journal")]
     print_digests: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum RebuildProfile {
+    /// Re-encode the old lineage's closed-epoch blocks layers under the
+    /// blocks profile, compare each immutable file with Mithril's digest list
+    /// and seal the blocks lineage, appending each sequence to the journal.
+    Blocks(RebuildBlocksArgs),
+}
+
+#[derive(Debug, Args)]
+struct RebuildBlocksArgs {
+    /// The repository of the lineage before the diff chain:
+    /// oci://HOST/cardano/NETWORK.
+    #[arg(long, value_name = "OCI_URL")]
+    source: Repository,
+    #[arg(long, action)]
+    insecure: bool,
+    /// A line per sequence, its number and inscription digest. A run resumes
+    /// after the journal's last line and appends to it.
+    #[arg(long, value_name = "PATH")]
+    journal: PathBuf,
+    /// Upload the lineage to the `blocks` repository of this network root,
+    /// oci://HOST/cardano/NETWORK. Without it nothing is written to a
+    /// registry.
+    #[arg(long, value_name = "OCI_URL")]
+    upload: Option<Repository>,
+    /// The Mithril aggregator whose digest list the blocks are compared
+    /// with; defaults to the configured network's.
+    #[arg(long, env = "DOLOS_MITHRIL_AGGREGATOR", value_name = "URL")]
+    mithril_aggregator: Option<String>,
+    /// A digest list saved from the aggregator's digests route, compared
+    /// with in place of fetching one.
+    #[arg(long, value_name = "PATH")]
+    mithril_digests: Option<PathBuf>,
+    #[arg(long)]
+    scratch_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1006,6 +1046,7 @@ fn run_inspect(
 }
 
 fn run_rebuild(genesis: &Genesis, args: &RebuildArgs, auth: ResolveReadAuth) -> miette::Result<()> {
+    let source = args.source.as_ref().expect("required without a subcommand");
     let read = |path: &Path| {
         std::fs::read_to_string(path)
             .into_diagnostic()
@@ -1020,9 +1061,9 @@ fn run_rebuild(genesis: &Genesis, args: &RebuildArgs, auth: ResolveReadAuth) -> 
         None => Default::default(),
     };
     let options = rebuild::Options {
-        source: args.source.clone(),
+        source: source.clone(),
         insecure: args.insecure,
-        auth: auth(&args.source)?,
+        auth: auth(source)?,
         blocks,
         kept,
     };
@@ -1079,7 +1120,7 @@ fn run_rebuild(genesis: &Genesis, args: &RebuildArgs, auth: ResolveReadAuth) -> 
     };
     say(format!(
         "{}: epoch-{} to epoch-{}, every sequence self-checked",
-        args.source, summary.first, summary.last
+        source, summary.first, summary.last
     ));
     say(format!(
         "layers: {} diff and {} tip; dropped {} closed-epoch blocks and {} retained dumps",
@@ -1099,6 +1140,88 @@ fn run_rebuild(genesis: &Genesis, args: &RebuildArgs, auth: ResolveReadAuth) -> 
             println!("{sequence} {digest}");
         }
     }
+    Ok(())
+}
+
+fn run_rebuild_blocks(
+    config: &RootConfig,
+    genesis: &Genesis,
+    args: &RebuildBlocksArgs,
+    auth: ResolveAuth,
+    read_auth: ResolveReadAuth,
+) -> miette::Result<()> {
+    use rebuild::blocks;
+
+    let digests = match &args.mithril_digests {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .into_diagnostic()
+                .with_context(|| format!("reading {}", path.display()))?;
+            blocks::ChunkDigests::parse(&bytes).into_diagnostic()?
+        }
+        None => {
+            let aggregator = config::mithril_aggregator(config, args.mithril_aggregator.clone())
+                .into_diagnostic()?;
+            blocks::fetch(&aggregator).into_diagnostic()?
+        }
+    };
+    let journal = match std::fs::read_to_string(&args.journal) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error)
+                .into_diagnostic()
+                .with_context(|| format!("reading {}", args.journal.display()))
+        }
+    };
+    let upload = match &args.upload {
+        Some(root) => Some(blocks::Upload {
+            root: root.clone(),
+            auth: auth()?,
+        }),
+        None => None,
+    };
+    let options = blocks::Options {
+        source: args.source.clone(),
+        auth: read_auth(&args.source)?,
+        insecure: args.insecure,
+        upload,
+        scratch_dir: args.scratch_dir.clone(),
+    };
+    let mut append = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&args.journal)
+        .into_diagnostic()
+        .with_context(|| format!("opening {}", args.journal.display()))?;
+
+    let summary = blocks::run(&options, genesis, &digests, &journal, &mut append).map_err(
+        |error| match error {
+            blocks::Error::Mithril { .. } => miette::Report::new(Mismatch(Box::new(error))),
+            error => miette::Report::from_err(error),
+        },
+    )?;
+
+    println!(
+        "{}: epoch-1 to epoch-{}, {} resumed from the journal, {} re-encoded",
+        args.source, summary.last, summary.resumed, summary.epochs
+    );
+    println!(
+        "compared with Mithril: {} immutable files, 0 mismatches",
+        summary.files
+    );
+    println!(
+        "layers: {} uncompressed bytes, {} compressed bytes",
+        summary.uncompressed_bytes, summary.compressed_bytes
+    );
+    println!(
+        "{}; journal: {}",
+        match &args.upload {
+            Some(root) => format!("uploaded to the blocks repository of {root}"),
+            None => "nothing written to a registry".to_owned(),
+        },
+        args.journal.display()
+    );
     Ok(())
 }
 
@@ -1149,6 +1272,10 @@ fn execute(cli: Cli, env: Env) -> miette::Result<()> {
         Command::Digest(args) => run_digest(&config, &genesis, &args, &read_auth),
         Command::Verify(args) => run_verify(&config, &genesis, &args, &read_auth),
         Command::Inspect(args) => run_inspect(&config, &args, &read_auth),
+        Command::Rebuild(RebuildArgs {
+            profile: Some(RebuildProfile::Blocks(args)),
+            ..
+        }) => run_rebuild_blocks(&config, &genesis, &args, &auth, &read_auth),
         Command::Rebuild(args) => run_rebuild(&genesis, &args, &read_auth),
     }
 }
@@ -1193,6 +1320,51 @@ mod tests {
         match parse(&args).unwrap().command {
             Command::Backfill(args) => args.limits(),
             _ => unreachable!("parsed a backfill"),
+        }
+    }
+
+    #[test]
+    fn rebuild_takes_the_dolos_lineage_by_its_flags_and_blocks_as_a_subcommand() {
+        const OLD: &str = "oci://registry.invalid/cardano/preview";
+
+        match parse(&["rebuild", "--source", OLD]).unwrap().command {
+            Command::Rebuild(RebuildArgs {
+                profile: None,
+                source: Some(source),
+                ..
+            }) => assert_eq!(source.to_string(), OLD),
+            other => panic!("{other:?}"),
+        }
+
+        let blocks = ["rebuild", "blocks", "--source", OLD, "--journal", "j"];
+        match parse(&blocks).unwrap().command {
+            Command::Rebuild(RebuildArgs {
+                profile: Some(RebuildProfile::Blocks(args)),
+                source: None,
+                ..
+            }) => {
+                assert_eq!(args.journal, PathBuf::from("j"));
+                assert!(args.upload.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+
+        for refused in [
+            ["rebuild"].as_slice(),
+            ["rebuild", "blocks", "--source", OLD].as_slice(),
+            [
+                "rebuild",
+                "--source",
+                OLD,
+                "blocks",
+                "--source",
+                OLD,
+                "--journal",
+                "j",
+            ]
+            .as_slice(),
+        ] {
+            assert!(parse(refused).is_err(), "{refused:?}");
         }
     }
 
