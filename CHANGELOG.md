@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-11-18
+
+### 🚀 Features
+
+- Add the io.txpipe.cardano.blocks profile crate (#29)
+- [**breaking**] List an inscription's layers as diff and tip, linked by previous (#31)
+- [**breaking**] Upload and list only a publish's own layers (#32)
+- [**breaking**] Publish each sequence as a diff manifest and a tip manifest (#33)
+- [**breaking**] Resolve a snapshot by walking its chain (#35)
+- Build a blocks snapshot from immutable files (#34)
+- [**breaking**] Hold a repository in a directory as an OCI image layout (#36)
+- [**breaking**] Move the publisher host onto the diff chain (#37)
+- Plan the rebuild of a lineage from before the diff chain (#39)
+- [**breaking**] Publish a blocks snapshot at every boundary (#38)
+- Write a rebuilt lineage to the network root's dolos repository (#41)
+- Re-encode an old lineage's blocks layers under the blocks profile (#40)
+
+### 🚜 Refactor
+
+- [**breaking**] Name the protocol's artifact a snapshot in stelae and stelae-driver (#28)
+- [**breaking**] Move the manifest into a protocol module outside the oci feature (#30)
+
+### Build
+
+- Pin the publisher host to the Stelae revision its Dolos uses (#27)
+
 ## [0.6.0] - 2026-11-12
 
 ### 🚀 Features
@@ -19,6 +45,10 @@ All notable changes to this project will be documented in this file.
 ### 🧪 Testing
 
 - Prove batched publication's parity and measure its cost (#22)
+
+### Release
+
+- V0.6.0
 
 ## [0.5.2] - 2026-11-04
 
