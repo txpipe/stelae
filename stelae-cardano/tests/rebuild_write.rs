@@ -621,3 +621,68 @@ fn a_blob_over_the_default_goes_up_in_one_request_under_a_raised_limit() {
     assert_eq!(patches("raised", 2 * oci::DEFAULT_MONOLITHIC_MAX), 0);
     assert!(patches("default", oci::DEFAULT_MONOLITHIC_MAX) > 0);
 }
+
+/// A single-request size above the upload memory is clamped to it: a blob
+/// larger than the budget streams as a `PATCH` chain instead of waiting
+/// forever for more resident bytes than the budget holds.
+#[test]
+fn a_single_request_size_above_the_upload_memory_is_clamped_to_it() {
+    const MIB: u64 = 1024 * 1024;
+    provider();
+    let root = tempfile::tempdir().unwrap();
+    let size = 2 * MIB;
+    let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let digest = Digest::compute(&body);
+    let blobs = root.path().join(OLD).join("blobs/sha256");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(digest.to_hex()), &body).unwrap();
+    drop(body);
+
+    let loopback = Loopback::serve(root.path()).unwrap();
+    let counted = Arc::new(AtomicU64::new(0));
+    let count = counted.clone();
+    loopback.rule(move |seen| {
+        if seen.method == "PATCH" {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+        Verdict::Proceed
+    });
+    let open = |name: &str, options: oci::Options| {
+        Registry::open(&loopback.repository(name).parse().unwrap(), options).unwrap()
+    };
+    let source = open(
+        OLD,
+        oci::Options {
+            insecure: true,
+            ..Default::default()
+        },
+    );
+    let target = open(
+        "clamped",
+        oci::Options {
+            insecure: true,
+            monolithic_max: u64::MAX,
+            upload_memory: MIB,
+            ..Default::default()
+        },
+    );
+    let blob = stelae::manifest::Descriptor {
+        media_type: "application/octet-stream".to_owned(),
+        digest: digest.to_string(),
+        size: size as i64,
+        ..Default::default()
+    };
+
+    let (done, carried) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _ = done.send(target.carry_blob(&source, &blob).map_err(|e| e.to_string()));
+        });
+        let carried = carried
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("a blob over the upload memory never finished uploading");
+        assert_eq!(carried.unwrap(), oci::Carried::Pulled);
+    });
+    assert_eq!(loopback.blobs("clamped").get(&blob.digest), Some(&size));
+    assert!(counted.load(Ordering::SeqCst) > 0);
+}

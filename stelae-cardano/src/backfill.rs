@@ -606,6 +606,15 @@ impl Options {
     fn spool(&self, storage: &StorageConfig) -> PathBuf {
         node::scratch_dir(storage, self.scratch_dir.as_deref())
     }
+
+    /// The transport tuning a run publishes with.
+    fn tuning(&self) -> dolos_snapshot::registry::Tuning {
+        dolos_snapshot::registry::Tuning {
+            direct_s3: self.direct_s3.clone(),
+            concurrency: self.concurrency,
+            monolithic_max: self.monolithic_max,
+        }
+    }
 }
 
 fn require_synchronous_context() -> Result<(), Error> {
@@ -642,11 +651,7 @@ pub fn run(
         auth: options.auth.clone(),
         insecure: options.insecure,
         scratch_dir: options.scratch_dir.as_deref(),
-        tuning: dolos_snapshot::registry::Tuning {
-            direct_s3: options.direct_s3.clone(),
-            concurrency: options.concurrency,
-            monolithic_max: options.monolithic_max,
-        },
+        tuning: options.tuning(),
     };
     let publisher = BackfillPublisher {
         config,
@@ -1951,6 +1956,36 @@ mod tests {
         };
         assert_eq!(options(Some("/spool")).spool(storage), Path::new("/spool"));
         assert_eq!(options(None).spool(storage), storage.path.join("scratch"));
+    }
+
+    #[test]
+    fn a_run_publishes_with_the_single_request_size_it_is_given() {
+        let tuning = |monolithic_max| {
+            Options {
+                direct_s3: None,
+                repository: "oci://registry.invalid/cardano/preview".parse().unwrap(),
+                auth: Auth::Anonymous,
+                insecure: false,
+                scratch_dir: None,
+                concurrency: None,
+                monolithic_max,
+                download_dir: None,
+                window: 1,
+                until_epoch: None,
+                skip_validation: true,
+                mithril: MithrilSource {
+                    aggregator: String::new(),
+                    genesis_vkey: String::new(),
+                },
+                limits: Limits::ONE,
+            }
+            .tuning()
+            .monolithic_max
+        };
+        let raised = 4 * stelae::oci::DEFAULT_MONOLITHIC_MAX;
+        assert_eq!(tuning(None), None);
+        assert_eq!(tuning(Some(0)), Some(0));
+        assert_eq!(tuning(Some(raised)), Some(raised));
     }
 
     #[test]

@@ -1175,6 +1175,44 @@ fn monolithic_max(mib: Option<u64>) -> Option<u64> {
     mib.map(|mib| mib.saturating_mul(1024 * 1024))
 }
 
+impl RebuildBlocksArgs {
+    /// What `rebuild blocks` runs with, reading the source as `auth`.
+    fn options(
+        &self,
+        auth: Auth,
+        upload: Option<rebuild::blocks::Upload>,
+    ) -> rebuild::blocks::Options {
+        rebuild::blocks::Options {
+            source: self.source.clone(),
+            auth,
+            insecure: self.insecure,
+            upload,
+            scratch_dir: self.scratch_dir.clone(),
+            monolithic_max: monolithic_max(self.monolithic_max_mib),
+        }
+    }
+}
+
+impl RebuildArgs {
+    /// What `rebuild --write` writes with.
+    fn write_options(
+        &self,
+        network_magic: u64,
+        auth: Auth,
+        direct_s3: Option<Box<stelae::oci::s3_upload::Config>>,
+    ) -> rebuild::write::Options {
+        rebuild::write::Options {
+            network_magic,
+            root: self.root.clone(),
+            insecure: self.insecure,
+            auth,
+            direct_s3,
+            scratch_dir: self.scratch_dir.clone(),
+            monolithic_max: monolithic_max(self.monolithic_max_mib),
+        }
+    }
+}
+
 fn run_rebuild_blocks(
     config: &RootConfig,
     genesis: &Genesis,
@@ -1213,14 +1251,7 @@ fn run_rebuild_blocks(
         }),
         None => None,
     };
-    let options = blocks::Options {
-        source: args.source.clone(),
-        auth: read_auth(&args.source)?,
-        insecure: args.insecure,
-        upload,
-        scratch_dir: args.scratch_dir.clone(),
-        monolithic_max: monolithic_max(args.monolithic_max_mib),
-    };
+    let options = args.options(read_auth(&args.source)?, upload);
     let mut append = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1270,15 +1301,11 @@ fn run_rebuild_write(
         .into_diagnostic()
         .with_context(|| format!("reading {}", path.display()))?;
     let plan = rebuild::write::Plan::read(&text).into_diagnostic()?;
-    let options = rebuild::write::Options {
-        network_magic: u64::from(genesis.network_magic()),
-        root: args.root.clone(),
-        insecure: args.insecure,
-        auth: auth()?,
-        direct_s3: read_direct_s3(args.direct_s3_config.as_deref())?,
-        scratch_dir: args.scratch_dir.clone(),
-        monolithic_max: monolithic_max(args.monolithic_max_mib),
-    };
+    let options = args.write_options(
+        u64::from(genesis.network_magic()),
+        auth()?,
+        read_direct_s3(args.direct_s3_config.as_deref())?,
+    );
 
     let written = rebuild::write::write(&plan, &options).map_err(|error| match error {
         rebuild::write::Error::Resolved { .. } => miette::Report::new(Mismatch(Box::new(error))),
@@ -1638,8 +1665,10 @@ mod tests {
                 Command::Rebuild(RebuildArgs {
                     profile: Some(RebuildProfile::Blocks(args)),
                     ..
-                }) => monolithic_max(args.monolithic_max_mib),
-                Command::Rebuild(args) => monolithic_max(args.monolithic_max_mib),
+                }) => args.options(Auth::Anonymous, None).monolithic_max,
+                Command::Rebuild(args) => {
+                    args.write_options(2, Auth::Anonymous, None).monolithic_max
+                }
                 other => panic!("{other:?}"),
             }
         };
