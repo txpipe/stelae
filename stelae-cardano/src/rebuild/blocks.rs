@@ -341,6 +341,9 @@ pub struct Options {
     /// Without it, nothing is written to a registry.
     pub upload: Option<Upload>,
     pub scratch_dir: Option<PathBuf>,
+    /// The largest layer, in bytes, uploaded as one request; the transport's
+    /// default when `None`.
+    pub monolithic_max: Option<u64>,
 }
 
 /// What a run did.
@@ -371,6 +374,9 @@ pub fn run(
         insecure: options.insecure,
         auth: auth.clone(),
         scratch_dir: options.scratch_dir.clone(),
+        monolithic_max: options
+            .monolithic_max
+            .unwrap_or(stelae::oci::DEFAULT_MONOLITHIC_MAX),
         ..Default::default()
     };
     let repository = options.source.to_string();

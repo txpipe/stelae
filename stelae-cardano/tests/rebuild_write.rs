@@ -133,6 +133,7 @@ fn options() -> write::Options {
         auth: Auth::Anonymous,
         direct_s3: None,
         scratch_dir: None,
+        monolithic_max: None,
     }
 }
 
@@ -534,4 +535,89 @@ fn a_plan_whose_documents_disagree_is_refused() {
     assert!(refused(&short).1.contains("epoch-1 to epoch-8"));
 
     Plan::read(&text).unwrap();
+}
+
+/// A blob the write pulls goes up in one request under the transport's
+/// default single-request size, and as a `PATCH` chain when the option says
+/// `0`, so the option reaches the registry the write pushes to.
+#[test]
+fn the_single_request_size_reaches_the_pushed_blobs() {
+    let patches = |monolithic_max: Option<u64>| {
+        let served = Served::new();
+        let plan = Plan::read(&served.plan(&[])).unwrap();
+        let counted = Arc::new(AtomicU64::new(0));
+        let count = counted.clone();
+        served.guard(move |method, _| {
+            if method == "PATCH" {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            Verdict::Proceed
+        });
+        let options = write::Options {
+            monolithic_max,
+            ..options()
+        };
+        let written = write::write(&plan, &options).unwrap();
+        assert!(written.blobs_pulled > 0);
+        counted.load(Ordering::SeqCst)
+    };
+
+    assert_eq!(patches(None), 0);
+    assert!(patches(Some(0)) > 0);
+}
+
+/// A blob over the transport's default single-request size goes up in one
+/// request once the option is raised above it, and as a `PATCH` chain under
+/// the default.
+#[test]
+fn a_blob_over_the_default_goes_up_in_one_request_under_a_raised_limit() {
+    provider();
+    let root = tempfile::tempdir().unwrap();
+    let size = oci::DEFAULT_MONOLITHIC_MAX + 1;
+    let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let digest = Digest::compute(&body);
+    let blobs = root.path().join(OLD).join("blobs/sha256");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(digest.to_hex()), &body).unwrap();
+    drop(body);
+
+    let loopback = Loopback::serve(root.path()).unwrap();
+    let counted = Arc::new(AtomicU64::new(0));
+    let count = counted.clone();
+    loopback.rule(move |seen| {
+        if seen.method == "PATCH" {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+        Verdict::Proceed
+    });
+    let open = |name: &str, monolithic_max| {
+        Registry::open(
+            &loopback.repository(name).parse().unwrap(),
+            oci::Options {
+                insecure: true,
+                monolithic_max,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let source = open(OLD, oci::DEFAULT_MONOLITHIC_MAX);
+    let blob = stelae::manifest::Descriptor {
+        media_type: "application/octet-stream".to_owned(),
+        digest: digest.to_string(),
+        size: size as i64,
+        ..Default::default()
+    };
+    let patches = |name: &str, monolithic_max| {
+        counted.store(0, Ordering::SeqCst);
+        let carried = open(name, monolithic_max)
+            .carry_blob(&source, &blob)
+            .unwrap();
+        assert_eq!(carried, oci::Carried::Pulled);
+        assert_eq!(loopback.blobs(name).get(&blob.digest), Some(&size));
+        counted.load(Ordering::SeqCst)
+    };
+
+    assert_eq!(patches("raised", 2 * oci::DEFAULT_MONOLITHIC_MAX), 0);
+    assert!(patches("default", oci::DEFAULT_MONOLITHIC_MAX) > 0);
 }

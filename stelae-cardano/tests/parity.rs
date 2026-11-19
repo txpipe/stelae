@@ -156,6 +156,7 @@ fn publish(
         insecure: true,
         scratch_dir: None,
         concurrency: None,
+        monolithic_max: None,
         download_dir: Some(download),
         window: 1,
         until_epoch: until,

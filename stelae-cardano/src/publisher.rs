@@ -503,6 +503,7 @@ pub fn publish_once(
                     tuning: Tuning {
                         direct_s3,
                         concurrency,
+                        monolithic_max: None,
                     },
                 };
                 let publisher = Publisher::open(config, &settings)?;

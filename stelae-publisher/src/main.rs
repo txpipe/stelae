@@ -212,6 +212,11 @@ struct RebuildArgs {
     /// Where a blob pulled from the source is staged on its way up.
     #[arg(long, value_name = "PATH", requires = "write")]
     scratch_dir: Option<PathBuf>,
+    /// The largest layer, in MiB, uploaded as one request rather than in
+    /// chunks; 100 MB by default, `0` streams every layer. A value above the
+    /// upload memory budget is clamped to it.
+    #[arg(long, value_name = "MIB", requires = "write")]
+    monolithic_max_mib: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -249,6 +254,11 @@ struct RebuildBlocksArgs {
     mithril_digests: Option<PathBuf>,
     #[arg(long)]
     scratch_dir: Option<PathBuf>,
+    /// The largest layer, in MiB, uploaded as one request rather than in
+    /// chunks; 100 MB by default, `0` streams every layer. A value above the
+    /// upload memory budget is clamped to it.
+    #[arg(long, value_name = "MIB")]
+    monolithic_max_mib: Option<u64>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -316,6 +326,11 @@ struct BackfillArgs {
     scratch_dir: Option<PathBuf>,
     #[arg(long)]
     concurrency: Option<NonZeroUsize>,
+    /// The largest layer, in MiB, uploaded as one request rather than in
+    /// chunks; 100 MB by default, `0` streams every layer. A value above the
+    /// upload memory budget is clamped to it.
+    #[arg(long, value_name = "MIB")]
+    monolithic_max_mib: Option<u64>,
     #[arg(long)]
     download_dir: Option<PathBuf>,
     #[arg(long, default_value = "40")]
@@ -381,6 +396,7 @@ impl BackfillArgs {
             insecure: self.insecure,
             scratch_dir: self.scratch_dir.clone(),
             concurrency: self.concurrency,
+            monolithic_max: monolithic_max(self.monolithic_max_mib),
             download_dir: self.download_dir.clone(),
             window: self.window,
             until_epoch: self.until_epoch,
@@ -1154,6 +1170,11 @@ fn run_rebuild(genesis: &Genesis, args: &RebuildArgs, auth: ResolveReadAuth) -> 
     Ok(())
 }
 
+/// `--monolithic-max-mib` in bytes, as the transport takes it.
+fn monolithic_max(mib: Option<u64>) -> Option<u64> {
+    mib.map(|mib| mib.saturating_mul(1024 * 1024))
+}
+
 fn run_rebuild_blocks(
     config: &RootConfig,
     genesis: &Genesis,
@@ -1198,6 +1219,7 @@ fn run_rebuild_blocks(
         insecure: args.insecure,
         upload,
         scratch_dir: args.scratch_dir.clone(),
+        monolithic_max: monolithic_max(args.monolithic_max_mib),
     };
     let mut append = std::fs::OpenOptions::new()
         .create(true)
@@ -1255,6 +1277,7 @@ fn run_rebuild_write(
         auth: auth()?,
         direct_s3: read_direct_s3(args.direct_s3_config.as_deref())?,
         scratch_dir: args.scratch_dir.clone(),
+        monolithic_max: monolithic_max(args.monolithic_max_mib),
     };
 
     let written = rebuild::write::write(&plan, &options).map_err(|error| match error {
@@ -1593,6 +1616,60 @@ mod tests {
         let options = args.options(&config, &|| Ok(Auth::Anonymous)).unwrap();
         assert_eq!(options.limits, args.limits().unwrap());
         assert_eq!(options.limits.max_epochs.get(), 4);
+    }
+
+    /// `--monolithic-max-mib` on each uploading command, read in MiB: absent
+    /// is the transport's default, `0` is passed on to stream every layer, and
+    /// a value above the upload memory is passed on for the transport to clamp.
+    #[test]
+    fn the_uploading_commands_take_the_single_request_size_in_mib() {
+        const OLD: &str = "oci://registry.invalid/cardano/preview";
+        const MIB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let config = config::load(Some(Path::new(&node(dir.path())))).unwrap();
+
+        let given = |flag: &[&str], command: &[&str]| -> Option<u64> {
+            let args: Vec<&str> = command.iter().chain(flag).copied().collect();
+            match parse(&args).unwrap().command {
+                Command::Run(args) => {
+                    let (_, backfill) = args.options(&config, &|| Ok(Auth::Anonymous)).unwrap();
+                    backfill.monolithic_max
+                }
+                Command::Rebuild(RebuildArgs {
+                    profile: Some(RebuildProfile::Blocks(args)),
+                    ..
+                }) => monolithic_max(args.monolithic_max_mib),
+                Command::Rebuild(args) => monolithic_max(args.monolithic_max_mib),
+                other => panic!("{other:?}"),
+            }
+        };
+        let above_budget = stelae::oci::DEFAULT_UPLOAD_MEMORY / MIB * 4;
+        let above = above_budget.to_string();
+        for command in [
+            ["run", "--repo", OLD].as_slice(),
+            ["rebuild", "blocks", "--source", OLD, "--journal", "j"].as_slice(),
+            ["rebuild", "--write", "--plan", "p"].as_slice(),
+        ] {
+            assert_eq!(given(&[], command), None, "{command:?}");
+            assert_eq!(
+                given(&["--monolithic-max-mib", "0"], command),
+                Some(0),
+                "{command:?}"
+            );
+            assert_eq!(
+                given(&["--monolithic-max-mib", "512"], command),
+                Some(512 * MIB),
+                "{command:?}"
+            );
+            assert_eq!(
+                given(&["--monolithic-max-mib", &above], command),
+                Some(above_budget * MIB),
+                "{command:?}"
+            );
+        }
+
+        // Planning writes nothing, so it has no upload to size.
+        assert!(parse(&["rebuild", "--source", OLD, "--monolithic-max-mib", "512"]).is_err());
     }
 
     #[test]

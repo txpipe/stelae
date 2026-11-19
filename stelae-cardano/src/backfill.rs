@@ -590,6 +590,9 @@ pub struct Options {
     pub insecure: bool,
     pub scratch_dir: Option<PathBuf>,
     pub concurrency: Option<std::num::NonZeroUsize>,
+    /// The largest layer, in bytes, pushed as one request; the transport's
+    /// default when `None`.
+    pub monolithic_max: Option<u64>,
     pub download_dir: Option<PathBuf>,
     pub window: u64,
     pub until_epoch: Option<u64>,
@@ -642,6 +645,7 @@ pub fn run(
         tuning: dolos_snapshot::registry::Tuning {
             direct_s3: options.direct_s3.clone(),
             concurrency: options.concurrency,
+            monolithic_max: options.monolithic_max,
         },
     };
     let publisher = BackfillPublisher {
@@ -1934,6 +1938,7 @@ mod tests {
             insecure: false,
             scratch_dir: scratch_dir.map(PathBuf::from),
             concurrency: None,
+            monolithic_max: None,
             download_dir: None,
             window: 1,
             until_epoch: None,

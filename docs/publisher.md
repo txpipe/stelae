@@ -171,6 +171,38 @@ stores are cleared. `--allow-genesis` is the only genesis fallback and is for
 a deliberately verified first publication. `initialize`, `publish`, and
 `backfill` are also available independently.
 
+`run` and `backfill` take `--monolithic-max-mib M`, the largest layer uploaded
+as one request; see [Single-request uploads](#single-request-uploads).
+
+### Single-request uploads
+
+A layer of up to 100 MB goes to the registry as one `POST` and one `PUT`
+carrying the whole body. A larger one is streamed as a chain of 4 MiB `PATCH`
+requests, and a registry that spends a fixed time on each `PATCH` makes that
+chain far slower than one request. The 100 MB default fits the registry it was
+measured against, which refuses a larger single request. zot accepts a whole
+layer in one request, so against zot the limit can be raised.
+
+`run`, `backfill`, `rebuild blocks` and `rebuild --write` take
+`--monolithic-max-mib M` to set it, in MiB:
+
+- absent, the 100 MB default holds;
+- `0` streams every layer, for a registry that handles a single large `PUT`
+  badly;
+- a layer under the limit is held in memory in full while it goes up, inside
+  the transport's 1 GiB upload budget. A value above that budget is clamped to
+  it, not refused;
+- with `--direct-s3-config`, blobs go to the registry's storage directly and
+  the option has no effect.
+
+```sh
+stelae-publisher --config dolos.toml rebuild blocks \
+  --source oci://registry.example/cardano/preview \
+  --journal blocks.journal \
+  --upload oci://registry.example/cardano/preview \
+  --monolithic-max-mib 1024
+```
+
 ### Reading and reproducing snapshots
 
 `digest`, `verify` and `inspect` replace Dolos's former `snapshot` commands
@@ -325,7 +357,9 @@ under the same digest, as after an interruption, is not sent again. Before
 anything is written, the repository's newest snapshot must be where the
 journal ends, or the one after it, whose journal line was lost and which is
 sealed again with the same bytes. The summary gives the epochs re-encoded and
-resumed, the files compared, and the layers' sizes.
+resumed, the files compared, and the layers' sizes. `--monolithic-max-mib M`
+sets the largest layer uploaded as one request; see
+[Single-request uploads](#single-request-uploads).
 
 #### Writing the rebuilt lineage
 
@@ -363,6 +397,8 @@ pass that finds the target other than the plan exits 3; one the registry
 could not answer exits 1, and a rerun resumes it. Either way `latest` is left
 unwritten. Other failures exit 1 too.
 `--scratch-dir` is where a pulled blob is staged on its way up.
+`--monolithic-max-mib M` sets the largest pushed blob that goes up as one
+request; see [Single-request uploads](#single-request-uploads).
 
 OCI operations run synchronously on the process thread. Mithril calls have a
 separate Tokio runtime. SIGINT and SIGTERM cancel acquisition and are observed

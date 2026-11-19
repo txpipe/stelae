@@ -90,13 +90,14 @@ fn options(insecure: bool, auth: Auth, scratch_dir: PathBuf, tuning: Tuning) -> 
         // transfers a restore loses, not to how fast it should go.
         read_attempts: stelae::oci::DEFAULT_READ_ATTEMPTS,
         read_delay: stelae::oci::DEFAULT_READ_DELAY,
-        // Nor these, for a related reason: both are facts about the
-        // registry this publishes to and about the pod the publisher runs
-        // in, measured rather than chosen, and neither moves when an
-        // operator changes how fast a publish goes. `upload_memory` in
-        // particular is what keeps `--concurrency` from being a claim on
-        // memory — raising one does not raise the other.
-        monolithic_max: stelae::oci::DEFAULT_MONOLITHIC_MAX,
+        // The registry decides how large a single request may be, and the
+        // transport cannot read it, so an operator may say so.
+        monolithic_max: tuning
+            .monolithic_max
+            .unwrap_or(stelae::oci::DEFAULT_MONOLITHIC_MAX),
+        // A fact about the pod the publisher runs in, not about how fast a
+        // publish goes: it keeps `--concurrency` and the single-request size
+        // from being claims on memory, and raising either does not raise it.
         upload_memory: stelae::oci::DEFAULT_UPLOAD_MEMORY,
         // A read knob: a publish reads its predecessor's head and walks no
         // chain.
@@ -109,8 +110,8 @@ fn options(insecure: bool, auth: Auth, scratch_dir: PathBuf, tuning: Tuning) -> 
 ///
 /// Separated from [`open`]'s other arguments because it is the only one of them
 /// a caller can leave alone: a repository, a credential and a staging directory
-/// are facts a publish cannot be run without, and these two are a default and
-/// an escape hatch. A restore or an inspection passes [`Tuning::default`] and
+/// are facts a publish cannot be run without, and these are defaults and
+/// escape hatches. A restore or an inspection passes [`Tuning::default`] and
 /// means it.
 #[derive(Debug, Clone, Default)]
 pub struct Tuning {
@@ -119,6 +120,10 @@ pub struct Tuning {
     /// How many layer round trips run at once; `None` is
     /// [`DEFAULT_CONCURRENCY`].
     pub concurrency: Option<NonZeroUsize>,
+    /// The largest layer, in bytes, pushed as one request; `None` is
+    /// [`stelae::oci::DEFAULT_MONOLITHIC_MAX`]. Clamped to the transport's
+    /// upload memory, and `0` streams every layer.
+    pub monolithic_max: Option<u64>,
 }
 
 /// Where a publish is going, and what the host running it knows about itself.
@@ -1013,6 +1018,23 @@ mod tests {
         assert_eq!(options.read_attempts, stelae::oci::DEFAULT_READ_ATTEMPTS);
         assert_eq!(options.read_delay, stelae::oci::DEFAULT_READ_DELAY);
         assert_eq!(options.attempts, stelae::oci::DEFAULT_ATTEMPTS);
+    }
+
+    /// The single-request size is the transport's default unless the tuning
+    /// names one, and a named one, `0` included, is passed through as given.
+    #[test]
+    fn the_single_request_size_defaults_and_follows_the_tuning() {
+        let opened = |monolithic_max| {
+            let tuning = Tuning {
+                monolithic_max,
+                ..Tuning::default()
+            };
+            options(false, Auth::default(), PathBuf::new(), tuning).monolithic_max
+        };
+
+        assert_eq!(opened(None), stelae::oci::DEFAULT_MONOLITHIC_MAX);
+        assert_eq!(opened(Some(0)), 0);
+        assert_eq!(opened(Some(512 << 20)), 512 << 20);
     }
 
     /// The publish half of the one policy, over a peak this test supplies.

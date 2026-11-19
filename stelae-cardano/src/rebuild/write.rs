@@ -255,6 +255,9 @@ pub struct Options {
     /// The registry's storage, for copying blobs inside it.
     pub direct_s3: Option<Box<s3_upload::Config>>,
     pub scratch_dir: Option<PathBuf>,
+    /// The largest blob, in bytes, pushed as one request; the transport's
+    /// default when `None`.
+    pub monolithic_max: Option<u64>,
 }
 
 /// What a write did.
@@ -312,6 +315,9 @@ pub fn write(plan: &Plan, options: &Options) -> Result<Written, Error> {
                 insecure: options.insecure,
                 auth: options.auth.clone(),
                 scratch_dir: options.scratch_dir.clone(),
+                monolithic_max: options
+                    .monolithic_max
+                    .unwrap_or(stelae::oci::DEFAULT_MONOLITHIC_MAX),
                 ..Default::default()
             },
         )
