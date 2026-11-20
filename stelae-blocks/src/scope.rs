@@ -141,13 +141,17 @@ impl EpochScope {
 
         if object.len() != 3 {
             return Err(Error::MalformedScope(format!(
-                "expected epoch, startSlot and endSlot, found {scope}"
+                "expected epoch, startSlot and endSlot, found {:?}",
+                scope.to_string()
             )));
         }
 
         let uint = |name: &str| {
             object.get(name).and_then(|v| v.as_u64()).ok_or_else(|| {
-                Error::MalformedScope(format!("{name} is missing or not a u64 in {scope}"))
+                Error::MalformedScope(format!(
+                    "{name} is missing or not a u64 in {:?}",
+                    scope.to_string()
+                ))
             })
         };
 
@@ -163,6 +167,28 @@ impl EpochScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A descriptor scope the error repeats is escaped, so a hostile key cannot
+    /// write a terminal escape sequence into the report.
+    #[test]
+    fn a_malformed_scope_is_repeated_escaped() {
+        // ESC, a C1 CSI and a bidi override: JSON escapes only the first.
+        let key = "\u{1b}[2J\u{9b}\u{202e}";
+
+        for scope in [
+            serde_json::json!({ key: 1 }),
+            serde_json::json!({ key: 1, "startSlot": 0, "endSlot": 1 }),
+        ] {
+            let message = EpochScope::read_descriptor(1, &scope)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !message.contains(['\u{1b}', '\u{9b}', '\u{202e}']),
+                "{message:?}"
+            );
+            assert!(message.contains("\\u{202e}"), "{message}");
+        }
+    }
 
     #[test]
     fn both_encodings_round_trip() {

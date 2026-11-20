@@ -1030,6 +1030,48 @@ fn the_retired_envelope_is_refused_off_the_registry() {
     assert_eq!(by_sequence.read_inscription().unwrap(), published);
 }
 
+/// A config whose claimed size no inscription could have is refused before the
+/// reader reserves memory for it, by the snapshot reader and the raw one alike.
+#[test]
+#[ignore = "spawns a registry"]
+fn a_config_claiming_an_impossible_size_is_refused_not_allocated() {
+    let _serial = exclusive();
+
+    let fixture = Fixture::spawn();
+    let registry = fixture.registry("stelae/oversized");
+
+    write_snapshot(&registry, 3);
+    let valid = registry
+        .pull_latest(&ToyProfile)
+        .unwrap()
+        .manifest()
+        .clone();
+
+    // The config blob the registry holds is the valid one; only the size the
+    // manifest claims for it moves.
+    let mut oversized = valid;
+    oversized.config.size = i64::MAX;
+    // Plain JSON, not `manifest_bytes`: RFC 8785 renders a number past 2^53 as
+    // a float, which the registry would refuse before the reader saw it.
+    fixture.put_manifest_raw(
+        "stelae/oversized",
+        "latest",
+        serde_json::to_vec(&oversized).unwrap(),
+    );
+
+    let err = registry.pull_latest(&ToyProfile).unwrap_err();
+    assert!(
+        matches!(&err, Error::ManifestMismatch(m) if m.contains("config blob claims")),
+        "{err:?}"
+    );
+
+    let err = registry.pull_raw("latest").unwrap_err();
+    assert!(
+        matches!(&err, Error::ManifestMismatch(m) if m.contains("config blob claims")),
+        "{err:?}"
+    );
+}
+
 /// The `diffId` annotations of a manifest's layers, in order.
 fn annotated(manifest: &Manifest) -> Vec<String> {
     manifest
