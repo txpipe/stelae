@@ -341,6 +341,24 @@ pub struct Options {
     /// Without it, nothing is written to a registry.
     pub upload: Option<Upload>,
     pub scratch_dir: Option<PathBuf>,
+    /// The largest layer, in bytes, uploaded as one request; the transport's
+    /// default when `None`.
+    pub monolithic_max: Option<u64>,
+}
+
+impl Options {
+    /// The transport options a run opens a registry with, under `auth`.
+    fn registry_options(&self, auth: &Auth) -> stelae::oci::Options {
+        stelae::oci::Options {
+            insecure: self.insecure,
+            auth: auth.clone(),
+            scratch_dir: self.scratch_dir.clone(),
+            monolithic_max: self
+                .monolithic_max
+                .unwrap_or(stelae::oci::DEFAULT_MONOLITHIC_MAX),
+            ..Default::default()
+        }
+    }
 }
 
 /// What a run did.
@@ -367,12 +385,7 @@ pub fn run(
     journal: &str,
     append: &mut dyn Write,
 ) -> Result<Summary, Error> {
-    let registry_options = |auth: &Auth| stelae::oci::Options {
-        insecure: options.insecure,
-        auth: auth.clone(),
-        scratch_dir: options.scratch_dir.clone(),
-        ..Default::default()
-    };
+    let registry_options = |auth: &Auth| options.registry_options(auth);
     let repository = options.source.to_string();
     let read = |what: String, source: stelae::Error| super::Error::Read {
         repository: repository.clone(),
@@ -619,6 +632,28 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// The single-request size a run is given reaches the transport as
+    /// given, above the default included; without one it is the default.
+    #[test]
+    fn a_run_opens_its_registries_with_the_single_request_size_it_is_given() {
+        let opened = |monolithic_max| {
+            Options {
+                source: "oci://registry.invalid/cardano/preview".parse().unwrap(),
+                auth: Auth::Anonymous,
+                insecure: false,
+                upload: None,
+                scratch_dir: None,
+                monolithic_max,
+            }
+            .registry_options(&Auth::Anonymous)
+            .monolithic_max
+        };
+        let raised = 4 * stelae::oci::DEFAULT_MONOLITHIC_MAX;
+        assert_eq!(opened(None), stelae::oci::DEFAULT_MONOLITHIC_MAX);
+        assert_eq!(opened(Some(0)), 0);
+        assert_eq!(opened(Some(raised)), raised);
+    }
 
     fn hex(byte: u8) -> String {
         format!("{byte:02x}").repeat(32)

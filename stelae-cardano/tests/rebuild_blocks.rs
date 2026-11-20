@@ -252,6 +252,7 @@ impl Served {
                 auth: Auth::Anonymous,
             }),
             scratch_dir: None,
+            monolithic_max: None,
         }
     }
 
@@ -471,4 +472,32 @@ fn a_failed_digest_fetch_does_not_report_the_aggregator_credentials() {
         !error.contains("secret") && !error.contains("reader"),
         "{error}"
     );
+}
+
+/// A re-encoded layer goes up in one request under the transport's default
+/// single-request size, and as a `PATCH` chain when the option says `0`, so
+/// the option reaches the registry the lineage is uploaded to.
+#[test]
+fn the_single_request_size_reaches_the_uploaded_layers() {
+    let patches = |monolithic_max: Option<u64>| {
+        let served = serve();
+        let counted = Arc::new(AtomicU64::new(0));
+        let count = counted.clone();
+        served.loopback.rule(move |seen| {
+            if seen.method == "PATCH" {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            Verdict::Proceed
+        });
+        let options = Options {
+            monolithic_max,
+            ..served.options(true)
+        };
+        let digests = chunk_digests(&served.immutable, 0..EPOCHS);
+        blocks::run(&options, &genesis(), &digests, "", &mut Vec::new()).unwrap();
+        counted.load(Ordering::SeqCst)
+    };
+
+    assert_eq!(patches(None), 0);
+    assert!(patches(Some(0)) > 0);
 }

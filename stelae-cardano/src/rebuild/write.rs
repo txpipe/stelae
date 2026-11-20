@@ -255,6 +255,25 @@ pub struct Options {
     /// The registry's storage, for copying blobs inside it.
     pub direct_s3: Option<Box<s3_upload::Config>>,
     pub scratch_dir: Option<PathBuf>,
+    /// The largest blob, in bytes, pushed as one request; the transport's
+    /// default when `None`.
+    pub monolithic_max: Option<u64>,
+}
+
+impl Options {
+    /// The transport options a write opens a registry with.
+    fn registry_options(&self, direct_s3: Option<Box<s3_upload::Config>>) -> stelae::oci::Options {
+        stelae::oci::Options {
+            direct_s3,
+            insecure: self.insecure,
+            auth: self.auth.clone(),
+            scratch_dir: self.scratch_dir.clone(),
+            monolithic_max: self
+                .monolithic_max
+                .unwrap_or(stelae::oci::DEFAULT_MONOLITHIC_MAX),
+            ..Default::default()
+        }
+    }
 }
 
 /// What a write did.
@@ -305,17 +324,7 @@ pub fn write(plan: &Plan, options: &Options) -> Result<Written, Error> {
         }
     };
     let open = |repository: &Repository, direct_s3| {
-        Registry::open(
-            repository,
-            stelae::oci::Options {
-                direct_s3,
-                insecure: options.insecure,
-                auth: options.auth.clone(),
-                scratch_dir: options.scratch_dir.clone(),
-                ..Default::default()
-            },
-        )
-        .map_err(failed(
+        Registry::open(repository, options.registry_options(direct_s3)).map_err(failed(
             &repository.to_string(),
             "opening the repository".into(),
         ))
@@ -559,6 +568,29 @@ mod tests {
     use oci_client::errors::{DigestError, OciDistributionError};
 
     use super::found_wrong;
+
+    /// The single-request size a write is given reaches the transport as
+    /// given, above the default included; without one it is the default.
+    #[test]
+    fn a_write_opens_its_registries_with_the_single_request_size_it_is_given() {
+        let opened = |monolithic_max| {
+            super::Options {
+                network_magic: 2,
+                root: None,
+                insecure: false,
+                auth: crate::Auth::Anonymous,
+                direct_s3: None,
+                scratch_dir: None,
+                monolithic_max,
+            }
+            .registry_options(None)
+            .monolithic_max
+        };
+        let raised = 4 * stelae::oci::DEFAULT_MONOLITHIC_MAX;
+        assert_eq!(opened(None), stelae::oci::DEFAULT_MONOLITHIC_MAX);
+        assert_eq!(opened(Some(0)), 0);
+        assert_eq!(opened(Some(raised)), raised);
+    }
 
     fn exhausted(source: stelae::Error) -> stelae::Error {
         stelae::Error::RetriesExhausted {
