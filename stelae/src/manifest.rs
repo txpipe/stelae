@@ -48,9 +48,10 @@ pub const SCOPE_ANNOTATION: &str = "store.stelae.layer.scope";
 
 /// An OCI image manifest.
 ///
-/// Every field the OCI image specification defines, so a manifest read from
-/// anywhere converts without loss; unknown fields are ignored, as the
-/// specification requires.
+/// The OCI-defined fields a reader can see, so [`check_envelope`] can refuse
+/// the ones a snapshot never carries. A field the type does not model, such
+/// as a descriptor's `data`, is dropped when the document is parsed, so no
+/// reader sees it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
@@ -295,6 +296,44 @@ pub(crate) fn check_envelope(manifest: &Manifest) -> Result<(), Error> {
             "config blob is {:?}, not the inscription's {INSCRIPTION_MEDIA_TYPE:?}",
             manifest.config.media_type,
         )));
+    }
+
+    if manifest.subject.is_some() {
+        return Err(Error::ManifestMismatch(
+            "a subject; a Stelae snapshot's manifest carries none".to_owned(),
+        ));
+    }
+
+    if manifest.annotations.is_some() {
+        return Err(Error::ManifestMismatch(
+            "manifest annotations; a Stelae snapshot's manifest carries none".to_owned(),
+        ));
+    }
+
+    if manifest.config.annotations.is_some() {
+        return Err(Error::ManifestMismatch(
+            "config annotations; a Stelae snapshot's config descriptor carries none".to_owned(),
+        ));
+    }
+
+    // A client fetches a descriptor's `urls`, unauthenticated, when the
+    // registry's own GET fails. Stelae never writes them.
+    for descriptor in std::iter::once(&manifest.config).chain(&manifest.layers) {
+        if descriptor.urls.is_some() {
+            return Err(Error::ManifestMismatch(format!(
+                "the descriptor of {} lists urls; a Stelae snapshot's blobs are read from its \
+                 repository only",
+                descriptor.digest,
+            )));
+        }
+
+        if descriptor.artifact_type.is_some() {
+            return Err(Error::ManifestMismatch(format!(
+                "the descriptor of {} has an artifactType; a Stelae snapshot's descriptors \
+                 carry none",
+                descriptor.digest,
+            )));
+        }
     }
 
     check_config_size(manifest.config.size)

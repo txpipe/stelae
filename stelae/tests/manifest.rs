@@ -237,9 +237,10 @@ fn a_manifest_yields_the_identity_to_blob_map() {
     assert_eq!(blobs.blob_for(&digest_of(0xcc)), None);
 }
 
-/// A manifest read back from its own bytes is the manifest that was built, and
-/// fields the specification may add are ignored rather than refused, so a
-/// transport that parses the document itself reads what a registry serves.
+/// A manifest read back from its own bytes is the manifest that was built.
+/// Fields the types do not model are dropped on parsing, as the registry
+/// client drops them, so a transport that parses the document itself reads
+/// what a registry transport reads.
 #[test]
 fn a_manifest_reads_back_from_its_bytes() {
     let (inscription, manifests, _) = manifests();
@@ -435,6 +436,71 @@ fn a_manifest_that_is_not_a_snapshots_own_is_refused() {
         matches!(&err, Error::ManifestMismatch(m) if m.contains("config blob is")),
         "{err:?}"
     );
+}
+
+/// A field the specification's manifest shape leaves out is refused, not
+/// ignored: `urls` or `artifactType` on any descriptor, config `annotations`,
+/// a `subject`, manifest `annotations`.
+#[test]
+fn a_manifest_outside_the_closed_shape_is_refused() {
+    let (inscription, manifests, _) = manifests();
+    let manifest = manifests.diff;
+    let urls = Some(vec!["http://127.0.0.1:9/blob".to_owned()]);
+    // A second layer, so a check that stops at the first one is caught: the
+    // envelope is checked before the layers are matched to the inscription.
+    let mut two_layers = manifest.clone();
+    two_layers.layers.push(manifest.layers[0].clone());
+
+    let mut layer_urls = manifest.clone();
+    layer_urls.layers[0].urls = urls.clone();
+
+    let mut last_layer_urls = two_layers.clone();
+    last_layer_urls.layers[1].urls = urls.clone();
+
+    let mut layer_artifact_type = two_layers;
+    layer_artifact_type.layers[1].artifact_type = Some("x".to_owned());
+
+    let mut config_artifact_type = manifest.clone();
+    config_artifact_type.config.artifact_type = Some("x".to_owned());
+
+    let mut config_urls = manifest.clone();
+    config_urls.config.urls = urls;
+
+    let mut config_annotated = manifest.clone();
+    config_annotated.config.annotations = Some(BTreeMap::from([("x".to_owned(), "y".to_owned())]));
+
+    let mut subject = manifest.clone();
+    subject.subject = Some(manifest.config.clone());
+
+    let mut annotated = manifest.clone();
+    annotated.annotations = Some(BTreeMap::new());
+
+    for (case, outside, said) in [
+        ("layer urls", layer_urls, "lists urls"),
+        ("last layer urls", last_layer_urls, "lists urls"),
+        (
+            "layer artifactType",
+            layer_artifact_type,
+            "has an artifactType",
+        ),
+        (
+            "config artifactType",
+            config_artifact_type,
+            "has an artifactType",
+        ),
+        ("config urls", config_urls, "lists urls"),
+        ("config annotations", config_annotated, "config annotations"),
+        ("subject", subject, "a subject"),
+        ("annotations", annotated, "manifest annotations"),
+    ] {
+        let err = read_manifest(&outside, &inscription, Array::Diff).unwrap_err();
+        assert!(
+            matches!(&err, Error::ManifestMismatch(m) if m.contains(said)),
+            "{case}: {err:?}"
+        );
+    }
+
+    assert!(read_manifest(&manifest, &inscription, Array::Diff).is_ok());
 }
 
 /// What the 4 MiB ceiling refuses, stated as a test rather than as a comment.

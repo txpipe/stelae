@@ -3408,6 +3408,46 @@ fn a_tip_manifest_of_another_inscription_is_refused() {
     );
 }
 
+/// A tip manifest whose layer lists `urls`, for a blob the repository lacks,
+/// is refused, and no request leaves for them: not on the pull, and not on a
+/// raw blob read, which checks no envelope.
+#[test]
+fn a_layer_listing_urls_is_refused_and_never_followed() {
+    let fault = FaultRegistry::spawn();
+    let registry = faulty(&fault, "stelae/urls");
+    write_snapshot(&registry, 3);
+
+    // Somewhere a writer chose, counting every connection made to it.
+    let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = elsewhere.local_addr().unwrap();
+    let called = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::clone(&called);
+    std::thread::spawn(move || {
+        for stream in elsewhere.incoming() {
+            counting.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+
+    let mut tip: Manifest =
+        serde_json::from_slice(&fault.manifest("chapter-3.tip").unwrap()).unwrap();
+    tip.layers[0].digest = digest_of(0xee).to_string();
+    tip.layers[0].urls = Some(vec![format!("http://{address}/blob")]);
+    fault.put_manifest("chapter-3.tip", manifest_bytes(&tip).unwrap());
+
+    let err = registry.pull_sequence(&ToyProfile, 3).unwrap_err();
+    assert!(
+        matches!(&err, Error::ManifestMismatch(m) if m.contains("lists urls")),
+        "{err:?}"
+    );
+
+    // The registry answers 404 for the blob; a client handed the `urls` would
+    // try them next.
+    assert!(registry.pull_raw_blob(&tip.layers[0]).is_err());
+
+    assert_eq!(called.load(Ordering::SeqCst), 0, "a request left for urls");
+}
+
 /// A seal interrupted after each of its steps resumes to the same result.
 ///
 /// The steps are the seal's own: the layer blobs, the config blob, the tip

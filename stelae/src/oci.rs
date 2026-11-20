@@ -3209,12 +3209,16 @@ fn from_oci_descriptor(descriptor: OciDescriptor) -> Descriptor {
 }
 
 /// A protocol descriptor as the client's, for the blob pulls that take one.
+///
+/// Without its `urls`: the client would fetch them when the repository's own
+/// GET fails, and a blob is read from the repository or not at all. That holds
+/// for [`Registry::pull_raw`] too, which checks no envelope.
 fn to_oci(descriptor: &Descriptor) -> OciDescriptor {
     OciDescriptor {
         media_type: descriptor.media_type.clone(),
         digest: descriptor.digest.clone(),
         size: descriptor.size,
-        urls: descriptor.urls.clone(),
+        urls: None,
         annotations: descriptor.annotations.clone(),
         artifact_type: descriptor.artifact_type.clone(),
     }
@@ -3411,9 +3415,14 @@ mod tests {
 
         assert_eq!(back, manifest);
         assert_eq!(manifest_bytes(&back).unwrap(), body);
+
+        // Every field but `urls`, which no blob pull is handed.
         assert_eq!(
             from_oci_descriptor(to_oci(&manifest.layers[0])),
-            manifest.layers[0]
+            Descriptor {
+                urls: None,
+                ..manifest.layers[0].clone()
+            }
         );
     }
 
