@@ -48,10 +48,10 @@ pub const SCOPE_ANNOTATION: &str = "store.stelae.layer.scope";
 
 /// An OCI image manifest.
 ///
-/// Every field the OCI image specification defines, so a manifest read from
-/// anywhere converts without loss and [`check_envelope`] can refuse the ones a
-/// snapshot never carries. A field the type does not model is dropped when the
-/// document is parsed, so no reader sees it.
+/// The OCI-defined fields a reader can see, so [`check_envelope`] can refuse
+/// the ones a snapshot never carries. A field the type does not model, such
+/// as a descriptor's `data`, is dropped when the document is parsed, so no
+/// reader sees it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
@@ -312,14 +312,22 @@ pub(crate) fn check_envelope(manifest: &Manifest) -> Result<(), Error> {
 
     // A client fetches a descriptor's `urls`, unauthenticated, when the
     // registry's own GET fails. Stelae never writes them.
-    let mut descriptors = std::iter::once(&manifest.config).chain(&manifest.layers);
+    for descriptor in std::iter::once(&manifest.config).chain(&manifest.layers) {
+        if descriptor.urls.is_some() {
+            return Err(Error::ManifestMismatch(format!(
+                "the descriptor of {} lists urls; a Stelae snapshot's blobs are read from its \
+                 repository only",
+                descriptor.digest,
+            )));
+        }
 
-    if let Some(listed) = descriptors.find(|d| d.urls.is_some()) {
-        return Err(Error::ManifestMismatch(format!(
-            "the descriptor of {} lists urls; a Stelae snapshot's blobs are read from its \
-             repository only",
-            listed.digest,
-        )));
+        if descriptor.artifact_type.is_some() {
+            return Err(Error::ManifestMismatch(format!(
+                "the descriptor of {} has an artifactType; a Stelae snapshot's descriptors \
+                 carry none",
+                descriptor.digest,
+            )));
+        }
     }
 
     Ok(())

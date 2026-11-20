@@ -365,10 +365,11 @@ Three failures stay distinct:
 
 Each manifest of a sequence is an OCI image manifest, and its shape is
 closed: a conforming publisher writes exactly the fields below. A conforming
-client refuses any field the OCI image manifest defines that the list below
-leaves out, such as a descriptor's `urls`. A field the OCI specification does
-not define may not survive a client's parsing, so a client is not required to
-see it, and nothing in it is ever read.
+client refuses any field it parses that the list below leaves out: a
+manifest's `subject` or `annotations`, and a descriptor's `urls` or
+`artifactType`. A field the client's parser drops, such as a descriptor's
+`data` or a field the OCI specification does not define, is never read, so a
+client is not required to refuse it.
 
 - `schemaVersion: 2`; `mediaType: application/vnd.oci.image.manifest.v1+json`;
   `artifactType: application/vnd.stelae.snapshot.v1`.

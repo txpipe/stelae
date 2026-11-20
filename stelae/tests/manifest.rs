@@ -445,9 +445,22 @@ fn a_manifest_outside_the_closed_shape_is_refused() {
     let (inscription, manifests, _) = manifests();
     let manifest = manifests.diff;
     let urls = Some(vec!["http://127.0.0.1:9/blob".to_owned()]);
+    // A second layer, so a check that stops at the first one is caught: the
+    // envelope is checked before the layers are matched to the inscription.
+    let mut two_layers = manifest.clone();
+    two_layers.layers.push(manifest.layers[0].clone());
 
     let mut layer_urls = manifest.clone();
     layer_urls.layers[0].urls = urls.clone();
+
+    let mut last_layer_urls = two_layers.clone();
+    last_layer_urls.layers[1].urls = urls.clone();
+
+    let mut layer_artifact_type = two_layers;
+    layer_artifact_type.layers[1].artifact_type = Some("x".to_owned());
+
+    let mut config_artifact_type = manifest.clone();
+    config_artifact_type.config.artifact_type = Some("x".to_owned());
 
     let mut config_urls = manifest.clone();
     config_urls.config.urls = urls;
@@ -460,6 +473,17 @@ fn a_manifest_outside_the_closed_shape_is_refused() {
 
     for (case, outside, said) in [
         ("layer urls", layer_urls, "lists urls"),
+        ("last layer urls", last_layer_urls, "lists urls"),
+        (
+            "layer artifactType",
+            layer_artifact_type,
+            "has an artifactType",
+        ),
+        (
+            "config artifactType",
+            config_artifact_type,
+            "has an artifactType",
+        ),
         ("config urls", config_urls, "lists urls"),
         ("subject", subject, "a subject"),
         ("annotations", annotated, "manifest annotations"),
