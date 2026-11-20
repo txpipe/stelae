@@ -366,10 +366,11 @@ Three failures stay distinct:
 Each manifest of a sequence is an OCI image manifest, and its shape is
 closed: a conforming publisher writes exactly the fields below. A conforming
 client refuses any field it parses that the list below leaves out: a
-manifest's `subject` or `annotations`, and a descriptor's `urls` or
-`artifactType`. A field the client's parser drops, such as a descriptor's
-`data` or a field the OCI specification does not define, is never read, so a
-client is not required to refuse it.
+manifest's `subject` or `annotations`, the config descriptor's
+`annotations`, and any descriptor's `urls` or `artifactType`. A field the
+client's parser drops, such as a descriptor's `data` or a field the OCI
+specification does not define, is never read, so a client is not required to
+refuse it.
 
 - `schemaVersion: 2`; `mediaType: application/vnd.oci.image.manifest.v1+json`;
   `artifactType: application/vnd.stelae.snapshot.v1`.
@@ -382,9 +383,10 @@ client is not required to refuse it.
   the tip manifest every `tip` layer. Each descriptor carries the layer's
   `mediaType` exactly as the inscription states it, the compressed blob's
   `digest` and `size`, and the three annotations below.
-- No `subject`, no manifest-level `annotations`, and no `urls` on any
-  descriptor. A blob is read from the repository that holds the manifest and
-  from nowhere else.
+- No `subject`, no manifest-level `annotations`, no `annotations` on the
+  config descriptor, and no `urls` or `artifactType` on any descriptor. A
+  blob is read from the repository that holds the manifest and from nowhere
+  else.
 
 The manifest bytes are canonical JSON per RFC 8785, through the same
 canonicalizer as the inscription, and are pushed verbatim: the protocol has
@@ -431,9 +433,10 @@ A client refuses a manifest — before any of its layer blobs is fetched — whe
   no alias and no migration path, and a manifest bearing it is refused like
   any foreign type.
 - the config descriptor's media type is not the inscription's.
-- it carries a `subject` or manifest-level `annotations`, or any of its
-  descriptors carries `urls`. A client that followed `urls` would send
-  requests, without credentials, wherever a writer pointed them.
+- it carries a `subject` or manifest-level `annotations`, its config
+  descriptor carries `annotations`, or any of its descriptors carries `urls`
+  or `artifactType`. A client that followed `urls` would send requests,
+  without credentials, wherever a writer pointed them.
 - the config descriptor's digest is not the inscription's. A tip manifest
   under a sequence's `.tip` tag that names another inscription is not that
   sequence's tip.

@@ -310,6 +310,12 @@ pub(crate) fn check_envelope(manifest: &Manifest) -> Result<(), Error> {
         ));
     }
 
+    if manifest.config.annotations.is_some() {
+        return Err(Error::ManifestMismatch(
+            "config annotations; a Stelae snapshot's config descriptor carries none".to_owned(),
+        ));
+    }
+
     // A client fetches a descriptor's `urls`, unauthenticated, when the
     // registry's own GET fails. Stelae never writes them.
     for descriptor in std::iter::once(&manifest.config).chain(&manifest.layers) {

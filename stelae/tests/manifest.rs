@@ -439,7 +439,8 @@ fn a_manifest_that_is_not_a_snapshots_own_is_refused() {
 }
 
 /// A field the specification's manifest shape leaves out is refused, not
-/// ignored: `urls` on any descriptor, a `subject`, manifest `annotations`.
+/// ignored: `urls` or `artifactType` on any descriptor, config `annotations`,
+/// a `subject`, manifest `annotations`.
 #[test]
 fn a_manifest_outside_the_closed_shape_is_refused() {
     let (inscription, manifests, _) = manifests();
@@ -465,6 +466,9 @@ fn a_manifest_outside_the_closed_shape_is_refused() {
     let mut config_urls = manifest.clone();
     config_urls.config.urls = urls;
 
+    let mut config_annotated = manifest.clone();
+    config_annotated.config.annotations = Some(BTreeMap::from([("x".to_owned(), "y".to_owned())]));
+
     let mut subject = manifest.clone();
     subject.subject = Some(manifest.config.clone());
 
@@ -485,6 +489,7 @@ fn a_manifest_outside_the_closed_shape_is_refused() {
             "has an artifactType",
         ),
         ("config urls", config_urls, "lists urls"),
+        ("config annotations", config_annotated, "config annotations"),
         ("subject", subject, "a subject"),
         ("annotations", annotated, "manifest annotations"),
     ] {
