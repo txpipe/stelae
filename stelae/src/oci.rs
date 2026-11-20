@@ -299,8 +299,8 @@ use crate::{
     inscription::{Inscription, LayerDescriptor},
     layer::LayerReader,
     manifest::{
-        build_manifests, check_envelope, inscription_of, manifest_bytes, read_manifest, Array,
-        Descriptor, Manifest, Manifests, IMAGE_MANIFEST_MEDIA_TYPE,
+        build_manifests, check_config_size, check_envelope, inscription_of, manifest_bytes,
+        read_manifest, Array, Descriptor, Manifest, Manifests, IMAGE_MANIFEST_MEDIA_TYPE,
     },
     profile::{checked_tag_for_sequence, tip_tag, validate_tag, Profile},
     progress::{Event, Observer},
@@ -2353,7 +2353,10 @@ impl Shared {
         reference: &Reference,
         descriptor: &OciDescriptor,
     ) -> Result<Vec<u8>, Error> {
-        let mut buffer = Vec::with_capacity(descriptor.size.max(0) as usize);
+        // Held here as well as in the envelope check, because `pull_raw`
+        // reads a document's config without checking its envelope.
+        check_config_size(descriptor.size)?;
+        let mut buffer = Vec::with_capacity(descriptor.size as usize);
 
         // No observer: the config blob is the inscription, not a layer, and a
         // watcher summing byte deltas against a layer total would find them

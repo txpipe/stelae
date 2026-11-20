@@ -482,10 +482,11 @@ fn a_manifest_past_the_size_ceiling_is_refused() {
             layers.push(layer);
         }
 
-        build_manifests(&inscription, &layers).unwrap().0.diff
+        let manifest = build_manifests(&inscription, &layers).unwrap().0.diff;
+        (inscription, manifest)
     };
 
-    let err = manifest_bytes(&build(TOO_MANY)).unwrap_err();
+    let err = manifest_bytes(&build(TOO_MANY).1).unwrap_err();
 
     assert!(
         matches!(err, Error::ManifestTooLarge { layers, .. } if layers == TOO_MANY),
@@ -494,7 +495,9 @@ fn a_manifest_past_the_size_ceiling_is_refused() {
 
     // A mainnet-sized snapshot passes it with room to spare, which is the claim
     // Dolos ADR-004 sized the format against.
-    let body = manifest_bytes(&build(MAINNET)).unwrap();
+    let (inscription, manifest) = build(MAINNET);
+    let body = manifest_bytes(&manifest).unwrap();
+    let config = inscription.canonicalize().unwrap();
 
     println!(
         "manifest: {} bytes for {MAINNET} layers ({} bytes per layer), \
@@ -508,6 +511,41 @@ fn a_manifest_past_the_size_ceiling_is_refused() {
         body.len() < stelae::MANIFEST_SIZE_LIMIT / 2,
         "a mainnet-sized manifest is {} bytes",
         body.len(),
+    );
+
+    // Its inscription is held to the same ceiling as a config blob, so it has
+    // to fit under it with the same room.
+    println!("inscription: {} bytes for {MAINNET} layers", config.len());
+    assert!(
+        config.len() < stelae::MANIFEST_SIZE_LIMIT / 2,
+        "a mainnet-sized inscription is {} bytes",
+        config.len(),
+    );
+}
+
+/// A reader reserves memory for the config blob by the size the manifest
+/// claims, so a claim no inscription could have is refused at the envelope.
+#[test]
+fn a_config_size_outside_the_bound_is_refused() {
+    let (inscription, manifests, _) = manifests();
+    let manifest = manifests.diff;
+
+    for size in [-1, stelae::MANIFEST_SIZE_LIMIT as i64 + 1, i64::MAX] {
+        let mut claimed = manifest.clone();
+        claimed.config.size = size;
+        let err = read_manifest(&claimed, &inscription, Array::Diff).unwrap_err();
+        assert!(
+            matches!(&err, Error::ManifestMismatch(m) if m.contains("config blob claims")),
+            "{size}: {err:?}"
+        );
+    }
+
+    let mut at_bound = manifest;
+    at_bound.config.size = stelae::MANIFEST_SIZE_LIMIT as i64;
+    let err = read_manifest(&at_bound, &inscription, Array::Diff);
+    assert!(
+        !matches!(&err, Err(Error::ManifestMismatch(m)) if m.contains("config blob claims")),
+        "{err:?}"
     );
 }
 
