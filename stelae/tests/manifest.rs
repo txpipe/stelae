@@ -540,13 +540,13 @@ fn a_config_size_outside_the_bound_is_refused() {
         );
     }
 
-    let mut at_bound = manifest;
-    at_bound.config.size = stelae::MANIFEST_SIZE_LIMIT as i64;
-    let err = read_manifest(&at_bound, &inscription, Array::Diff);
-    assert!(
-        !matches!(&err, Err(Error::ManifestMismatch(m)) if m.contains("config blob claims")),
-        "{err:?}"
-    );
+    // Both ends of the bound are inside it.
+    for size in [0, stelae::MANIFEST_SIZE_LIMIT as i64] {
+        let mut claimed = manifest.clone();
+        claimed.config.size = size;
+        let read = read_manifest(&claimed, &inscription, Array::Diff);
+        assert!(read.is_ok(), "{size}: {read:?}");
+    }
 }
 
 /// The annotation map is a `BTreeMap`, so the golden's canonical JSON is not
