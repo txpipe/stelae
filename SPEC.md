@@ -364,8 +364,11 @@ Three failures stay distinct:
 ### The manifest
 
 Each manifest of a sequence is an OCI image manifest, and its shape is
-closed: a conforming publisher writes exactly the fields below, and a
-conforming client refuses anything else.
+closed: a conforming publisher writes exactly the fields below. A conforming
+client refuses any field the OCI image manifest defines that the list below
+leaves out, such as a descriptor's `urls`. A field the OCI specification does
+not define may not survive a client's parsing, so a client is not required to
+see it, and nothing in it is ever read.
 
 - `schemaVersion: 2`; `mediaType: application/vnd.oci.image.manifest.v1+json`;
   `artifactType: application/vnd.stelae.snapshot.v1`.
@@ -378,7 +381,9 @@ conforming client refuses anything else.
   the tip manifest every `tip` layer. Each descriptor carries the layer's
   `mediaType` exactly as the inscription states it, the compressed blob's
   `digest` and `size`, and the three annotations below.
-- No `subject` and no manifest-level `annotations`.
+- No `subject`, no manifest-level `annotations`, and no `urls` on any
+  descriptor. A blob is read from the repository that holds the manifest and
+  from nowhere else.
 
 The manifest bytes are canonical JSON per RFC 8785, through the same
 canonicalizer as the inscription, and are pushed verbatim: the protocol has
@@ -425,6 +430,9 @@ A client refuses a manifest — before any of its layer blobs is fetched — whe
   no alias and no migration path, and a manifest bearing it is refused like
   any foreign type.
 - the config descriptor's media type is not the inscription's.
+- it carries a `subject` or manifest-level `annotations`, or any of its
+  descriptors carries `urls`. A client that followed `urls` would send
+  requests, without credentials, wherever a writer pointed them.
 - the config descriptor's digest is not the inscription's. A tip manifest
   under a sequence's `.tip` tag that names another inscription is not that
   sequence's tip.

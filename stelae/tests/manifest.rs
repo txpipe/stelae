@@ -237,9 +237,10 @@ fn a_manifest_yields_the_identity_to_blob_map() {
     assert_eq!(blobs.blob_for(&digest_of(0xcc)), None);
 }
 
-/// A manifest read back from its own bytes is the manifest that was built, and
-/// fields the specification may add are ignored rather than refused, so a
-/// transport that parses the document itself reads what a registry serves.
+/// A manifest read back from its own bytes is the manifest that was built.
+/// Fields the types do not model are dropped on parsing, as the registry
+/// client drops them, so a transport that parses the document itself reads
+/// what a registry transport reads.
 #[test]
 fn a_manifest_reads_back_from_its_bytes() {
     let (inscription, manifests, _) = manifests();
@@ -435,6 +436,42 @@ fn a_manifest_that_is_not_a_snapshots_own_is_refused() {
         matches!(&err, Error::ManifestMismatch(m) if m.contains("config blob is")),
         "{err:?}"
     );
+}
+
+/// A field the specification's manifest shape leaves out is refused, not
+/// ignored: `urls` on any descriptor, a `subject`, manifest `annotations`.
+#[test]
+fn a_manifest_outside_the_closed_shape_is_refused() {
+    let (inscription, manifests, _) = manifests();
+    let manifest = manifests.diff;
+    let urls = Some(vec!["http://127.0.0.1:9/blob".to_owned()]);
+
+    let mut layer_urls = manifest.clone();
+    layer_urls.layers[0].urls = urls.clone();
+
+    let mut config_urls = manifest.clone();
+    config_urls.config.urls = urls;
+
+    let mut subject = manifest.clone();
+    subject.subject = Some(manifest.config.clone());
+
+    let mut annotated = manifest.clone();
+    annotated.annotations = Some(BTreeMap::new());
+
+    for (case, outside, said) in [
+        ("layer urls", layer_urls, "lists urls"),
+        ("config urls", config_urls, "lists urls"),
+        ("subject", subject, "a subject"),
+        ("annotations", annotated, "manifest annotations"),
+    ] {
+        let err = read_manifest(&outside, &inscription, Array::Diff).unwrap_err();
+        assert!(
+            matches!(&err, Error::ManifestMismatch(m) if m.contains(said)),
+            "{case}: {err:?}"
+        );
+    }
+
+    assert!(read_manifest(&manifest, &inscription, Array::Diff).is_ok());
 }
 
 /// What the 4 MiB ceiling refuses, stated as a test rather than as a comment.
