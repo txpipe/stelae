@@ -673,16 +673,21 @@ fn a_single_request_size_above_the_upload_memory_is_clamped_to_it() {
         ..Default::default()
     };
 
+    // A detached thread, so a stuck upload fails the test instead of hanging
+    // it in a scoped join.
     let (done, carried) = std::sync::mpsc::channel();
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let _ = done.send(target.carry_blob(&source, &blob).map_err(|e| e.to_string()));
-        });
-        let carried = carried
-            .recv_timeout(std::time::Duration::from_secs(120))
-            .expect("a blob over the upload memory never finished uploading");
-        assert_eq!(carried.unwrap(), oci::Carried::Pulled);
+    let pushed = blob.clone();
+    std::thread::spawn(move || {
+        let _ = done.send(
+            target
+                .carry_blob(&source, &pushed)
+                .map_err(|e| e.to_string()),
+        );
     });
+    let carried = carried
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("a blob over the upload memory never finished uploading");
+    assert_eq!(carried.unwrap(), oci::Carried::Pulled);
     assert_eq!(loopback.blobs("clamped").get(&blob.digest), Some(&size));
     assert!(counted.load(Ordering::SeqCst) > 0);
 }
