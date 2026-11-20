@@ -4769,7 +4769,7 @@ checksum = "5c0e04424e733e69714ca1bbb9204c1a57f09f5493439520f9f68c132ad25eec"
 
 [[package]]
 name = "stelae"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -4793,7 +4793,7 @@ dependencies = [
 
 [[package]]
 name = "stelae-blocks"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "minicbor 0.26.5",
  "pallas-hardano",
@@ -4808,7 +4808,7 @@ dependencies = [
 
 [[package]]
 name = "stelae-cardano"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "dolos",
  "dolos-cardano",
@@ -4840,7 +4840,7 @@ dependencies = [
 
 [[package]]
 name = "stelae-driver"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "fs4",
  "hex",
@@ -4856,7 +4856,7 @@ dependencies = [
 
 [[package]]
 name = "stelae-publisher"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "clap",
  "config",

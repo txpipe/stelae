@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-11-20
+
+### 🚀 Features
+
+- Let an operator set the single-request upload size (#43)
+
+### 🚜 Refactor
+
+- Say "snapshot" for the published artifact in the publisher host (#42)
+
 ## [0.7.0] - 2026-11-18
 
 ### 🚀 Features
