@@ -87,7 +87,10 @@ distinct, explicit decisions.
    `Chart.yaml` `version:`, independent of the workspace version, and only
    once: a version the registry already holds is skipped, never replaced. A
    pull request that changes a chart since the newest release tag must bump
-   that chart's version, or the chart check fails.
+   that chart's version, or the chart check fails. The release repeats that
+   check against the previous release tag before it pushes, so a change that
+   reached the branch without a bump fails the release instead of going
+   unpublished.
 6. The first push of a chart creates a private package. The organization
    owner makes it public by hand in the package settings; later versions
    inherit that visibility.

@@ -42,4 +42,19 @@ rm k8s/dolos-publisher/chart/Chart.yaml.bak
 git commit -q -am "bump the chart"
 "$CHECK" v0.1.0
 
+# At release time, a change that landed without a bump after the previous
+# release fails against the tag the release job resolves.
+git tag v0.1.1
+echo 'kind: Secret' >k8s/registry/chart/templates/secret.yaml
+git add k8s/registry/chart/templates/secret.yaml
+git commit -q -m "add a template without a bump"
+git tag v0.1.2
+previous=$(git describe --tags --abbrev=0 --match 'v*' HEAD^)
+test "$previous" = v0.1.1
+if "$CHECK" "$previous" 2>"$REPO/err"; then
+    echo "an unbumped change since the previous release passed" >&2
+    exit 1
+fi
+grep -F 'registry:' "$REPO/err"
+
 echo "check-chart-versions: ok"
