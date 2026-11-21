@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-11-21
+
+### 🐛 Bug Fixes
+
+- Refuse manifest fields outside the snapshot's closed shape (#46)
+- Bound the config blob size a manifest claims, and escape document text in errors (#45)
+
+### Build
+
+- [**breaking**] Move the publisher host to the Dolos v2-beta.1 store contract (#47)
+
 ## [0.7.1] - 2026-11-20
 
 ### 🚀 Features
