@@ -30,17 +30,18 @@ item() {
     '
 }
 
-# The Job mounts its volume named data read-write at /data, and that volume
-# has the expected source line.
+# The Job (or the kind named third) mounts its volume named data read-write
+# at /data, and that volume has the expected source line.
 data_volume() {
-    mount=$(doc Job "$1" | under volumeMounts | item data)
+    kind=${3:-Job}
+    mount=$(doc "$kind" "$1" | under volumeMounts | item data)
     if ! printf '%s\n' "$mount" | grep -Eq '^ +mountPath: /data$' ||
         printf '%s\n' "$mount" | grep -Fq readOnly; then
         echo "$1: /data is not the read-write mount of volume data" >&2
         exit 1
     fi
-    doc Job "$1" | under volumes | item data | grep -Fx "$2"
-    if doc Job "$1" | under volumes | item data | grep -Fq readOnly; then
+    doc "$kind" "$1" | under volumes | item data | grep -Fx "$2"
+    if doc "$kind" "$1" | under volumes | item data | grep -Fq readOnly; then
         echo "$1: volume data is read-only at its source" >&2
         exit 1
     fi
@@ -280,3 +281,66 @@ for key in epochs scratchMib reserveMib; do
 done
 helm template publisher "$CHART" --values "$VALUES" --set batch.epochs=null >"$OUT/batch-null-default.yaml"
 cmp "$OUT/default.yaml" "$OUT/batch-null-default.yaml"
+
+# Without a schedule the chart renders the one-shot Job and no CronJob.
+grep -Fx 'kind: Job' "$OUT/default.yaml"
+grep -Fx 'kind: Job' "$OUT/claim.yaml"
+if grep -Fq 'kind: CronJob' "$OUT/default.yaml" "$OUT/claim.yaml"; then
+    echo "a CronJob rendered without a schedule" >&2
+    exit 1
+fi
+if helm template publisher "$CHART" --values "$VALUES" \
+    --set run=null >"$OUT/invalid.yaml" 2>&1; then
+    echo "a one-shot Job without run was accepted" >&2
+    exit 1
+fi
+grep -Fq run "$OUT/invalid.yaml"
+
+# With a schedule it renders a CronJob on the kept claim instead, with the
+# Job's pod, and never a run beside one in flight.
+helm lint "$CHART" --values "$VALUES" \
+    --set persistence.enabled=true --set-string 'schedule=0 */6 * * *'
+helm template publisher "$CHART" --values "$VALUES" \
+    --set persistence.enabled=true --set-string 'schedule=0 */6 * * *' >"$OUT/schedule.yaml"
+grep -Fx 'kind: CronJob' "$OUT/schedule.yaml"
+if grep -Fxq 'kind: Job' "$OUT/schedule.yaml"; then
+    echo "a scheduled release also rendered the one-shot Job" >&2
+    exit 1
+fi
+doc CronJob "$OUT/schedule.yaml" | under metadata | grep -Fx '  name: preview-publisher'
+doc CronJob "$OUT/schedule.yaml" | grep -Fx '  schedule: "0 */6 * * *"'
+doc CronJob "$OUT/schedule.yaml" | grep -Fx '  concurrencyPolicy: Forbid'
+doc CronJob "$OUT/schedule.yaml" | grep -Fx '  startingDeadlineSeconds: 3600'
+doc CronJob "$OUT/schedule.yaml" | grep -Fx '  suspend: false'
+doc CronJob "$OUT/schedule.yaml" | grep -Fx '  successfulJobsHistoryLimit: 3'
+doc CronJob "$OUT/schedule.yaml" | grep -Fx '  failedJobsHistoryLimit: 3'
+doc CronJob "$OUT/schedule.yaml" | grep -Fx '      backoffLimit: 200'
+doc CronJob "$OUT/schedule.yaml" | grep -Fx '            app: preview-publisher'
+if grep -Fq activeDeadlineSeconds "$OUT/schedule.yaml"; then
+    echo "a run deadline rendered without a value" >&2
+    exit 1
+fi
+data_volume "$OUT/schedule.yaml" '                claimName: publisher-data' CronJob
+doc Job "$OUT/claim.yaml" | under args | sed 's/^ *//' >"$OUT/job-args.txt"
+doc CronJob "$OUT/schedule.yaml" | under args | sed 's/^ *//' >"$OUT/cron-args.txt"
+grep -Fx -- '- run' "$OUT/cron-args.txt"
+cmp "$OUT/job-args.txt" "$OUT/cron-args.txt"
+
+# With a schedule run is ignored and may be absent.
+helm template publisher "$CHART" --values "$VALUES" --set run=null \
+    --set persistence.enabled=true --set-string 'schedule=0 */6 * * *' >"$OUT/schedule-norun.yaml"
+cmp "$OUT/schedule.yaml" "$OUT/schedule-norun.yaml"
+
+helm template publisher "$CHART" --values "$VALUES" \
+    --set persistence.enabled=true,suspend=true,activeDeadlineSeconds=86400 \
+    --set-string 'schedule=0 */6 * * *' >"$OUT/schedule-suspend.yaml"
+doc CronJob "$OUT/schedule-suspend.yaml" | grep -Fx '  suspend: true'
+doc CronJob "$OUT/schedule-suspend.yaml" | grep -Fx '      activeDeadlineSeconds: 86400'
+
+# Every scheduled run on an emptyDir would restore all of history.
+if helm template publisher "$CHART" --values "$VALUES" \
+    --set-string 'schedule=0 */6 * * *' >"$OUT/invalid.yaml" 2>&1; then
+    echo "a schedule without persistence was accepted" >&2
+    exit 1
+fi
+grep -Fq persistence.enabled "$OUT/invalid.yaml"

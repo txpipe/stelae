@@ -1,14 +1,27 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["network", "run", "repo", "concurrency", "dolosToml", "image", "resources"],
+  "required": ["network", "repo", "concurrency", "dolosToml", "image", "resources"],
   "properties": {
     "directS3SecretName": { "type": "string" },
     "network": { "type": "string", "minLength": 1 },
     "run": {
       "oneOf": [
         { "type": "integer", "minimum": 1 },
-        { "type": "string", "pattern": "^[1-9][0-9]*$" }
+        { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        { "const": "" },
+        { "type": "null" }
+      ]
+    },
+    "schedule": { "type": "string" },
+    "suspend": { "type": "boolean" },
+    "startingDeadlineSeconds": { "type": "integer", "minimum": 1 },
+    "successfulJobsHistoryLimit": { "type": "integer", "minimum": 0 },
+    "failedJobsHistoryLimit": { "type": "integer", "minimum": 0 },
+    "activeDeadlineSeconds": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "integer", "minimum": 1 }
       ]
     },
     "repo": { "type": "string", "pattern": "^oci://[^/]+/.+" },
@@ -81,6 +94,18 @@
     "nodeSelector": { "type": "object" },
     "tolerations": { "type": "array" },
     "resources": { "type": "object", "minProperties": 1 }
+  },
+  "if": { "properties": { "schedule": { "const": "" } } },
+  "then": {
+    "required": ["run"],
+    "properties": {
+      "run": {
+        "oneOf": [
+          { "type": "integer", "minimum": 1 },
+          { "type": "string", "pattern": "^[1-9][0-9]*$" }
+        ]
+      }
+    }
   },
   "additionalProperties": true
 }

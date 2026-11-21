@@ -1,4 +1,4 @@
-# One Stelae publisher Job per network, built on the Dolos v2 configuration:
+# One Stelae publisher per network, a one-shot Job or a schedule, built on the Dolos v2 configuration:
 # dolosToml is a v2 file keeping full history.
 #
 # These defaults are instance-agnostic — no network, registry, image pin or
@@ -13,7 +13,8 @@
 # The network name. Prefixes the Job name and labels the pod.
 network: ""
 
-# The deliberate re-run counter. The Job is named <network>-backfill-<run>,
+# The deliberate re-run counter of the one-shot Job, required when schedule
+# is empty and ignored when it is set. The Job is named <network>-backfill-<run>,
 # so bumping it makes the upgrade create a new Job and remove the old one.
 # With an emptyDir the new Job restores from latest, paying the restart cost
 # on purpose. With persistence it resumes the stores the last run left, so an
@@ -22,6 +23,30 @@ network: ""
 # fails the upgrade against the Job's immutable template, which is the guard
 # against re-running by accident. See README.md.
 run: ""
+
+# A cron schedule, such as "0 */6 * * *". Empty renders the one-shot Job.
+# Set, the chart renders the CronJob <network>-publisher instead: each run
+# resumes the kept claim and exits when there is nothing to publish, and a
+# run never starts beside one still in flight. It needs persistence.enabled,
+# since every run on an emptyDir would restore all of history. See README.md.
+schedule: ""
+
+# Scheduled runs only. Suspended, the CronJob starts no new run; a run in
+# flight goes on.
+suspend: false
+
+# Scheduled runs only. Seconds after its scheduled time a missed run may
+# still start, say after a run in flight held it back; later than that it is
+# skipped until the next time.
+startingDeadlineSeconds: 3600
+
+# Scheduled runs only. Finished Jobs kept for their logs.
+successfulJobsHistoryLimit: 3
+failedJobsHistoryLimit: 3
+
+# Scheduled runs only. Seconds a run may last before it is stopped and
+# marked failed. Unset, a run lasts as long as it needs.
+activeDeadlineSeconds: null
 
 # Where the publisher writes: an oci:// URL to the network root. Each
 # boundary's blocks snapshot goes to its `blocks` repository, then the Dolos snapshot
@@ -79,7 +104,8 @@ persistence:
   # deletes it.
   existingClaim: ""
 
-# Restart budget. On spot capacity an eviction counts here too.
+# Restart budget. On spot capacity an eviction counts here too. A Job is
+# marked failed only once it is spent, so a scheduled release wants it small.
 backoffLimit: 200
 
 # Covers the driver's SIGTERM handler finishing its chunk and flushing the
