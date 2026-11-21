@@ -1079,6 +1079,34 @@ mod tests {
         assert!(matches!(err, Error::DuplicateLayer { .. }), "{err:?}");
     }
 
+    /// Document text an error repeats is escaped, so a hostile key or scope
+    /// cannot write a terminal escape sequence into the report.
+    #[test]
+    fn errors_escape_control_characters_from_the_document() {
+        // ESC, a C1 CSI and a bidi override: JSON escapes only the first.
+        let key = "\u{1b}[2J\u{9b}\u{202e}";
+
+        let unsafe_integer = check_safe_numbers(&json!({ key: MAX_SAFE_INTEGER as u64 + 1 }));
+        let non_integer = check_safe_numbers(&json!({ key: 1.5 }));
+
+        let mut duplicate = sample();
+        duplicate.diff = vec![notes(3, json!({ key: 3 }))];
+        duplicate.tip = vec![notes(4, json!({ key: 3 }))];
+
+        for err in [
+            unsafe_integer.unwrap_err(),
+            non_integer.unwrap_err(),
+            duplicate.validate().unwrap_err(),
+        ] {
+            let message = err.to_string();
+            assert!(
+                !message.contains(['\u{1b}', '\u{9b}', '\u{202e}']),
+                "{message:?}"
+            );
+            assert!(message.contains("\\u{202e}"), "{message}");
+        }
+    }
+
     #[test]
     fn rejects_numbers_outside_the_jcs_safe_integer_range() {
         let safe = MAX_SAFE_INTEGER as u64;

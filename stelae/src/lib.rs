@@ -199,13 +199,13 @@ pub enum Error {
     /// A number outside the range RFC 8785 renders exactly. Refused rather than
     /// silently rounded.
     #[error(
-        "number at {path} is outside the JCS-safe integer range (±{MAX_SAFE_INTEGER}): {value}"
+        "number at {path:?} is outside the JCS-safe integer range (±{MAX_SAFE_INTEGER}): {value}"
     )]
     UnsafeInteger { path: String, value: String },
 
     /// A non-integer number. The inscription schema admits integers only, so
     /// that canonicalization never depends on floating-point rendering.
-    #[error("number at {path} is not an integer: {value}")]
+    #[error("number at {path:?} is not an integer: {value}")]
     NonIntegerNumber { path: String, value: String },
 
     #[error("unsupported inscription schema {found}; this implementation writes and accepts {SCHEMA_VERSION}")]
@@ -232,7 +232,7 @@ pub enum Error {
     /// Two layers of one kind at one scope, across an inscription's `diff`
     /// and `tip`. `scope` is the scope's canonical JSON.
     #[error(
-        "layer kind {kind:?} at scope {scope} is listed more than once; an inscription lists \
+        "layer kind {kind:?} at scope {scope:?} is listed more than once; an inscription lists \
          each kind and scope once across diff and tip"
     )]
     DuplicateLayer { kind: String, scope: String },

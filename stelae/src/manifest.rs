@@ -336,6 +336,22 @@ pub(crate) fn check_envelope(manifest: &Manifest) -> Result<(), Error> {
         }
     }
 
+    check_config_size(manifest.config.size)
+}
+
+/// Refuse a config blob whose claimed size is negative or past
+/// [`MANIFEST_SIZE_LIMIT`], before a reader reserves memory for it.
+///
+/// The config is the inscription, which lists every layer once, so it stays
+/// the same order of size as the manifest that carries it.
+pub(crate) fn check_config_size(size: i64) -> Result<(), Error> {
+    if !(0..=MANIFEST_SIZE_LIMIT as i64).contains(&size) {
+        return Err(Error::ManifestMismatch(format!(
+            "config blob claims {size} bytes, outside the 0..={MANIFEST_SIZE_LIMIT}-byte bound \
+             for an inscription"
+        )));
+    }
+
     Ok(())
 }
 
