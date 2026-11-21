@@ -71,7 +71,10 @@ divergence authenticates a user and grants nothing.
 
 A publish creates blobs and `epoch-N` tags and moves `latest`, which is an
 update of an existing tag; it sends no `DELETE`, so a scheduled publisher
-runs as the writer and cannot remove what it published. The admin user stays
+runs as the writer and zot refuses it any delete. `update` still lets the
+writer repoint an existing tag: tag immutability rests on the publisher's
+checks, not on zot, and with `storage.gc` off a repointed tag's manifest
+stays reachable by digest. The admin user stays
 for the acts that delete: the wipe before a first publication and the removal
 of a refused tag. The writer's bcrypt line goes into the htpasswd Secret like
 the other two, and the publisher chart points at the writer's credential
