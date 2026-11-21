@@ -61,6 +61,26 @@ driver through the AWS credential chain. The usernames live in both the
 values and the htpasswd lines and only convention keeps them matched;
 divergence authenticates a user and grants nothing.
 
+### Users
+
+| value | zot policy | for |
+|---|---|---|
+| `auth.readonlyUsername` | `read` on every repository | clients |
+| `auth.writerUsername` (optional) | `read`, `create`, `update` on every repository; no `delete` | unattended publishers |
+| `auth.publisherUsername` | admin: `read`, `create`, `update`, `delete` | manual work |
+
+A publish creates blobs and `epoch-N` tags and moves `latest`, which is an
+update of an existing tag; it sends no `DELETE`, so a scheduled publisher
+runs as the writer and cannot remove what it published. The admin user stays
+for the acts that delete: the wipe before a first publication and the removal
+of a refused tag. The writer's bcrypt line goes into the htpasswd Secret like
+the other two, and the publisher chart points at the writer's credential
+Secret through its `publisherSecretName`. Leaving `writerUsername` empty
+renders `config.json` without a writer; naming it like either other user
+fails the render.
+
+`test.sh` renders the chart and checks those policies; CI runs it.
+
 Kubernetes does not restart a pod when a referenced Secret changes. After
 rotating the store credentials, apply the Secret and explicitly restart the
 registry Deployment before revoking the old credentials:
