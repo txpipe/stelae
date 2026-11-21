@@ -29,7 +29,8 @@ beside one still in flight, but a Job started by hand beside the CronJob is a
 second writer: suspend the schedule and wait for its run to finish first.
 So is the Job that clearing schedule, or a rollback to a chart before 0.5,
 creates: suspend and wait for the run in flight to terminate before that
-upgrade. Forbid keeps one writer only on Kubernetes 1.31 and later. An
+upgrade. The schedule requires Kubernetes 1.31 or later: before 1.31 a run
+can start beside a failed run's terminating pod. An
 image on a new Dolos profile pin starts a fresh lineage in the root's emptied
 dolos repository, and leaves a lineage from before the diff chain, at the root
 itself, alone (see the chart README).

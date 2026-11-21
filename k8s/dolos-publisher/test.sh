@@ -315,6 +315,7 @@ doc CronJob "$OUT/schedule.yaml" | grep -Fx '  suspend: false'
 doc CronJob "$OUT/schedule.yaml" | grep -Fx '  successfulJobsHistoryLimit: 3'
 doc CronJob "$OUT/schedule.yaml" | grep -Fx '  failedJobsHistoryLimit: 3'
 doc CronJob "$OUT/schedule.yaml" | grep -Fx '      backoffLimit: 200'
+doc CronJob "$OUT/schedule.yaml" | grep -Fx '      podReplacementPolicy: Failed'
 doc CronJob "$OUT/schedule.yaml" | grep -Fx '            app: preview-publisher'
 if grep -Fq activeDeadlineSeconds "$OUT/schedule.yaml"; then
     echo "a run deadline rendered without a value" >&2

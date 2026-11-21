@@ -35,6 +35,9 @@ spec:
         {{- include "dolos-publisher.labels" . | nindent 8 }}
     spec:
       backoffLimit: {{ .Values.backoffLimit }}
+      {{- /* A replacement pod waits until the old one has terminated, so a
+      deleted or evicted run never overlaps its successor on the claim. */}}
+      podReplacementPolicy: Failed
       {{- with .Values.activeDeadlineSeconds }}
       activeDeadlineSeconds: {{ . | int64 }}
       {{- end }}

@@ -239,14 +239,14 @@ history, and the render refuses it.
   hand beside it, `kubectl create job --from=cronjob/...` included, is a
   second writer on the claim; preventing that is the operator's. Set
   `suspend: true`, wait for the run in flight to finish, and only then start
-  one by hand. The guarantee needs Kubernetes 1.31 or later. Before 1.31 a
-  Job that reaches `activeDeadlineSeconds` or `backoffLimit` is marked failed
-  while its pod is still terminating, for up to its grace period, so a run
-  held back by `Forbid` can start beside that pod on the claim. On an older
-  cluster, set `startingDeadlineSeconds` and the schedule so that no held-back
-  run can start within the grace period of a failed one, or leave
-  `activeDeadlineSeconds` unset and `backoffLimit` small and watch for
-  failures.
+  one by hand. Within a run, `podReplacementPolicy: Failed` keeps a
+  replacement pod from starting until the pod it replaces has terminated, so
+  a run's pod that is deleted or evicted does not overlap its successor.
+  The schedule requires Kubernetes 1.31 or later. Before 1.31 a Job is
+  marked failed while its pod may still be terminating, for up to its grace
+  period, and the next run can start beside that pod on the claim; no choice
+  of values prevents it. Do not run the schedule on an older cluster: use the
+  one-shot Job there.
 - **Failure.** A Job is marked failed only after `backoffLimit` restarts,
   and until then it holds the schedule back under `Forbid`. The default of
   200 suits a one-shot backfill on spot capacity; a scheduled release wants a
