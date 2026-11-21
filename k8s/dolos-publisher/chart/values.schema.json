@@ -87,6 +87,31 @@
       },
       "additionalProperties": false
     },
+    "freshness": {
+      "type": "object",
+      "properties": {
+        "schedule": { "type": "string" },
+        "deadlineHours": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "integer", "minimum": 1 },
+            { "type": "string", "pattern": "^[1-9][0-9]*$" }
+          ]
+        },
+        "repo": {
+          "oneOf": [
+            { "const": "" },
+            { "type": "string", "pattern": "^oci://[^/]+/.+" }
+          ]
+        },
+        "insecure": { "type": ["boolean", "null"] },
+        "secretName": { "type": "string" },
+        "resources": { "type": "object" },
+        "backoffLimit": { "type": "integer", "minimum": 0 },
+        "activeDeadlineSeconds": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
     "insecure": { "type": "boolean" },
     "publisherSecretName": { "type": "string", "minLength": 1 },
     "backoffLimit": { "type": "integer", "minimum": 0 },

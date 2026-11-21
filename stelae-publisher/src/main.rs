@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -16,7 +17,7 @@ use stelae::{
 use stelae_cardano::{
     backfill,
     batch::Limits,
-    config, initialize,
+    config, freshness, initialize,
     publisher::{self, Destination, PublishOutcome},
     rebuild,
     snapshot::{self, Boundary, Inputs, PlanReport, Published, Verified},
@@ -44,9 +45,9 @@ struct Cli {
 /// process listings.
 #[derive(Debug, Args, Clone, Default)]
 struct CredentialArgs {
-    /// The user to authenticate to the registry as; `verify` and `inspect`
-    /// read the configured network's official repository as its published
-    /// read-only user when none is given.
+    /// The user to authenticate to the registry as; `verify`, `inspect` and
+    /// `freshness` read the configured network's official repository as its
+    /// published read-only user when none is given.
     #[arg(long, global = true, env = "DOLOS_STELAE_USER", value_name = "USER")]
     registry_user: Option<String>,
     /// A TOML file naming the registry secret as `password` or `token`, in
@@ -162,6 +163,32 @@ enum Command {
     /// its documents, self-checking every sequence and writing nothing to a
     /// registry; with --write, execute such a plan.
     Rebuild(RebuildArgs),
+    /// Check that a network's newest published snapshot is as recent as a
+    /// deadline after each epoch's start says it should be, from the clock
+    /// and the registry alone.
+    Freshness(FreshnessArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(after_help = "\
+Exit status:
+  0  latest is at or past the expected sequence
+  1  the check could not run (the configuration, the deadline or the registry failed),
+     or latest is another network's snapshot
+  2  a usage error
+  4  latest is behind the expected sequence, or the repository holds no latest")]
+struct FreshnessArgs {
+    /// Network root whose `dolos` repository holds the snapshots:
+    /// oci://HOST/PATH, or file://DIR for image layouts on disk.
+    #[arg(long, value_name = "URL")]
+    repo: RestoreSource,
+    /// Hours after an epoch starts by which its snapshot should be published.
+    /// The expected sequence is the newest epoch whose start plus this many
+    /// hours is at or before now.
+    #[arg(long, value_name = "HOURS")]
+    deadline_hours: u64,
+    #[arg(long, action)]
+    insecure: bool,
 }
 
 #[derive(Debug, Args)]
@@ -746,6 +773,23 @@ impl miette::Diagnostic for Mismatch {}
 /// error, as Dolos's commands exit.
 const MISMATCH_EXIT: u8 = 3;
 
+/// A repository whose `latest` is behind what a freshness deadline expects.
+#[derive(Debug)]
+struct Stale(String);
+
+impl std::fmt::Display for Stale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Stale {}
+
+impl miette::Diagnostic for Stale {}
+
+/// The exit status of a [`Stale`] repository.
+const STALE_EXIT: u8 = 4;
+
 fn diagnose(error: snapshot::Error) -> miette::Report {
     if error.is_mismatch() {
         miette::Report::new(Mismatch(Box::new(error)))
@@ -1070,6 +1114,79 @@ fn run_inspect(
     Ok(())
 }
 
+/// Unix seconds as the reports print them.
+fn utc(seconds: u64) -> String {
+    humantime::format_rfc3339_seconds(UNIX_EPOCH + Duration::from_secs(seconds)).to_string()
+}
+
+fn run_freshness(
+    config: &RootConfig,
+    args: &FreshnessArgs,
+    auth: ResolveReadAuth,
+    now: u64,
+) -> miette::Result<()> {
+    let epochs = freshness::Epochs::of(config).into_diagnostic()?;
+    let Some(expected) = freshness::expected(&epochs, args.deadline_hours, now) else {
+        miette::bail!(
+            "a deadline of {} hours reaches back before the network's first epoch, so no \
+             snapshot could ever be due",
+            args.deadline_hours
+        );
+    };
+    let latest = open_snapshot(config, &args.repo, args.insecure, auth)?
+        .latest_inscription()
+        .map_err(diagnose)?;
+    if let Some(inscription) = &latest {
+        let found = snapshot::read_position(&inscription.position)
+            .into_diagnostic()
+            .context("reading the latest snapshot's position")?
+            .network
+            .magic();
+        if found != epochs.magic() {
+            miette::bail!(
+                "{}'s latest is a snapshot of network magic {found}, and this configuration's \
+                 network {} has magic {}",
+                source_name(&args.repo),
+                config.chain.network,
+                epochs.magic(),
+            );
+        }
+    }
+    let latest = latest.map(|inscription| inscription.sequence);
+
+    let network = &config.chain.network;
+    let held = latest.map_or_else(|| "none".to_owned(), |sequence| sequence.to_string());
+    println!(
+        "{network}: latest {held}, expected {}, epoch {} started {}",
+        expected.sequence,
+        expected.sequence,
+        utc(expected.start)
+    );
+
+    match latest {
+        Some(sequence) if sequence >= expected.sequence => Ok(()),
+        Some(sequence) => {
+            let behind = expected.sequence - sequence;
+            let noun = if behind == 1 { "sequence" } else { "sequences" };
+            Err(Stale(format!(
+                "{} is {behind} {noun} behind: latest is {sequence}, and epoch {}'s snapshot was \
+                 due {} hours after the epoch started",
+                source_name(&args.repo),
+                expected.sequence,
+                args.deadline_hours,
+            ))
+            .into())
+        }
+        None => Err(Stale(format!(
+            "{} holds no latest snapshot, and epoch {}'s was due {} hours after the epoch started",
+            source_name(&args.repo),
+            expected.sequence,
+            args.deadline_hours,
+        ))
+        .into()),
+    }
+}
+
 fn run_rebuild(genesis: &Genesis, args: &RebuildArgs, auth: ResolveReadAuth) -> miette::Result<()> {
     let Some(source) = &args.source else {
         unreachable!("clap requires --source without --write or a subcommand");
@@ -1337,9 +1454,12 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(report) => {
             eprintln!("Error: {report:?}");
-            match report.downcast_ref::<Mismatch>() {
-                Some(_) => ExitCode::from(MISMATCH_EXIT),
-                None => ExitCode::FAILURE,
+            if report.downcast_ref::<Mismatch>().is_some() {
+                ExitCode::from(MISMATCH_EXIT)
+            } else if report.downcast_ref::<Stale>().is_some() {
+                ExitCode::from(STALE_EXIT)
+            } else {
+                ExitCode::FAILURE
             }
         }
     }
@@ -1349,12 +1469,22 @@ fn execute(cli: Cli, env: Env) -> miette::Result<()> {
     let config = config::load(cli.config.as_deref())
         .into_diagnostic()
         .context("parsing configuration")?;
-    let genesis = load_genesis(&config)?;
     let auth = || cli.credentials.auth_from(env);
     let read_auth = |repository: &Repository| {
         let official = snapshot::official_reader(&config, repository);
         cli.credentials.read_auth_from(env, official)
     };
+    // Before the genesis loads: the check places epochs from well-known
+    // values, and refuses a network it has none for, genesis files or not.
+    if let Command::Freshness(args) = &cli.command {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .into_diagnostic()
+            .context("reading the clock")?
+            .as_secs();
+        return run_freshness(&config, args, &read_auth, now);
+    }
+    let genesis = load_genesis(&config)?;
     let observer = Observer::new(Arc::new(ConsoleProgress));
 
     match cli.command {
@@ -1380,6 +1510,7 @@ fn execute(cli: Cli, env: Env) -> miette::Result<()> {
         }) => run_rebuild_blocks(&config, &genesis, &args, &auth, &read_auth),
         Command::Rebuild(args) if args.write => run_rebuild_write(&genesis, &args, &auth),
         Command::Rebuild(args) => run_rebuild(&genesis, &args, &read_auth),
+        Command::Freshness(_) => unreachable!("freshness runs before the genesis loads"),
     }
 }
 

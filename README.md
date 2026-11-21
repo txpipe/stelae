@@ -29,8 +29,9 @@ producer and consumer; it carries no Cardano assumption.
 
 Publisher commands (`initialize`, `publish`, `backfill`, `run`, `digest`,
 `verify` and `inspect` for reading and reproducing published snapshots, and
-`rebuild` for planning a lineage from before the diff chain, and `rebuild
-blocks` for re-encoding its blocks), configuration precedence and persisted-state contracts are documented in
+`rebuild` for planning a lineage from before the diff chain, `rebuild
+blocks` for re-encoding its blocks, and `freshness` for checking that a
+network's latest snapshot is as recent as a deadline), configuration precedence and persisted-state contracts are documented in
 [docs/publisher.md](docs/publisher.md). Reproducible image inputs,
 release provenance and a fresh lineage's first publication on the chart are in
 [docs/publisher-packaging.md](docs/publisher-packaging.md).
