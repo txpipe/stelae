@@ -1,6 +1,8 @@
 # Publisher — deployment unit
 
-The chart in [chart/](chart/) runs one `stelae-publisher` Job per network.
+The chart in [chart/](chart/) runs one `stelae-publisher` per network, as a
+one-shot Job or, with `schedule` set, as a CronJob (see
+[Scheduled runs](#scheduled-runs)).
 The publisher restores its latest snapshot, replays to epoch boundaries,
 publishes, prunes, and exits at the aggregator tip. The operator maintains
 network values and owns deployment, first publication and monitoring.
@@ -31,6 +33,9 @@ helm pull oci://ghcr.io/txpipe/charts/dolos-publisher --version <v>
   [Data volume](#data-volume)) and reads registry credentials from the existing Secret's
   `DOLOS_STELAE_REGISTRY_USER` and `DOLOS_STELAE_REGISTRY_PASSWORD` keys into
   the publisher's `DOLOS_STELAE_USER` and `DOLOS_STELAE_PASSWORD`.
+  Rendered only when `schedule` is empty.
+- CronJob `<network>-publisher`, only when `schedule` is set, in place of the
+  Job. Its runs have the Job's pod, labelled `app: <network>-publisher`.
 
 A known network (`mainnet`, `preprod`, `preview`) takes its genesis and
 Mithril aggregator from the Dolos catalog, so `dolosToml` names neither.
@@ -137,7 +142,12 @@ adds another Job. To recover, delete the release's backfill Jobs with
 | Value | Purpose |
 | --- | --- |
 | `network` | Job name prefix |
-| `run` | Deliberate re-run counter; bump when changing the Job |
+| `run` | Deliberate re-run counter; bump when changing the Job. Required without `schedule`, ignored with it |
+| `schedule` | Cron schedule; set, renders the CronJob instead of the Job. Needs `persistence.enabled` |
+| `suspend` | Scheduled runs: start no new run; default `false` |
+| `startingDeadlineSeconds` | Scheduled runs: how late a missed run may still start; default 3600 |
+| `successfulJobsHistoryLimit`, `failedJobsHistoryLimit` | Scheduled runs: finished Jobs kept; default 3 each |
+| `activeDeadlineSeconds` | Scheduled runs: seconds a run may last; unset by default |
 | `repo` | Network root, `oci://`: each boundary's blocks snapshot goes to its `blocks` repository, then the Dolos snapshot naming it to its `dolos` repository |
 | `concurrency` | Measured upload concurrency, with no chart default |
 | `dolosToml` | Network's Dolos v2 configuration, verbatim |
@@ -220,6 +230,56 @@ image or roll back to a chart without them only once the batch has drained, as
 [Upgrade and rollback](../../docs/publisher.md#upgrade-and-rollback)
 explains.
 
+## Scheduled runs
+
+Setting `schedule` renders the CronJob `<network>-publisher` instead of the
+Job. Each run is `stelae-publisher run` on the kept claim, so `schedule`
+needs `persistence.enabled`: on an emptyDir every run would restore all of
+history, and the render refuses it.
+
+- **Nothing to publish.** A run resumes the stores the last one left,
+  publishes any boundary Mithril has added since, and exits 0 when there is
+  nothing further, publishing nothing. Running more often than epochs close
+  is safe, and most runs are of that kind.
+- **One writer.** `concurrencyPolicy: Forbid` is the single-writer guarantee
+  between scheduled runs: a run due while one is still in flight is held
+  back, and starts late within `startingDeadlineSeconds` or is skipped until
+  the next time. It covers only the CronJob's own runs. A Job started by
+  hand beside it, `kubectl create job --from=cronjob/...` included, is a
+  second writer on the claim; preventing that is the operator's. Set
+  `suspend: true`, wait for the run in flight to finish, and only then start
+  one by hand. Within a run, `podReplacementPolicy: Failed` keeps a
+  replacement pod from starting until the pod it replaces has terminated, so
+  a run's pod that is deleted or evicted does not overlap its successor.
+  The schedule requires Kubernetes 1.31 or later. Before 1.31 a Job is
+  marked failed while its pod may still be terminating, for up to its grace
+  period, and the next run can start beside that pod on the claim; no choice
+  of values prevents it. Do not run the schedule on an older cluster: use the
+  one-shot Job there.
+- **Failure.** A Job is marked failed only after `backoffLimit` restarts,
+  and until then it holds the schedule back under `Forbid`. The default of
+  200 suits a one-shot backfill on spot capacity; a scheduled release wants a
+  small `backoffLimit`, so a run that keeps failing shows as failed within
+  one interval. `activeDeadlineSeconds` bounds a run that hangs.
+- **From the one-shot Job.** Moving a release to the schedule is one
+  upgrade that sets `schedule` (and `persistence.enabled`, which a release
+  on the claim already has). It removes the finished Job and keeps the
+  claim, so the first scheduled run resumes the Job's stores. Wait for the
+  Job to finish first: removing a Job in flight stops its pod, and the first
+  scheduled run may start before that pod has terminated.
+- **Back to the one-shot Job.** Clearing `schedule`, or rolling back to a
+  chart before 0.5, deletes the CronJob and creates the Job in the same
+  upgrade. Deleting the CronJob stops its run in flight, whose pod keeps
+  writing to the claim until it terminates, beside the new Job. Set
+  `suspend: true` first, wait for the run in flight to finish and its pod to
+  terminate, and only then upgrade.
+- **Changes.** An image or values change takes effect at the next run, with
+  no `run` bump: each run is a new Job from the CronJob's current template,
+  and a run in flight keeps the template it started with. The claim rules of
+  [Data volume](#data-volume) still apply: when the kept stores no longer fit
+  the release, suspend the schedule, wait for the run in flight, delete the
+  claim, and only then upgrade and resume.
+
 ## Validation
 
 ```sh
@@ -229,12 +289,15 @@ helm template stelae-publisher-preprod k8s/dolos-publisher/chart \
 ```
 
 The checks cover direct invocation, the removed `stateEpochs` value refused,
-both `/data` modes, batching all or none, genesis opt-in, TLS selection, missing or invalid configuration and
+both `/data` modes, the scheduled form and its refusals, batching all or none, genesis opt-in, TLS selection, missing or invalid configuration and
 accidental use of the legacy Dolos image.
 
 ## Upgrade and rollback
 
-A Job's pod template is immutable. Bump `run` to create a new Job for an
+This section is about the one-shot Job; a scheduled release takes a change
+at its next run, and moving it back to the Job, by values or by rollback,
+needs the schedule suspended first (see [Scheduled runs](#scheduled-runs)). A Job's pod
+template is immutable. Bump `run` to create a new Job for an
 upgrade or re-run. Helm also removes the old Job, but that replacement order
 does not guarantee a single writer: stop the previous writer and wait for its
 pod to terminate before starting the next run. With an emptyDir the new Job

@@ -1,0 +1,46 @@
+{{/*
+The scheduled publisher, rendered instead of the Job when a schedule is set.
+Each run resumes the kept claim and exits when there is nothing to publish;
+Forbid keeps a run from starting beside one still in flight.
+*/}}
+{{- if .Values.schedule }}
+{{- if not .Values.persistence.enabled }}
+{{- fail "schedule needs persistence.enabled: every scheduled run on an emptyDir would restore all of history" }}
+{{- end }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "dolos-publisher.cronJobName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dolos-publisher.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.schedule | quote }}
+  concurrencyPolicy: Forbid
+  {{- /* A null value drops the key; render none rather than 0, which would
+  make every schedule time missed. History limits of 0 stay valid. */}}
+  {{- if not (kindIs "invalid" .Values.startingDeadlineSeconds) }}
+  startingDeadlineSeconds: {{ .Values.startingDeadlineSeconds | int64 }}
+  {{- end }}
+  suspend: {{ .Values.suspend | default false }}
+  {{- if not (kindIs "invalid" .Values.successfulJobsHistoryLimit) }}
+  successfulJobsHistoryLimit: {{ .Values.successfulJobsHistoryLimit | int64 }}
+  {{- end }}
+  {{- if not (kindIs "invalid" .Values.failedJobsHistoryLimit) }}
+  failedJobsHistoryLimit: {{ .Values.failedJobsHistoryLimit | int64 }}
+  {{- end }}
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "dolos-publisher.labels" . | nindent 8 }}
+    spec:
+      backoffLimit: {{ .Values.backoffLimit }}
+      {{- /* A replacement pod waits until the old one has terminated, so a
+      deleted or evicted run never overlaps its successor on the claim. */}}
+      podReplacementPolicy: Failed
+      {{- with .Values.activeDeadlineSeconds }}
+      activeDeadlineSeconds: {{ . | int64 }}
+      {{- end }}
+      template:
+        {{- include "dolos-publisher.podTemplate" (dict "root" . "app" "publisher") | nindent 8 }}
+{{- end }}

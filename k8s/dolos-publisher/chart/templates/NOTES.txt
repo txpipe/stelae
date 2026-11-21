@@ -1,7 +1,15 @@
+{{ if .Values.schedule -}}
+CronJob {{ include "dolos-publisher.cronJobName" . }} in {{ .Release.Namespace }} — {{ .Values.network }}, schedule "{{ .Values.schedule }}"{{ if .Values.suspend }} (suspended){{ end }}, {{ .Values.image.repository }}:{{ .Values.image.tag }}
+
+Follow the latest run: list the runs, newest last, and follow the last one.
+  kubectl -n {{ .Release.Namespace }} get jobs -l app.kubernetes.io/instance={{ .Release.Name }} --sort-by=.metadata.creationTimestamp
+  kubectl -n {{ .Release.Namespace }} logs -f job/<job>
+{{- else -}}
 {{ include "dolos-publisher.jobName" . }} in {{ .Release.Namespace }} — {{ .Values.network }}, run {{ .Values.run }}, {{ .Values.image.repository }}:{{ .Values.image.tag }}
 
 Follow the run:
   kubectl -n {{ .Release.Namespace }} logs -f job/{{ include "dolos-publisher.jobName" . }}
+{{- end }}
 
 {{ if .Values.persistence.enabled -}}
 The run resumes the stores kept on claim {{ include "dolos-publisher.claimName" . }}.
@@ -15,8 +23,21 @@ Initialization restores latest and fails closed. Enable allowGenesisFallback
 only for a verified first publication.
 {{- end }}
 
+{{ if .Values.schedule -}}
+An image or values change takes effect at the next run. A run never starts
+beside one still in flight, but a Job started by hand beside the CronJob is a
+second writer: suspend the schedule and wait for its run to finish first.
+So is the Job that clearing schedule, or a rollback to a chart before 0.5,
+creates: suspend and wait for the run in flight to terminate before that
+upgrade. The schedule requires Kubernetes 1.31 or later: before 1.31 a run
+can start beside a failed run's terminating pod. An
+image on a new Dolos profile pin starts a fresh lineage in the root's emptied
+dolos repository, and leaves a lineage from before the diff chain, at the root
+itself, alone (see the chart README).
+{{- else -}}
 Before an upgrade or rollback, stop the previous writer and wait for its pod
 to terminate. Bump run for the new Job. An image on a new Dolos profile pin
 starts a fresh lineage in the root's emptied dolos repository, and leaves a
 lineage from before the diff chain, at the root itself, alone (see the chart
 README).
+{{- end }}

@@ -137,6 +137,12 @@ naming.
    then restores the published `latest`, or resumes the kept stores on a
    persistent claim, and fails closed if it cannot.
 
+The first publication runs as the one-shot Job. Once it has finished, a
+release on a persistent claim can move to the scheduled form: setting
+`schedule` replaces the Job with a CronJob whose runs resume the kept claim
+and publish each new boundary as it appears, one run at a time (see the chart
+README's [Scheduled runs](../k8s/dolos-publisher/README.md#scheduled-runs)).
+
 The `/data` volume is an emptyDir by default, and every run restores the
 published head, all of history. A mainnet publisher needs the persistent
 claim. With a persistent claim the next run resumes the kept stores

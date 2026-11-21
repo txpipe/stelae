@@ -2,6 +2,10 @@
 {{ required "network is required" .Values.network }}-backfill-{{ required "run is required" .Values.run }}
 {{- end -}}
 
+{{- define "dolos-publisher.cronJobName" -}}
+{{ required "network is required" .Values.network }}-publisher
+{{- end -}}
+
 {{- define "dolos-publisher.configMapName" -}}
 {{ .Release.Name }}-config
 {{- end -}}
@@ -36,5 +40,108 @@ with a value.
 {{ toYaml (pick $b "epochs" "scratchMib" "reserveMib") }}
 {{- else if $set -}}
 {{- fail (printf "batch.epochs, batch.scratchMib and batch.reserveMib go together; set all three or none (set: %s)" (join ", " $set)) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The publisher pod template, shared by the one-shot Job and the CronJob.
+Called with a dict: "root" is the chart context and "app" the suffix of the
+pod's app label after the network name.
+*/}}
+{{- define "dolos-publisher.podTemplate" -}}
+{{- with .root -}}
+metadata:
+  labels:
+    app: {{ .Values.network }}-{{ $.app }}
+spec:
+  restartPolicy: OnFailure
+  securityContext:
+    runAsNonRoot: true
+    fsGroup: 65532
+    {{- if .Values.persistence.enabled }}
+    fsGroupChangePolicy: OnRootMismatch
+    {{- end }}
+  {{- with .Values.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.tolerations }}
+  tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+  containers:
+    - name: publisher
+      image: {{ .Values.image.repository }}:{{ required "image.tag is required" .Values.image.tag }}
+      command: ["/usr/local/bin/stelae-publisher"]
+      args:
+        - --config
+        - /etc/publisher/dolos.toml
+        - run
+        - --repo
+        - {{ required "repo is required" .Values.repo | quote }}
+        {{- if .Values.insecure }}
+        - --insecure
+        {{- end }}
+        - --concurrency
+        - {{ required "concurrency is required" .Values.concurrency | quote }}
+        {{- if .Values.allowGenesisFallback }}
+        - --allow-genesis
+        {{- end }}
+        {{- with include "dolos-publisher.batch" . | fromYaml }}
+        - --batch-epochs
+        - {{ .epochs | int64 | quote }}
+        - --batch-scratch-mib
+        - {{ .scratchMib | int64 | quote }}
+        - --batch-reserve-mib
+        - {{ .reserveMib | int64 | quote }}
+        {{- end }}
+        {{- if .Values.directS3SecretName }}
+        - --direct-s3-config
+        - /run/direct-s3/direct-s3.json
+        {{- end }}
+      env:
+        - name: DOLOS_STELAE_USER
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.publisherSecretName }}
+              key: DOLOS_STELAE_REGISTRY_USER
+        - name: DOLOS_STELAE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.publisherSecretName }}
+              key: DOLOS_STELAE_REGISTRY_PASSWORD
+      resources:
+        {{- required "resources is required" .Values.resources | toYaml | nindent 8 }}
+      volumeMounts:
+        {{- if .Values.directS3SecretName }}
+        - name: direct-s3
+          mountPath: /run/direct-s3
+          readOnly: true
+        {{- end }}
+        - name: data
+          mountPath: /data
+        - name: {{ .Values.network }}-config
+          mountPath: /etc/publisher
+  volumes:
+    {{- if .Values.directS3SecretName }}
+    - name: direct-s3
+      secret:
+        secretName: {{ .Values.directS3SecretName | quote }}
+        defaultMode: 0440
+        items:
+          - key: direct-s3.json
+            path: direct-s3.json
+    {{- end }}
+    - name: data
+      {{- if .Values.persistence.enabled }}
+      persistentVolumeClaim:
+        claimName: {{ include "dolos-publisher.claimName" . }}
+      {{- else }}
+      emptyDir: {}
+      {{- end }}
+    - name: {{ .Values.network }}-config
+      configMap:
+        name: {{ include "dolos-publisher.configMapName" . }}
 {{- end -}}
 {{- end -}}
