@@ -18,7 +18,10 @@ pub struct UnknownEpochs {
 
 /// A network's epochs, placed in time by its well-known genesis values.
 #[derive(Debug, Clone)]
-pub struct Epochs(GenesisValues);
+pub struct Epochs {
+    magic: u64,
+    values: GenesisValues,
+}
 
 /// The newest sequence a deadline says should be published, and when its
 /// epoch started, in Unix seconds.
@@ -41,18 +44,24 @@ impl Epochs {
     }
 
     pub fn of_magic(magic: u64) -> Option<Self> {
-        GenesisValues::from_magic(magic).map(Self)
+        let values = GenesisValues::from_magic(magic)?;
+        Some(Self { magic, values })
+    }
+
+    /// The network magic these epochs are placed for.
+    pub fn magic(&self) -> u64 {
+        self.magic
     }
 
     /// When `epoch` started, in Unix seconds.
     pub fn start(&self, epoch: u64) -> u64 {
-        let slot = self.0.relative_slot_to_absolute(epoch, 0);
-        self.0.slot_to_wallclock(slot)
+        let slot = self.values.relative_slot_to_absolute(epoch, 0);
+        self.values.slot_to_wallclock(slot)
     }
 
     /// The epoch open at `time`, Unix seconds, or `None` before the first.
     pub fn at(&self, time: u64) -> Option<u64> {
-        let values = &self.0;
+        let values = &self.values;
         let slot = if time < values.byron_known_time {
             return None;
         } else if time < values.shelley_known_time {
@@ -156,5 +165,6 @@ mod tests {
         );
 
         assert!(Epochs::of_magic(42).is_none());
+        assert_eq!(network("preprod").magic(), 1);
     }
 }

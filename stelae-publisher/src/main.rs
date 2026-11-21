@@ -173,7 +173,8 @@ enum Command {
 #[command(after_help = "\
 Exit status:
   0  latest is at or past the expected sequence
-  1  the check could not run: the configuration, the registry or the source failed
+  1  the check could not run (the configuration, the deadline or the registry failed),
+     or latest is another network's snapshot
   2  a usage error
   4  latest is behind the expected sequence, or the repository holds no latest")]
 struct FreshnessArgs {
@@ -1125,20 +1126,36 @@ fn run_freshness(
     now: u64,
 ) -> miette::Result<()> {
     let epochs = freshness::Epochs::of(config).into_diagnostic()?;
-    let expected = freshness::expected(&epochs, args.deadline_hours, now);
+    let Some(expected) = freshness::expected(&epochs, args.deadline_hours, now) else {
+        miette::bail!(
+            "a deadline of {} hours reaches back before the network's first epoch, so no \
+             snapshot could ever be due",
+            args.deadline_hours
+        );
+    };
     let latest = open_snapshot(config, &args.repo, args.insecure, auth)?
-        .latest_sequence()
+        .latest_inscription()
         .map_err(diagnose)?;
+    if let Some(inscription) = &latest {
+        let found = snapshot::read_position(&inscription.position)
+            .into_diagnostic()
+            .context("reading the latest snapshot's position")?
+            .network
+            .magic();
+        if found != epochs.magic() {
+            miette::bail!(
+                "{}'s latest is a snapshot of network magic {found}, and this configuration's \
+                 network {} has magic {}",
+                source_name(&args.repo),
+                config.chain.network,
+                epochs.magic(),
+            );
+        }
+    }
+    let latest = latest.map(|inscription| inscription.sequence);
 
     let network = &config.chain.network;
     let held = latest.map_or_else(|| "none".to_owned(), |sequence| sequence.to_string());
-    let Some(expected) = expected else {
-        println!(
-            "{network}: latest {held}, expected none, epoch 0's deadline not passed at {}",
-            utc(now)
-        );
-        return Ok(());
-    };
     println!(
         "{network}: latest {held}, expected {}, epoch {} started {}",
         expected.sequence,

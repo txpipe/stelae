@@ -925,6 +925,17 @@ fn freshness_exits_zero_at_the_expected_sequence_and_four_behind_it() {
         "{line}"
     );
 
+    let ahead = fixture.run(&[
+        "freshness",
+        "--repo",
+        &repo,
+        "--deadline-hours",
+        &deadline_expecting(0),
+    ]);
+    assert_eq!(code(&ahead), 0, "{}", stderr_words(&ahead));
+    let line = String::from_utf8(ahead.stdout).unwrap();
+    assert!(line.starts_with("preview: latest 1, expected 0,"), "{line}");
+
     let stale = fixture.run(&[
         "freshness",
         "--repo",
@@ -970,23 +981,8 @@ fn freshness_that_cannot_read_the_root_exits_one_and_opens_no_store() {
     let fixture = Fixture::published();
     let dir = tempfile::tempdir().unwrap();
     let storage = dir.path().join("never");
-    let config = dir.path().join("dolos.toml");
-    std::fs::write(
-        &config,
-        format!(
-            "compatibility = \"v2-beta.1\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"preview\"\n[storage]\npath = {:?}\n",
-            storage.display().to_string(),
-        ),
-    )
-    .unwrap();
-    let run = |repo: &str| {
-        Command::new(env!("CARGO_BIN_EXE_stelae-publisher"))
-            .arg("--config")
-            .arg(&config)
-            .args(["freshness", "--repo", repo, "--deadline-hours", "30"])
-            .output()
-            .unwrap()
-    };
+    let config = freshness_config(dir.path(), "preview");
+    let run = |repo: &str| freshness(&config, &["--repo", repo, "--deadline-hours", "30"]);
 
     let missing = format!("file://{}", dir.path().join("missing").display());
     assert_eq!(code(&run(&missing)), 1);
@@ -995,6 +991,122 @@ fn freshness_that_cannot_read_the_root_exits_one_and_opens_no_store() {
 
     let without = fixture.run(&["freshness", "--repo", &fixture.repo()]);
     assert_eq!(code(&without), 2);
+}
+
+/// A configuration for `network`, with a storage path that should never be
+/// created, written under `dir`.
+fn freshness_config(dir: &Path, network: &str) -> PathBuf {
+    let config = dir.join(format!("{network}.toml"));
+    std::fs::write(
+        &config,
+        format!(
+            "compatibility = \"v2-beta.1\"\n[chain]\nprotocol = \"cardano\"\nnetwork = \"{network}\"\n[storage]\npath = {:?}\n",
+            dir.join("never").display().to_string(),
+        ),
+    )
+    .unwrap();
+    config
+}
+
+fn freshness(config: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_stelae-publisher"))
+        .arg("--config")
+        .arg(config)
+        .arg("freshness")
+        .args(args)
+        .env_remove("DOLOS_STELAE_USER")
+        .env_remove("DOLOS_STELAE_PASSWORD")
+        .env_remove("DOLOS_STELAE_TOKEN")
+        .output()
+        .unwrap()
+}
+
+/// A `latest` of another network is no evidence of this one's: refused as a
+/// failure, not passed or reported stale.
+#[test]
+fn freshness_refuses_a_latest_of_another_network() {
+    let fixture = Fixture::published();
+    let dir = tempfile::tempdir().unwrap();
+    let preprod = freshness_config(dir.path(), "preprod");
+
+    let output = freshness(
+        &preprod,
+        &["--repo", &fixture.repo(), "--deadline-hours", "1"],
+    );
+    assert_eq!(code(&output), 1, "{}", stderr_words(&output));
+    let words = stderr_words(&output);
+    assert!(words.contains("network magic 2"), "{words}");
+    assert!(words.contains("preprod has magic 1"), "{words}");
+    assert!(output.stdout.is_empty());
+}
+
+/// A deadline reaching back before the first epoch can never fall due, so it
+/// is refused rather than passing forever, even against an empty root.
+#[test]
+fn freshness_refuses_a_deadline_before_the_first_epoch() {
+    let fixture = Fixture::published();
+    let empty = fixture.node.path().join("empty");
+    stelae::dir::SnapshotDir::create(empty.join("dolos")).unwrap();
+
+    for hours in ["1000000", &u64::MAX.to_string()] {
+        let output = fixture.run(&[
+            "freshness",
+            "--repo",
+            &format!("file://{}", empty.display()),
+            "--deadline-hours",
+            hours,
+        ]);
+        assert_eq!(code(&output), 1, "{}", stderr_words(&output));
+        let words = stderr_words(&output);
+        assert!(
+            words.contains(&format!("a deadline of {hours} hours reaches back")),
+            "{words}"
+        );
+    }
+}
+
+/// Over a registry: an empty repository is stale, a published one fresh, and
+/// one that cannot be reached a failure, not a missing `latest`.
+#[test]
+fn freshness_reads_a_registry() {
+    let fixture = Fixture::published();
+    let registry = tempfile::tempdir().unwrap();
+    let loopback = Loopback::serve(registry.path()).unwrap();
+    let repo = loopback.repository("cardano/test");
+    seed_first_blocks(&fixture, &loopback, "cardano/test");
+    let published = fixture.run(&["publish", "--repo", &repo, "--insecure"]);
+    assert_eq!(code(&published), 0, "{}", stderr_words(&published));
+    let deadline = deadline_expecting(1);
+
+    let fresh = fixture.run(&[
+        "freshness",
+        "--repo",
+        &repo,
+        "--insecure",
+        "--deadline-hours",
+        &deadline,
+    ]);
+    assert_eq!(code(&fresh), 0, "{}", stderr_words(&fresh));
+    assert!(String::from_utf8_lossy(&fresh.stdout).starts_with("preview: latest 1, expected 1,"));
+
+    let empty = fixture.run(&[
+        "freshness",
+        "--repo",
+        &loopback.repository("cardano/empty"),
+        "--insecure",
+        "--deadline-hours",
+        &deadline,
+    ]);
+    assert_eq!(code(&empty), 4, "{}", stderr_words(&empty));
+    assert!(
+        stderr_words(&empty).contains("holds no latest snapshot"),
+        "{}",
+        stderr_words(&empty)
+    );
+
+    // TLS to a plain-HTTP registry: it cannot be read at all.
+    let unreachable = fixture.run(&["freshness", "--repo", &repo, "--deadline-hours", &deadline]);
+    assert_eq!(code(&unreachable), 1, "{}", stderr_words(&unreachable));
 }
 
 /// Refused before the genesis files, which this configuration names and does

@@ -120,7 +120,7 @@ takes the same way:
 | --- | --- | --- |
 | Mithril aggregator | `--mithril-aggregator` or `DOLOS_MITHRIL_AGGREGATOR` | the known network's; required for `custom` |
 | Mithril genesis key | `--mithril-genesis-vkey` or `DOLOS_MITHRIL_GENESIS_VKEY` | the known network's; required for `custom` |
-| Registry user | global `--registry-user` or `DOLOS_STELAE_USER` | anonymous; `verify` and `inspect` with no user or token read the configured network's official repository as its published read-only user, as Dolos does |
+| Registry user | global `--registry-user` or `DOLOS_STELAE_USER` | anonymous; `verify`, `inspect` and `freshness` with no user or token read the configured network's official repository as its published read-only user, as Dolos does |
 | Registry secret | `DOLOS_STELAE_PASSWORD` or `DOLOS_STELAE_TOKEN`, or global `--registry-credentials-file PATH` (a TOML file naming only `password` or `token`, in their place); never an argument | none; a user with no secret takes the official registry's read-only password |
 
 Every source and destination a command names is a network root, such as
@@ -295,17 +295,20 @@ well-known genesis values pallas carries for the networks of Dolos's catalog
 and so is a custom network with the magic of a known one. The expected
 sequence `E` is the newest epoch whose start plus `--deadline-hours` hours is
 at or before now: sequence `E` is the cut at the boundary that opens epoch
-`E`. The command reads the sequence `latest` names in the root's `dolos`
-repository, its own documents only, as the identity `inspect` reads with, and
-prints one line on stdout: the network, `latest`'s sequence, `E` and the start
+`E`. A deadline that reaches back before the network's first epoch is
+refused, naming it. The command reads the sequence and network `latest` names
+in the root's `dolos` repository, its own documents only, as the identity
+`inspect` reads with, refuses a `latest` of another network, naming both
+magics, and prints one line on stdout: the network, `latest`'s sequence, `E` and the start
 of epoch `E`. It opens no store and writes nothing. The `dolos` repository is
 the one checked because a Dolos snapshot is published only after the blocks
 snapshot it names, so its `latest` is the later of the two to move.
 
 It exits 0 when `latest` is at or past `E`, and 4 when it is behind, saying by
 how many sequences, or when the repository holds no `latest`. Any other
-failure, a registry that cannot be reached included, exits 1, and a usage
-error 2.
+failure, a registry that cannot be reached and a `latest` of another network
+included, exits 1, and a usage error 2. A failed check is therefore either
+stale or unable to read; its log says which.
 
 Choosing `H`: Mithril certifies a boundary's immutable files 18 to 23 hours
 after it, and a scheduled publisher picks them up at its first run after
