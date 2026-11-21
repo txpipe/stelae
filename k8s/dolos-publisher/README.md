@@ -165,11 +165,12 @@ adds another Job. To recover, delete the release's backfill Jobs with
 | `batch.reserveMib` | MiB kept free per prepared boundary, with no default |
 | `freshness.schedule` | Cron schedule of the freshness check; empty renders none |
 | `freshness.deadlineHours` | Hours after an epoch starts by which its snapshot is due; required with `freshness.schedule` |
-| `freshness.repo` | Network root checked; defaults to `repo` |
+| `freshness.repo` | Network root checked; defaults to `repo`, which then needs `freshness.secretName` |
 | `freshness.insecure` | Plain HTTP to `freshness.repo`; defaults to `insecure` |
-| `freshness.secretName` | Secret with the reader's `DOLOS_STELAE_REGISTRY_USER` and `DOLOS_STELAE_REGISTRY_PASSWORD`; empty passes no credentials |
+| `freshness.secretName` | Secret with the reader's `DOLOS_STELAE_REGISTRY_USER` and `DOLOS_STELAE_REGISTRY_PASSWORD`; empty passes no credentials, and is refused with an empty `freshness.repo` |
 | `freshness.resources` | The check's resources; required with `freshness.schedule` |
 | `freshness.backoffLimit` | Retries before a check is marked failed; default 2 |
+| `freshness.activeDeadlineSeconds` | Seconds a check, its retries included, may last before it is marked failed; default 600 |
 
 [values.yaml](chart/values.yaml) also exposes transport, secret name, retry
 budget, termination grace period and placement. Initialization fails closed
@@ -298,8 +299,12 @@ stops, none run. Setting `freshness.schedule` renders a second CronJob,
 [the publisher's commands](../../docs/publisher.md#checking-freshness)): each
 fails once the root's `latest` is behind the newest epoch that started
 `freshness.deadlineHours` or more hours ago, or when it holds no `latest`.
-Nothing is delivered: the failed Job, after `freshness.backoffLimit` retries,
-is the signal, for whatever reads Jobs from kube-state-metrics.
+Nothing is delivered: the failed Job, after `freshness.backoffLimit` retries
+or `freshness.activeDeadlineSeconds`, is the signal, for whatever reads Jobs
+from kube-state-metrics. A run also fails when it cannot read the root or
+never starts, so a failure means stale or unreadable; the Job's log says
+which. The freshness Jobs carry `app.kubernetes.io/component: freshness`,
+which the install notes filter out of the publisher's runs.
 
 - **What it reads.** It mounts the release's ConfigMap for the network and no
   `/data`, holds no claim and writes nothing, so it never competes with the
@@ -312,8 +317,11 @@ is the signal, for whatever reads Jobs from kube-state-metrics.
   readers cannot see it.
 - **As whom.** With no `freshness.secretName` it passes no credentials, so it
   reads as the network's published read-only user on the official registry,
-  and anonymously elsewhere. Name a Secret only for a registry that needs a
-  reader's account; the publisher's own Secret is a writer.
+  and anonymously elsewhere. Name a Secret for a registry that needs a
+  reader's account; the publisher's own Secret is a writer. The chart's own
+  `repo` is the publisher's write path, which the repository's registry does
+  not show an anonymous reader, so the render refuses a schedule with neither
+  `freshness.repo` nor `freshness.secretName`.
 - **Choosing the deadline.** Mithril certifies a boundary's files 18 to 23
   hours after it; add the publisher's interval, a run's duration and a margin.
   The [publisher docs](../../docs/publisher.md#checking-freshness) have the

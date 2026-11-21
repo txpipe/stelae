@@ -148,18 +148,23 @@ freshness:
   # Hours after an epoch starts by which its snapshot should be published.
   # Required with a schedule; a network fact, with no default.
   deadlineHours: null
-  # The network root checked; empty checks repo. Most useful as the public
-  # hostname consumers read, oci://<public host>/cardano/<network>.
+  # The network root checked; empty checks repo, which then needs
+  # secretName. Most useful as the public hostname consumers read,
+  # oci://<public host>/cardano/<network>.
   repo: ""
   # Plain HTTP to repo; null takes insecure above. Set false for a TLS
   # hostname.
   insecure: null
-  # Secret holding DOLOS_STELAE_REGISTRY_USER and
+  # Secret holding a reader's DOLOS_STELAE_REGISTRY_USER and
   # DOLOS_STELAE_REGISTRY_PASSWORD, as publisherSecretName. Empty passes no
-  # credentials, so the check reads as the network's published read-only
-  # user.
+  # credentials: the check reads as the network's published read-only user
+  # on the official registry, and anonymously elsewhere. Required when repo
+  # above is empty.
   secretName: ""
   # Required with a schedule, with no default.
   resources: {}
   # Retries before a run is marked failed.
   backoffLimit: 2
+  # Seconds a run, its retries included, may last before it is marked
+  # failed, so one that never starts still fails.
+  activeDeadlineSeconds: 600

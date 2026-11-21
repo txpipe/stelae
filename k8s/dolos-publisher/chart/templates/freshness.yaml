@@ -14,6 +14,11 @@ signal. It holds no claim and writes nothing.
 {{- if not $f.resources }}
 {{- fail "freshness.resources is required with freshness.schedule" }}
 {{- end }}
+{{- /* The chart's repo is the publisher's write path, which a private
+registry does not let an anonymous reader see; every run would fail. */}}
+{{- if and (not $f.repo) (not $f.secretName) }}
+{{- fail "freshness.repo or freshness.secretName is required with freshness.schedule: the chart's own repo needs a reader Secret, or set freshness.repo to the public root consumers read" }}
+{{- end }}
 {{- $insecure := .Values.insecure -}}
 {{- if not (kindIs "invalid" $f.insecure) }}{{ $insecure = $f.insecure }}{{ end -}}
 apiVersion: batch/v1
@@ -36,8 +41,13 @@ spec:
     metadata:
       labels:
         {{- include "dolos-publisher.labels" . | nindent 8 }}
+        app.kubernetes.io/component: freshness
     spec:
       backoffLimit: {{ if kindIs "invalid" $f.backoffLimit }}2{{ else }}{{ $f.backoffLimit | int64 }}{{ end }}
+      {{- /* A run that never starts (an image not pushed, a Secret key
+      missing) would otherwise never fail, and Forbid would skip every later
+      run. */}}
+      activeDeadlineSeconds: {{ if kindIs "invalid" $f.activeDeadlineSeconds }}600{{ else }}{{ $f.activeDeadlineSeconds | int64 }}{{ end }}
       template:
         metadata:
           labels:

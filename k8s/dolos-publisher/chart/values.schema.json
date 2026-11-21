@@ -107,7 +107,8 @@
         "insecure": { "type": ["boolean", "null"] },
         "secretName": { "type": "string" },
         "resources": { "type": "object" },
-        "backoffLimit": { "type": "integer", "minimum": 0 }
+        "backoffLimit": { "type": "integer", "minimum": 0 },
+        "activeDeadlineSeconds": { "type": "integer", "minimum": 1 }
       },
       "additionalProperties": false
     },

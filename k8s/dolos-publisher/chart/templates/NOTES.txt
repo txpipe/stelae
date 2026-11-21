@@ -2,7 +2,7 @@
 CronJob {{ include "dolos-publisher.cronJobName" . }} in {{ .Release.Namespace }} — {{ .Values.network }}, schedule "{{ .Values.schedule }}"{{ if .Values.suspend }} (suspended){{ end }}, {{ .Values.image.repository }}:{{ .Values.image.tag }}
 
 Follow the latest run: list the runs, newest last, and follow the last one.
-  kubectl -n {{ .Release.Namespace }} get jobs -l app.kubernetes.io/instance={{ .Release.Name }} --sort-by=.metadata.creationTimestamp
+  kubectl -n {{ .Release.Namespace }} get jobs -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component!=freshness --sort-by=.metadata.creationTimestamp
   kubectl -n {{ .Release.Namespace }} logs -f job/<job>
 {{- else -}}
 {{ include "dolos-publisher.jobName" . }} in {{ .Release.Namespace }} — {{ .Values.network }}, run {{ .Values.run }}, {{ .Values.image.repository }}:{{ .Values.image.tag }}
@@ -45,5 +45,6 @@ README).
 
 CronJob {{ $.Values.network }}-freshness checks {{ .repo | default $.Values.repo }} on
 "{{ .schedule }}". A failed run means latest is behind the newest epoch that
-started {{ .deadlineHours }} or more hours ago.
+started {{ .deadlineHours | int64 }} or more hours ago, or that the check could
+not read it; its log says which.
 {{- end }}{{ end }}
