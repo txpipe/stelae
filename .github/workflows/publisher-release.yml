@@ -68,6 +68,7 @@ jobs:
         with:
           version: v3.17.3
       - run: k8s/dolos-publisher/test.sh
+      - run: k8s/registry/test.sh
 
   publish:
     name: Publish multi-architecture image

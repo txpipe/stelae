@@ -128,6 +128,13 @@ auth:
   # in the Secret below — divergence authenticates a user and grants nothing.
   publisherUsername: ""
   readonlyUsername: ""
+  # Optional: a user that may read, create and update every repository but
+  # never delete — for unattended publishers, which send no delete. Empty
+  # renders no writer. Its bcrypt line goes into the htpasswd Secret like the
+  # other two, and the publisher chart reaches its credential Secret through
+  # publisherSecretName. publisherUsername stays the admin for the acts that
+  # delete: a first publication's wipe, a refused tag. Must differ from both.
+  writerUsername: ""
   # Referenced, never templated: htpasswd needs bcrypt hashing no template can
   # do, and object-store keys are credentials. The store Secret's keys reach
   # the S3 driver through the AWS credential chain, so they must be named
