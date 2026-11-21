@@ -363,3 +363,137 @@ if helm template publisher "$CHART" --values "$VALUES" \
     exit 1
 fi
 grep -Fq persistence.enabled "$OUT/invalid.yaml"
+
+# The freshness check: nothing without its schedule.
+for rendered in default claim schedule; do
+    if grep -Fq 'preview-freshness' "$OUT/$rendered.yaml"; then
+        echo "a freshness CronJob rendered without freshness.schedule ($rendered)" >&2
+        exit 1
+    fi
+done
+
+fresh() {
+    helm template publisher "$CHART" --values "$VALUES" \
+        --set-string 'freshness.schedule=17 * * * *' --set freshness.deadlineHours=30 \
+        --set freshness.resources.requests.cpu=100m "$@"
+}
+fresh_only() {
+    fresh --show-only templates/freshness.yaml "$@"
+}
+helm lint "$CHART" --values "$VALUES" \
+    --set-string 'freshness.schedule=17 * * * *' --set freshness.deadlineHours=30 \
+    --set freshness.resources.requests.cpu=100m
+
+# Beside the one-shot Job, a CronJob of its own: the check's arguments, the
+# ConfigMap, no /data and, by default, no credentials.
+fresh >"$OUT/fresh.yaml"
+grep -Fx 'kind: Job' "$OUT/fresh.yaml"
+fresh_only >"$OUT/fresh-only.yaml"
+grep -Fx '  name: preview-freshness' "$OUT/fresh-only.yaml"
+grep -Fx '  schedule: "17 * * * *"' "$OUT/fresh-only.yaml"
+grep -Fx '  concurrencyPolicy: Forbid' "$OUT/fresh-only.yaml"
+grep -Fx '  successfulJobsHistoryLimit: 3' "$OUT/fresh-only.yaml"
+grep -Fx '  failedJobsHistoryLimit: 3' "$OUT/fresh-only.yaml"
+grep -Fx '      backoffLimit: 2' "$OUT/fresh-only.yaml"
+grep -Fx '            app: preview-freshness' "$OUT/fresh-only.yaml"
+grep -F 'image: ghcr.io/txpipe/stelae-publisher:sha-deadbee' "$OUT/fresh-only.yaml"
+under args <"$OUT/fresh-only.yaml" | sed 's/^ *//' >"$OUT/fresh-args.txt"
+printf '%s\n' '- --config' '- /etc/publisher/dolos.toml' '- freshness' '- --repo' \
+    '- "oci://registry.invalid/cardano/preview"' '- --deadline-hours' '- "30"' '- --insecure' \
+    >"$OUT/fresh-args-want.txt"
+cmp "$OUT/fresh-args.txt" "$OUT/fresh-args-want.txt"
+under volumeMounts <"$OUT/fresh-only.yaml" | grep -Fx '                  mountPath: /etc/publisher'
+under volumes <"$OUT/fresh-only.yaml" | grep -Fx '                name: publisher-config'
+if grep -Eq '/data|name: data$|persistentVolumeClaim|emptyDir' "$OUT/fresh-only.yaml"; then
+    echo "the freshness check mounts /data" >&2
+    exit 1
+fi
+if grep -Eq 'DOLOS_STELAE|secretKeyRef|env:' "$OUT/fresh-only.yaml"; then
+    echo "the freshness check passes credentials without freshness.secretName" >&2
+    exit 1
+fi
+under resources <"$OUT/fresh-only.yaml" | grep -Fx '                  cpu: 100m'
+
+# Credentials only from its own Secret, and only when named.
+fresh_only --set freshness.secretName=stelae-registry-reader >"$OUT/fresh-secret.yaml"
+item DOLOS_STELAE_USER <"$OUT/fresh-secret.yaml" | grep -Fx '                      name: stelae-registry-reader'
+item DOLOS_STELAE_USER <"$OUT/fresh-secret.yaml" | grep -Fx '                      key: DOLOS_STELAE_REGISTRY_USER'
+item DOLOS_STELAE_PASSWORD <"$OUT/fresh-secret.yaml" | grep -Fx '                      name: stelae-registry-reader'
+item DOLOS_STELAE_PASSWORD <"$OUT/fresh-secret.yaml" | grep -Fx '                      key: DOLOS_STELAE_REGISTRY_PASSWORD'
+if grep -Fq stelae-registry-publisher "$OUT/fresh-secret.yaml"; then
+    echo "the freshness check read the publisher's Secret" >&2
+    exit 1
+fi
+
+# Its own root and transport, else the chart's; placement and history are
+# the release's.
+fresh_only --set freshness.repo=oci://oci.example/cardano/preview \
+    --set freshness.insecure=false >"$OUT/fresh-public.yaml"
+grep -Fx -- '                - "oci://oci.example/cardano/preview"' "$OUT/fresh-public.yaml"
+if grep -Fq -- '--insecure' "$OUT/fresh-public.yaml"; then
+    echo "freshness.insecure=false still passed --insecure" >&2
+    exit 1
+fi
+fresh_only --set insecure=false >"$OUT/fresh-tls.yaml"
+if grep -Fq -- '--insecure' "$OUT/fresh-tls.yaml"; then
+    echo "the freshness check did not take insecure from the chart" >&2
+    exit 1
+fi
+fresh_only --set insecure=false --set freshness.insecure=true | grep -Fx -- '                - --insecure'
+fresh_only --set nodeSelector.pool=spot --set 'tolerations[0].key=spot' \
+    --set successfulJobsHistoryLimit=1,failedJobsHistoryLimit=5 \
+    --set freshness.backoffLimit=0 >"$OUT/fresh-placed.yaml"
+under nodeSelector <"$OUT/fresh-placed.yaml" | grep -Fx '            pool: spot'
+under tolerations <"$OUT/fresh-placed.yaml" | grep -Fx '            - key: spot'
+grep -Fx '  successfulJobsHistoryLimit: 1' "$OUT/fresh-placed.yaml"
+grep -Fx '  failedJobsHistoryLimit: 5' "$OUT/fresh-placed.yaml"
+grep -Fx '      backoffLimit: 0' "$OUT/fresh-placed.yaml"
+# A values file reads numbers as floats; the deadline still renders as digits.
+printf '%s\n' 'freshness:' '  schedule: "17 * * * *"' '  deadlineHours: 1000000' \
+    '  resources: { requests: { cpu: 100m } }' >"$OUT/fresh-values.yaml"
+helm template publisher "$CHART" --values "$VALUES" --values "$OUT/fresh-values.yaml" \
+    --show-only templates/freshness.yaml |
+    grep -A1 -Fx -- '                - --deadline-hours' | grep -Fx '                - "1000000"'
+
+# Beside the scheduled publisher too, which it leaves as it was.
+helm lint "$CHART" --values "$VALUES" \
+    --set persistence.enabled=true --set-string 'schedule=0 */6 * * *' \
+    --set-string 'freshness.schedule=17 * * * *' --set freshness.deadlineHours=30 \
+    --set freshness.resources.requests.cpu=100m
+fresh --set persistence.enabled=true --set-string 'schedule=0 */6 * * *' >"$OUT/fresh-schedule.yaml"
+[ "$(grep -cFx 'kind: CronJob' "$OUT/fresh-schedule.yaml")" -eq 2 ]
+grep -Fx '  name: preview-publisher' "$OUT/fresh-schedule.yaml"
+grep -Fx '  name: preview-freshness' "$OUT/fresh-schedule.yaml"
+if grep -Fxq 'kind: Job' "$OUT/fresh-schedule.yaml"; then
+    echo "a scheduled release with a freshness check rendered the one-shot Job" >&2
+    exit 1
+fi
+helm template publisher "$CHART" --values "$VALUES" \
+    --set persistence.enabled=true --set-string 'schedule=0 */6 * * *' \
+    --show-only templates/cronjob.yaml >"$OUT/publisher-alone.yaml"
+fresh --set persistence.enabled=true --set-string 'schedule=0 */6 * * *' \
+    --show-only templates/cronjob.yaml >"$OUT/publisher-beside.yaml"
+cmp "$OUT/publisher-alone.yaml" "$OUT/publisher-beside.yaml"
+
+# A schedule needs its deadline and resources; a deadline is whole hours.
+for invalid in freshness.deadlineHours=null freshness.resources=null \
+    freshness.deadlineHours=0 freshness.deadlineHours=-1 freshness.deadline=30 \
+    freshness.repo=registry.invalid/cardano/preview; do
+    if fresh --set "$invalid" >"$OUT/invalid.yaml" 2>&1; then
+        echo "invalid freshness configuration accepted: $invalid" >&2
+        exit 1
+    fi
+done
+fresh --set freshness.deadlineHours=null >"$OUT/invalid.yaml" 2>&1 || true
+grep -Fq 'freshness.deadlineHours is required' "$OUT/invalid.yaml"
+fresh --set freshness.resources=null >"$OUT/invalid.yaml" 2>&1 || true
+grep -Fq 'freshness.resources is required' "$OUT/invalid.yaml"
+
+# The install notes name the check only when it is scheduled.
+if grep -Fq freshness "$OUT/notes-default.txt"; then
+    echo "default notes named a freshness check" >&2
+    exit 1
+fi
+notes --set-string 'freshness.schedule=17 * * * *' --set freshness.deadlineHours=30 \
+    --set freshness.resources.requests.cpu=100m |
+    grep -F 'CronJob preview-freshness checks oci://registry.invalid/cardano/preview on'

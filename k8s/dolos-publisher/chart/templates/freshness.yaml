@@ -1,0 +1,94 @@
+{{/*
+The freshness check, rendered when freshness.schedule is set, with or
+without the publisher's own schedule. Each run reads the network root's
+latest and fails, after its retries, when it is behind what
+freshness.deadlineHours says should be published; the failed Job is the
+signal. It holds no claim and writes nothing.
+*/}}
+{{- $f := .Values.freshness | default dict -}}
+{{- if $f.schedule }}
+{{- $hours := $f.deadlineHours -}}
+{{- if or (kindIs "invalid" $hours) (eq (toString $hours) "") }}
+{{- fail "freshness.deadlineHours is required with freshness.schedule" }}
+{{- end }}
+{{- if not $f.resources }}
+{{- fail "freshness.resources is required with freshness.schedule" }}
+{{- end }}
+{{- $insecure := .Values.insecure -}}
+{{- if not (kindIs "invalid" $f.insecure) }}{{ $insecure = $f.insecure }}{{ end -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ required "network is required" .Values.network }}-freshness
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dolos-publisher.labels" . | nindent 4 }}
+spec:
+  schedule: {{ $f.schedule | quote }}
+  concurrencyPolicy: Forbid
+  {{- if not (kindIs "invalid" .Values.successfulJobsHistoryLimit) }}
+  successfulJobsHistoryLimit: {{ .Values.successfulJobsHistoryLimit | int64 }}
+  {{- end }}
+  {{- if not (kindIs "invalid" .Values.failedJobsHistoryLimit) }}
+  failedJobsHistoryLimit: {{ .Values.failedJobsHistoryLimit | int64 }}
+  {{- end }}
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "dolos-publisher.labels" . | nindent 8 }}
+    spec:
+      backoffLimit: {{ if kindIs "invalid" $f.backoffLimit }}2{{ else }}{{ $f.backoffLimit | int64 }}{{ end }}
+      template:
+        metadata:
+          labels:
+            app: {{ .Values.network }}-freshness
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: freshness
+              image: {{ .Values.image.repository }}:{{ required "image.tag is required" .Values.image.tag }}
+              command: ["/usr/local/bin/stelae-publisher"]
+              args:
+                - --config
+                - /etc/publisher/dolos.toml
+                - freshness
+                - --repo
+                - {{ $f.repo | default (required "repo is required" .Values.repo) | quote }}
+                - --deadline-hours
+                - {{ $hours | int64 | quote }}
+                {{- if $insecure }}
+                - --insecure
+                {{- end }}
+              {{- with $f.secretName }}
+              env:
+                - name: DOLOS_STELAE_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ . }}
+                      key: DOLOS_STELAE_REGISTRY_USER
+                - name: DOLOS_STELAE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ . }}
+                      key: DOLOS_STELAE_REGISTRY_PASSWORD
+              {{- end }}
+              resources:
+                {{- toYaml $f.resources | nindent 16 }}
+              volumeMounts:
+                - name: {{ .Values.network }}-config
+                  mountPath: /etc/publisher
+          volumes:
+            - name: {{ .Values.network }}-config
+              configMap:
+                name: {{ include "dolos-publisher.configMapName" . }}
+{{- end }}

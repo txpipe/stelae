@@ -41,3 +41,9 @@ starts a fresh lineage in the root's emptied dolos repository, and leaves a
 lineage from before the diff chain, at the root itself, alone (see the chart
 README).
 {{- end }}
+{{- with .Values.freshness }}{{ if .schedule }}
+
+CronJob {{ $.Values.network }}-freshness checks {{ .repo | default $.Values.repo }} on
+"{{ .schedule }}". A failed run means latest is behind the newest epoch that
+started {{ .deadlineHours }} or more hours ago.
+{{- end }}{{ end }}

@@ -36,6 +36,8 @@ helm pull oci://ghcr.io/txpipe/charts/dolos-publisher --version <v>
   Rendered only when `schedule` is empty.
 - CronJob `<network>-publisher`, only when `schedule` is set, in place of the
   Job. Its runs have the Job's pod, labelled `app: <network>-publisher`.
+- CronJob `<network>-freshness`, only when `freshness.schedule` is set, with
+  or without `schedule`. See [Freshness check](#freshness-check).
 
 A known network (`mainnet`, `preprod`, `preview`) takes its genesis and
 Mithril aggregator from the Dolos catalog, so `dolosToml` names neither.
@@ -161,6 +163,13 @@ adds another Job. To recover, delete the release's backfill Jobs with
 | `batch.epochs` | Boundaries in a prepared batch, at least 2; unset publishes one at a time |
 | `batch.scratchMib` | MiB a batch may hold on disk, with no default |
 | `batch.reserveMib` | MiB kept free per prepared boundary, with no default |
+| `freshness.schedule` | Cron schedule of the freshness check; empty renders none |
+| `freshness.deadlineHours` | Hours after an epoch starts by which its snapshot is due; required with `freshness.schedule` |
+| `freshness.repo` | Network root checked; defaults to `repo` |
+| `freshness.insecure` | Plain HTTP to `freshness.repo`; defaults to `insecure` |
+| `freshness.secretName` | Secret with the reader's `DOLOS_STELAE_REGISTRY_USER` and `DOLOS_STELAE_REGISTRY_PASSWORD`; empty passes no credentials |
+| `freshness.resources` | The check's resources; required with `freshness.schedule` |
+| `freshness.backoffLimit` | Retries before a check is marked failed; default 2 |
 
 [values.yaml](chart/values.yaml) also exposes transport, secret name, retry
 budget, termination grace period and placement. Initialization fails closed
@@ -280,6 +289,36 @@ history, and the render refuses it.
   the release, suspend the schedule, wait for the run in flight, delete the
   claim, and only then upgrade and resume.
 
+## Freshness check
+
+A publisher run that succeeds does not say the network is current: when
+Mithril stalls, runs succeed with nothing to publish, and when the schedule
+stops, none run. Setting `freshness.schedule` renders a second CronJob,
+`<network>-freshness`, whose runs are `stelae-publisher freshness` (see
+[the publisher's commands](../../docs/publisher.md#checking-freshness)): each
+fails once the root's `latest` is behind the newest epoch that started
+`freshness.deadlineHours` or more hours ago, or when it holds no `latest`.
+Nothing is delivered: the failed Job, after `freshness.backoffLimit` retries,
+is the signal, for whatever reads Jobs from kube-state-metrics.
+
+- **What it reads.** It mounts the release's ConfigMap for the network and no
+  `/data`, holds no claim and writes nothing, so it never competes with the
+  publisher. It runs with or without `schedule`, and suspending the publisher
+  leaves it running, which is when it is wanted.
+- **Where it reads.** The check is most useful against the public hostname
+  consumers read, `oci://<public host>/cardano/<network>` in
+  `freshness.repo` with `freshness.insecure: false`, rather than the
+  in-cluster write path: it then also fails when the publisher writes but
+  readers cannot see it.
+- **As whom.** With no `freshness.secretName` it passes no credentials, so it
+  reads as the network's published read-only user on the official registry,
+  and anonymously elsewhere. Name a Secret only for a registry that needs a
+  reader's account; the publisher's own Secret is a writer.
+- **Choosing the deadline.** Mithril certifies a boundary's files 18 to 23
+  hours after it; add the publisher's interval, a run's duration and a margin.
+  The [publisher docs](../../docs/publisher.md#checking-freshness) have the
+  reasoning.
+
 ## Validation
 
 ```sh
@@ -289,7 +328,8 @@ helm template stelae-publisher-preprod k8s/dolos-publisher/chart \
 ```
 
 The checks cover direct invocation, the removed `stateEpochs` value refused,
-both `/data` modes, the scheduled form and its refusals, batching all or none, genesis opt-in, TLS selection, missing or invalid configuration and
+both `/data` modes, the scheduled form and its refusals, the freshness
+check and its refusals, batching all or none, genesis opt-in, TLS selection, missing or invalid configuration and
 accidental use of the legacy Dolos image.
 
 ## Upgrade and rollback
