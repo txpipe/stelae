@@ -70,6 +70,7 @@ jobs:
         with:
           version: v3.17.3
       - run: k8s/dolos-publisher/test.sh
+      - run: k8s/registry/test.sh
       - name: Package the charts
         run: k8s/package-charts.sh "$RUNNER_TEMP/charts"
       - name: Test the chart version check

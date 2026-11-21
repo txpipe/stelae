@@ -1,7 +1,13 @@
 {{/*
 zot's config.json. The htpasswd file it references is mounted alongside from
 a pre-created Secret, projected into the same directory by the Deployment.
+The optional writer publishes without delete; the admin user keeps delete.
 */}}
+{{- with .Values.auth.writerUsername }}
+{{- if or (eq . $.Values.auth.publisherUsername) (eq . $.Values.auth.readonlyUsername) }}
+{{- fail (printf "auth.writerUsername %q must differ from auth.publisherUsername %q and auth.readonlyUsername %q" . $.Values.auth.publisherUsername $.Values.auth.readonlyUsername) }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -50,6 +56,12 @@ data:
                   "users": [{{ required "auth.readonlyUsername is required" .Values.auth.readonlyUsername | quote }}],
                   "actions": ["read"]
                 }
+                {{- with .Values.auth.writerUsername }},
+                {
+                  "users": [{{ . | quote }}],
+                  "actions": ["read", "create", "update"]
+                }
+                {{- end }}
               ],
               "defaultPolicy": [],
               "anonymousPolicy": []

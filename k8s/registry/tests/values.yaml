@@ -1,0 +1,10 @@
+image:
+  repository: ghcr.io/example/zot
+  tag: v2.1.20
+  binary: zot-linux-arm64
+s3:
+  endpoint: https://store.example.com
+  bucket: stelae
+auth:
+  publisherUsername: publisher
+  readonlyUsername: reader
