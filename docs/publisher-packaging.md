@@ -90,7 +90,9 @@ distinct, explicit decisions.
    that chart's version, or the chart check fails. The release repeats that
    check against the previous release tag before it pushes, so a change that
    reached the branch without a bump fails the release instead of going
-   unpublished.
+   unpublished. The previous release is the highest `v*` tag below the one
+   being released, even when it was tagged on a commit the branch does not
+   reach, as a squash-merged release PR leaves it.
 6. The first push of a chart creates a private package. The organization
    owner makes it public by hand in the package settings; later versions
    inherit that visibility.

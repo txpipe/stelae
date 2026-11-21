@@ -100,7 +100,7 @@ jobs:
         with:
           version: v3.17.3
       - name: Check charts changed since the previous release bumped their version
-        run: k8s/check-chart-versions.sh "$(git describe --tags --abbrev=0 --match 'v*' HEAD^)"
+        run: k8s/check-chart-versions.sh "$(k8s/previous-release-tag.sh "$GITHUB_REF_NAME")"
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
