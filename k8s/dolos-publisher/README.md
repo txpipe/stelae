@@ -239,7 +239,14 @@ history, and the render refuses it.
   hand beside it, `kubectl create job --from=cronjob/...` included, is a
   second writer on the claim; preventing that is the operator's. Set
   `suspend: true`, wait for the run in flight to finish, and only then start
-  one by hand.
+  one by hand. The guarantee needs Kubernetes 1.31 or later. Before 1.31 a
+  Job that reaches `activeDeadlineSeconds` or `backoffLimit` is marked failed
+  while its pod is still terminating, for up to its grace period, so a run
+  held back by `Forbid` can start beside that pod on the claim. On an older
+  cluster, set `startingDeadlineSeconds` and the schedule so that no held-back
+  run can start within the grace period of a failed one, or leave
+  `activeDeadlineSeconds` unset and `backoffLimit` small and watch for
+  failures.
 - **Failure.** A Job is marked failed only after `backoffLimit` restarts,
   and until then it holds the schedule back under `Forbid`. The default of
   200 suits a one-shot backfill on spot capacity; a scheduled release wants a
@@ -251,6 +258,12 @@ history, and the render refuses it.
   claim, so the first scheduled run resumes the Job's stores. Wait for the
   Job to finish first: removing a Job in flight stops its pod, and the first
   scheduled run may start before that pod has terminated.
+- **Back to the one-shot Job.** Clearing `schedule`, or rolling back to a
+  chart before 0.5, deletes the CronJob and creates the Job in the same
+  upgrade. Deleting the CronJob stops its run in flight, whose pod keeps
+  writing to the claim until it terminates, beside the new Job. Set
+  `suspend: true` first, wait for the run in flight to finish and its pod to
+  terminate, and only then upgrade.
 - **Changes.** An image or values change takes effect at the next run, with
   no `run` bump: each run is a new Job from the CronJob's current template,
   and a run in flight keeps the template it started with. The claim rules of
@@ -273,7 +286,8 @@ accidental use of the legacy Dolos image.
 ## Upgrade and rollback
 
 This section is about the one-shot Job; a scheduled release takes a change
-at its next run (see [Scheduled runs](#scheduled-runs)). A Job's pod
+at its next run, and moving it back to the Job, by values or by rollback,
+needs the schedule suspended first (see [Scheduled runs](#scheduled-runs)). A Job's pod
 template is immutable. Bump `run` to create a new Job for an
 upgrade or re-run. Helm also removes the old Job, but that replacement order
 does not guarantee a single writer: stop the previous writer and wait for its

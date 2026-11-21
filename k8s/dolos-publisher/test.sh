@@ -337,6 +337,24 @@ helm template publisher "$CHART" --values "$VALUES" \
 doc CronJob "$OUT/schedule-suspend.yaml" | grep -Fx '  suspend: true'
 doc CronJob "$OUT/schedule-suspend.yaml" | grep -Fx '      activeDeadlineSeconds: 86400'
 
+# A null CronJob number is left to the API default, never rendered as 0:
+# a startingDeadlineSeconds of 0 would skip every run. A history limit of 0
+# stays valid.
+helm template publisher "$CHART" --values "$VALUES" \
+    --set persistence.enabled=true,startingDeadlineSeconds=null \
+    --set successfulJobsHistoryLimit=null,failedJobsHistoryLimit=null \
+    --set-string 'schedule=0 */6 * * *' >"$OUT/schedule-null.yaml"
+for key in startingDeadlineSeconds successfulJobsHistoryLimit failedJobsHistoryLimit; do
+    if grep -Fq "$key" "$OUT/schedule-null.yaml"; then
+        echo "a null $key rendered" >&2
+        exit 1
+    fi
+done
+helm template publisher "$CHART" --values "$VALUES" \
+    --set persistence.enabled=true,successfulJobsHistoryLimit=0 \
+    --set-string 'schedule=0 */6 * * *' >"$OUT/schedule-zero.yaml"
+doc CronJob "$OUT/schedule-zero.yaml" | grep -Fx '  successfulJobsHistoryLimit: 0'
+
 # Every scheduled run on an emptyDir would restore all of history.
 if helm template publisher "$CHART" --values "$VALUES" \
     --set-string 'schedule=0 */6 * * *' >"$OUT/invalid.yaml" 2>&1; then

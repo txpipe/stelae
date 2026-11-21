@@ -17,10 +17,18 @@ metadata:
 spec:
   schedule: {{ .Values.schedule | quote }}
   concurrencyPolicy: Forbid
+  {{- /* A null value drops the key; render none rather than 0, which would
+  make every schedule time missed. History limits of 0 stay valid. */}}
+  {{- if not (kindIs "invalid" .Values.startingDeadlineSeconds) }}
   startingDeadlineSeconds: {{ .Values.startingDeadlineSeconds | int64 }}
-  suspend: {{ .Values.suspend }}
+  {{- end }}
+  suspend: {{ .Values.suspend | default false }}
+  {{- if not (kindIs "invalid" .Values.successfulJobsHistoryLimit) }}
   successfulJobsHistoryLimit: {{ .Values.successfulJobsHistoryLimit | int64 }}
+  {{- end }}
+  {{- if not (kindIs "invalid" .Values.failedJobsHistoryLimit) }}
   failedJobsHistoryLimit: {{ .Values.failedJobsHistoryLimit | int64 }}
+  {{- end }}
   jobTemplate:
     metadata:
       labels:

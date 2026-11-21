@@ -37,10 +37,11 @@ suspend: false
 
 # Scheduled runs only. Seconds after its scheduled time a missed run may
 # still start, say after a run in flight held it back; later than that it is
-# skipped until the next time.
+# skipped until the next time. Null leaves no deadline.
 startingDeadlineSeconds: 3600
 
-# Scheduled runs only. Finished Jobs kept for their logs.
+# Scheduled runs only. Finished Jobs kept for their logs; null leaves the
+# Kubernetes default.
 successfulJobsHistoryLimit: 3
 failedJobsHistoryLimit: 3
 
