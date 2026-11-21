@@ -47,7 +47,7 @@ carries [PR 1546](https://github.com/txpipe/dolos/pull/1546), which changes
 how `state-datums` counts hash-datum outputs and moves the WAL to version 10.
 Stores synced before that range lack its `state-datums` counts, and
 relabeling them would not add them, so delete a claim kept from before it
-rather than relabel it, as for any storage pin change (see
+rather than relabel it (see
 [publisher-packaging.md](publisher-packaging.md)). The normative profile is
 [`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/c31f215cfcc48e5a1f57176914eefd932af273ee/crates/snapshot/PROFILE.md)
 at the pinned commit, and the preparation contract this host consumes is
@@ -460,10 +460,13 @@ claim only after both stores are relabeled to that contract (Dolos's
 and `compatibility` is updated. A prepared bundle records the contract it was
 captured under, and the new image refuses one captured under the old, so stop
 the publisher at a boundary with no prepared batch under `.stelae-batch/`.
-The procedure is: wait for such a boundary, stop the publisher, relabel the
-state and archive stores, set `compatibility` and the new image together, and
-start it again. The protocol, profile and media-type versions do not change
-with the store contract, so the published lineage continues unchanged.
+The procedure is: wait for such a boundary, stop the publisher, confirm that
+`.stelae-batch/` still holds no prepared batch, relabel the state and archive
+stores, set `compatibility` and the new image together, and start it again. If
+a batch was prepared before the stop, start the old image again and drain it
+first, as under [Upgrade and rollback](#upgrade-and-rollback). The protocol,
+profile and media-type versions do not change with the store contract, so the
+published lineage continues unchanged.
 
 ### Stores whose state passed the archive
 
