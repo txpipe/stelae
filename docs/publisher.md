@@ -9,8 +9,13 @@ No command starts or shells out to a Dolos executable.
 ## Source and dependency identity
 
 Every Dolos crate in the publisher's dependency graph, normal and dev, is
-pinned to `e52f2cf8f7d25870fac712fd85a31b4545c42acf`, the merge of
-[PR 1625](https://github.com/txpipe/dolos/pull/1625). Its profile exports the
+pinned to `c31f215cfcc48e5a1f57176914eefd932af273ee`, the merge of
+[PR 1650](https://github.com/txpipe/dolos/pull/1650). It records and admits
+the `v2-beta.1` store contract
+([PR 1646](https://github.com/txpipe/dolos/pull/1646)), so it opens only
+stores and configurations that name `v2-beta.1` (see
+[Crossing a store contract](#crossing-a-store-contract)). Its profile is the
+one of [PR 1625](https://github.com/txpipe/dolos/pull/1625): it exports the
 diff chain ([PR 1610](https://github.com/txpipe/dolos/pull/1610)), leaves
 closed epochs' blocks to the blocks profile
 ([PR 1619](https://github.com/txpipe/dolos/pull/1619)) and names the blocks
@@ -40,13 +45,13 @@ revision 1, and only the epoch-boundary cut publishable. The pin keeps all
 of that, but it is not the baseline plus the envelope alone: the range also
 carries [PR 1546](https://github.com/txpipe/dolos/pull/1546), which changes
 how `state-datums` counts hash-datum outputs and moves the WAL to version 10.
-Initialization does not refuse stores synced at an earlier pin (opening them
-only wipes their WAL), so delete a kept claim before the upgrade, as for any
-storage pin change (see
+Stores synced before that range lack its `state-datums` counts, and
+relabeling them would not add them, so delete a claim kept from before it
+rather than relabel it, as for any storage pin change (see
 [publisher-packaging.md](publisher-packaging.md)). The normative profile is
-[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/e52f2cf8f7d25870fac712fd85a31b4545c42acf/crates/snapshot/PROFILE.md)
+[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/c31f215cfcc48e5a1f57176914eefd932af273ee/crates/snapshot/PROFILE.md)
 at the pinned commit, and the preparation contract this host consumes is
-[`docs/contracts/export-preparation.md`](https://github.com/txpipe/dolos/blob/e52f2cf8f7d25870fac712fd85a31b4545c42acf/docs/contracts/export-preparation.md).
+[`docs/contracts/export-preparation.md`](https://github.com/txpipe/dolos/blob/c31f215cfcc48e5a1f57176914eefd932af273ee/docs/contracts/export-preparation.md).
 
 Like every revision since the publisher retirement of
 [PR 1335](https://github.com/txpipe/dolos/pull/1335), the pin retains the
@@ -444,6 +449,21 @@ The backfill state machine preserves these rules from the accepted Dolos host:
   [Blocks snapshots](#blocks-snapshots));
 - keep the plan, schema, media-type,
   compression and journal identities of the pinned profile.
+
+### Crossing a store contract
+
+Each store records the Dolos store contract it was created under, and the
+configuration's `compatibility` names one too. An image whose Dolos records a
+newer contract refuses the older stores and configuration, so it opens the
+claim only after both stores are relabeled to that contract (Dolos's
+[`store relabel`](https://github.com/txpipe/dolos/blob/c31f215cfcc48e5a1f57176914eefd932af273ee/xtask/README.md#store-relabel))
+and `compatibility` is updated. A prepared bundle records the contract it was
+captured under, and the new image refuses one captured under the old, so stop
+the publisher at a boundary with no prepared batch under `.stelae-batch/`.
+The procedure is: wait for such a boundary, stop the publisher, relabel the
+state and archive stores, set `compatibility` and the new image together, and
+start it again. The protocol, profile and media-type versions do not change
+with the store contract, so the published lineage continues unchanged.
 
 ### Stores whose state passed the archive
 
