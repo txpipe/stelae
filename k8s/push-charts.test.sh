@@ -4,7 +4,8 @@
 set -eu
 
 K8S=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-IMAGE=${STELAE_TEST_REGISTRY_IMAGE:-public.ecr.aws/docker/library/registry:2}
+# zot from GHCR: ECR Public throttles anonymous pulls from shared runner IPs.
+IMAGE=${STELAE_TEST_REGISTRY_IMAGE:-ghcr.io/project-zot/zot:v2.1.20}
 OUT=$(mktemp -d)
 container=
 cleanup() {
@@ -13,6 +14,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# A failed pull is infrastructure, not a finding: back off and try again.
+for attempt in 1 2 3 4 5; do
+    docker pull --quiet "$IMAGE" >/dev/null && break
+    if [ "$attempt" = 5 ]; then
+        echo "cannot pull $IMAGE" >&2
+        exit 1
+    fi
+    sleep $((attempt * 15))
+done
 container=$(docker run -d -p 127.0.0.1::5000 "$IMAGE")
 port=$(docker port "$container" 5000/tcp | sed -n '1s/.*://p')
 for attempt in $(seq 30); do
