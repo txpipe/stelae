@@ -1198,7 +1198,7 @@ checksum = "780955b8b195a21ab8e4ac6b60dd1dbdcec1dc6c51c0617964b08c81785e12c9"
 [[package]]
 name = "dolos"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e52f2cf8f7d25870fac712fd85a31b4545c42acf#e52f2cf8f7d25870fac712fd85a31b4545c42acf"
+source = "git+https://github.com/txpipe/dolos?rev=c31f215cfcc48e5a1f57176914eefd932af273ee#c31f215cfcc48e5a1f57176914eefd932af273ee"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1235,6 +1235,7 @@ dependencies = [
  "protoc-wkt",
  "rayon",
  "redb-extras",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",
@@ -1251,6 +1252,7 @@ dependencies = [
  "unicase",
  "unicode-normalization",
  "vergen-gitcl",
+ "whoami",
  "xxhash-rust",
  "zstd",
 ]
@@ -1258,7 +1260,7 @@ dependencies = [
 [[package]]
 name = "dolos-cardano"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e52f2cf8f7d25870fac712fd85a31b4545c42acf#e52f2cf8f7d25870fac712fd85a31b4545c42acf"
+source = "git+https://github.com/txpipe/dolos?rev=c31f215cfcc48e5a1f57176914eefd932af273ee#c31f215cfcc48e5a1f57176914eefd932af273ee"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1284,7 +1286,7 @@ dependencies = [
 [[package]]
 name = "dolos-core"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e52f2cf8f7d25870fac712fd85a31b4545c42acf#e52f2cf8f7d25870fac712fd85a31b4545c42acf"
+source = "git+https://github.com/txpipe/dolos?rev=c31f215cfcc48e5a1f57176914eefd932af273ee#c31f215cfcc48e5a1f57176914eefd932af273ee"
 dependencies = [
  "bytes",
  "config",
@@ -1311,7 +1313,7 @@ dependencies = [
 [[package]]
 name = "dolos-fjall"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e52f2cf8f7d25870fac712fd85a31b4545c42acf#e52f2cf8f7d25870fac712fd85a31b4545c42acf"
+source = "git+https://github.com/txpipe/dolos?rev=c31f215cfcc48e5a1f57176914eefd932af273ee#c31f215cfcc48e5a1f57176914eefd932af273ee"
 dependencies = [
  "bincode 1.3.3",
  "dolos-core",
@@ -1330,7 +1332,7 @@ dependencies = [
 [[package]]
 name = "dolos-flatfiles"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e52f2cf8f7d25870fac712fd85a31b4545c42acf#e52f2cf8f7d25870fac712fd85a31b4545c42acf"
+source = "git+https://github.com/txpipe/dolos?rev=c31f215cfcc48e5a1f57176914eefd932af273ee#c31f215cfcc48e5a1f57176914eefd932af273ee"
 dependencies = [
  "rayon",
  "tempfile",
@@ -1340,7 +1342,7 @@ dependencies = [
 [[package]]
 name = "dolos-mithril"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e52f2cf8f7d25870fac712fd85a31b4545c42acf#e52f2cf8f7d25870fac712fd85a31b4545c42acf"
+source = "git+https://github.com/txpipe/dolos?rev=c31f215cfcc48e5a1f57176914eefd932af273ee#c31f215cfcc48e5a1f57176914eefd932af273ee"
 dependencies = [
  "mithril-client",
  "tracing",
@@ -1349,7 +1351,7 @@ dependencies = [
 [[package]]
 name = "dolos-redb3"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e52f2cf8f7d25870fac712fd85a31b4545c42acf#e52f2cf8f7d25870fac712fd85a31b4545c42acf"
+source = "git+https://github.com/txpipe/dolos?rev=c31f215cfcc48e5a1f57176914eefd932af273ee#c31f215cfcc48e5a1f57176914eefd932af273ee"
 dependencies = [
  "bincode 1.3.3",
  "bytes",
@@ -1373,7 +1375,7 @@ dependencies = [
 [[package]]
 name = "dolos-snapshot"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e52f2cf8f7d25870fac712fd85a31b4545c42acf#e52f2cf8f7d25870fac712fd85a31b4545c42acf"
+source = "git+https://github.com/txpipe/dolos?rev=c31f215cfcc48e5a1f57176914eefd932af273ee#c31f215cfcc48e5a1f57176914eefd932af273ee"
 dependencies = [
  "dolos-cardano",
  "dolos-core",
@@ -1394,7 +1396,7 @@ dependencies = [
 [[package]]
 name = "dolos-testing"
 version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=e52f2cf8f7d25870fac712fd85a31b4545c42acf#e52f2cf8f7d25870fac712fd85a31b4545c42acf"
+source = "git+https://github.com/txpipe/dolos?rev=c31f215cfcc48e5a1f57176914eefd932af273ee#c31f215cfcc48e5a1f57176914eefd932af273ee"
 dependencies = [
  "bech32 0.9.1",
  "crc32fast",
@@ -1406,6 +1408,8 @@ dependencies = [
  "futures-util",
  "hex",
  "itertools 0.14.0",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "pallas",
  "rand 0.9.5",
  "serde",
@@ -1782,7 +1786,7 @@ dependencies = [
  "cfg-if 1.0.4",
  "js-sys",
  "libc",
- "wasi",
+ "wasi 0.11.1+wasi-snapshot-preview1",
  "wasm-bindgen",
 ]
 
@@ -2556,6 +2560,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "libredox"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61ff90caf6077a803a240f62fdbe88645a890bbca49ef8174c3cb0404362171d"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2728,7 +2741,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30d65c71f1ce40ab09135ce117d742b9f8a19ff91a41a8b57ed50bc2de59c427"
 dependencies = [
  "libc",
- "wasi",
+ "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.61.2",
 ]
 
@@ -3089,6 +3102,24 @@ name = "number_prefix"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
+
+[[package]]
+name = "objc2-core-foundation"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
+dependencies = [
+ "bitflags 2.13.1",
+]
+
+[[package]]
+name = "objc2-system-configuration"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7216bd11cbda54ccabcab84d523dc93b858ec75ecfb3a7d89513fa22464da396"
+dependencies = [
+ "objc2-core-foundation",
+]
 
 [[package]]
 name = "object"
@@ -3733,7 +3764,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "once_cell",
@@ -3753,7 +3784,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -3766,7 +3797,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -5350,11 +5381,13 @@ dependencies = [
  "pin-project",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -5757,12 +5790,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
+name = "wasi"
+version = "0.14.7+wasi-0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "883478de20367e224c0090af9cf5f9fa85bed63a95c1abf3afc5c083ebc06e8c"
+dependencies = [
+ "wasip2",
+]
+
+[[package]]
 name = "wasip2"
 version = "1.0.4+wasi-0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
 dependencies = [
  "wit-bindgen",
+]
+
+[[package]]
+name = "wasite"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66fe902b4a6b8028a753d5424909b764ccf79b7a209eac9bf97e59cda9f71a42"
+dependencies = [
+ "wasi 0.14.7+wasi-0.2.4",
 ]
 
 [[package]]
@@ -5860,6 +5911,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "whoami"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "626c4bac6755d76ffc12cb01b2eac751db1996b9e0041de9aa02c8c211ddc82c"
+dependencies = [
+ "libc",
+ "libredox",
+ "objc2-system-configuration",
+ "wasite",
+ "web-sys",
 ]
 
 [[package]]

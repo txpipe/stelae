@@ -27,8 +27,9 @@ pub use dolos_snapshot::{
 
 /// The Dolos revision this publisher reads its configuration and stores with:
 /// the profile that exports the diff chain and names its blocks snapshot
-/// (txpipe/dolos PR #1610 through PR #1625).
-pub const DOLOS_REVISION: &str = "e52f2cf8f7d25870fac712fd85a31b4545c42acf";
+/// (txpipe/dolos PR #1610 through PR #1625), under the `v2-beta.1` store
+/// contract (PR #1646).
+pub const DOLOS_REVISION: &str = "c31f215cfcc48e5a1f57176914eefd932af273ee";
 
 #[cfg(test)]
 mod dependency_identity {

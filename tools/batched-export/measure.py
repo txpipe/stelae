@@ -79,7 +79,7 @@ def sha256_of(path):
 
 def write_config(path, network, storage):
     Path(path).write_text(
-        'compatibility = "v2-alpha.2"\n\n'
+        'compatibility = "v2-beta.1"\n\n'
         f'[chain]\nprotocol = "cardano"\nnetwork = "{network}"\n\n'
         f'[storage]\npath = "{storage}"\n'
     )
