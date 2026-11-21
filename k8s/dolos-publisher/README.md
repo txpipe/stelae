@@ -9,6 +9,15 @@ The chart runs a publisher built on the Dolos v2 configuration: `dolosToml`
 is a v2 file keeping full history. There is no host selector. The directory and chart name stay
 `dolos-publisher` to preserve release and object naming.
 
+## Getting the chart
+
+A release publishes the chart as an OCI package at its own `version:`. Pull
+or install a pinned version without a checkout:
+
+```sh
+helm pull oci://ghcr.io/txpipe/charts/dolos-publisher --version <v>
+```
+
 ## Rendered resources
 
 - ConfigMap `<release>-config`, mounted at `/etc/publisher`, carries

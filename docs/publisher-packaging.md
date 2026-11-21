@@ -82,6 +82,16 @@ distinct, explicit decisions.
    `gh attestation verify oci://ghcr.io/txpipe/stelae-publisher@sha256:<digest> --repo txpipe/stelae`.
    Operations selects the tested image for a separate deployment.
 
+5. The same tag publishes the charts under `oci://ghcr.io/txpipe/charts/`:
+   `dolos-publisher` and `stelae-registry`. Each is published at its own
+   `Chart.yaml` `version:`, independent of the workspace version, and only
+   once: a version the registry already holds is skipped, never replaced. A
+   pull request that changes a chart since the newest release tag must bump
+   that chart's version, or the chart check fails.
+6. The first push of a chart creates a private package. The organization
+   owner makes it public by hand in the package settings; later versions
+   inherit that visibility.
+
 Pull requests and branch-based manual runs only build and test. A manual run
 on a version tag follows the same publication path as a tag push. The workflow
 does not create GitHub Releases, tags, or deployments.

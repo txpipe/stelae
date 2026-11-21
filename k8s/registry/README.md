@@ -75,6 +75,15 @@ Render and install are the operator's responsibility. `templates/NOTES.txt`
 prints the smoke test: a `401` on `/v2/`, a sub-second blob `HEAD`, and a
 `307` on a blob `GET`.
 
+## Getting the chart
+
+A release publishes the chart as an OCI package at its own `version:`. Pull
+or install a pinned version without a checkout:
+
+```sh
+helm pull oci://ghcr.io/txpipe/charts/stelae-registry --version <v>
+```
+
 ## The interim image
 
 zot v2.1.17–v2.1.20 resolve a blob `HEAD`'s Content-Type by walking the
