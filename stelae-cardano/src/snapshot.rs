@@ -505,6 +505,24 @@ impl Published {
         inspected.map_err(Error::profile("reading the snapshot"))
     }
 
+    /// The sequence `latest` names, or `None` where the repository holds no
+    /// `latest`. Only its own documents are read, not its chain's.
+    pub fn latest_sequence(&self) -> Result<Option<u64>, Error> {
+        let pulled = match &self.dolos {
+            Side::Repository(registry) => registry
+                .pull_latest(&DolosProfile)
+                .and_then(|snapshot| snapshot.read_inscription()),
+            Side::Directory(dir) => dir
+                .pull_latest(&DolosProfile)
+                .and_then(|snapshot| snapshot.read_inscription()),
+        };
+        match pulled {
+            Ok(inscription) => Ok(Some(inscription.sequence)),
+            Err(error) if error.is_absent() => Ok(None),
+            Err(error) => Err(Error::profile("reading the latest snapshot")(error.into())),
+        }
+    }
+
     /// Check the snapshot's digests: its chain, its documents against each
     /// other, then every blob of its layer set against both of its digests.
     ///

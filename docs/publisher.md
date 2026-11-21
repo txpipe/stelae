@@ -277,6 +277,43 @@ exits 1, including a record the local stores hold out of order or malformed
 under `--reproduce`, as does a `--point` the source does not hold, a tip the
 registry no longer keeps, and any refusal by `inspect` or `digest`.
 
+### Checking freshness
+
+A publisher run that exits 0 says nothing about whether a network's snapshots
+are current: when Mithril stalls, runs succeed with nothing to publish, and
+when the schedule stops, none run, while `latest` ages either way. `freshness`
+asks the question from the clock and the registry alone:
+
+```sh
+stelae-publisher --config dolos.toml freshness \
+  --repo oci://registry.example/cardano/preview --deadline-hours 30
+```
+
+The network is the configuration's. Its epochs are placed in time by the
+well-known genesis values pallas carries for the networks of Dolos's catalog
+(`mainnet`, `preprod`, `preview`); any other network is refused, naming it,
+and so is a custom network with the magic of a known one. The expected
+sequence `E` is the newest epoch whose start plus `--deadline-hours` hours is
+at or before now: sequence `E` is the cut at the boundary that opens epoch
+`E`. The command reads the sequence `latest` names in the root's `dolos`
+repository, its own documents only, as the identity `inspect` reads with, and
+prints one line on stdout: the network, `latest`'s sequence, `E` and the start
+of epoch `E`. It opens no store and writes nothing. The `dolos` repository is
+the one checked because a Dolos snapshot is published only after the blocks
+snapshot it names, so its `latest` is the later of the two to move.
+
+It exits 0 when `latest` is at or past `E`, and 4 when it is behind, saying by
+how many sequences, or when the repository holds no `latest`. Any other
+failure, a registry that cannot be reached included, exits 1, and a usage
+error 2.
+
+Choosing `H`: Mithril certifies a boundary's immutable files 18 to 23 hours
+after it, and a scheduled publisher picks them up at its first run after
+that. `H` is the certification delay, plus the publisher's interval, plus a
+run's own duration and a margin, so that one slow run does not fail the check
+and a stall shows within a deadline. On preview, whose epochs last a day, an
+`H` past 24 hours puts the deadline of one epoch inside the next.
+
 ### Rebuilding a lineage from before the diff chain
 
 `rebuild` plans how a Dolos lineage published before the diff chain becomes

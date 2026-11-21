@@ -9,6 +9,7 @@ pub mod backfill;
 pub mod batch;
 pub mod blocks;
 pub mod config;
+pub mod freshness;
 pub mod initialize;
 pub mod publisher;
 pub mod rebuild;
