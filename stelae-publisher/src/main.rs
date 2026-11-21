@@ -1872,11 +1872,17 @@ mod tests {
 
     #[test]
     fn the_chart_sets_the_credential_names_the_binary_reads() {
-        let job = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../k8s/dolos-publisher/chart/templates/job.yaml"),
-        )
-        .unwrap();
+        // The Job and the CronJob both render the pod from the shared template.
+        let templates =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../k8s/dolos-publisher/chart/templates");
+        let pod = std::fs::read_to_string(templates.join("_helpers.tpl")).unwrap();
+        for workload in ["job.yaml", "cronjob.yaml"] {
+            let text = std::fs::read_to_string(templates.join(workload)).unwrap();
+            assert!(
+                text.contains(r#"include "dolos-publisher.podTemplate""#),
+                "{workload} does not render the shared pod template"
+            );
+        }
         let command = Cli::command();
         let user = command
             .get_arguments()
@@ -1888,8 +1894,8 @@ mod tests {
         for name in [user, PASSWORD_ENV] {
             let entry = format!("- name: {name}");
             assert!(
-                job.lines().any(|line| line.trim() == entry),
-                "job.yaml does not set {name}"
+                pod.lines().any(|line| line.trim() == entry),
+                "the pod template does not set {name}"
             );
         }
     }
