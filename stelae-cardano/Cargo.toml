@@ -7,10 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-stelae = { path = "../stelae", version = "=0.8.0", features = ["oci"] }
-stelae-driver = { path = "../stelae-driver", version = "=0.8.0", features = ["oci"] }
+stelae = { path = "../stelae", version = "=0.9.0", features = ["oci"] }
+stelae-driver = { path = "../stelae-driver", version = "=0.9.0", features = ["oci"] }
 # `hardano`: the host exports each closed epoch from its immutable files.
-stelae-blocks = { path = "../stelae-blocks", version = "=0.8.0", features = ["hardano"] }
+stelae-blocks = { path = "../stelae-blocks", version = "=0.9.0", features = ["hardano"] }
 
 # The Dolos commit whose profile exports the diff chain and names its blocks
 # snapshot (txpipe/dolos PR #1610 through PR #1625), under the `v2-beta.1`
@@ -50,7 +50,7 @@ required-features = ["testing"]
 [dev-dependencies]
 stelae-cardano = { path = ".", features = ["testing"] }
 # The re-encode test exports the same epoch from immutable files.
-stelae-blocks = { path = "../stelae-blocks", version = "=0.8.0", features = ["hardano"] }
+stelae-blocks = { path = "../stelae-blocks", version = "=0.9.0", features = ["hardano"] }
 dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "c31f215cfcc48e5a1f57176914eefd932af273ee" }
 dolos-fjall = { git = "https://github.com/txpipe/dolos", rev = "c31f215cfcc48e5a1f57176914eefd932af273ee" }
 # The tests build fjall errors directly, so this must be the fork revision

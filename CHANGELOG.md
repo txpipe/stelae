@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] - 2026-11-22
+
+### 🚀 Features
+
+- Let the registry chart render a writer that cannot delete (#48)
+- Publish the Helm charts as OCI packages on release (#49)
+- Run the publisher chart on a schedule (#50)
+- Check that a network's published snapshots are fresh (#51)
+
 ## [0.8.0] - 2026-11-21
 
 ### 🐛 Bug Fixes
@@ -13,6 +22,10 @@ All notable changes to this project will be documented in this file.
 
 - [**breaking**] Move the publisher host to the Dolos v2-beta.1 store contract (#47)
 
+### Release
+
+- V0.8.0
+
 ## [0.7.1] - 2026-11-20
 
 ### 🚀 Features
@@ -22,6 +35,10 @@ All notable changes to this project will be documented in this file.
 ### 🚜 Refactor
 
 - Say "snapshot" for the published artifact in the publisher host (#42)
+
+### Release
+
+- V0.7.1 (#44)
 
 ## [0.7.0] - 2026-11-18
 
@@ -48,6 +65,10 @@ All notable changes to this project will be documented in this file.
 ### Build
 
 - Pin the publisher host to the Stelae revision its Dolos uses (#27)
+
+### Release
+
+- V0.7.0
 
 ## [0.6.0] - 2026-11-12
 
