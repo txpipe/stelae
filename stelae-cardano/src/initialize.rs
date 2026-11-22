@@ -146,7 +146,7 @@ fn restoring<'a>(
         resume: options.resume,
         skip_space_check: options.skip_space_check,
         journals,
-        read_ahead: 1,
+        read_ahead: Some(1),
         source: None,
     }
 }
