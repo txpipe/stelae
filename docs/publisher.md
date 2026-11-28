@@ -9,9 +9,9 @@ No command starts or shells out to a Dolos executable.
 ## Source and dependency identity
 
 Every Dolos crate in the publisher's dependency graph, normal and dev, is
-pinned to `827220007408996f79cd96a6493268dfc53201e5`, the merge of
-[PR 1665](https://github.com/txpipe/dolos/pull/1665), which builds Dolos on
-Pallas `1.5.0-rc.3`; the publisher requires that same Pallas, so the graph
+pinned to `25548d6818953301ce42c79ab2a906277b008dbe`, the merge of
+[PR 1686](https://github.com/txpipe/dolos/pull/1686), which builds Dolos on
+Pallas `1.5.1`; the publisher requires that same Pallas, so the graph
 holds one. It records and admits
 the `v2-beta.1` store contract
 ([PR 1646](https://github.com/txpipe/dolos/pull/1646)), so it opens only
@@ -51,9 +51,9 @@ Stores synced before that range lack its `state-datums` counts, and
 relabeling them would not add them, so delete a claim kept from before it
 rather than relabel it (see
 [publisher-packaging.md](publisher-packaging.md)). The normative profile is
-[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/827220007408996f79cd96a6493268dfc53201e5/crates/snapshot/PROFILE.md)
+[`crates/snapshot/PROFILE.md`](https://github.com/txpipe/dolos/blob/25548d6818953301ce42c79ab2a906277b008dbe/crates/snapshot/PROFILE.md)
 at the pinned commit, and the preparation contract this host consumes is
-[`docs/contracts/export-preparation.md`](https://github.com/txpipe/dolos/blob/827220007408996f79cd96a6493268dfc53201e5/docs/contracts/export-preparation.md).
+[`docs/contracts/export-preparation.md`](https://github.com/txpipe/dolos/blob/25548d6818953301ce42c79ab2a906277b008dbe/docs/contracts/export-preparation.md).
 
 Like every revision since the publisher retirement of
 [PR 1335](https://github.com/txpipe/dolos/pull/1335), the pin retains the
@@ -498,7 +498,7 @@ Each store records the Dolos store contract it was created under, and the
 configuration's `compatibility` names one too. An image whose Dolos records a
 newer contract refuses the older stores and configuration, so it opens the
 claim only after both stores are relabeled to that contract (Dolos's
-[`store relabel`](https://github.com/txpipe/dolos/blob/827220007408996f79cd96a6493268dfc53201e5/xtask/README.md#store-relabel))
+[`store relabel`](https://github.com/txpipe/dolos/blob/25548d6818953301ce42c79ab2a906277b008dbe/xtask/README.md#store-relabel))
 and `compatibility` is updated. A prepared bundle records the contract it was
 captured under, and the new image refuses one captured under the old, so stop
 the publisher at a boundary with no prepared batch under `.stelae-batch/`.

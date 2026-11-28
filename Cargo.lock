@@ -1197,8 +1197,8 @@ checksum = "780955b8b195a21ab8e4ac6b60dd1dbdcec1dc6c51c0617964b08c81785e12c9"
 
 [[package]]
 name = "dolos"
-version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=827220007408996f79cd96a6493268dfc53201e5#827220007408996f79cd96a6493268dfc53201e5"
+version = "2.0.0-beta.1"
+source = "git+https://github.com/txpipe/dolos?rev=25548d6818953301ce42c79ab2a906277b008dbe#25548d6818953301ce42c79ab2a906277b008dbe"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1218,6 +1218,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "gasket",
+ "gasket-otel",
  "hex",
  "http",
  "hyper",
@@ -1259,8 +1260,8 @@ dependencies = [
 
 [[package]]
 name = "dolos-cardano"
-version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=827220007408996f79cd96a6493268dfc53201e5#827220007408996f79cd96a6493268dfc53201e5"
+version = "2.0.0-beta.1"
+source = "git+https://github.com/txpipe/dolos?rev=25548d6818953301ce42c79ab2a906277b008dbe#25548d6818953301ce42c79ab2a906277b008dbe"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1285,8 +1286,8 @@ dependencies = [
 
 [[package]]
 name = "dolos-core"
-version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=827220007408996f79cd96a6493268dfc53201e5#827220007408996f79cd96a6493268dfc53201e5"
+version = "2.0.0-beta.1"
+source = "git+https://github.com/txpipe/dolos?rev=25548d6818953301ce42c79ab2a906277b008dbe#25548d6818953301ce42c79ab2a906277b008dbe"
 dependencies = [
  "bytes",
  "config",
@@ -1312,8 +1313,8 @@ dependencies = [
 
 [[package]]
 name = "dolos-fjall"
-version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=827220007408996f79cd96a6493268dfc53201e5#827220007408996f79cd96a6493268dfc53201e5"
+version = "2.0.0-beta.1"
+source = "git+https://github.com/txpipe/dolos?rev=25548d6818953301ce42c79ab2a906277b008dbe#25548d6818953301ce42c79ab2a906277b008dbe"
 dependencies = [
  "bincode 1.3.3",
  "dolos-core",
@@ -1331,8 +1332,8 @@ dependencies = [
 
 [[package]]
 name = "dolos-flatfiles"
-version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=827220007408996f79cd96a6493268dfc53201e5#827220007408996f79cd96a6493268dfc53201e5"
+version = "2.0.0-beta.1"
+source = "git+https://github.com/txpipe/dolos?rev=25548d6818953301ce42c79ab2a906277b008dbe#25548d6818953301ce42c79ab2a906277b008dbe"
 dependencies = [
  "rayon",
  "tempfile",
@@ -1341,8 +1342,8 @@ dependencies = [
 
 [[package]]
 name = "dolos-mithril"
-version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=827220007408996f79cd96a6493268dfc53201e5#827220007408996f79cd96a6493268dfc53201e5"
+version = "2.0.0-beta.1"
+source = "git+https://github.com/txpipe/dolos?rev=25548d6818953301ce42c79ab2a906277b008dbe#25548d6818953301ce42c79ab2a906277b008dbe"
 dependencies = [
  "mithril-client",
  "tracing",
@@ -1350,8 +1351,8 @@ dependencies = [
 
 [[package]]
 name = "dolos-redb3"
-version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=827220007408996f79cd96a6493268dfc53201e5#827220007408996f79cd96a6493268dfc53201e5"
+version = "2.0.0-beta.1"
+source = "git+https://github.com/txpipe/dolos?rev=25548d6818953301ce42c79ab2a906277b008dbe#25548d6818953301ce42c79ab2a906277b008dbe"
 dependencies = [
  "bincode 1.3.3",
  "bytes",
@@ -1374,8 +1375,8 @@ dependencies = [
 
 [[package]]
 name = "dolos-snapshot"
-version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=827220007408996f79cd96a6493268dfc53201e5#827220007408996f79cd96a6493268dfc53201e5"
+version = "2.0.0-beta.1"
+source = "git+https://github.com/txpipe/dolos?rev=25548d6818953301ce42c79ab2a906277b008dbe#25548d6818953301ce42c79ab2a906277b008dbe"
 dependencies = [
  "dolos-cardano",
  "dolos-core",
@@ -1395,11 +1396,12 @@ dependencies = [
 
 [[package]]
 name = "dolos-testing"
-version = "2.0.0-alpha.0"
-source = "git+https://github.com/txpipe/dolos?rev=827220007408996f79cd96a6493268dfc53201e5#827220007408996f79cd96a6493268dfc53201e5"
+version = "2.0.0-beta.1"
+source = "git+https://github.com/txpipe/dolos?rev=25548d6818953301ce42c79ab2a906277b008dbe#25548d6818953301ce42c79ab2a906277b008dbe"
 dependencies = [
  "bech32 0.9.1",
  "crc32fast",
+ "curve25519-dalek",
  "dolos-cardano",
  "dolos-core",
  "dolos-fjall",
@@ -1414,6 +1416,7 @@ dependencies = [
  "rand 0.9.5",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tar",
  "tempfile",
  "tokio",
@@ -1745,9 +1748,9 @@ dependencies = [
 
 [[package]]
 name = "gasket"
-version = "0.9.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37057b6b0b48bb9bdcd4c2bc8ec51090a6cd754744caf28d44b813584473be3a"
+checksum = "4dceef5bf697fce670432aa547d57847b07cb62b956c50752d74f42ffb29b67b"
 dependencies = [
  "async-trait",
  "crossbeam",
@@ -1762,13 +1765,23 @@ dependencies = [
 
 [[package]]
 name = "gasket-derive"
-version = "0.9.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00c4883f898206041f02b010ab10400715e89e7845c63410f6bad162a3841174"
+checksum = "fcca62f09206877df06e23bfe18a8d9fdb63426c81ca4360253dd19d746739f0"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "gasket-otel"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6c1244dc5eee15484bcc037dd0f4fe0f252863d02f91173c351c0045ae30092"
+dependencies = [
+ "gasket",
+ "opentelemetry",
 ]
 
 [[package]]
@@ -3355,9 +3368,9 @@ checksum = "13c45bb4a6ae1280ec0803b1ef9d3455eb50f01efbbe1447ab020f1d54fba9d8"
 
 [[package]]
 name = "pallas"
-version = "1.5.0-rc.3"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfb92ccf1b252530452965eae92b2c0a154e3d0f9a90e4753b2639cb8b1ead34"
+checksum = "ca89916e320789410a2735c967acf87f2d6cd8417d76b65a16a0a03037830582"
 dependencies = [
  "pallas-addresses",
  "pallas-codec",
@@ -3374,9 +3387,9 @@ dependencies = [
 
 [[package]]
 name = "pallas-addresses"
-version = "1.5.0-rc.3"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84c239845e5aea059cf85d17de8b6971fb8f6575ef0a9d4b2a45a2c10ad6fcc3"
+checksum = "94c60e9538d367c32a77826aed31af84647ae9e4399484806679d6ca4123db18"
 dependencies = [
  "base58",
  "bech32 0.11.1",
@@ -3390,9 +3403,9 @@ dependencies = [
 
 [[package]]
 name = "pallas-codec"
-version = "1.5.0-rc.3"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08458513d43d89daed59d9c6732f0c1ae346c00eb4d08d1c432097d792ef22df"
+checksum = "dff4596f8f420d9a9a909df4241f95094e8dcdc971ec5e022ce2b926a897f409"
 dependencies = [
  "hex",
  "minicbor 0.26.5",
@@ -3402,9 +3415,9 @@ dependencies = [
 
 [[package]]
 name = "pallas-configs"
-version = "1.5.0-rc.3"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d8245ccee40e4fb45005e7b8386cc480a6f4697da2065957b64f80c809518ee"
+checksum = "5f764250dd5e6df1c24971a946ff0b8dbf713c05940f80e72ed8625649fd803b"
 dependencies = [
  "base64 0.22.1",
  "num-rational",
@@ -3418,11 +3431,12 @@ dependencies = [
 
 [[package]]
 name = "pallas-crypto"
-version = "1.5.0-rc.3"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ee7b5abbe8a5b13aaf05625272a9a5a9adc3ea97b2911c13986611fa069b803"
+checksum = "463773f784cf4b3d7b0567a8c1eb6f9b3b8d8cf5ae40735a3e3859c03f9f66d0"
 dependencies = [
  "cryptoxide",
+ "ed25519-dalek",
  "hex",
  "pallas-codec",
  "rand_core 0.10.1",
@@ -3432,9 +3446,9 @@ dependencies = [
 
 [[package]]
 name = "pallas-hardano"
-version = "1.5.0-rc.3"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1019328eb4511bbacc915ca95b08a0a971abf5c8f0b3aec829c8206e468ffab"
+checksum = "50e84be19ef64d5e135389b73fee7fd644070f8cd840e1cb6a150dfa4a6ad46b"
 dependencies = [
  "binary-layout",
  "hex",
@@ -3453,9 +3467,9 @@ dependencies = [
 
 [[package]]
 name = "pallas-network"
-version = "1.5.0-rc.3"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d2b304bb852d1ed46eb2ac979e1ed75ad0a2e57b2477e20475ab2919404a073"
+checksum = "474acda87227c18c32b84ea0f74c11a84fcbac66af7a052ec2380a5b117d0ed5"
 dependencies = [
  "byteorder",
  "hex",
@@ -3471,9 +3485,9 @@ dependencies = [
 
 [[package]]
 name = "pallas-primitives"
-version = "1.5.0-rc.3"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9683e36342262c9461c2b9552515a5c46b06dc9a39f43538ab57bfa361c18b41"
+checksum = "f1da79178a7c389fa39c33472ee15343beef2c1dc8067d3c84a5b0f669d46bb0"
 dependencies = [
  "hex",
  "pallas-codec",
@@ -3484,9 +3498,9 @@ dependencies = [
 
 [[package]]
 name = "pallas-traverse"
-version = "1.5.0-rc.3"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dc897fa303b261b73950cfb8748aa328c9fc37b76669da5bd37754b8bcc3c1b"
+checksum = "d628fd962e833d235e8372c407851049b39d5c2819ab21a7a59bc210bcd9e999"
 dependencies = [
  "hex",
  "itertools 0.14.0",
@@ -3501,9 +3515,9 @@ dependencies = [
 
 [[package]]
 name = "pallas-txbuilder"
-version = "1.5.0-rc.3"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fea8e49340077f91e42eb52b83dc47de959eca4ad1397d0bca18f01b45a041de"
+checksum = "18bbbd3c52b14bc2804ed45ba04e9695e868293800490175eb5f1c97be269638"
 dependencies = [
  "hex",
  "pallas-addresses",
@@ -3518,9 +3532,9 @@ dependencies = [
 
 [[package]]
 name = "pallas-utxorpc"
-version = "1.5.0-rc.3"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e7db9e093c9ac90070a7fe1c1c336768b05ba690a95c4ba9bdcd8eaee01effe"
+checksum = "1e11865ca72deb25ba57490b8ca402104de51fdffdaec3320e28a9edb9ef29e6"
 dependencies = [
  "pallas-codec",
  "pallas-crypto",
@@ -3533,9 +3547,9 @@ dependencies = [
 
 [[package]]
 name = "pallas-validate"
-version = "1.5.0-rc.3"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc75d92505ba105a5836c3c87394a8d999308550b4aa9a291206a66e08d05255"
+checksum = "4c908a3978b9e9953cbe9f4fd192a6fb7c2bcaa1f5214dabbeb30865983a1934"
 dependencies = [
  "amaru-uplc",
  "chrono",

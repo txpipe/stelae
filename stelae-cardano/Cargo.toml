@@ -16,14 +16,14 @@ stelae-blocks = { path = "../stelae-blocks", version = "=0.9.0", features = ["ha
 # snapshot (txpipe/dolos PR #1610 through PR #1625), under the `v2-beta.1`
 # store contract (PR #1646); see docs/publisher.md.
 # DOLOS_REVISION in src/lib.rs names the same commit.
-dolos = { git = "https://github.com/txpipe/dolos", rev = "827220007408996f79cd96a6493268dfc53201e5", default-features = false }
-dolos-cardano = { git = "https://github.com/txpipe/dolos", rev = "827220007408996f79cd96a6493268dfc53201e5" }
-dolos-core = { git = "https://github.com/txpipe/dolos", rev = "827220007408996f79cd96a6493268dfc53201e5" }
-dolos-mithril = { git = "https://github.com/txpipe/dolos", rev = "827220007408996f79cd96a6493268dfc53201e5" }
-dolos-snapshot = { git = "https://github.com/txpipe/dolos", rev = "827220007408996f79cd96a6493268dfc53201e5" }
+dolos = { git = "https://github.com/txpipe/dolos", rev = "25548d6818953301ce42c79ab2a906277b008dbe", default-features = false }
+dolos-cardano = { git = "https://github.com/txpipe/dolos", rev = "25548d6818953301ce42c79ab2a906277b008dbe" }
+dolos-core = { git = "https://github.com/txpipe/dolos", rev = "25548d6818953301ce42c79ab2a906277b008dbe" }
+dolos-mithril = { git = "https://github.com/txpipe/dolos", rev = "25548d6818953301ce42c79ab2a906277b008dbe" }
+dolos-snapshot = { git = "https://github.com/txpipe/dolos", rev = "25548d6818953301ce42c79ab2a906277b008dbe" }
 
 itertools = "0.14.0"
-pallas = { version = "=1.5.0-rc.3", features = ["hardano", "phase2", "unstable"] }
+pallas = { version = "1.5.1", features = ["hardano", "phase2", "unstable"] }
 serde = { version = "1.0.136", features = ["derive"] }
 serde_json = "1.0.122"
 # `rebuild blocks` hashes each immutable file's bodies, and fetches Mithril's
@@ -36,7 +36,7 @@ tokio-util = { version = "0.7.11", features = ["rt"] }
 tracing = "0.1.37"
 
 # The `testing` fixture's, which the publisher's binary tests build stores with.
-dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "827220007408996f79cd96a6493268dfc53201e5", optional = true }
+dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "25548d6818953301ce42c79ab2a906277b008dbe", optional = true }
 tempfile = { version = "3.20.0", optional = true }
 toml = { version = "0.8.13", optional = true }
 
@@ -51,8 +51,8 @@ required-features = ["testing"]
 stelae-cardano = { path = ".", features = ["testing"] }
 # The re-encode test exports the same epoch from immutable files.
 stelae-blocks = { path = "../stelae-blocks", version = "=0.9.0", features = ["hardano"] }
-dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "827220007408996f79cd96a6493268dfc53201e5" }
-dolos-fjall = { git = "https://github.com/txpipe/dolos", rev = "827220007408996f79cd96a6493268dfc53201e5" }
+dolos-testing = { git = "https://github.com/txpipe/dolos", rev = "25548d6818953301ce42c79ab2a906277b008dbe" }
+dolos-fjall = { git = "https://github.com/txpipe/dolos", rev = "25548d6818953301ce42c79ab2a906277b008dbe" }
 # The tests build fjall errors directly, so this must be the fork revision
 # dolos-fjall pins at the Dolos commit above, or two fjall crates would resolve.
 fjall = { git = "https://github.com/txpipe/fjall", rev = "ae794ad448d90214c3491df4c50f59f0fe15cf90" }

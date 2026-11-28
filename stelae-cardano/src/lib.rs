@@ -30,7 +30,7 @@ pub use dolos_snapshot::{
 /// the profile that exports the diff chain and names its blocks snapshot
 /// (txpipe/dolos PR #1610 through PR #1625), under the `v2-beta.1` store
 /// contract (PR #1646).
-pub const DOLOS_REVISION: &str = "827220007408996f79cd96a6493268dfc53201e5";
+pub const DOLOS_REVISION: &str = "25548d6818953301ce42c79ab2a906277b008dbe";
 
 #[cfg(test)]
 mod dependency_identity {
