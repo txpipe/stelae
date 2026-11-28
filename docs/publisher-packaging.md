@@ -49,7 +49,7 @@ custom provenance files.
 ## Candidate identity
 
 A candidate is the tuple of the full Stelae commit, committed `Cargo.lock`,
-Dolos revision `827220007408996f79cd96a6493268dfc53201e5` (fjall built from the
+Dolos revision `25548d6818953301ce42c79ab2a906277b008dbe` (fjall built from the
 txpipe fork, see
 [publisher.md](publisher.md#source-and-dependency-identity)),
 chart source at that same Stelae
